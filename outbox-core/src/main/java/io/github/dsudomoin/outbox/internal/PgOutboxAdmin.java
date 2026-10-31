@@ -25,6 +25,7 @@ import java.util.Collection;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
@@ -326,7 +327,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             log.info("outbox admin {} on {} returned {}, the rows re-sent", call, names.base(), sent.get());
             if (cleanup != null) {
                 log.warn("outbox admin {} on {}: the recovery committed, then releasing the maintenance lock,"
-                        + " resetting idle_session_timeout or closing the connection failed: {}", call, names.base(),
+                        + " giving idle_session_timeout back or closing the connection failed: {}", call, names.base(),
                         printable(cleanup.toString()));
             }
             try {
@@ -488,13 +489,13 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     /**
      * {@code body} on {@code c} under the maintenance lock, waited for at most {@link #maintenanceWait}, so no
      * maintenance run goes on beside it. The session gets {@code idle_session_timeout = 60s} first, as
-     * {@link Maintenance} does, so Postgres ends the session of a frozen holder and frees the lock; reset, and the lock
-     * released, before the connection goes back to the pool.
+     * {@link Maintenance} does, so Postgres ends the session of a frozen holder and frees the lock; the session's own
+     * value given back, and the lock released, before the connection goes back to the pool.
      */
     private <T> T underMaintenanceLock(Connection c, String call, SqlFunction0<T> body) throws SQLException {
         PartitionDdl.requireSessionStable(c, "outbox admin " + call + " on " + names.base());
         // before the lock, so a holder frozen right after taking it loses it too
-        execute(c, "set idle_session_timeout = '60s'");
+        var session = SessionSettings.set(c, Map.of("idle_session_timeout", "'60s'"));
         boolean locked = false;
         Throwable failure = null;
         try {
@@ -509,7 +510,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                 if (locked) {
                     advisory(c, "pg_advisory_unlock");
                 }
-                execute(c, "reset idle_session_timeout");
+                session.restore(c);
             } catch (SQLException e) { // the session died, and its lock and setting with it: keep the cause
                 if (failure == null) {
                     throw e;

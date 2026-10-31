@@ -60,6 +60,14 @@ public final class OutboxSchema implements AutoCloseable {
     private static final Duration LOCK_TIMEOUT = Duration.ofSeconds(5);
     /** Bounds every bootstrap statement, and replaces a shorter role default that would cut its lock waits short. */
     private static final Duration STATEMENT_TIMEOUT = Duration.ofMinutes(1);
+    /**
+     * Set on the bootstrap's session before the schema lock, so that wait is bounded too; {@code idle_session_timeout}
+     * off, as a role's own value would end the session during the reshard's tick wait.
+     */
+    private static final Map<String, String> BOOTSTRAP_SETTINGS = Map.of(
+            "lock_timeout", String.valueOf(LOCK_TIMEOUT.toMillis()),
+            "statement_timeout", String.valueOf(STATEMENT_TIMEOUT.toMillis()),
+            "idle_session_timeout", "0");
     /** {@code LOCK_TIMEOUT} each: a minute for other instances' bootstraps, which take milliseconds each. */
     private static final int SCHEMA_LOCK_ATTEMPTS = 12;
     private static final String LOCK_NOT_AVAILABLE = "55P03";
@@ -337,15 +345,10 @@ public final class OutboxSchema implements AutoCloseable {
             }
             boolean autoCommit = c.getAutoCommit();
             c.setAutoCommit(true);
-            try (var st = c.createStatement()) {
+            try {
                 // first: behind a transaction-pooling proxy even the settings below would leak
                 PartitionDdl.requireSessionStable(c, "outbox bootstrap of " + spelled.base());
-                // before the schema lock, so that wait is bounded too
-                st.execute("set lock_timeout = " + LOCK_TIMEOUT.toMillis());
-                st.execute("set statement_timeout = " + STATEMENT_TIMEOUT.toMillis());
-                // a role's own value would end the session during the reshard's tick wait
-                st.execute("set idle_session_timeout = 0");
-                try {
+                SessionSettings.with(c, BOOTSTRAP_SETTINGS, () -> {
                     // where the table is or will be created, so every spelling of it takes the same schema lock
                     var resolved = spelled.resolve(c);
                     lockSchema(c, resolved);
@@ -355,14 +358,17 @@ public final class OutboxSchema implements AutoCloseable {
                     } finally {
                         advisory(c, "pg_advisory_unlock", resolved, TableNames.LOCK_SCHEMA);
                     }
-                } finally {
-                    st.execute("reset lock_timeout");
-                    st.execute("reset statement_timeout");
-                    st.execute("reset idle_session_timeout");
+                    return null;
+                });
+            } catch (Throwable e) {
+                try {
+                    c.setAutoCommit(autoCommit);
+                } catch (SQLException cleanup) { // the session died, or was aborted (SessionSettings)
+                    e.addSuppressed(cleanup);
                 }
-            } finally {
-                c.setAutoCommit(autoCommit);
+                throw e;
             }
+            c.setAutoCommit(autoCommit);
         }
     }
 

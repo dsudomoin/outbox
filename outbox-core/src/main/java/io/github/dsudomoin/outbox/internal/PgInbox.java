@@ -15,6 +15,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
@@ -196,15 +197,13 @@ public final class PgInbox implements Inbox, AutoCloseable {
             }
             c.setAutoCommit(true);
             PartitionDdl.requireSessionStable(c, "outbox inbox bootstrap of " + names.base());
-            execute(c, "set lock_timeout = " + LOCK_TIMEOUT.toMillis());
-            // a shorter role or database default would end the lock waits with 57014 instead of 55P03
-            execute(c, "set statement_timeout = " + LOCK_TIMEOUT.plus(PartitionDdl.DDL_MARGIN).toMillis());
-            try {
+            // statement_timeout: a shorter role or database default would end the lock waits with 57014, not 55P03
+            var settings = Map.of("lock_timeout", String.valueOf(LOCK_TIMEOUT.toMillis()),
+                    "statement_timeout", String.valueOf(LOCK_TIMEOUT.plus(PartitionDdl.DDL_MARGIN).toMillis()));
+            SessionSettings.with(c, settings, () -> {
                 bootstrap(c);
-            } finally {
-                execute(c, "reset lock_timeout");
-                execute(c, "reset statement_timeout");
-            }
+                return null;
+            });
             if (!OutboxSchema.columnExists(c, names.base(), "consumer")) {
                 throw new IllegalStateException("outbox inbox table " + names.base() + " has no consumer column: an"
                         + " earlier version made it, and its dedup spans every consumer of a message; drop the table"
@@ -302,7 +301,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
     private void maintain(Connection c) throws SQLException {
         int ns = names.resolve(c).internalNamespace();
         // before the lock, so a holder frozen right after taking it loses it too
-        execute(c, "set idle_session_timeout = '60s'");
+        var session = SessionSettings.set(c, Map.of("idle_session_timeout", "'60s'"));
         boolean locked = false;
         Throwable failure = null;
         try {
@@ -340,7 +339,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
                 if (locked) {
                     advisory(c, "pg_advisory_unlock", ns);
                 }
-                execute(c, "reset idle_session_timeout");
+                session.restore(c);
             } catch (SQLException e) { // the session died, and its lock and setting with it: keep the cause on top
                 if (failure == null) {
                     throw e;

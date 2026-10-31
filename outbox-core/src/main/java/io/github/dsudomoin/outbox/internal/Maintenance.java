@@ -35,7 +35,7 @@ import org.slf4j.LoggerFactory;
  * {@code outbox.maintenance.transaction_pooling} at 1 (0 otherwise). It runs on at most one instance at a time: it
  * holds the session lock {@code pg_try_advisory_lock(internalNs, LOCK_MAINTENANCE)} on one autocommit connection with
  * {@code idle_session_timeout = 60s}, so Postgres ends the session of a frozen holder and frees the lock; the setting
- * is reset and the lock released before the connection goes back to the pool. While halted the one step under the
+ * is given back and the lock released before the connection goes back to the pool. While halted the one step under the
  * lock is the recovery ({@link XidRecovery#autoRecover}), with {@code outbox.recovery.xidRegression = auto}; with
  * {@code halt} the run takes no lock. Otherwise the steps, each on its own (a failure is logged and the next step
  * still runs): finish a pending detach, premade partitions (the extension swaps the tail in one transaction, a tail
@@ -487,7 +487,7 @@ public final class Maintenance {
     /** {@code check}: the halt found by this run's check, null when none. */
     private boolean maintain(Connection c, @Nullable XidRecovery.Check check) throws SQLException {
         // before the lock, so a holder frozen right after taking it loses it too
-        execute(c, "set idle_session_timeout = '60s'");
+        var session = SessionSettings.set(c, Map.of("idle_session_timeout", "'60s'"));
         boolean locked = false;
         Throwable failure = null;
         try {
@@ -513,7 +513,7 @@ public final class Maintenance {
                 if (locked) {
                     advisory(c, "pg_advisory_unlock");
                 }
-                execute(c, "reset idle_session_timeout");
+                session.restore(c);
             } catch (SQLException e) { // the session died, and its lock and setting with it: keep the cause on top
                 if (failure == null) {
                     throw e;
