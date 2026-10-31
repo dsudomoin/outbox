@@ -158,13 +158,57 @@ class HeartbeatConnectionsIT {
         assertThat(app.opened.get(0).isClosed()).isTrue();
     }
 
+    /** A pooler connects at once and waits on the first query: a check that gets no answer does not fail the start. */
+    @Test
+    void checkQueryFailureAtStartDoesNotFailIt() throws Exception {
+        var app = new Recorded("app", MAIN, n -> false);
+        var lane = new Recorded("lane", MAIN, n -> false, n -> n == 1);
+        var connections = new HeartbeatConnections(app, lane);
+
+        try (var log = new CapturedStderr()) {
+            try (var reference = MAIN.getConnection()) {
+                connections.start(reference, TABLE);
+            }
+            assertThat(log.text()).containsOnlyOnce("unreachable at start")
+                    .doesNotContain("this beat uses the application's connections");
+        }
+        try (var c = connections.newConnection()) {
+            assertThat(c).isSameAs(lane.opened.get(1));
+        }
+        assertThat(app.calls).as("the deferred check's").isEqualTo(1);
+    }
+
+    @Test
+    void checkQueryFailureLaterFallsBackForThatBeat() throws Exception {
+        var app = new Recorded("app", MAIN, n -> false);
+        var lane = new Recorded("lane", MAIN, n -> n == 1, n -> n == 2);
+        var connections = new HeartbeatConnections(app, lane);
+        try (var reference = MAIN.getConnection()) {
+            connections.start(reference, TABLE);
+        }
+
+        try (var log = new CapturedStderr()) {
+            try (var c = connections.newConnection()) {
+                assertThat(c).isSameAs(app.opened.get(0)).isNotSameAs(lane.opened.get(0));
+            }
+            assertThat(log.text()).containsOnlyOnce("this beat uses the application's connections");
+        }
+        try (var c = connections.newConnection()) {
+            assertThat(c).as("checked again").isSameAs(lane.opened.get(1));
+        }
+        assertThat(app.calls).isEqualTo(2);
+    }
+
     private static DataSource other() {
         var ds = (PGSimpleDataSource) TestDataSources.newDataSource();
         ds.setDatabaseName(OTHER);
         return ds;
     }
 
-    /** Counts its calls and keeps what it handed out; call {@code n} (from 1) throws when {@code fails} says so. */
+    /**
+     * Counts its calls and keeps what it handed out; call {@code n} (from 1) throws when {@code fails} says so, and
+     * hands out a connection already closed, whose every query fails, when {@code closed} does.
+     */
     private static final class Recorded implements ConnectionSource {
 
         final List<Connection> opened = new ArrayList<>();
@@ -172,11 +216,17 @@ class HeartbeatConnectionsIT {
         private final String name;
         private final DataSource source;
         private final IntPredicate fails;
+        private final IntPredicate closed;
 
         Recorded(String name, DataSource source, IntPredicate fails) {
+            this(name, source, fails, n -> false);
+        }
+
+        Recorded(String name, DataSource source, IntPredicate fails, IntPredicate closed) {
             this.name = name;
             this.source = source;
             this.fails = fails;
+            this.closed = closed;
         }
 
         @Override
@@ -185,6 +235,9 @@ class HeartbeatConnectionsIT {
                 throw new SQLException(name + " refused");
             }
             var c = source.getConnection();
+            if (closed.test(calls)) {
+                c.close();
+            }
             opened.add(c);
             return c;
         }
