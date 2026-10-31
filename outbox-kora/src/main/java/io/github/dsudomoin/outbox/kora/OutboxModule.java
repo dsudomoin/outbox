@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.kora;
 
+import com.zaxxer.hikari.HikariDataSource;
 import io.github.dsudomoin.outbox.InternalApi;
 import io.github.dsudomoin.outbox.Outbox;
 import io.github.dsudomoin.outbox.OutboxAdmin;
@@ -83,16 +84,25 @@ public interface OutboxModule extends OutboxCommonModule {
         if (owner != null) {
             builder.ownerConnections(owner::newConnection);
         }
-        var pool = heartbeat == null && heartbeatConfig.dedicatedConnection()
-                ? HeartbeatPool.derive(db, config.partitions().maintenanceInterval()) : null;
+        HikariDataSource pool = null;
         if (heartbeat != null) {
             builder.heartbeatConnections(heartbeat::newConnection);
-        } else if (pool != null) {
-            builder.heartbeatConnections(pool::getConnection);
         } else if (heartbeatConfig.dedicatedConnection()) {
-            LoggerFactory.getLogger(OutboxModule.class).info("outbox heartbeat gets no pool of its own: the outbox's"
-                    + " transactions are not KoraOutboxTransactions over a Hikari-backed JdbcDatabase, whose pool it"
-                    + " would copy; give it one as a JdbcConnectionFactory tagged @Tag(OutboxHeartbeat.class)");
+            var log = LoggerFactory.getLogger(OutboxModule.class);
+            try {
+                pool = HeartbeatPool.derive(db, config.partitions().maintenanceInterval());
+                if (pool == null) {
+                    log.info("outbox heartbeat gets no pool of its own: the outbox's transactions are not"
+                            + " KoraOutboxTransactions over a Hikari-backed JdbcDatabase, whose pool it would copy;"
+                            + " give it one as a JdbcConnectionFactory tagged @Tag(OutboxHeartbeat.class)");
+                }
+            } catch (RuntimeException e) { // from Hikari's setters or constructor: a broken pool is no worse than none
+                log.warn("outbox heartbeat of {} could not derive a pool of its own from the app's and shares the"
+                        + " application's connections: {}", config.table(), e.toString());
+            }
+            if (pool != null) {
+                builder.heartbeatConnections(pool::getConnection);
+            }
         }
         Runnable closePool = pool != null ? pool::close : () -> {};
         OutboxRuntime runtime;

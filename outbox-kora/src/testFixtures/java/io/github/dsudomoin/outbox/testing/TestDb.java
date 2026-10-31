@@ -78,8 +78,18 @@ public final class TestDb {
 
     private static TestDatabase newDatabase(
             String jdbcUrl, String user, String password, int maxPoolSize, Properties dsProperties) {
+        return new TestDatabase(config(jdbcUrl, user, password, maxPoolSize, dsProperties));
+    }
+
+    /** The config of a {@link #newDatabase(int)} pool, for a test's own {@code JdbcDatabase} over the container. */
+    public static JdbcDatabaseConfig config(int maxPoolSize) {
+        return config(jdbcUrl(), user(), password(), maxPoolSize, new Properties());
+    }
+
+    private static JdbcDatabaseConfig config(
+            String jdbcUrl, String user, String password, int maxPoolSize, Properties dsProperties) {
         var poolName = "test-" + POOLS.incrementAndGet();
-        var config = new JdbcDatabaseConfig() {
+        return new JdbcDatabaseConfig() {
             @Override
             public String username() {
                 return user;
@@ -125,10 +135,9 @@ public final class TestDb {
             @Nullable
             @Override
             public TelemetryConfig telemetry() {
-                return null; // read only by the DataBaseTelemetryFactory constructor, not the one used below
+                return null; // read only by the DataBaseTelemetryFactory constructor, not the one TestDatabase uses
             }
         };
-        return new TestDatabase(config);
     }
 
     /** {@code ob_} + 10 random lowercase hex digits. */

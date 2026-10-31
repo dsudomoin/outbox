@@ -19,19 +19,22 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicInteger;
+import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.application.graph.All;
 import ru.tinkoff.kora.application.graph.LifecycleWrapper;
 import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
+import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetryFactory;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 
 /**
  * {@link OutboxModule#outboxRuntime}'s heartbeat: on a pool of one connection derived from the app's by default, so
- * beats go on while business load holds every app connection; on the app's connections with the flag off; on a tagged
- * factory whatever the flag says. The derived pool closes after the runtime has deleted its row.
+ * beats go on while business load holds every app connection; on the app's connections with the flag off or when the
+ * pool cannot be derived; on a tagged factory whatever the flag says. The derived pool closes after the runtime has
+ * deleted its row.
  */
 class HeartbeatPoolIT {
 
@@ -63,40 +66,67 @@ class HeartbeatPoolIT {
     }
 
     @Test
-    void aTaggedFactoryWinsOverTheFlag() throws Exception {
-        var other = TestDb.newDatabase(1);
-        var taken = new AtomicInteger();
-        var wrapper = runtime(counting(other, taken), false);
-        try {
-            wrapper.init();
-            var names = wrapper.value().schema().names();
-            int before = taken.get();
-            awaitBeat(names);
-            awaitBeat(names);
+    void aTaggedFactoryWinsOverTheFlagOff() throws Exception {
+        taggedFactoryServesTheBeats(false);
+    }
 
-            assertThat(taken.get()).as("connections the tagged factory gave across two beats").isGreaterThan(before);
+    @Test
+    void aTaggedFactoryWinsOverTheFlagOn() throws Exception {
+        taggedFactoryServesTheBeats(true);
+    }
+
+    @Test
+    void aFailedDerivationSharesTheAppConnections() throws Exception {
+        var taken = new AtomicInteger();
+        var app = new JdbcDatabase(TestDb.config(2), DataBaseTelemetryFactory.EMPTY) {
+            @Override
+            public DataSource value() {
+                return new HikariDataSource(); // not started and without a URL: a pool derived from it fails to build
+            }
+
+            @Override
+            public Connection newConnection() {
+                taken.incrementAndGet();
+                return super.newConnection();
+            }
+        };
+        try (var log = new CapturedStderr()) {
+            var wrapper = new OutboxModule() {}.outboxRuntime(config, new KoraOutboxTransactions(app),
+                    new RecordingHandler(), All.of(), null, new OutboxTelemetry() {}, null, null, flag(true));
+            try {
+                wrapper.init();
+                var names = wrapper.value().schema().names();
+                int before = taken.get();
+                awaitBeat(names);
+                awaitBeat(names);
+
+                assertThat(taken.get()).as("app connections across two beats").isGreaterThan(before);
+            } finally {
+                wrapper.release();
+            }
+            assertThat(log.text()).containsOnlyOnce("could not derive a pool of its own")
+                    .containsOnlyOnce("outbox heartbeat shares the application's connections");
         } finally {
-            wrapper.release();
-            other.release();
+            app.release();
         }
     }
 
     @Test
     void releaseDeletesTheRowBeforeClosingThePool() throws Exception {
+        var wrapper = runtime(null, true);
+        wrapper.init();
+        var names = wrapper.value().schema().names();
+        assertThat(poolRuns()).as("the derived pool, before the release").isTrue();
         try (var log = new CapturedStderr()) {
-            var wrapper = runtime(null, true);
-            wrapper.init();
-            var names = wrapper.value().schema().names();
-            assertThat(poolRuns()).as("the derived pool, before the release").isTrue();
             wrapper.release();
 
-            try (var c = TestDb.connect()) {
-                assertThat(TestSql.queryLong(c, "select count(*) from " + names.instance())).isZero();
-            }
-            assertThat(log.text()).doesNotContain("outbox heartbeat connection source")
-                    .doesNotContain("outbox heartbeat shares the application's connections");
-            await(() -> !poolRuns());
+            assertThat(log.text()).doesNotContain("this beat uses the application's connections")
+                    .doesNotContain("could not delete its row");
         }
+        try (var c = TestDb.connect()) {
+            assertThat(TestSql.queryLong(c, "select count(*) from " + names.instance())).isZero();
+        }
+        await(() -> !poolRuns());
     }
 
     @Test
@@ -123,6 +153,26 @@ class HeartbeatPoolIT {
                     .containsOnlyOnce("@Tag(OutboxHeartbeat.class)");
         }
         assertThat(poolRuns()).isFalse();
+    }
+
+    /** Beats on a tagged factory, with no pool derived whatever {@code dedicated} says. */
+    private void taggedFactoryServesTheBeats(boolean dedicated) throws Exception {
+        var other = TestDb.newDatabase(1);
+        var taken = new AtomicInteger();
+        var wrapper = runtime(counting(other, taken), dedicated);
+        try {
+            wrapper.init();
+            var names = wrapper.value().schema().names();
+            int before = taken.get();
+            awaitBeat(names);
+            awaitBeat(names);
+
+            assertThat(taken.get()).as("connections the tagged factory gave across two beats").isGreaterThan(before);
+            assertThat(poolRuns()).as("a pool derived from the app's").isFalse();
+        } finally {
+            wrapper.release();
+            other.release();
+        }
     }
 
     /** {@code last_seen} sampled twice, 2 s apart, while both app connections are held, and its age as they go back. */
