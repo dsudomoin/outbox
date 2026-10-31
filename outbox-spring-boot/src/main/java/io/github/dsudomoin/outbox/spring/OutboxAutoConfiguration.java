@@ -58,11 +58,11 @@ public final class OutboxAutoConfiguration {
     @Configuration(proxyBeanMethods = false)
     @ConditionalOnMissingBean(OutboxConfig.class)
     @EnableConfigurationProperties(OutboxProperties.class)
-    static class Properties {}
+    static class PropertiesConfiguration {}
 
     @Configuration(proxyBeanMethods = false)
     @ConditionalOnProperty(prefix = "outbox", name = "enabled", matchIfMissing = true)
-    static class Runtime {
+    static class RuntimeConfiguration {
 
         /** Eager under global lazy init: nothing else would start the relay; stopped on a failed refresh too. */
         @Bean(destroyMethod = "stop")
@@ -105,7 +105,7 @@ public final class OutboxAutoConfiguration {
 
     /** Lazy, as a SmartLifecycle bean would be created whether used or not: its users start later anyway. */
     @Configuration(proxyBeanMethods = false)
-    static class InboxBeans {
+    static class InboxConfiguration {
 
         @Bean(initMethod = "start", destroyMethod = "close")
         @Lazy
