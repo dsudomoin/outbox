@@ -134,7 +134,7 @@ final class SchemaCheck {
         }
     }
 
-    private static String where(Connection c, String table) throws SQLException {
+    static String where(Connection c, String table) throws SQLException {
         try (var ps = c.prepareStatement("select current_database(), pg_postmaster_start_time(),"
                 + " to_regclass(?)::oid")) {
             ps.setString(1, table);
