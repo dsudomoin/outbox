@@ -16,7 +16,8 @@ final class HeartbeatPool {
      * {@code app}'s config with one connection, always open, named {@code <app pool>-outbox-heartbeat}, whose
      * construction never probes the database. A borrow may wait {@code connectionTimeout} and then validate for
      * {@code validationTimeout}; the first is capped at a quarter of {@code maintenanceInterval} and the second at half
-     * of the first, so together they stay under 0.375 intervals, and neither goes below Hikari's 250 ms floor.
+     * of the first, so from a 2 s interval up together they stay within 0.375 intervals. Below it the floors hold: the
+     * first never goes under 500 ms, the second never under Hikari's 250 ms, 750 ms in all.
      */
     static HikariConfig config(HikariConfig app, Duration maintenanceInterval) {
         var config = new HikariConfig();

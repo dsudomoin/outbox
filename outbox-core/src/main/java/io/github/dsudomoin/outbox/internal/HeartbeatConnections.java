@@ -50,9 +50,10 @@ final class HeartbeatConnections implements ConnectionSource {
 
     /**
      * Checks the heartbeat source against {@code reference}, a connection to the application's database, on
-     * {@code table}, the base table name the beats use. Only another database fails it: a heartbeat source that does
-     * not connect or answer (a pooler may connect at once and wait on the first query) only logs a WARN, while a
-     * failure of {@code reference} is thrown.
+     * {@code table}, the base table name the beats use. Only another database fails it, and a failure of
+     * {@code reference} is thrown. A heartbeat source that fails to connect, or whose check query fails, only logs a
+     * WARN. One that does not answer at all holds the start: without a connection, statement or network timeout of its
+     * own, this waits until it answers or gives up (a pooler may connect at once and wait on the first query).
      */
     void start(Connection reference, String table) throws SQLException {
         this.table = table;
