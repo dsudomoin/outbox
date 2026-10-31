@@ -336,6 +336,7 @@ package io.github.dsudomoin.outbox {
   public static final class OutboxRuntime.Builder {
     method public io.github.dsudomoin.outbox.OutboxRuntime! build();
     method public io.github.dsudomoin.outbox.OutboxRuntime.Builder! deadLetterHandler(io.github.dsudomoin.outbox.OutboxDeadLetterHandler!);
+    method public io.github.dsudomoin.outbox.OutboxRuntime.Builder! heartbeatConnections(io.github.dsudomoin.outbox.ConnectionSource!);
     method public io.github.dsudomoin.outbox.OutboxRuntime.Builder! ownerConnections(io.github.dsudomoin.outbox.ConnectionSource!);
     method public io.github.dsudomoin.outbox.OutboxRuntime.Builder! route(io.github.dsudomoin.outbox.OutboxTopicHandler!);
     method public io.github.dsudomoin.outbox.OutboxRuntime.Builder! telemetry(io.github.dsudomoin.outbox.OutboxTelemetry!);

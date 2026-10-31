@@ -16,6 +16,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * The outbox assembled from public parts: config, the application's transactions, the handler and, optionally, topic
@@ -36,8 +38,13 @@ import java.util.TreeSet;
  *         .route(new BillingHandler(billing))
  *         .build();
  * }</pre>
+ * The heartbeat, which keeps this instance's row fresh and reads the reports that guard routed sends, takes the
+ * application's connections unless {@link Builder#heartbeatConnections} gives it a pool of its own; then business load
+ * that exhausts the application's pool does not starve it.
  */
 public final class OutboxRuntime implements AutoCloseable {
+
+    private static final Logger log = LoggerFactory.getLogger(OutboxRuntime.class);
 
     static final String OWNER_NEEDS_MIGRATIONS = "outbox.schema.bootstrap must be false when an owner connection source"
             + " is set: objects it created would leave the application role without rights on them";
@@ -64,6 +71,8 @@ public final class OutboxRuntime implements AutoCloseable {
     /** The transactions with the owner's new connections, or {@link #transactions} without an owner source. */
     private final OutboxTransactions ddl;
     @Nullable
+    private final ConnectionSource heartbeat;
+    @Nullable
     private volatile Parts parts;
 
     private OutboxRuntime(Builder builder, OutboxHandler handler, @Nullable Set<String> claimedTopics,
@@ -77,6 +86,7 @@ public final class OutboxRuntime implements AutoCloseable {
         this.deadLetterHandler = builder.deadLetterHandler;
         this.telemetry = GuardedTelemetry.of(builder.telemetry);
         this.ddl = OwnerTransactions.of(transactions, builder.owner);
+        this.heartbeat = builder.heartbeat;
     }
 
     /**
@@ -131,7 +141,12 @@ public final class OutboxRuntime implements AutoCloseable {
         if (parts != null) {
             throw new IllegalStateException("OutboxRuntime.start() has run already");
         }
-        var schema = new OutboxSchema(transactions, ddl, config, contracts, routes);
+        if (heartbeat == null) {
+            log.info("outbox heartbeat shares the application's connections: business load that exhausts their pool"
+                    + " delays the beats of {}, and sends to its routes then go unchecked; give it a pool of its own"
+                    + " with OutboxRuntime.Builder#heartbeatConnections", config.table());
+        }
+        var schema = new OutboxSchema(transactions, ddl, config, contracts, routes, heartbeat);
         try {
             schema.start();
         } catch (SQLException e) {
@@ -188,6 +203,8 @@ public final class OutboxRuntime implements AutoCloseable {
         private OutboxTelemetry telemetry = OutboxTelemetry.NONE;
         @Nullable
         private ConnectionSource owner;
+        @Nullable
+        private ConnectionSource heartbeat;
 
         private Builder(OutboxConfig config, OutboxTransactions transactions, @Nullable OutboxHandler handler) {
             this.config = Objects.requireNonNull(config, "config");
@@ -232,6 +249,21 @@ public final class OutboxRuntime implements AutoCloseable {
          */
         public Builder ownerConnections(ConnectionSource owner) {
             this.owner = Objects.requireNonNull(owner, "owner");
+            return this;
+        }
+
+        /**
+         * Connections for the heartbeat alone: its beats, which keep this instance's row fresh and read the other
+         * instances' reports that route and contract checks of sends rely on, and its row's delete on
+         * {@link OutboxRuntime#close()}. Without it they take the application's connections, and business load that
+         * exhausts that pool starves them. It should be a pool of its own with one connection, as a beat borrows one
+         * every {@code maintenanceInterval} for a few milliseconds, and its connection timeout should stay well below
+         * {@code maintenanceInterval}, as a beat waits that long for it. A beat that gets no connection from it takes
+         * the application's, with a WARN at most once a minute. It must reach the application's database:
+         * {@link OutboxRuntime#start()} fails when it reaches another one.
+         */
+        public Builder heartbeatConnections(ConnectionSource heartbeat) {
+            this.heartbeat = Objects.requireNonNull(heartbeat, "heartbeat");
             return this;
         }
 

@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.internal;
 
+import io.github.dsudomoin.outbox.ConnectionSource;
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxTransactions;
 import jakarta.annotation.Nullable;
@@ -94,6 +95,9 @@ public final class OutboxSchema implements AutoCloseable {
     private final String instanceId = Heartbeat.newId();
     private final ShardGuard guard = new ShardGuard();
     private final ContractGuard contracts;
+    /** The heartbeat's own connections, which fall back on {@link #db}; null without a source of its own. */
+    @Nullable
+    private final HeartbeatConnections heartbeat;
     /** The tick guard's lower bound, whatever the intervals say; shorter in tests. */
     Duration tickFloor = Duration.ofMinutes(1);
     /** How long the reshard waits for the tick guard alone to pass before it refuses; shorter in tests. */
@@ -122,15 +126,24 @@ public final class OutboxSchema implements AutoCloseable {
      */
     public OutboxSchema(OutboxTransactions db, OutboxTransactions ddl, OutboxConfig config,
             Map<String, Integer> contracts, Set<String> routes) {
-        this(db, ddl, config, SCHEMA_LOCK_ATTEMPTS, contracts, routes);
+        this(db, ddl, config, contracts, routes, null);
+    }
+
+    /**
+     * {@code heartbeat}: connections for the heartbeat alone, its beats and its row's delete, null for those of
+     * {@code db}; {@link #start()} fails when it reaches another database than {@code db}'s.
+     */
+    public OutboxSchema(OutboxTransactions db, OutboxTransactions ddl, OutboxConfig config,
+            Map<String, Integer> contracts, Set<String> routes, @Nullable ConnectionSource heartbeat) {
+        this(db, ddl, config, SCHEMA_LOCK_ATTEMPTS, contracts, routes, heartbeat);
     }
 
     OutboxSchema(OutboxTransactions db, OutboxConfig config, int schemaLockAttempts) {
-        this(db, db, config, schemaLockAttempts, Map.of(), Set.of());
+        this(db, db, config, schemaLockAttempts, Map.of(), Set.of(), null);
     }
 
     private OutboxSchema(OutboxTransactions db, OutboxTransactions ddl, OutboxConfig config, int schemaLockAttempts,
-            Map<String, Integer> contracts, Set<String> routes) {
+            Map<String, Integer> contracts, Set<String> routes, @Nullable ConnectionSource heartbeat) {
         validate(config);
         this.db = db;
         this.ddl = ddl;
@@ -138,6 +151,7 @@ public final class OutboxSchema implements AutoCloseable {
         this.spelled = TableNames.of(config.table());
         this.schemaLockAttempts = schemaLockAttempts;
         this.contracts = new ContractGuard(contracts, routes, config.partitions().maintenanceInterval());
+        this.heartbeat = heartbeat == null ? null : new HeartbeatConnections(db, heartbeat);
     }
 
     /**
@@ -293,6 +307,12 @@ public final class OutboxSchema implements AutoCloseable {
         return contracts;
     }
 
+    /** The heartbeat's own connections, which fall back on the application's; null without a source of its own. */
+    @Nullable
+    ConnectionSource heartbeatConnections() {
+        return heartbeat;
+    }
+
     /**
      * {@code config} with the shard count resolved at bootstrap, and this instance's {@link ShardGuard}, which the
      * writes of every component built from it check ({@link ShardGuard#of}).
@@ -351,6 +371,9 @@ public final class OutboxSchema implements AutoCloseable {
                 SessionSettings.with(c, BOOTSTRAP_SETTINGS, () -> {
                     // where the table is or will be created, so every spelling of it takes the same schema lock
                     var resolved = spelled.resolve(c);
+                    if (heartbeat != null) { // before any DDL, and before the bootstrap writes the row
+                        heartbeat.start(c, resolved.base());
+                    }
                     lockSchema(c, resolved);
                     try {
                         bootstrap(c, resolved);
@@ -377,7 +400,7 @@ public final class OutboxSchema implements AutoCloseable {
     public void close() {
         var n = names;
         if (n != null) {
-            Heartbeat.delete(db, n, instanceId);
+            Heartbeat.delete(heartbeat != null ? heartbeat : db, n, instanceId);
         }
     }
 

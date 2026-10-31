@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.internal;
 
+import io.github.dsudomoin.outbox.ConnectionSource;
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxTransactions;
 import java.net.InetAddress;
@@ -33,14 +34,17 @@ import org.slf4j.LoggerFactory;
  * row; a beat that commits after it deletes it again. A failed beat is logged, and the next one retries. A beat waits
  * at most {@code 100 ms} for a lock: a recovery holds the cursor table for its run, so the shard count then stands as
  * last read, with a one-line WARN; the reports were read and the row refreshed before, so the guards of other instances
- * keep counting this one.
+ * keep counting this one. With a connection source of its own ({@link OutboxSchema#heartbeatConnections()}) the beats
+ * and the delete take their connections from it, so business load that exhausts the application's pool does not starve
+ * them.
  */
 public final class Heartbeat {
 
     private static final Logger log = LoggerFactory.getLogger(Heartbeat.class);
     static final Duration FORGET_AFTER = Duration.ofHours(1);
 
-    private final OutboxTransactions db;
+    /** The schema's heartbeat connections, else {@code db}. */
+    private final ConnectionSource connections;
     private final TableNames names;
     private final String id;
     private final int shards;
@@ -55,7 +59,8 @@ public final class Heartbeat {
 
     /** {@code config}: the instance's, as {@link OutboxSchema#config()} resolved it. */
     public Heartbeat(OutboxTransactions db, OutboxSchema schema, OutboxConfig config, boolean hookActive) {
-        this.db = db;
+        var own = schema.heartbeatConnections();
+        this.connections = own != null ? own : db;
         this.names = schema.names();
         this.id = schema.instanceId();
         this.shards = config.shards();
@@ -105,7 +110,7 @@ public final class Heartbeat {
     }
 
     /** Deletes the row of {@code id}; a failure is a WARN, as the row expires anyway. */
-    static void delete(OutboxTransactions db, TableNames names, String id) {
+    static void delete(ConnectionSource db, TableNames names, String id) {
         try (var c = db.newConnection(); var ps = c.prepareStatement(
                 "delete from " + names.instance() + " where instance_id = ?")) {
             c.setAutoCommit(true);
@@ -142,12 +147,12 @@ public final class Heartbeat {
                 Thread.currentThread().interrupt();
             }
         }
-        delete(db, names, id);
+        delete(connections, names, id);
     }
 
     void beat() { // package-private for a test
         boolean refreshed = false;
-        try (var c = db.newConnection()) {
+        try (var c = connections.newConnection()) {
             c.setAutoCommit(false);
             lockTimeout(c);
             contracts.refresh(c, names); // before the statement below, which may give up on its lock
@@ -166,7 +171,7 @@ public final class Heartbeat {
                 contracts.renewed(id);
             }
             if (stopped) { // stop() deleted it before this commit
-                delete(db, names, id);
+                delete(connections, names, id);
                 return;
             }
             lockTimeout(c);
