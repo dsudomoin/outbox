@@ -30,8 +30,8 @@ on Apple M5 Pro cores and a single Kafka broker with replication factor 1. Your 
 
 | Quantity | Formula | Source |
 |---|---|---|
-| Pool per instance | `db.maxPoolSize` = own need + `relay.workers` + 3 (+1 while `drain()` runs); the 3 are outbox maintenance, inbox maintenance and the dead-letter thread. Besides: the `outbox-heartbeat` thread takes a connection for one short statement every `maintenanceInterval`, and after an upgrade the one-time `<table>_dead_due` build (thread `outbox-dead-index`) holds one while it runs | README «Размер пула соединений» |
-| Postgres connections | Σ over services and instances of `maxPoolSize` + other clients + `superuser_reserved_connections` (3) ≤ `max_connections` (Postgres default 100) | Postgres |
+| Pool per instance | `db.maxPoolSize` = own need + `relay.workers` + 3 (+1 while `drain()` runs); the 3 are outbox maintenance, inbox maintenance and the dead-letter thread. Besides: after an upgrade the one-time `<table>_dead_due` build (thread `outbox-dead-index`) holds one while it runs. The heartbeat takes none from it: in Kora it has a pool of its own of one connection (`outbox.heartbeat.dedicatedConnection`, default `true`) | README «Размер пула соединений» |
+| Postgres connections | Σ over services and instances of `maxPoolSize` + 1 per outbox instance (the heartbeat's own connection) + other clients + `superuser_reserved_connections` (3) ≤ `max_connections` (Postgres default 100); the + 1 also counts against the role's `CONNECTION LIMIT` and a pooler's per-user pool | Postgres, README «Размер пула соединений» |
 | Advisory lock slots | `max_locks_per_transaction × (max_connections + max_prepared_transactions)` ≥ concurrent writer transactions × distinct keys each + other locks | README «max_locks_per_transaction для массовой отправки» |
 | Kafka call budget | `batchTimeout ≥ delivery.timeout.ms + 5 s + max.block.ms` (defaults 20 + 5 + 5 = 30 s) | `KafkaOutboxSender` |
 | Dead-letter hook budget | `deadLetters.timeout` ≥ the same sum with the Kafka DLQ | README «Kafka DLQ» |
@@ -88,8 +88,8 @@ kafka-topics.sh --bootstrap-server "$KAFKA" --create --topic orders --partitions
   --replication-factor 3 --config min.insync.replicas=2 --config unclean.leader.election.enable=false
 ```
 
-**Postgres:** 2 × 13 = 26 connections. Each transaction holds 1 key lock, so the default `max_locks_per_transaction`
-(64) is enough.
+**Postgres:** 2 × (13 + 1 heartbeat) = 28 connections. Each transaction holds 1 key lock, so the default
+`max_locks_per_transaction` (64) is enough.
 
 **Why these numbers:** the default shard count costs nothing extra here: idle cost is about 1 / 0.2 s = 5 write
 transactions per second per cluster at any shard count (5.1 xid/s measured), and one instance with 4 workers carried
@@ -150,8 +150,8 @@ kafka-topics.sh --bootstrap-server "$KAFKA" --create --topic orders --partitions
 
 **Postgres:**
 
-- Connections: 3 × 26 + 3 × 9 = 105. That is above the default `max_connections` (100) before any other client, so
-  raise it (the bench used 300).
+- Connections: 3 × (26 + 1 heartbeat) + 3 × 9 = 108 (an inbox-only service has no heartbeat). That is above the
+  default `max_connections` (100) before any other client, so raise it (the bench used 300).
 - Locks: ≤ 3 keys per transaction, so the default `max_locks_per_transaction` is enough. Send several keyed messages
   of one transaction with one `sendAll`.
 - Inbox disk: rows ≈ consumed msg/s × retention. The bench soak held 9.0 GB of inbox after 1 h at ~22k msg/s, about
@@ -203,7 +203,7 @@ kafka-topics.sh --bootstrap-server "$KAFKA" --create --topic imports --partition
 - Locks: 2 instances × 2 writers × 10 000 keys = 40 000 advisory locks at peak. With `max_connections = 300`,
   `max_locks_per_transaction` ≥ 40 000 / 300 ≈ 134 plus other locks; the bench used 256 (76 800 slots). Changing it
   needs a restart, and a hot standby needs at least the primary's value.
-- Connections: 2 × 15 = 30.
+- Connections: 2 × (15 + 1 heartbeat) = 32.
 
 **Why these numbers:**
 
@@ -245,7 +245,7 @@ httpClient.audit {
 }
 ```
 
-**Postgres:** 3 × 26 = 78 connections. The Kafka topic is as in profile 2.
+**Postgres:** 3 × (26 + 1 heartbeat) = 81 connections. The Kafka topic is as in profile 2.
 
 **Why these numbers:**
 

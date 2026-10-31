@@ -23,7 +23,7 @@ against the library's tables**; run only the README's SQL, on a staging copy fir
 | ERROR «... holds cursors for N shards, but this instance runs with outbox.shards = M ...» or «... refuses this write ...» | Old-count instance after a reshard: restart with the new count or unset | «Решардинг» |
 | `outbox.waiting.oldest` > `outbox.relay.waiting.alertAfter` (15 min, rule `max(outbox_waiting_oldest) > 900`) or ERROR «outbox: N keys of ... wait for an instance that can handle them ...» | No running release reads them (half-rolled-out, or rolled back past the transition release): their keys stand, nothing is lost. N counts keys whose head waits; the later records of each key wait behind it. `outbox.messages.waiting{kind}` and the line name the cause (`contract`, `no_route`: also a record marked `outbox-local` for a route this release lacks; it never goes to Kafka). Deploy the release that reads them; for a final rollback, abandon them (below) | «Версии контрактов и откат» |
 | `outbox.messages.contract_rejected` growing | A release writes a contract version a live relay instance cannot read: those business transactions fail with `OutboxIncompatibleContractException` (WARN «outbox ... refused a send» names the instances). Deploy the reading release everywhere first | «Версии контрактов и откат» |
-| `outbox.messages.route_rejected` growing | A release writes to its route's topic while a live relay instance does not report that route: those business transactions fail with `OutboxMissingRouteException` (WARN «outbox ... refused a send» names the instances). Writing was switched on before the heartbeat showed the route everywhere, or a release without it still runs: deploy the route everywhere, then switch writing on. A refusal naming no instance («... has never read the live relay instances' reports ...», or «... has not read the live relay instances' reports for N s ...», the seconds only once a read happened): the writer's own heartbeat fails | «Версии контрактов и откат» |
+| `outbox.messages.route_rejected` growing | A release writes to its route's topic while a live relay instance does not report that route: those business transactions fail with `OutboxMissingRouteException` (WARN «outbox ... refused a send» names the instances). Writing was switched on before the heartbeat showed the route everywhere, or a release without it still runs: deploy the route everywhere, then switch writing on. A refusal naming no instance («... has never read the live relay instances' reports ...», or «... has not read the live relay instances' reports for N s ...», the seconds only once a read happened): the writer's own heartbeat fails; check its connection source as for `route_unchecked` below | «Версии контрактов и откат» |
 
 ## Morning: nothing lost, waits for a human
 
@@ -34,7 +34,7 @@ against the library's tables**; run only the README's SQL, on a staging copy fir
 | `outbox.partitions.overflow` = 1 past an extension, `premade` < 2 | «Переполнение хвоста (tail overflow)» |
 | ERROR «... has not run», «... over outbox.partitions.maxTailScan» | «Партиции» |
 | `outbox.parked.size` not back to its level | «Алерты» |
-| `outbox.messages.route_unchecked` growing: a writer's heartbeat has not read the reports for over 3 × `maintenanceInterval` (WARN «outbox heartbeat of instance ... failed»), so the writer guard lets sends through by its last read. Nothing is lost (an unreadable record waits); fix the heartbeat (connections, pool) | «Версии контрактов и откат» |
+| `outbox.messages.route_unchecked` growing: a writer's heartbeat has not read the reports for over 3 × `maintenanceInterval` (WARN «outbox heartbeat of instance ... failed»), so the writer guard lets sends through by its last read. Nothing is lost (an unreadable record waits). The heartbeat's own pool (Kora default) does not depend on the app pool, so check the heartbeat source itself: WARN «outbox heartbeat connection source of ... failed, this beat uses the application's connections ...», ERROR «outbox heartbeat connection source reaches another database ...», the `hikaricp_*` meters with `pool="<db.poolName>-outbox-heartbeat"`, or `outbox.heartbeat.dedicatedConnection = false` (startup INFO «outbox heartbeat shares the application's connections ...»). A slow database or a transaction-mode pooler delays it even on its own pool | «Версии контрактов и откат» |
 
 Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dashboards/outbox.json`.
 
@@ -53,6 +53,13 @@ Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dash
   («Решардинг», [config-reference.md](../using-outbox/config-reference.md)).
 - **Pool:** `db.maxPoolSize` ≥ own peak + `relay.workers` + 3, + 1 while `drain()` runs. Profiles:
   [sizing-examples.md](../using-outbox/sizing-examples.md).
+- **Heartbeat connection:** in Kora the heartbeat takes nothing from `db.maxPoolSize`; it holds a pool of its own,
+  `<db.poolName>-outbox-heartbeat`, one connection always open: +1 server connection per instance. Count it into
+  `max_connections`, the role's `CONNECTION LIMIT` and a pooler's per-user pool. On an upgrade where that limit is
+  sized to exactly instances × `maxPoolSize`, the pool cannot connect: startup does not fail, the heartbeat runs on
+  the app pool as before, with a WARN once a minute («... this beat uses the application's connections ...»). Raise
+  the limit by 1 per instance, or set `outbox.heartbeat.dedicatedConnection = false`
+  ([config-reference.md](../using-outbox/config-reference.md)).
 
 ## Deploys and incidents
 

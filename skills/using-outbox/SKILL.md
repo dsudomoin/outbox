@@ -76,7 +76,9 @@ data (a record no running release reads waits; it is never lost or dead-lettered
 - A writer whose heartbeat has not read the reports for over 3 × `maintenanceInterval` decides both the version and
   the route check by its last read: refused if there was none, if it found no live relay instance, or if a live relay
   instance in it had no report (`contracts` or `routes` null) or an incompatible one; otherwise let through, counted in
-  `outbox.messages.route_unchecked`. Such a refusal names no instance.
+  `outbox.messages.route_unchecked`. Such a refusal names no instance. An exhausted app pool no longer causes a stale
+  read when the heartbeat has a pool of its own (Kora default, «Config rules»); a slow database or a transaction-mode
+  pooler still delays it.
 
 **Routes and their releases.** A record of an `OutboxTopicHandler` route's topic must never reach Kafka on an instance
 that lacks the route (an older release mid-rollout, or after a rollback). Kafka-bound topics are unaffected: no marker,
@@ -137,6 +139,27 @@ no route check.
   forgotten after 10 min ([config-reference.md](config-reference.md), «Oversized records»).
 - Metrics need a Micrometer `MeterRegistry`: Kora's `MetricsModule`, only with an HTTP server module (`/metrics` on
   `httpServer.privateApiHttpPort`, 8085); else say outbox metrics are off.
+- **Heartbeat connection**: `OutboxModule` gives the heartbeat a HikariCP pool of one connection, copied from the
+  Hikari-backed `JdbcDatabase` behind the outbox's transactions and named `<db.poolName>-outbox-heartbeat`, so business
+  load that exhausts the app pool does not starve it (nothing to copy: a startup INFO names the tag below, and the
+  heartbeat shares the app's connections). It does not take from `db.maxPoolSize`, but each instance holds one more
+  server connection. `outbox.heartbeat.dedicatedConnection = false` turns it off; a `JdbcConnectionFactory` tagged
+  `@Tag(OutboxHeartbeat.class)` replaces it whatever the key says (to bypass a pooler, or for other timeouts). Without
+  Kora, pass a pool of one connection on the app's database and role, its connection timeout well below
+  `maintenanceInterval`:
+
+  ```java
+  var runtime = OutboxRuntime.builder(config, new JdbcTransactions(appDataSource), handler)
+          .heartbeatConnections(heartbeatPool::getConnection) // DataSource heartbeatPool: 1 connection, same database
+          .build();
+  runtime.start();
+  // ...
+  runtime.close(); // deletes this instance's row through heartbeatPool: close that pool only after this
+  ```
+
+  A heartbeat source that hands out no connection makes that beat use the app's, with a WARN at most once a minute;
+  one unreachable at start does not fail the start; one on another database fails the start when seen there, else
+  logs an ERROR and the heartbeat keeps the app's connections until restart.
 
 ## Before deploy
 
@@ -161,7 +184,10 @@ for ops:
    seconds.
 3. **Connections**: direct or session-mode pooler, never transaction pooling, the owner database included.
    `db.maxPoolSize` ≥ the service's own peak + `relay.workers` + 3 (+ 1 while `drain()` runs). Leave `outbox.shards`
-   unset (256 for a new outbox).
+   unset (256 for a new outbox). The heartbeat's own pool adds one server connection per instance: count it into
+   `max_connections`, the role's `CONNECTION LIMIT` and a pooler's per-user pool. With a limit sized to exactly
+   instances × `maxPoolSize` that pool cannot connect, and the heartbeat runs on the app pool as before, with a WARN
+   once a minute: raise the limit by 1 per instance or set `outbox.heartbeat.dedicatedConnection = false`.
 4. **Table**: `outbox.table = "<schema>.outbox"` in the service's own schema, the same on every instance. Schema
    unknown: leave it unqualified and ask; never guess `public`.
 5. **Bulk**: `sendAll` with thousands of distinct keys needs `max_locks_per_transaction × (max_connections +
@@ -178,5 +204,6 @@ for ops:
 8. **Alerts**: `outbox.shard.lag` growing, `outbox.dead.size > 0`, `outbox.maintenance.since_success > 5 ×
    maintenanceInterval`, `outbox.maintenance.transaction_pooling = 1`, `outbox.partitions.premade < 2`, `overflow = 1`,
    `xids_left` not NaN, `orphaned > 0`, `outbox.waiting.oldest > 900` (`relay.waiting.alertAfter`),
-   `outbox.messages.contract_rejected` or `outbox.messages.route_rejected` growing; with a dead-letter hook,
-   `outbox.dead.pending.oldest`. Dead letters: admin API, never SQL.
+   `outbox.messages.contract_rejected` or `outbox.messages.route_rejected` growing, `outbox.messages.route_unchecked`
+   growing (morning: the heartbeat fails, operating-outbox); with a dead-letter hook, `outbox.dead.pending.oldest`.
+   Dead letters: admin API, never SQL.
