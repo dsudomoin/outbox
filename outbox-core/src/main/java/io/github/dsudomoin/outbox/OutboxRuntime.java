@@ -144,7 +144,7 @@ public final class OutboxRuntime implements AutoCloseable {
         if (heartbeat == null) {
             log.info("outbox heartbeat shares the application's connections: business load that exhausts their pool"
                     + " delays the beats of {}, and sends to its routes then go unchecked; give it a pool of its own"
-                    + " with OutboxRuntime.Builder#heartbeatConnections", config.table());
+                    + " with OutboxRuntime.Builder#heartbeatConnections (in Kora: outbox.heartbeat)", config.table());
         }
         var schema = new OutboxSchema(transactions, ddl, config, contracts, routes, heartbeat);
         try {
