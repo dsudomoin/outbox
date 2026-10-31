@@ -43,12 +43,12 @@ import org.slf4j.LoggerFactory;
  * </ul>
  * A message neither check covers, of version 1 and a topic no route here claims, is never checked.
  * <p>
- * The reports are as the bootstrap, then each beat of this instance's {@link Heartbeat}, last read them. On a fresh
- * read, without a live relay instance nothing is refused. A read older than {@value OutboxSchema#LIVE_INTERVALS}
- * {@code maintenanceInterval}s is stale, and the last read decides what a check covers: refused when there is no read,
- * when it found no live relay instance, or when the check refuses on it, an unknown report included; else let through
- * unchecked, counted once per message ({@link OutboxTelemetry#routeUnchecked}) and logged at WARN at most once a
- * minute. A stale refusal names no instance.
+ * The reports are as the bootstrap, then each beat of this instance's {@link Heartbeat}, last read them, a running
+ * relay's own report as its beat renewed it ({@link #renewed}). On a fresh read, without a live relay instance nothing
+ * is refused. A read older than {@value OutboxSchema#LIVE_INTERVALS} {@code maintenanceInterval}s is stale, and the
+ * last read decides what a check covers: refused when there is no read, when it found no live relay instance, or when
+ * the check refuses on it, an unknown report included; else let through unchecked, counted once per message
+ * ({@link OutboxTelemetry#routeUnchecked}) and logged at WARN at most once a minute. A stale refusal names no instance.
  * <p>
  * A refusal is counted ({@link OutboxTelemetry#routeRejected}, {@link OutboxTelemetry#contractRejected}) and logged at
  * WARN with every instance id, at most once a minute per check. A message of a topic no route here claims, so written
@@ -154,6 +154,23 @@ final class ContractGuard {
 
     void observed(Snapshot read) {
         snapshot = read;
+    }
+
+    /**
+     * The last read, with the report of this instance's row ({@code id}) as {@link #contracts()} and {@link #routes()}
+     * give it: called by a running relay once its beat renewed the row, as the beat's read before that misses the row
+     * when it had expired.
+     */
+    void renewed(String id) {
+        var s = snapshot;
+        if (s == null) {
+            return;
+        }
+        var reports = new HashMap<>(s.reports);
+        reports.put(id, contracts);
+        var routed = new HashMap<>(s.routes);
+        routed.put(id, routes);
+        observed(new Snapshot(s.readAt, reports, routed));
     }
 
     /** The last read, null before the first. */

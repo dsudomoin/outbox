@@ -106,6 +106,64 @@ class HeartbeatContractsIT {
     }
 
     /**
+     * The row expired (a pause, an outage): the beat reads the reports before it renews the row, so that read misses
+     * it, yet a send this relay's own route cannot read is refused right after, by the report the beat just wrote.
+     */
+    @Test
+    void aBeatThatRenewsAnExpiredRowGuardsByItsOwnReport() throws Exception {
+        var db = new JdbcTransactions(TestDataSources.newDataSource());
+        var config = new TestOutboxConfig();
+        try (var schema = new OutboxSchema(db, db, config, Map.of("orders", 1), Set.of("orders"))) {
+            schema.start();
+            var names = schema.names();
+            var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, OutboxTelemetry.NONE);
+            var v2 = OutboxMessage.of("orders", "k", "p".getBytes(UTF_8))
+                    .withHeader(Contracts.HEADER, "2".getBytes(US_ASCII));
+            expire(db, names);
+
+            new Heartbeat(db, schema, schema.config(), false).beat();
+
+            assertThat(live(db, names, schema.instanceId())).as("renewed").isEqualTo("true");
+            assertThatThrownBy(() -> db.inTx(c -> outbox.send(v2)))
+                    .isInstanceOfSatisfying(OutboxIncompatibleContractException.class,
+                            e -> assertThat(e.incompatibleInstances()).containsExactly(schema.instanceId()));
+        }
+    }
+
+    /** A writer-only instance (relay off) is no relay: its own routes guard nothing, before the expiry or after. */
+    @Test
+    void aWriterOnlyBeatAfterItsRowExpiredCountsNoRelay() throws Exception {
+        var db = new JdbcTransactions(TestDataSources.newDataSource());
+        var config = new TestOutboxConfig().relayEnabled(false);
+        try (var schema = new OutboxSchema(db, db, config, Map.of("orders", 1), Set.of("orders"))) {
+            schema.start();
+            var names = schema.names();
+            var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, OutboxTelemetry.NONE);
+            var v2 = OutboxMessage.of("orders", "k", "p".getBytes(UTF_8))
+                    .withHeader(Contracts.HEADER, "2".getBytes(US_ASCII));
+            expire(db, names);
+
+            new Heartbeat(db, schema, schema.config(), false).beat();
+
+            assertThat(live(db, names, schema.instanceId())).as("renewed").isEqualTo("true");
+            db.inTx(c -> outbox.send(v2)); // no live relay instance
+            assertThat(schema.contractGuard().snapshot().reports).isEmpty();
+        }
+    }
+
+    private static void expire(JdbcTransactions db, TableNames names) {
+        db.inTx(c -> {
+            TestSql.execute(c, "update " + names.instance() + " set expires_at = now() - interval '1 second'");
+            return null;
+        });
+    }
+
+    private static String live(JdbcTransactions db, TableNames names, String id) {
+        return db.inTx(c -> TestSql.queryString(c, "select (expires_at > now())::text from " + names.instance()
+                + " where instance_id = ?", id));
+    }
+
+    /**
      * A recovery holds the cursor table for its run, which may outlast the row's expiry: a beat that gives up on that
      * lock has refreshed the row, so the instance stays live to every guard.
      */

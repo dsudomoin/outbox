@@ -26,12 +26,14 @@ import org.slf4j.LoggerFactory;
  * without one); {@code routes}: every topic a route claims, typed or plain, sorted ({@code {}} without one). First, in
  * a statement of its own, a beat reads the live relay instances' reports into the instance's
  * {@link ContractGuard}. Then one statement deletes other instances' rows expired for {@link #FORGET_AFTER} (instances
- * that died without a clean shutdown) and upserts the row, committed on their own. Last, in a transaction of its own,
- * it reads the cursors' shard count into the instance's {@link ShardGuard}, so a writer-only instance stops writing
- * within one beat of another instance's reshard. {@link #stop()} deletes the row; a beat that commits after it deletes
- * it again. A failed beat is logged, and the next one retries. A beat waits at most {@code 100 ms} for a lock: a
- * recovery holds the cursor table for its run, so the shard count then stands as last read, with a one-line WARN; the
- * reports were read and the row refreshed before, so the guards of other instances keep counting this one.
+ * that died without a clean shutdown) and upserts the row, committed on their own; on a running relay, the guard's read
+ * then takes the row's report as written, as the read before it misses the row when it had expired (a pause, an
+ * outage). Last, in a transaction of its own, it reads the cursors' shard count into the instance's {@link ShardGuard},
+ * so a writer-only instance stops writing within one beat of another instance's reshard. {@link #stop()} deletes the
+ * row; a beat that commits after it deletes it again. A failed beat is logged, and the next one retries. A beat waits
+ * at most {@code 100 ms} for a lock: a recovery holds the cursor table for its run, so the shard count then stands as
+ * last read, with a one-line WARN; the reports were read and the row refreshed before, so the guards of other instances
+ * keep counting this one.
  */
 public final class Heartbeat {
 
@@ -160,6 +162,9 @@ public final class Heartbeat {
             }
             c.commit(); // before the shard count, whose lock a recovery may hold for its run
             refreshed = true;
+            if (relay) {
+                contracts.renewed(id);
+            }
             if (stopped) { // stop() deleted it before this commit
                 delete(db, names, id);
                 return;
