@@ -12,6 +12,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.UncategorizedSQLException;
 import org.springframework.jdbc.datasource.ConnectionHolder;
+import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import org.springframework.jdbc.support.SQLExceptionSubclassTranslator;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -22,7 +23,8 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * for this DataSource ({@code DataSourceTransactionManager}, {@code JdbcTransactionManager},
  * {@code JpaTransactionManager}), in one PostgreSQL transaction with the business writes. Outside a transaction, or
  * inside a transaction of another DataSource, they are refused; this class never opens a transaction or fetches a
- * connection for them.
+ * connection for them. A {@link TransactionAwareDataSourceProxy} is unwrapped to its target, as Spring's transaction
+ * managers do.
  */
 public final class SpringOutboxTransactions implements OutboxTransactions {
 
@@ -33,19 +35,19 @@ public final class SpringOutboxTransactions implements OutboxTransactions {
     private final SQLExceptionSubclassTranslator translator = new SQLExceptionSubclassTranslator();
 
     public SpringOutboxTransactions(DataSource dataSource) {
-        this.dataSource = Objects.requireNonNull(dataSource, "dataSource");
-        this.connections = autocommit(dataSource);
+        this.dataSource = target(dataSource);
+        this.connections = autocommit(this.dataSource);
     }
 
     /**
      * New connections of {@code dataSource}, switched to autocommit when the pool hands them without it (as
      * {@code spring.datasource.hikari.auto-commit=false} does), as {@link ConnectionSource#newConnection()} requires;
-     * never the connection of the caller's transaction.
+     * never the connection of the caller's transaction, even through a {@link TransactionAwareDataSourceProxy}.
      */
     public static ConnectionSource autocommit(DataSource dataSource) {
-        Objects.requireNonNull(dataSource, "dataSource");
+        var target = target(dataSource);
         return () -> {
-            var c = dataSource.getConnection();
+            var c = target.getConnection();
             try {
                 if (!c.getAutoCommit()) {
                     c.setAutoCommit(true);
@@ -60,6 +62,14 @@ public final class SpringOutboxTransactions implements OutboxTransactions {
             }
             return c;
         };
+    }
+
+    /** The proxy would hand out the caller's transaction connection, and the transaction managers key by the target. */
+    private static DataSource target(DataSource dataSource) {
+        Objects.requireNonNull(dataSource, "dataSource");
+        return dataSource instanceof TransactionAwareDataSourceProxy proxy
+            ? Objects.requireNonNull(proxy.getTargetDataSource(), "the TransactionAwareDataSourceProxy's target")
+            : dataSource;
     }
 
     /** The connection bound for this DataSource by the actual transaction on this thread; null without one. */

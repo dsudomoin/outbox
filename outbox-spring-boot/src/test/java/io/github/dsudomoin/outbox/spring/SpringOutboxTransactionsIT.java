@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 
+import io.github.dsudomoin.outbox.ConnectionSource;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRuntime;
@@ -20,6 +21,7 @@ import jakarta.persistence.Table;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -37,6 +39,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.DataSourceUtils;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import org.springframework.orm.jpa.JpaTransactionManager;
 import org.springframework.orm.jpa.SharedEntityManagerCreator;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -75,6 +78,16 @@ class SpringOutboxTransactionsIT {
             var runtime = OutboxRuntime.builder(config, transactions, handler).build();
             runtime.start();
             return runtime;
+        }
+    }
+
+    /** The app's DataSource is a proxy that hands out the connection of the caller's transaction. */
+    @Configuration(proxyBeanMethods = false)
+    static class TransactionAwareDataSource {
+
+        @Bean
+        DataSource dataSource() {
+            return new TransactionAwareDataSourceProxy(TestDataSources.newDataSource());
         }
     }
 
@@ -372,6 +385,39 @@ class SpringOutboxTransactionsIT {
             try (Connection c = SpringOutboxTransactions.autocommit(ctx.dataSource()).newConnection()) {
                 assertThat(c.getAutoCommit()).isTrue();
             }
+        });
+    }
+
+    @Test
+    void transactionAwareProxyUnwrapped() {
+        runner().withUserConfiguration(TransactionAwareDataSource.class).run(context -> {
+            var ctx = Ctx.of(context);
+            assertThat(ctx.dataSource()).isInstanceOf(TransactionAwareDataSourceProxy.class);
+            var businessId = UUID.randomUUID();
+
+            var messageId = ctx.jdbcTx().execute(status -> ctx.insertAndSend(businessId));
+            assertThat(ctx.outboxXid(messageId)).isEqualTo(ctx.businessXid(businessId));
+            // nothing used the proxy in this transaction yet, so Spring bound no holder for it
+            assertThat(ctx.outboxRows(ctx.jdbcTx().execute(status -> ctx.send()))).isOne();
+
+            var rolledBack = UUID.randomUUID();
+            List<ConnectionSource> sources = List.of(context.getBean(SpringOutboxTransactions.class),
+                SpringOutboxTransactions.autocommit(ctx.dataSource()));
+            assertThatThrownBy(() -> ctx.jdbcTx().execute(status -> {
+                ctx.jdbc().update("insert into " + ctx.business() + " (id) values (?)", rolledBack);
+                long transactionPid = ctx.jdbc().queryForObject("select pg_backend_pid()", Long.class);
+                for (var source : sources) {
+                    try (var c = source.newConnection()) {
+                        assertThat(TestSql.queryLong(c, "select pg_backend_pid()")).as("a fresh connection")
+                            .isNotEqualTo(transactionPid);
+                    } catch (SQLException e) {
+                        throw new AssertionError(e);
+                    }
+                }
+                throw new IllegalArgumentException("business failure");
+            })).isInstanceOf(IllegalArgumentException.class);
+            assertThat(ctx.businessRows(rolledBack)).as("the transaction's work not committed by newConnection()")
+                .isZero();
         });
     }
 

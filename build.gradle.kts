@@ -239,6 +239,9 @@ configure(springBootModules.map { project(":$it") }) {
         "boot41Test"("org.springframework.boot:spring-boot-jackson2")
     }
 
+    // Incremental recompiles make the configuration processor lose the properties' descriptions in its metadata
+    tasks.withType<JavaCompile>().configureEach { options.isIncremental = false }
+
     val sourceSets = the<SourceSetContainer>()
     tasks.named<Test>("test") { systemProperty("outbox.test.boot", "3.5") }
     val testBoot4 = tasks.register<Test>("testBoot4") {
