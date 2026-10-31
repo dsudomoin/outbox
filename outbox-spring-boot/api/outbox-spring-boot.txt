@@ -123,5 +123,14 @@ package io.github.dsudomoin.outbox.spring {
     method public java.time.Duration! maxDelay();
   }
 
+  public final class SpringOutboxTransactions implements io.github.dsudomoin.outbox.OutboxTransactions {
+    ctor public SpringOutboxTransactions(javax.sql.DataSource!);
+    method public void afterCommit(Runnable!);
+    method public static io.github.dsudomoin.outbox.ConnectionSource! autocommit(javax.sql.DataSource!);
+    method public java.sql.Connection? currentConnection();
+    method public java.sql.Connection! newConnection() throws java.sql.SQLException;
+    method public String! transactionHint();
+  }
+
 }
 

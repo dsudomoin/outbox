@@ -3,6 +3,7 @@
 dependencies {
     api(project(":outbox-core"))
     api(project(":outbox-micrometer"))
+    implementation("org.slf4j:slf4j-api:2.0.17")
     compileOnly("org.springframework.boot:spring-boot-autoconfigure")
     compileOnly("org.springframework:spring-jdbc")
     compileOnly("org.springframework:spring-tx")
