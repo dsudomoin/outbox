@@ -62,6 +62,7 @@ class HeartbeatLaneIT {
         assertThat(run.rowAge()).isLessThan(STALE_MILLIS);
         assertThat(run.readAge()).isLessThan(STALE_MILLIS);
         assertThat(run.unchecked()).isEmpty();
+        assertThat(run.rows()).as("the row, deleted on close behind the closed gate").isZero();
     }
 
     @Test
@@ -70,6 +71,7 @@ class HeartbeatLaneIT {
 
         assertThat(run.rowAge()).isGreaterThan(STALE_MILLIS);
         assertThat(run.unchecked()).as("the send went in on a stale read").containsExactly("audit");
+        assertThat(run.rows()).as("the row, whose delete on close needs the closed gate").isOne();
     }
 
     @Test
@@ -94,13 +96,13 @@ class HeartbeatLaneIT {
         }
     }
 
-    /** What {@link #exhaust} saw; ages in milliseconds. */
-    private record Run(long first, long second, long rowAge, long readAge, List<String> unchecked) {}
+    /** What {@link #exhaust} saw; ages in milliseconds, {@code rows}: the instance rows left after the close. */
+    private record Run(long first, long second, long rowAge, long readAge, List<String> unchecked, long rows) {}
 
     /**
      * Starts a runtime on a gated application pool, with the heartbeat on its own source when {@code lane}; after the
      * first beat closes the gate inside a transaction, waits 8 intervals, sampling {@code last_seen} twice, 2 s apart,
-     * sends a routed message and commits. Then measures, opens the gate, closes the runtime and checks the row is gone.
+     * sends a routed message and commits. Then measures, closes the runtime with the gate still closed, and opens it.
      */
     private static Run exhaust(boolean lane) throws Exception {
         var gate = new Gate();
@@ -119,11 +121,12 @@ class HeartbeatLaneIT {
         var runtime = builder.build();
         runtime.start();
         var names = runtime.schema().names();
-        Run run;
+        var samples = new long[2];
+        long rowAge;
+        long readAge;
         try {
             long bootstrapped = millis("last_seen", names);
             await(() -> millis("last_seen", names) > bootstrapped);
-            var samples = new long[2];
             var id = transactions.inTx(c -> {
                 gate.closed = true;
                 sleep(1000);
@@ -133,22 +136,21 @@ class HeartbeatLaneIT {
                 sleep(1000);
                 return runtime.outbox().send(OutboxMessage.of("audit", "k", "p".getBytes(UTF_8)));
             });
-            long rowAge = millis("now() - last_seen", names);
+            rowAge = millis("now() - last_seen", names);
             var read = runtime.schema().contractGuard().snapshot();
-            long readAge = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - read.readAt);
+            readAge = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - read.readAt);
             try (var c = DIRECT.getConnection()) {
                 assertThat(TestSql.queryString(c, "select message_id::text from " + names.base()))
                         .as("the send went in").isEqualTo(id.toString());
             }
-            run = new Run(samples[0], samples[1], rowAge, readAge, List.copyOf(unchecked));
         } finally {
-            gate.closed = false;
             runtime.close();
+            gate.closed = false;
         }
         try (var c = DIRECT.getConnection()) {
-            assertThat(TestSql.queryLong(c, "select count(*) from " + names.instance())).as("the row").isZero();
+            return new Run(samples[0], samples[1], rowAge, readAge, List.copyOf(unchecked),
+                    TestSql.queryLong(c, "select count(*) from " + names.instance()));
         }
-        return run;
     }
 
     /** The start's log of a runtime on a fresh table, with the heartbeat on its own source when {@code lane}. */

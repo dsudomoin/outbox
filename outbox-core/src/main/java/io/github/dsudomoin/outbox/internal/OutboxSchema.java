@@ -131,7 +131,9 @@ public final class OutboxSchema implements AutoCloseable {
 
     /**
      * {@code heartbeat}: connections for the heartbeat alone, its beats and its row's delete, null for those of
-     * {@code db}; {@link #start()} fails when it reaches another database than {@code db}'s.
+     * {@code db}. One that reaches another database than {@code db}'s fails {@link #start()} when seen there; seen only
+     * later, as when it could not connect at start, it is reported by an ERROR, and the heartbeat keeps {@code db}'s
+     * connections until restart.
      */
     public OutboxSchema(OutboxTransactions db, OutboxTransactions ddl, OutboxConfig config,
             Map<String, Integer> contracts, Set<String> routes, @Nullable ConnectionSource heartbeat) {

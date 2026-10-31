@@ -111,14 +111,20 @@ public final class Heartbeat {
 
     /** Deletes the row of {@code id}; a failure is a WARN, as the row expires anyway. */
     static void delete(ConnectionSource db, TableNames names, String id) {
-        try (var c = db.newConnection(); var ps = c.prepareStatement(
-                "delete from " + names.instance() + " where instance_id = ?")) {
-            c.setAutoCommit(true);
-            ps.setString(1, id);
-            ps.executeUpdate();
+        try (var c = db.newConnection()) {
+            delete(c, names, id);
         } catch (Exception e) {
             log.warn("outbox instance {} could not delete its row from {}; it expires by itself: {}", id,
                     names.instance(), e.toString());
+        }
+    }
+
+    /** Deletes the row of {@code id} on {@code c}, which it leaves in autocommit. */
+    private static void delete(Connection c, TableNames names, String id) throws SQLException {
+        try (var ps = c.prepareStatement("delete from " + names.instance() + " where instance_id = ?")) {
+            c.setAutoCommit(true);
+            ps.setString(1, id);
+            ps.executeUpdate();
         }
     }
 
@@ -170,8 +176,8 @@ public final class Heartbeat {
             if (relay) {
                 contracts.renewed(id);
             }
-            if (stopped) { // stop() deleted it before this commit
-                delete(connections, names, id);
+            if (stopped) { // stop() deleted it before this commit; on c, as its source may hold no second connection
+                delete(c, names, id);
                 return;
             }
             lockTimeout(c);

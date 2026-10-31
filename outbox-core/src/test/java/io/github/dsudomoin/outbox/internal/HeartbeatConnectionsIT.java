@@ -7,10 +7,14 @@ import io.github.dsudomoin.outbox.ConnectionSource;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestSql;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntPredicate;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterAll;
@@ -197,6 +201,72 @@ class HeartbeatConnectionsIT {
             assertThat(c).as("checked again").isSameAs(lane.opened.get(1));
         }
         assertThat(app.calls).isEqualTo(2);
+    }
+
+    /** Another instance's first bootstrap may create the table between the two measures: measured again, they match. */
+    @Test
+    void tableCreatedBetweenTheMeasuresAtStartIsNoMismatch() throws Exception {
+        var table = "public." + TestSql.uniqueTable();
+        var app = new Recorded("app", MAIN, n -> false);
+        var connections = new HeartbeatConnections(app, creating(table));
+
+        try (var reference = MAIN.getConnection()) {
+            connections.start(reference, table);
+        }
+        try (var c = connections.newConnection()) {
+            assertThat(app.calls).as("checked at start: no comparison later").isZero();
+        }
+    }
+
+    @Test
+    void tableCreatedBetweenTheDeferredMeasuresIsNoMismatch() throws Exception {
+        var table = "public." + TestSql.uniqueTable();
+        var app = new Recorded("app", MAIN, n -> false);
+        var creating = creating(table);
+        var calls = new AtomicInteger();
+        var connections = new HeartbeatConnections(app, () -> {
+            if (calls.incrementAndGet() == 1) {
+                throw new SQLException("lane refused");
+            }
+            return creating.newConnection();
+        });
+        try (var reference = MAIN.getConnection()) {
+            connections.start(reference, table);
+        }
+
+        try (var log = new CapturedStderr()) {
+            try (var c = connections.newConnection()) {
+                assertThat(app.opened.get(0).isClosed()).as("the comparison's, closed: the lane serves").isTrue();
+            }
+            assertThat(log.text()).doesNotContain("reaches another database");
+        }
+        try (var c = connections.newConnection()) {
+            assertThat(app.calls).as("checked").isEqualTo(1);
+        }
+    }
+
+    /**
+     * Connections of {@link #MAIN}; the first creates {@code table} right before its first statement, as another
+     * instance's first bootstrap may between the application side's measure and the heartbeat side's.
+     */
+    private static ConnectionSource creating(String table) {
+        var created = new AtomicBoolean();
+        return () -> {
+            var real = MAIN.getConnection();
+            return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
+                    new Class<?>[] {Connection.class}, (proxy, method, args) -> {
+                        if (method.getName().equals("prepareStatement") && created.compareAndSet(false, true)) {
+                            try (var c = MAIN.getConnection()) {
+                                TestSql.execute(c, "create table " + table + " (id int)");
+                            }
+                        }
+                        try {
+                            return method.invoke(real, args);
+                        } catch (InvocationTargetException e) {
+                            throw e.getCause();
+                        }
+                    });
+        };
     }
 
     private static DataSource other() {

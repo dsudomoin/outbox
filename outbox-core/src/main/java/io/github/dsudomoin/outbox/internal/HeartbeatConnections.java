@@ -1,6 +1,7 @@
 package io.github.dsudomoin.outbox.internal;
 
 import io.github.dsudomoin.outbox.ConnectionSource;
+import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.concurrent.TimeUnit;
@@ -12,17 +13,19 @@ import org.slf4j.LoggerFactory;
  * The heartbeat's connections, from a source of its own, so that business load exhausting the application's pool does
  * not starve the beats. When the heartbeat source fails to connect, or its check query fails, that beat takes the
  * application's connection instead, with a WARN at most once a minute, so a broken heartbeat source is never worse than
- * none. The heartbeat source must reach the application's database, as {@link SchemaCheck#where} tells it:
- * {@link #start} fails on a mismatch, and on nothing else. When it cannot check at start, the first beat that gets an
- * answer from a connection of its own measures it against an application connection taken for it, and on a mismatch
- * logs an ERROR and stays on the application's connections until restart. Both sides are always measured together,
- * never against a value recorded earlier: {@code where} includes the server's start time, which changes on every
- * restart and failover.
+ * none. The heartbeat source must reach the application's database, as {@link SchemaCheck#where} tells it on the table
+ * name the beats use: {@link #start} fails on a mismatch, and on nothing else. When it cannot check at start, the first
+ * beat that gets an answer from a connection of its own measures it against an application connection taken for it,
+ * and on a mismatch logs an ERROR and stays on the application's connections until restart. Both sides are always
+ * measured together, back to back, never against a value recorded earlier: {@code where} includes the server's start
+ * time, which changes on every restart and failover. A mismatch is measured once more before it counts, as another
+ * instance's first bootstrap may create the table between the two measures, while another database stays another.
  */
 final class HeartbeatConnections implements ConnectionSource {
 
     private static final Logger log = LoggerFactory.getLogger(HeartbeatConnections.class);
     private static final long WARN_INTERVAL = TimeUnit.MINUTES.toNanos(1);
+    private static final String SEARCH_PATH = " (and, for an unqualified name, give both roles the same search_path)";
 
     private enum State {
         /** Not measured yet: the start could not reach the heartbeat source. */
@@ -47,25 +50,42 @@ final class HeartbeatConnections implements ConnectionSource {
 
     /**
      * Checks the heartbeat source against {@code reference}, a connection to the application's database, on
-     * {@code table}, the resolved, schema-qualified base name. Only another database fails it: a heartbeat source that
-     * does not connect or answer (a pooler may connect at once and wait on the first query) only logs a WARN.
+     * {@code table}, the base table name the beats use. Only another database fails it: a heartbeat source that does
+     * not connect or answer (a pooler may connect at once and wait on the first query) only logs a WARN, while a
+     * failure of {@code reference} is thrown.
      */
     void start(Connection reference, String table) throws SQLException {
         this.table = table;
-        var app = SchemaCheck.where(reference, table);
-        String mine;
-        try (var own = heartbeat.newConnection()) {
-            mine = SchemaCheck.where(own, table);
+        Connection own;
+        try {
+            own = heartbeat.newConnection(); // first, so that both measures follow each other
         } catch (SQLException | RuntimeException e) {
-            log.warn("outbox heartbeat connection source of {} unreachable at start: {}; the beats take the"
-                    + " application's connections until it connects, and its first connection is then checked against"
-                    + " the application's database", table, e.toString());
+            unreachable(e);
             return;
         }
-        if (!app.equals(mine)) {
-            throw new IllegalStateException(mismatch(mine, app) + "; point it at the database of " + table);
+        Measure m;
+        try {
+            m = measure(reference, own);
+        } finally {
+            try {
+                own.close();
+            } catch (SQLException e) { // the measures are taken: a failed close changes none of them
+            }
         }
-        state = State.CHECKED;
+        if (m.failure() != null) {
+            unreachable(m.failure());
+        } else if (!m.same()) {
+            throw new IllegalStateException(m.mismatch() + "; point it at the database of " + table + SEARCH_PATH);
+        } else {
+            state = State.CHECKED;
+        }
+    }
+
+    /** The WARN of a start that could not measure the heartbeat source. */
+    private void unreachable(Exception e) {
+        log.warn("outbox heartbeat connection source of {} unreachable at start: {}; the beats take the application's"
+                + " connections until it connects, and its first connection is then checked against the application's"
+                + " database", table, e.toString());
     }
 
     @Override
@@ -92,15 +112,16 @@ final class HeartbeatConnections implements ConnectionSource {
         Connection app = null;
         try {
             app = application.newConnection();
-            var expected = SchemaCheck.where(app, table);
-            var mine = measured(own);
-            if (mine == null) {
+            var m = measure(app, own);
+            if (m.failure() != null) {
+                close(own, m.failure());
+                fallback(m.failure());
                 return app;
             }
-            boolean same = expected.equals(mine);
+            boolean same = m.same();
             if (!same) {
                 log.error("{}; the heartbeat of {} uses the application's connections until restart, point the"
-                        + " heartbeat source at its database", mismatch(mine, expected), table);
+                        + " heartbeat source at its database" + SEARCH_PATH, m.mismatch(), table);
             }
             state = same ? State.CHECKED : State.OFF;
             (same ? app : own).close();
@@ -114,14 +135,37 @@ final class HeartbeatConnections implements ConnectionSource {
         }
     }
 
-    /** {@code where} on {@code own}; null when its query fails, which closes {@code own} and logs the fallback WARN. */
-    private String measured(Connection own) {
+    /**
+     * {@link #once}, and once more on a mismatch: another instance's first bootstrap may create the table between the
+     * two measures, while another database stays another.
+     */
+    private Measure measure(Connection app, Connection own) throws SQLException {
+        var first = once(app, own);
+        return first.failure() != null || first.same() ? first : once(app, own);
+    }
+
+    /**
+     * {@code where} on {@code app}, then at once on {@code own}; a failure on {@code app} is thrown, while one on
+     * {@code own} is kept in the measure.
+     */
+    private Measure once(Connection app, Connection own) throws SQLException {
+        var expected = SchemaCheck.where(app, table);
         try {
-            return SchemaCheck.where(own, table);
+            return new Measure(expected, SchemaCheck.where(own, table), null);
         } catch (SQLException | RuntimeException e) {
-            close(own, e);
-            fallback(e);
-            return null;
+            return new Measure(expected, null, e);
+        }
+    }
+
+    /** Both sides' {@code where}; {@code own} is null when its query failed with {@code failure}. */
+    private record Measure(String app, @Nullable String own, @Nullable Exception failure) {
+
+        boolean same() {
+            return app.equals(own);
+        }
+
+        String mismatch() {
+            return HeartbeatConnections.mismatch(own, app);
         }
     }
 
