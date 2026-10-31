@@ -57,12 +57,16 @@ Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dash
   `<db.poolName>-outbox-heartbeat`, one connection always open: +1 server connection per instance. Count it into
   `max_connections`, the role's `CONNECTION LIMIT` and a pooler's per-user pool. Where that limit is sized to exactly
   instances × `maxPoolSize`, raise it by 1 per instance BEFORE the upgrade, or set
-  `outbox.heartbeat.dedicatedConnection = false`. Otherwise who loses depends on who connects first: Kora's app pools
-  default to `minIdle = 0` and grow under load, while the heartbeat pool holds its connection from start. Either the
-  heartbeat pool cannot connect, and the heartbeat runs on the app pool as before, with a WARN once a minute («...
-  this beat uses the application's connections ...»); or it connected first, and at peak an app pool cannot reach
-  `maxPoolSize`, so business `getConnection` waits its `connectionTimeout` and fails. The two can alternate as idle
-  app connections close and connections are replaced every `maxLifetime`
+  `outbox.heartbeat.dedicatedConnection = false`. Otherwise not every connection fits: Kora's app pools default to
+  `minIdle = 0` and grow under load, while the heartbeat pool holds its connection from start. Either the heartbeat
+  pool cannot connect, and the heartbeat runs on the app pool as before, with a WARN once a minute («... this beat
+  uses the application's connections ...»); the heartbeat pool retries without end, at most 5 s apart, so with a role
+  limit Postgres logs FATAL «too many connections for role …» about every 5 s per instance, which may fire log-based
+  alerts. Or it connected first, and at peak an app pool cannot reach `maxPoolSize`, so a `getConnection` on it
+  (business code's, the relay's, the admin's) waits up to its `connectionTimeout` and fails if no connection frees.
+  The two can swap as idle app connections close and connections are replaced every `maxLifetime`, but the heartbeat
+  pool takes the first slot freed within 5 s, while an app pool connects only when a connection is wanted, so it
+  tends to settle on the second: the app pool one connection short at peak
   ([config-reference.md](../using-outbox/config-reference.md)).
 
 ## Deploys and incidents

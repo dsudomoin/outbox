@@ -188,8 +188,11 @@ for ops:
    `max_connections`, the role's `CONNECTION LIMIT` and a pooler's per-user pool. A limit sized to exactly instances
    × `maxPoolSize`: raise it by 1 per instance before the upgrade, or set
    `outbox.heartbeat.dedicatedConnection = false`. Otherwise either the heartbeat pool cannot connect (the heartbeat
-   runs on the app pool as before, with a WARN once a minute) or it connects first and at peak an app pool cannot
-   reach `maxPoolSize` (business `getConnection` waits its `connectionTimeout` and fails); the two can alternate.
+   runs on the app pool as before, with a WARN once a minute; the pool retries about every 5 s, and with a role limit
+   Postgres logs FATAL «too many connections for role …» each time) or it connects first and at peak an app pool
+   cannot reach `maxPoolSize` (a `getConnection` on it, the relay's and admin's included, waits up to its
+   `connectionTimeout` and fails if no connection frees). The heartbeat pool takes the first slot freed within 5 s,
+   so it tends to settle on the second.
 4. **Table**: `outbox.table = "<schema>.outbox"` in the service's own schema, the same on every instance. Schema
    unknown: leave it unqualified and ask; never guess `public`.
 5. **Bulk**: `sendAll` with thousands of distinct keys needs `max_locks_per_transaction × (max_connections +

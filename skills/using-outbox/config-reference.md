@@ -175,14 +175,18 @@ Kora only; without Kora, `OutboxRuntime.builder(...).heartbeatConnections(heartb
   fails, beats fall back to the app pool with the WARN below. A `HikariCredentialsProvider` set on the app's pool is
   shared by the copy, so its credentials are followed.
 - A role `CONNECTION LIMIT` or a pooler's per-user pool sized to exactly instances × `maxPoolSize`: raise it by 1 per
-  instance before the upgrade, or set the key to `false`. Otherwise who loses depends on who connects first (Kora's
-  app pools default to `minIdle = 0` and grow under load; this pool holds its connection from start):
+  instance before the upgrade, or set the key to `false`. Otherwise not every connection fits (Kora's app pools
+  default to `minIdle = 0` and grow under load; this pool holds its connection from start):
   - this pool cannot connect: startup does not fail, and the heartbeat runs on the app pool as before, with a WARN once
-    a minute («... this beat uses the application's connections ...»);
-  - it connected first: at peak an app pool cannot reach `maxPoolSize`, and business `getConnection` waits its
-    `connectionTimeout` and fails;
-  - the two can alternate as idle app connections close (`idleTimeout`) and connections are replaced every
-    `maxLifetime`.
+    a minute («... this beat uses the application's connections ...»). Hikari retries this pool's connection without
+    end, at most 5 s apart, so with a role limit Postgres logs FATAL «too many connections for role …» about every
+    5 s per instance, which may fire log-based alerts;
+  - it connected first: at peak an app pool cannot reach `maxPoolSize`, and a `getConnection` on it (business code's,
+    the relay's, the admin's) waits up to its `connectionTimeout` and fails if no connection frees.
+
+  The two can swap as idle app connections close (`idleTimeout`) and connections are replaced every `maxLifetime`.
+  This pool takes the first slot freed within 5 s, while an app pool connects only when a connection is wanted, so
+  the outcome tends to settle on the second: the app pool one connection short at peak.
 
 ## `outbox.kafka` (`KafkaOutboxModule`)
 
