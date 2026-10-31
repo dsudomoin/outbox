@@ -338,6 +338,33 @@ Files.writeString(Path.of("V8__outbox_inbox.sql"), OutboxSql.inbox(config, "app"
   инстансы прежней версии стартуют на схеме, которую миграции уже обновили.
 - База, созданная bootstrap, проходит проверку как есть: на `bootstrap = false` можно перейти в любой момент.
 
+**Ожидаемые default.** Проверка сверяет выражение каждого default с тем, что пишет `OutboxSql`, в том виде, в каком его
+печатает `pg_get_expr`:
+
+| Выражение | Колонки |
+|---|---|
+| `pg_current_xact_id()` | `<base>.xid` |
+| `clock_timestamp()` | `created_at` в `<base>`, `<base>_tick` и `<base>_checkpoint` |
+| `now()` | `<base>_dead.failed_at`, `<base>_redriven.at`, `<base>_halt.halted_at`, `<base>_dropping.at`, `<base>_instance.last_seen`, `received_at` в inbox |
+| `0` | `last_id` и `failures` в `<base>_cursor`; `attempts` и `requeues` в `<base>_retry` и `<base>_parked`; `handler_attempts` и `redrives` в `<base>_dead` |
+| `1` | `id` в `<base>_halt` и `<base>_maintenance` |
+| `false` | `hook_active` и `relay` в `<base>_instance` |
+| `'kept'::text` | `<base>_dead.status` |
+| `''::text` | `consumer` в inbox |
+
+Строковый литерал можно писать и без приведения (`default 'kept'`): Postgres печатает его так же. Запись, равную по
+смыслу, но другую по форме, проверка не распознаёт и валит старт: `CURRENT_TIMESTAMP` или `transaction_timestamp()`
+вместо `now()`, `'0'::bigint` или `0::bigint` вместо `0`. Она сверяет контракт схемы, а не доказывает
+эквивалентность SQL. Чинится это миграцией с ожидаемым выражением:
+
+```
+outbox schema check of app.outbox failed (outbox.schema.bootstrap = false): column app.outbox_dead.failed_at has default CURRENT_TIMESTAMP, not now()
+```
+
+```sql
+alter table app.outbox_dead alter column failed_at set default now();
+```
+
 ### Соединения: без transaction pooling
 
 **Bootstrap и обслуживанию нужно прямое соединение или пулер в сессионном режиме.** Они держат сессионные
