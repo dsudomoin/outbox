@@ -27,6 +27,7 @@ import java.util.concurrent.TimeUnit;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.BeanFactory;
+import org.springframework.beans.factory.config.BeanPostProcessor;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
@@ -185,6 +186,36 @@ class OutboxLifecycleIT {
                 "stop " + (Integer.MAX_VALUE - 2048) + " outbox running true");
             assertThat(queryLong(instances)).as("heartbeat row deleted at stop").isZero();
         });
+    }
+
+    /** Keeps the lifecycle bean of a context that failed. */
+    static final class LifecycleCapture implements BeanPostProcessor {
+
+        volatile OutboxLifecycle lifecycle;
+
+        @Override
+        public Object postProcessAfterInitialization(Object bean, String beanName) {
+            if (bean instanceof OutboxLifecycle l) {
+                lifecycle = l;
+            }
+            return bean;
+        }
+    }
+
+    @Test
+    void failedStartFailsTheContext() {
+        var table = TestSql.uniqueTable();
+        var capture = new LifecycleCapture();
+        runner("outbox.table=" + table, "outbox.schema.bootstrap=false").withUserConfiguration(WithRoute.class)
+            .withBean(LifecycleCapture.class, () -> capture).run(context -> {
+                assertThat(context).hasFailed();
+                assertThat(context.getStartupFailure()).hasMessageContaining("outboxLifecycle")
+                    .rootCause().hasMessageContaining("outbox schema check of " + table + " failed");
+                assertThat(capture.lifecycle).isNotNull();
+                assertThat(capture.lifecycle.isRunning()).isFalse();
+                assertThat(queryLong("select count(to_regclass('" + table + "_instance'))"))
+                    .as("no instance table, so no heartbeat row").isZero();
+            });
     }
 
     /**
