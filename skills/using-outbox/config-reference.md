@@ -162,18 +162,27 @@ Kora only; without Kora, `OutboxRuntime.builder(...).heartbeatConnections(heartb
 | `dedicatedConnection` | `true` | `true`: the heartbeat gets a pool of its own, so business load that exhausts the app pool does not starve its beats. A copy of the HikariCP pool of the `JdbcDatabase` behind the outbox's transactions (same database, role, driver properties and meters), named `<db.poolName>-outbox-heartbeat`, with `maximumPoolSize` and `minimumIdle` 1, `initializationFailTimeout` -1, `connectionTimeout` = max(500 ms, min(copied, `maintenanceInterval` / 4)) and `validationTimeout` = max(250 ms, min(copied, `connectionTimeout` / 2)); closed after the runtime. Its connection stays open: +1 server connection per instance, outside `db.maxPoolSize`. `false`: the heartbeat takes the app's connections, as before. |
 
 - A `JdbcConnectionFactory` tagged `@Tag(OutboxHeartbeat.class)` replaces the pool whatever the key says: to bypass a
-  pooler, run as another role (with the app role's rights) or use other timeouts. It must reach the app's database;
-  keep its connection timeout well below `maintenanceInterval`.
+  pooler, run as another role (with the app role's DML rights on the outbox tables and `USAGE` on their schema) or use
+  other timeouts. It must reach the app's database; keep its connection and validation timeouts together well below
+  `maintenanceInterval`, as one borrow can take both.
 - Transactions that are not Kora's over a Hikari-backed `JdbcDatabase` (an app's own `OutboxTransactions` or
   `JdbcConnectionFactory`) leave nothing to copy: the heartbeat shares the app's connections, and a startup INFO names
   the tag.
 - It helps against an exhausted app pool only: not behind a transaction-mode pooler (its transactions still wait for
-  the pooler's server connections) and not against a slow database. Credentials changed at runtime on the app's pool
-  are not followed by the copy (Kora's `JdbcDatabase` reads them from config once): once its connection is replaced
-  and the old ones fail, beats fall back to the app pool with the WARN below.
-- A role `CONNECTION LIMIT` or a pooler's per-user pool sized to exactly instances × `maxPoolSize` keeps the pool from
-  connecting: startup does not fail, and the heartbeat runs on the app pool with a WARN once a minute («... this beat
-  uses the application's connections ...»). Raise the limit by 1 per instance, or set the key to `false`.
+  the pooler's server connections) and not against a slow database. The username and password are copied once: a
+  password set at runtime on the app's pool is not followed (Kora's `JdbcDatabase` reads it from config at start, so
+  only if you change it on the running pool yourself), and once the copy's connection is replaced and the old one
+  fails, beats fall back to the app pool with the WARN below. A `HikariCredentialsProvider` set on the app's pool is
+  shared by the copy, so its credentials are followed.
+- A role `CONNECTION LIMIT` or a pooler's per-user pool sized to exactly instances × `maxPoolSize`: raise it by 1 per
+  instance before the upgrade, or set the key to `false`. Otherwise who loses depends on who connects first (Kora's
+  app pools default to `minIdle = 0` and grow under load; this pool holds its connection from start):
+  - this pool cannot connect: startup does not fail, and the heartbeat runs on the app pool as before, with a WARN once
+    a minute («... this beat uses the application's connections ...»);
+  - it connected first: at peak an app pool cannot reach `maxPoolSize`, and business `getConnection` waits its
+    `connectionTimeout` and fails;
+  - the two can alternate as idle app connections close (`idleTimeout`) and connections are replaced every
+    `maxLifetime`.
 
 ## `outbox.kafka` (`KafkaOutboxModule`)
 

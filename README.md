@@ -410,11 +410,19 @@ Heartbeat (поток `outbox-heartbeat`, несколько коротких з
 beat. Без Kora так же, пока вы не дадите ему свой источник через `heartbeatConnections` ([Без Kora](#без-kora)).
 
 **При обновлении.** Если `CONNECTION LIMIT` роли или пул пулера на пользователя рассчитан ровно на инстансы ×
-`maxPoolSize`, собственный пул heartbeat подключиться не сможет. Старт от этого не падает, а пишет WARN «outbox
-heartbeat connection source of ... unreachable at start ...». Дальше heartbeat работает как раньше, через пул
-приложения, и не чаще раза в минуту пишет WARN «... this beat uses the application's connections ...». Старт и
-каждый beat при этом сначала ждут свой пул до его `connectionTimeout` (7.5 с при значениях по умолчанию). Поднимите
-лимит на 1 на инстанс или выставьте `outbox.heartbeat.dedicatedConnection = false`.
+`maxPoolSize`, до обновления поднимите лимит на 1 на инстанс или выставьте
+`outbox.heartbeat.dedicatedConnection = false`. Иначе соединений не хватит на всех, и кто останется без соединения,
+зависит от того, кто подключился первым. У пулов приложения в Kora по умолчанию `minIdle = 0`, и они растут под
+нагрузкой, а пул heartbeat держит своё соединение с самого старта.
+
+- Пул heartbeat не смог подключиться. Тогда heartbeat работает как раньше, через пул приложения, и не чаще раза в
+  минуту пишет WARN «... this beat uses the application's connections ...». Если так вышло на старте, старт не падает,
+  а пишет WARN «outbox heartbeat connection source of ... unreachable at start ...». Старт и каждый beat при этом
+  сначала ждут свой пул до его `connectionTimeout` (7.5 с при значениях по умолчанию).
+- Пул heartbeat подключился первым. Тогда в пик пул приложения не дорастает до `maxPoolSize`: бизнес-код в
+  `getConnection` ждёт свой `connectionTimeout` и падает.
+- Пул приложения закрывает простаивающие соединения (`idleTimeout`), а оба пула заменяют свои каждые `maxLifetime`
+  (15 мин в Kora по умолчанию), поэтому эти два исхода могут чередоваться.
 
 ### `max_locks_per_transaction` для массовой отправки
 
@@ -1251,18 +1259,19 @@ runtime.close();                                     // relay останавли
 
 **Свой пул для heartbeat.** Без Kora heartbeat по умолчанию берёт соединения приложения, и бизнес-нагрузка, исчерпавшая
 их пул, задерживает его beats; старт пишет об этом INFO «outbox heartbeat shares the application's connections ...».
-Дайте ему пул из одного соединения к той же базе и под той же ролью (здесь HikariCP, подойдёт любой пул):
+Дайте ему пул из одного соединения к той же базе (здесь HikariCP, подойдёт любой пул). Роль может быть и другой, если у
+неё есть права DML роли приложения на таблицы outbox и `USAGE` на их схему:
 
 ```java
 var heartbeatConfig = new HikariConfig();
-heartbeatConfig.setJdbcUrl(jdbcUrl);                 // та же база и роль, что у dataSource
+heartbeatConfig.setJdbcUrl(jdbcUrl);                 // та же база, что у dataSource
 heartbeatConfig.setUsername(username);
 heartbeatConfig.setPassword(password);
 heartbeatConfig.setPoolName("app-outbox-heartbeat");
 heartbeatConfig.setMaximumPoolSize(1);
 heartbeatConfig.setMinimumIdle(1);
-heartbeatConfig.setConnectionTimeout(5_000);         // заметно меньше maintenanceInterval (30 с)
-heartbeatConfig.setValidationTimeout(2_500);
+heartbeatConfig.setConnectionTimeout(5_000);
+heartbeatConfig.setValidationTimeout(2_500);         // вместе 7.5 с: заметно меньше maintenanceInterval (30 с)
 heartbeatConfig.setInitializationFailTimeout(-1);    // создание пула в базу не ходит
 var heartbeatPool = new HikariDataSource(heartbeatConfig);
 
@@ -1275,11 +1284,12 @@ runtime.close();                                     // удаляет стро�
 heartbeatPool.close();                               // поэтому только после runtime.close()
 ```
 
-- Через этот источник идут beats heartbeat и удаление строки инстанса при `close()`; всё остальное — через
-  `transactions`. Каждый инстанс держит на сервере на одно соединение больше ([Размер пула
-  соединений](#размер-пула-соединений)).
-- Beat ждёт соединение до `connectionTimeout`, а проверка соединения после выдачи — до `validationTimeout`: держите
-  оба заметно меньше `maintenanceInterval`.
+- Через этот источник идут beats и удаление строки инстанса при `close()`, а на старте он один раз даёт соединение
+  для сверки базы (ниже). Всё остальное идёт через `transactions`, а DDL — через источник владельца, если он задан
+  ([Схема в миграциях и роль приложения только с DML](#схема-в-миграциях-и-роль-приложения-только-с-dml)). Каждый
+  инстанс держит на сервере на одно соединение больше ([Размер пула соединений](#размер-пула-соединений)).
+- Одна выдача соединения может занять `connectionTimeout` (ожидание) плюс `validationTimeout` (проверка соединения
+  после выдачи). Держите их сумму заметно меньше `maintenanceInterval`.
 - Если источник не выдал соединение, этот beat идёт через соединения приложения, с WARN «... this beat uses the
   application's connections ...» не чаще раза в минуту. Недоступный источник старт не валит.
 - Источник должен смотреть в базу приложения (а для имени без схемы — с одинаковым `search_path`). Старт сверяет
@@ -1699,12 +1709,13 @@ xid](#восстановление-после-регрессии-xid-xid-regress
 
 | Ключ | По умолчанию | Значение |
 |---|---|---|
-| `dedicatedConnection` | `true` | `true`: у heartbeat собственный пул из одного соединения, и бизнес-нагрузка, исчерпавшая пул приложения, его не задерживает. Пул — копия пула HikariCP того `JdbcDatabase`, через который идут транзакции outbox: та же база, роль, свойства драйвера и метры, имя `<poolName>-outbox-heartbeat`. В копии `maximumPoolSize` и `minimumIdle` = 1, `initializationFailTimeout` = -1 (создание пула в базу не ходит), `connectionTimeout` = max(500 мс, min(скопированный, `maintenanceInterval` / 4)), `validationTimeout` = max(250 мс, min(скопированный, `connectionTimeout` / 2)). Пул закрывается после outbox, когда строка инстанса уже удалена. Его соединение открыто всегда: +1 серверное соединение на инстанс. `false`: heartbeat берёт соединения приложения, как раньше. |
+| `dedicatedConnection` | `true` | `true`: у heartbeat собственный пул из одного соединения, и бизнес-нагрузка, исчерпавшая пул приложения, его не задерживает. Пул — копия пула HikariCP того `JdbcDatabase`, через который идут транзакции outbox: та же база, роль, свойства драйвера и метры, имя `<db.poolName>-outbox-heartbeat`. В копии `maximumPoolSize` и `minimumIdle` = 1, `initializationFailTimeout` = -1 (создание пула в базу не ходит), `connectionTimeout` = max(500 мс, min(скопированный, `maintenanceInterval` / 4)), `validationTimeout` = max(250 мс, min(скопированный, `connectionTimeout` / 2)). Пул закрывается после outbox, когда строка инстанса уже удалена. Его соединение открыто всегда: +1 серверное соединение на инстанс. `false`: heartbeat берёт соединения приложения, как раньше. |
 
 - `JdbcConnectionFactory` с тегом `OutboxHeartbeat` заменяет этот пул при любом значении ключа. Так heartbeat можно
-  пустить мимо пулера, под другой ролью (с правами роли приложения) или с другими таймаутами. Она должна смотреть в
-  базу приложения, и её проверяют так же, как `heartbeatConnections` ([Без Kora](#без-kora)). Одного соединения ей
-  хватает; её `connectionTimeout` держите заметно меньше `maintenanceInterval`.
+  пустить мимо пулера, под другой ролью (если у неё есть права DML роли приложения на таблицы outbox и `USAGE` на их
+  схему) или с другими таймаутами. Она должна смотреть в базу приложения, и её проверяют так же, как
+  `heartbeatConnections` ([Без Kora](#без-kora)). Одного соединения ей хватает; сумму её `connectionTimeout` и
+  `validationTimeout` держите заметно меньше `maintenanceInterval`.
 
   ```java
   @Tag(OutboxHeartbeat.class)
@@ -2166,7 +2177,7 @@ Gauge показывает, сколько xid осталось, а обслуж
 | `outbox.partitions.orphaned` > 0, `outbox.inbox.partitions.orphaned` > 0 | Отсоединённый диапазон со строками, который библиотека не вернула сама ([Осиротевшие партиции](#осиротевшие-партиции)). |
 | `outbox.partitions.overflow` = 1 дольше одного цикла расширения | Строки ушли в хвост, а своп не прошёл: держатель блокировки на outbox (WARN «deferred» и часовой ERROR «has not run on N due runs» называют его) или хвост больше `maxTailScan` (часовой ERROR «over outbox.partitions.maxTailScan»: его превратит окно `tailConversion`). Запись идёт, ничего не теряется ([Переполнение хвоста](#переполнение-хвоста-tail-overflow)). Одна выборка `overflow` = 1 — информация, а не авария. |
 | `outbox.partitions.premade` < 2 | Расширение отстаёт, строки скоро пойдут в хвост. |
-| `outbox.messages.route_unchecked` растёт | Heartbeat инстанса не читает отчёты других инстансов дольше 3 × `maintenanceInterval` (WARN «outbox heartbeat of instance ... failed»), и проверка при записи пропускает сообщения по последнему чтению (WARN «... through unchecked ...»). Ничего не теряется: запись, которую инстанс прочитать не сможет, ждёт. Чините heartbeat. Собственный пул heartbeat (в Kora по умолчанию) от исчерпанного пула приложения не зависит, поэтому смотрите сам источник heartbeat: WARN «outbox heartbeat connection source of ... failed, this beat uses the application's connections ...» (тогда beat ушёл в пул приложения), ERROR «outbox heartbeat connection source reaches another database ...», метры `hikaricp_*` с `pool="<poolName>-outbox-heartbeat"`, не выключен ли `outbox.heartbeat.dedicatedConnection` (тогда при старте INFO «outbox heartbeat shares the application's connections ...»). Медленная база и пулер в режиме transaction задерживают heartbeat и со своим пулом ([Версии контрактов и откат](#версии-контрактов-и-откат)). |
+| `outbox.messages.route_unchecked` растёт | Heartbeat инстанса не читает отчёты других инстансов дольше 3 × `maintenanceInterval` (WARN «outbox heartbeat of instance ... failed»), и проверка при записи пропускает сообщения по последнему чтению (WARN «... through unchecked ...»). Ничего не теряется: запись, которую инстанс прочитать не сможет, ждёт. Чините heartbeat. Собственный пул heartbeat (в Kora по умолчанию) от исчерпанного пула приложения не зависит, поэтому смотрите сам источник heartbeat: WARN «outbox heartbeat connection source of ... failed, this beat uses the application's connections ...» (тогда beat ушёл в пул приложения), ERROR «outbox heartbeat connection source reaches another database ...», метры `hikaricp_*` с `pool="<db.poolName>-outbox-heartbeat"`, не выключен ли `outbox.heartbeat.dedicatedConnection` (тогда при старте INFO «outbox heartbeat shares the application's connections ...»). Медленная база и пулер в режиме transaction задерживают heartbeat и со своим пулом ([Версии контрактов и откат](#версии-контрактов-и-откат)). |
 | `outbox.parked.size` не возвращается к обычному уровню или растёт | Записи откладываются снова и снова: блокирующий их процесс не заканчивается. `outbox.shard.lag` отложенных записей не видит. Предел задаёт обработчик или `relay.requeue.maxRequeues` ([Свой обработчик](#свой-обработчик)). |
 | WARN «outbox tick made without its shard set» | Проба шардов при записи тика не прошла, чаще всего потому, что партицию держит ACCESS EXCLUSIVE (ALTER TABLE, VACUUM FULL, TRUNCATE, LOCK вручную). Тики идут дальше без набора шардов, и relay шагает по всем шардам; пока партиция заблокирована, шаги ждут её, и растёт `outbox.shard.lag`. Не чаще раза в минуту. |
 
@@ -3650,10 +3661,12 @@ retry и dead пусты. Прогон на более ранней версии
   Собственное соединение heartbeat за таким пулером тоже не помогает: его транзакции ждут серверных соединений, которые
   держит бизнес-нагрузка ([Соединения: без transaction pooling](#соединения-без-transaction-pooling)).
 - Собственный пул heartbeat в Kora помогает от исчерпанного пула приложения, но не от медленной базы: beats
-  замедляются, как раньше. Учётные данные он копирует один раз, при создании: если их меняют на работающем пуле
-  приложения (`HikariConfigMXBean.setPassword`), копия держит прежние. Когда её соединение заменят, а прежние данные
-  уже не подходят, heartbeat ходит через пул приложения с WARN раз в минуту. `JdbcDatabase` Kora берёт учётные данные
-  из конфига при старте, так что это касается только своей настройки пула.
+  замедляются, как раньше. Имя пользователя и пароль он копирует один раз, при создании: если их меняют на работающем
+  пуле приложения (`HikariConfigMXBean.setPassword`), копия держит прежние. Когда её соединение заменят, а прежний
+  пароль уже не подходит, heartbeat ходит через пул приложения с WARN раз в минуту. `JdbcDatabase` Kora берёт пароль из
+  конфига при старте, так что это бывает, только если вы сами меняете пароль на работающем пуле.
+  `HikariCredentialsProvider`, если он задан у пула приложения, копия разделяет с ним: новые соединения обоих пулов
+  берут учётные данные из него, и их смену копия видит.
 - Один шард обрабатывается последовательно (чтение, отправка, ожидание ack, коммит): один горячий шард ограничивает
   пропускную способность; используйте больше шардов.
 - Если зависшая запись находится глубоко среди последующих записей ключа в retry-таблице, этот ключ разгребается

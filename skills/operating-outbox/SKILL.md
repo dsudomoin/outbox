@@ -55,10 +55,14 @@ Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dash
   [sizing-examples.md](../using-outbox/sizing-examples.md).
 - **Heartbeat connection:** in Kora the heartbeat takes nothing from `db.maxPoolSize`; it holds a pool of its own,
   `<db.poolName>-outbox-heartbeat`, one connection always open: +1 server connection per instance. Count it into
-  `max_connections`, the role's `CONNECTION LIMIT` and a pooler's per-user pool. On an upgrade where that limit is
-  sized to exactly instances × `maxPoolSize`, the pool cannot connect: startup does not fail, the heartbeat runs on
-  the app pool as before, with a WARN once a minute («... this beat uses the application's connections ...»). Raise
-  the limit by 1 per instance, or set `outbox.heartbeat.dedicatedConnection = false`
+  `max_connections`, the role's `CONNECTION LIMIT` and a pooler's per-user pool. Where that limit is sized to exactly
+  instances × `maxPoolSize`, raise it by 1 per instance BEFORE the upgrade, or set
+  `outbox.heartbeat.dedicatedConnection = false`. Otherwise who loses depends on who connects first: Kora's app pools
+  default to `minIdle = 0` and grow under load, while the heartbeat pool holds its connection from start. Either the
+  heartbeat pool cannot connect, and the heartbeat runs on the app pool as before, with a WARN once a minute («...
+  this beat uses the application's connections ...»); or it connected first, and at peak an app pool cannot reach
+  `maxPoolSize`, so business `getConnection` waits its `connectionTimeout` and fails. The two can alternate as idle
+  app connections close and connections are replaced every `maxLifetime`
   ([config-reference.md](../using-outbox/config-reference.md)).
 
 ## Deploys and incidents

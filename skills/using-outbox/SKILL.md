@@ -145,8 +145,8 @@ no route check.
   heartbeat shares the app's connections). It does not take from `db.maxPoolSize`, but each instance holds one more
   server connection. `outbox.heartbeat.dedicatedConnection = false` turns it off; a `JdbcConnectionFactory` tagged
   `@Tag(OutboxHeartbeat.class)` replaces it whatever the key says (to bypass a pooler, or for other timeouts). Without
-  Kora, pass a pool of one connection on the app's database and role, its connection timeout well below
-  `maintenanceInterval`:
+  Kora, pass a pool of one connection on the app's database (another role needs the app role's DML rights on the outbox
+  tables and `USAGE` on their schema), its connection and validation timeouts together well below `maintenanceInterval`:
 
   ```java
   var runtime = OutboxRuntime.builder(config, new JdbcTransactions(appDataSource), handler)
@@ -185,9 +185,11 @@ for ops:
 3. **Connections**: direct or session-mode pooler, never transaction pooling, the owner database included.
    `db.maxPoolSize` ≥ the service's own peak + `relay.workers` + 3 (+ 1 while `drain()` runs). Leave `outbox.shards`
    unset (256 for a new outbox). The heartbeat's own pool adds one server connection per instance: count it into
-   `max_connections`, the role's `CONNECTION LIMIT` and a pooler's per-user pool. With a limit sized to exactly
-   instances × `maxPoolSize` that pool cannot connect, and the heartbeat runs on the app pool as before, with a WARN
-   once a minute: raise the limit by 1 per instance or set `outbox.heartbeat.dedicatedConnection = false`.
+   `max_connections`, the role's `CONNECTION LIMIT` and a pooler's per-user pool. A limit sized to exactly instances
+   × `maxPoolSize`: raise it by 1 per instance before the upgrade, or set
+   `outbox.heartbeat.dedicatedConnection = false`. Otherwise either the heartbeat pool cannot connect (the heartbeat
+   runs on the app pool as before, with a WARN once a minute) or it connects first and at peak an app pool cannot
+   reach `maxPoolSize` (business `getConnection` waits its `connectionTimeout` and fails); the two can alternate.
 4. **Table**: `outbox.table = "<schema>.outbox"` in the service's own schema, the same on every instance. Schema
    unknown: leave it unqualified and ask; never guess `public`.
 5. **Bulk**: `sendAll` with thousands of distinct keys needs `max_locks_per_transaction × (max_connections +
