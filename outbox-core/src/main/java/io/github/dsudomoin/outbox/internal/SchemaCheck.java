@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.internal;
 
+import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
@@ -11,12 +12,13 @@ import org.slf4j.LoggerFactory;
 
 /**
  * The startup check of base objects the application's migrations own ({@code outbox.schema.bootstrap = false}): every
- * table, column (type, nullability, default, identity), index, primary key and partition key of
- * {@link SchemaObjects} as this version needs it; DML rights on every table (and {@code SELECT} on the outbox's id
- * sequence) for the role of {@code app}; and for the role of {@code ddl}, which makes and drops the partitions,
- * membership of the partitioned table's owner and {@code CREATE} on its schema. With an owner source, a WARN when the
- * application role may create where the owner's sessions resolve functions. What it does not know, a newer
- * schema's columns, indexes and tables, it ignores. Fails with one {@link IllegalStateException} naming every problem.
+ * table, column (type, nullability, default expression as {@code pg_get_expr} prints it, identity), index, primary key
+ * and partition key of {@link SchemaObjects} as this version needs it; DML rights on every table (and {@code SELECT} on
+ * the outbox's id sequence) for the role of {@code app}; and for the role of {@code ddl}, which makes and drops the
+ * partitions, membership of the partitioned table's owner and {@code CREATE} on its schema. With an owner source, a
+ * WARN when the application role may create where the owner's sessions resolve functions. What it does not know, a
+ * newer schema's columns, indexes, tables and defaults, it ignores. Fails with one {@link IllegalStateException}
+ * naming every problem.
  */
 final class SchemaCheck {
 
@@ -147,14 +149,16 @@ final class SchemaCheck {
 
     private static void columns(Connection c, long oid, SchemaObjects.Table t, String render, List<String> problems)
             throws SQLException {
-        record Actual(String type, boolean notNull, boolean hasDefault, boolean identity) {}
+        record Actual(String type, boolean notNull, @Nullable String defaultValue, boolean identity) {}
         var actual = new HashMap<String, Actual>();
-        try (var ps = c.prepareStatement("select attname, format_type(atttypid, atttypmod), attnotnull, atthasdef,"
-                + " attidentity <> '' from pg_attribute where attrelid = ?::oid and attnum > 0 and not attisdropped")) {
+        try (var ps = c.prepareStatement("select a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull,"
+                + " pg_get_expr(d.adbin, d.adrelid), a.attidentity <> '' from pg_attribute a left join pg_attrdef d"
+                + " on d.adrelid = a.attrelid and d.adnum = a.attnum where a.attrelid = ?::oid and a.attnum > 0"
+                + " and not a.attisdropped")) {
             ps.setLong(1, oid);
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    actual.put(rs.getString(1), new Actual(rs.getString(2), rs.getBoolean(3), rs.getBoolean(4),
+                    actual.put(rs.getString(1), new Actual(rs.getString(2), rs.getBoolean(3), rs.getString(4),
                             rs.getBoolean(5)));
                 }
             }
@@ -174,9 +178,13 @@ final class SchemaCheck {
             }
             if (column.identity() && !a.identity()) {
                 problems.add("column " + name + " is not an identity column" + fix(column.since(), render));
-            } else if (column.defaultValue() != null && !a.hasDefault()) {
+            } else if (column.defaultValue() != null && a.defaultValue() == null) {
                 problems.add("column " + name + " has no default (" + column.defaultValue() + ")"
                         + fix(column.since(), render));
+            } else if (column.defaultValue() != null && !a.defaultValue().equals(column.defaultValue())
+                    // as Postgres prints a literal: '' is ''::text
+                    && !a.defaultValue().equals(column.defaultValue() + "::" + column.type())) {
+                problems.add("column " + name + " has default " + a.defaultValue() + ", not " + column.defaultValue());
             }
         }
     }

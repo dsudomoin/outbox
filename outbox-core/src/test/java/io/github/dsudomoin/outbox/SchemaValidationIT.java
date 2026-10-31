@@ -100,10 +100,35 @@ class SchemaValidationIT {
                         + " OutboxSql.outbox)");
     }
 
+    /**
+     * A constant xid default passes for a default, but the relay counts xid 1 as visible long ago and never delivers
+     * the record, while the lag reads 0.
+     */
+    @Test
+    void wrongDefaultNamesTheExpectedOne() throws Exception {
+        sql(OutboxSql.outbox(config, null));
+        sql("alter table " + names.base() + " alter column xid set default '1'::xid8");
+
+        assertThatThrownBy(runtime(config, TestDataSources.newDataSource())::start)
+                .hasMessageContaining("column " + names.base() + ".xid has default '1'::xid8, not"
+                        + " pg_current_xact_id()");
+    }
+
+    @Test
+    void missingDefaultFails() throws Exception {
+        sql(OutboxSql.outbox(config, null));
+        sql("alter table " + names.dead() + " alter column status drop default");
+
+        assertThatThrownBy(runtime(config, TestDataSources.newDataSource())::start)
+                .hasMessageContaining("column " + names.dead() + ".status has no default ('kept') (schema version 1:"
+                        + " apply OutboxSql.outbox)");
+    }
+
     @Test
     void olderLibraryOnNewerSchemaStarts() throws Exception {
         sql(OutboxSql.outbox(config, null));
         sql("alter table " + names.base() + " add column trace_flags int");
+        sql("alter table " + names.dead() + " alter column error set default ''"); // none in this version
         sql("create index " + names.unqualified(names.tick()) + "_created on " + names.tick() + " (created_at)");
         sql("create table " + names.base() + "_future (id int primary key)");
 

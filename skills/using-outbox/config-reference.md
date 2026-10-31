@@ -118,7 +118,7 @@ The dead-letter hook and the dead table (writing-outbox-handlers, `dead-letter-h
 
 | Key | Default | Rule and meaning |
 |---|---|---|
-| `bootstrap` | `true` | `true`: every instance creates the missing base tables at startup and upgrades older ones. `false`: the application's migrations own them: render the SQL once with `OutboxSql.outbox(config, role)` (and `OutboxSql.inbox` for the inbox) into a Flyway or Liquibase migration; startup then creates nothing and checks every table, column, index, partition key and the roles' rights, failing with every problem and the schema version that adds a missing object. Partitions stay the library's in both modes, so its role owns the partitioned tables. A newer schema's extra columns, indexes and tables are accepted (rolling deploys). |
+| `bootstrap` | `true` | `true`: every instance creates the missing base tables at startup and upgrades older ones. `false`: the application's migrations own them: render the SQL once with `OutboxSql.outbox(config, role)` (and `OutboxSql.inbox` for the inbox) into a Flyway or Liquibase migration; startup then creates nothing and checks every table, column (default expressions included, as `pg_get_expr` prints them), index, partition key and the roles' rights, failing with every problem and the schema version that adds a missing object. Partitions stay the library's in both modes, so its role owns the partitioned tables. A newer schema's extra columns, indexes and tables are accepted (rolling deploys). |
 
 **DML-only application role.** With `bootstrap = false` the runtime DDL can run as the tables' owner while the app's
 own role has DML only: `OutboxRuntime.builder(...).ownerConnections(ownerDataSource::getConnection)` (and the same on
