@@ -72,6 +72,11 @@ public final class SpringOutboxTransactions implements OutboxTransactions {
             : dataSource;
     }
 
+    /** The DataSource, a {@link TransactionAwareDataSourceProxy} unwrapped. */
+    DataSource dataSource() {
+        return dataSource;
+    }
+
     /** The connection bound for this DataSource by the actual transaction on this thread; null without one. */
     @Nullable
     @Override

@@ -82,9 +82,14 @@ class OutboxPropertiesTest {
             assertThat(p.lifecycle().phase()).isEqualTo(Integer.MAX_VALUE - 4096);
             assertThat(p.telemetry().observeUnsampled()).isFalse();
             assertThat(p.json().mapper()).isEqualTo(OutboxProperties.Json.Mapper.AUTO);
+            assertThat(p.heartbeat().dedicatedConnection()).isTrue();
         });
         bind(p -> assertThat(p.json().mapper()).isEqualTo(OutboxProperties.Json.Mapper.JACKSON3),
             "outbox.json.mapper=jackson3");
+        bind(p -> assertThat(p.heartbeat().dedicatedConnection()).isFalse(),
+            "outbox.heartbeat.dedicated-connection=false");
+        bind(p -> assertThat(p.heartbeat().dedicatedConnection()).isFalse(),
+            "outbox.heartbeat.dedicatedConnection=false");
     }
 
     @Test
@@ -111,6 +116,9 @@ class OutboxPropertiesTest {
         }
         assertThat(String.valueOf(properties.get("outbox.relay.batch-size").get("defaultValue"))).isEqualTo("1000");
         assertThat(properties.get("outbox.relay.batch-timeout").get("defaultValue")).isEqualTo("30s");
+        assertThat(String.valueOf(properties.get("outbox.heartbeat.dedicated-connection").get("defaultValue")))
+            .isEqualTo("true");
+        assertThat((String) properties.get("outbox.heartbeat.dedicated-connection").get("description")).isNotBlank();
     }
 
     private static void collectKeys(String path, Class<?> type, List<String> keys) {

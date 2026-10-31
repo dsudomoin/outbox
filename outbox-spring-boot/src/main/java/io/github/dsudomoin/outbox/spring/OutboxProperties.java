@@ -27,6 +27,8 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  * @param lifecycle the outbox's start and stop within the application context.
  * @param telemetry the outbox's observations.
  * @param json the JSON mapper of typed payloads.
+ * @param heartbeat the connections of the heartbeat, which keeps this instance's row fresh and reads the reports that
+ *     guard routed sends.
  */
 @ConfigurationProperties("outbox")
 public record OutboxProperties(
@@ -41,7 +43,8 @@ public record OutboxProperties(
     @DefaultValue("true") boolean enabled,
     @DefaultValue Lifecycle lifecycle,
     @DefaultValue Telemetry telemetry,
-    @DefaultValue Json json
+    @DefaultValue Json json,
+    @DefaultValue Heartbeat heartbeat
 ) implements OutboxConfig {
 
     /**
@@ -289,4 +292,20 @@ public record OutboxProperties(
         /** Which Jackson maps typed payloads. */
         public enum Mapper { AUTO, JACKSON2, JACKSON3 }
     }
+
+    /**
+     * The connections of the heartbeat, which keeps this instance's row fresh and reads the reports that guard routed
+     * sends.
+     *
+     * @param dedicatedConnection whether the heartbeat gets a pool of its own, so that business load that exhausts the
+     *     app's pool does not starve its beats: one connection, always open, copied from the HikariDataSource the
+     *     outbox's DataSource is or unwraps to, with the same database, role, driver properties and meters, named
+     *     after that pool with -outbox-heartbeat appended (outbox-heartbeat while it has no name), its connection and
+     *     validation timeouts capped by outbox.partitions.maintenance-interval. Count its connection into
+     *     max_connections, the role's CONNECTION LIMIT and a pooler's per-user pool. A DataSource bean qualified
+     *     @OutboxHeartbeat wins over this key; false keeps the heartbeat on the app's connections. Default true.
+     */
+    public record Heartbeat(
+        @DefaultValue("true") boolean dedicatedConnection
+    ) {}
 }

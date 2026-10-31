@@ -5,6 +5,9 @@ package io.github.dsudomoin.outbox.spring {
     ctor public OutboxAutoConfiguration();
   }
 
+  @java.lang.annotation.Documented @java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) @java.lang.annotation.Target({java.lang.annotation.ElementType.FIELD, java.lang.annotation.ElementType.METHOD, java.lang.annotation.ElementType.PARAMETER, java.lang.annotation.ElementType.TYPE}) @org.springframework.beans.factory.annotation.Qualifier public @interface OutboxHeartbeat {
+  }
+
   public final class OutboxLifecycle implements org.springframework.context.SmartLifecycle {
     method public boolean isRunning();
     method public io.github.dsudomoin.outbox.OutboxRuntime! runtime();
@@ -17,9 +20,10 @@ package io.github.dsudomoin.outbox.spring {
   }
 
   @org.springframework.boot.context.properties.ConfigurationProperties("outbox") public final class OutboxProperties implements io.github.dsudomoin.outbox.OutboxConfig {
-    ctor public OutboxProperties(@org.springframework.boot.context.properties.bind.DefaultValue("outbox") String!, Integer?, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Relay!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Partitions!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Inbox!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.DeadLetters!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Recovery!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Schema!, @org.springframework.boot.context.properties.bind.DefaultValue("true") boolean, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Lifecycle!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Telemetry!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Json!);
+    ctor public OutboxProperties(@org.springframework.boot.context.properties.bind.DefaultValue("outbox") String!, Integer?, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Relay!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Partitions!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Inbox!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.DeadLetters!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Recovery!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Schema!, @org.springframework.boot.context.properties.bind.DefaultValue("true") boolean, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Lifecycle!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Telemetry!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Json!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Heartbeat!);
     method public io.github.dsudomoin.outbox.spring.OutboxProperties.DeadLetters! deadLetters();
     method public boolean enabled();
+    method public io.github.dsudomoin.outbox.spring.OutboxProperties.Heartbeat! heartbeat();
     method public io.github.dsudomoin.outbox.spring.OutboxProperties.Inbox! inbox();
     method public io.github.dsudomoin.outbox.spring.OutboxProperties.Json! json();
     method public io.github.dsudomoin.outbox.spring.OutboxProperties.Lifecycle! lifecycle();
@@ -38,6 +42,11 @@ package io.github.dsudomoin.outbox.spring {
     method public java.time.Duration! redriveHistory();
     method public java.time.Duration! retention();
     method public java.time.Duration! timeout();
+  }
+
+  public static final class OutboxProperties.Heartbeat {
+    ctor public OutboxProperties.Heartbeat(@org.springframework.boot.context.properties.bind.DefaultValue("true") boolean);
+    method public boolean dedicatedConnection();
   }
 
   public static final class OutboxProperties.Inbox implements io.github.dsudomoin.outbox.OutboxConfig.InboxConfig {

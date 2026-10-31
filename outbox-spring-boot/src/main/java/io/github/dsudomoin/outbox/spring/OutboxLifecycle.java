@@ -26,17 +26,17 @@ public final class OutboxLifecycle implements SmartLifecycle {
     static final String NOT_STARTED = "the outbox starts with the application context's lifecycle; send from an"
         + " ApplicationRunner or later, not from @PostConstruct";
 
-    private final Supplier<OutboxRuntime> runtimes;
+    private final Supplier<Built> runtimes;
     private final int phase;
     /** Built, not started: the next start's runtime. */
     @Nullable
-    private OutboxRuntime next;
+    private Built next;
     @Nullable
     private volatile Started current;
     private volatile boolean running;
 
     /** Builds the first runtime at once, so a config error fails the bean's creation. */
-    OutboxLifecycle(Supplier<OutboxRuntime> runtimes, int phase) {
+    OutboxLifecycle(Supplier<Built> runtimes, int phase) {
         this.runtimes = runtimes;
         this.phase = phase;
         this.next = runtimes.get();
@@ -47,19 +47,36 @@ public final class OutboxLifecycle implements SmartLifecycle {
         if (running) {
             return;
         }
-        var runtime = next != null ? next : runtimes.get(); // a runtime starts once
-        runtime.start();
+        var built = next != null ? next : runtimes.get(); // a runtime starts once
         next = null;
-        current = new Started(runtime, runtime.outbox(), runtime.admin());
+        var runtime = built.runtime();
+        try {
+            runtime.start();
+        } catch (RuntimeException | Error e) {
+            built.release().run();
+            throw e;
+        }
+        current = new Started(runtime, runtime.outbox(), runtime.admin(), built.release());
         running = true;
     }
 
-    /** Synchronous: the relay has stopped and the heartbeat row is gone when it returns. */
+    /**
+     * Synchronous: the relay has stopped and the heartbeat row is gone when it returns. Also releases a runtime built
+     * and never started, as on a context whose refresh failed before the start.
+     */
     @Override
     public synchronized void stop() {
         if (running) {
             running = false;
-            current().runtime.close();
+            var started = current();
+            try {
+                started.runtime.close(); // deletes this instance's row through the heartbeat's pool first
+            } finally {
+                started.release.run();
+            }
+        } else if (next != null) {
+            next.release().run();
+            next = null;
         }
     }
 
@@ -91,5 +108,8 @@ public final class OutboxLifecycle implements SmartLifecycle {
         return started;
     }
 
-    record Started(OutboxRuntime runtime, Outbox outbox, OutboxAdmin admin) {}
+    /** A runtime, built and not started, and what to release once it has closed or failed to start. */
+    record Built(OutboxRuntime runtime, Runnable release) {}
+
+    record Started(OutboxRuntime runtime, Outbox outbox, OutboxAdmin admin, Runnable release) {}
 }

@@ -10,6 +10,7 @@ dependencies {
     compileOnly("org.springframework:spring-aop")
     // optional: the app's classpath decides which of them are used
     compileOnly("io.micrometer:micrometer-tracing")
+    compileOnly("com.zaxxer:HikariCP")
     compileOnly("com.fasterxml.jackson.core:jackson-databind")
     compileOnly("tools.jackson.core:jackson-databind:3.1.7")
     compileOnly("com.google.protobuf:protobuf-java:3.25.8")
