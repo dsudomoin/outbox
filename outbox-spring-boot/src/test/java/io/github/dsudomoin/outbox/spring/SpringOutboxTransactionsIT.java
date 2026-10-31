@@ -51,7 +51,10 @@ class SpringOutboxTransactionsIT {
 
     private static final String HINT = "@Transactional or TransactionTemplate";
 
-    /** Boot's DataSource (Hikari), transaction manager, JdbcTemplate and JPA; the runtime built and started by hand. */
+    /**
+     * Boot's DataSource (Hikari), transaction manager, JdbcTemplate and JPA; the runtime built and started by hand, the
+     * outbox's own auto-configuration excluded.
+     */
     @Configuration(proxyBeanMethods = false)
     @EnableAutoConfiguration
     @AutoConfigurationPackage // the JPA entity below
@@ -109,7 +112,8 @@ class SpringOutboxTransactionsIT {
             .withPropertyValues("spring.datasource.url=" + TestDataSources.jdbcUrl(),
                 "spring.datasource.username=" + TestDataSources.user(),
                 "spring.datasource.password=" + TestDataSources.password(),
-                "spring.flyway.enabled=false", "spring.liquibase.enabled=false")
+                "spring.flyway.enabled=false", "spring.liquibase.enabled=false",
+                "spring.autoconfigure.exclude=io.github.dsudomoin.outbox.spring.OutboxAutoConfiguration")
             .withPropertyValues(properties);
     }
 
