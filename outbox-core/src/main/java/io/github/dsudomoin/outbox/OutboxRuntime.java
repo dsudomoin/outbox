@@ -51,8 +51,8 @@ public final class OutboxRuntime implements AutoCloseable {
     static final String OWNER_NEEDS_MIGRATIONS = "outbox.schema.bootstrap must be false when an owner connection source"
             + " is set: objects it created would leave the application role without rights on them";
     static final String NO_HANDLER = "the outbox has neither an OutboxHandler nor an OutboxTopicHandler route: nothing"
-            + " would deliver its records (in a Kora app the OutboxHandler comes from KafkaOutboxModule or the app's"
-            + " own component)";
+            + " would deliver its records (the Kafka adapters provide an OutboxHandler: KafkaOutboxModule in Kora,"
+            + " outbox-kafka-spring-boot in Spring Boot; or add your own)";
 
     private final OutboxConfig config;
     private final OutboxTransactions transactions;

@@ -6,6 +6,7 @@ import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.lang.reflect.TypeVariable;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 
@@ -44,12 +45,14 @@ public abstract class TypedOutboxTopicHandler<T> implements OutboxTopicHandler {
     private final Set<String> topics;
     private final OutboxDeserializer<T> deserializer;
     private final int contractVersion;
+    private final Class<?> named; // the class failure messages name
 
     /** {@code T} is the one the subclass declares, read through generic intermediate classes and proxies. */
     protected TypedOutboxTopicHandler(Set<String> topics, OutboxDeserializer<T> deserializer) {
         this.topics = Set.copyOf(topics);
         this.deserializer = Objects.requireNonNull(deserializer, "deserializer");
         this.contractVersion = Contracts.version(typeArgument(getClass()));
+        this.named = getClass();
     }
 
     /** For a class hierarchy that does not name {@code T}: {@code type} is {@code T}. */
@@ -57,6 +60,25 @@ public abstract class TypedOutboxTopicHandler<T> implements OutboxTopicHandler {
         this.topics = Set.copyOf(topics);
         this.deserializer = Objects.requireNonNull(deserializer, "deserializer");
         this.contractVersion = Contracts.version(Objects.requireNonNull(type, "type"));
+        this.named = getClass();
+    }
+
+    private TypedOutboxTopicHandler(TypedOutboxTopicHandler<T> handler) {
+        this.topics = handler.topics;
+        this.deserializer = handler.deserializer;
+        this.contractVersion = handler.contractVersion;
+        this.named = handler.named;
+    }
+
+    /**
+     * {@code handler} with its hooks ({@link #handle(Object, OutboxRecord)}, {@link #handleTombstone} and an overridden
+     * {@code handleBatch}) called on {@code via}, such as a proxy of it whose own fields are unset: topics, contract
+     * version and deserializer are {@code handler}'s.
+     */
+    @InternalApi
+    public static <T> TypedOutboxTopicHandler<T> calledThrough(TypedOutboxTopicHandler<T> handler,
+            TypedOutboxTopicHandler<T> via) {
+        return new Through<>(handler, via);
     }
 
     @Override
@@ -92,7 +114,7 @@ public abstract class TypedOutboxTopicHandler<T> implements OutboxTopicHandler {
      * default it moves to the dead table.
      */
     protected void handleTombstone(OutboxRecord record) throws Exception {
-        throw CannotHandle.permanent(record, getClass().getName() + " takes no tombstones", null);
+        throw CannotHandle.permanent(record, named.getName() + " takes no tombstones", null);
     }
 
     /**
@@ -117,13 +139,52 @@ public abstract class TypedOutboxTopicHandler<T> implements OutboxTopicHandler {
         } catch (OutboxWaitException | OutboxPermanentException e) {
             throw e;
         } catch (Exception e) {
-            throw CannotHandle.permanent(record, getClass().getName() + " cannot decode its payload", e);
+            throw CannotHandle.permanent(record, named.getName() + " cannot decode its payload", e);
         }
         if (value == null) {
-            throw CannotHandle.permanent(record, getClass().getName() + " cannot decode its payload: "
+            throw CannotHandle.permanent(record, named.getName() + " cannot decode its payload: "
                     + deserializer.getClass().getName() + " returned null", null);
         }
         return value;
+    }
+
+    private static final class Through<T> extends TypedOutboxTopicHandler<T> {
+
+        private final TypedOutboxTopicHandler<T> handler;
+        private final TypedOutboxTopicHandler<T> via;
+        private final boolean batchOnVia;
+
+        Through(TypedOutboxTopicHandler<T> handler, TypedOutboxTopicHandler<T> via) {
+            super(handler);
+            this.handler = handler;
+            this.via = Objects.requireNonNull(via, "via");
+            try { // the default loop must run here: on via it would call the handler's hooks past via
+                batchOnVia = handler.getClass().getMethod("handleBatch", List.class).getDeclaringClass()
+                        != OutboxTopicHandler.class;
+            } catch (NoSuchMethodException e) {
+                throw new AssertionError(e);
+            }
+        }
+
+        @Override
+        protected void handle(T value, OutboxRecord record) throws Exception {
+            via.handle(value, record);
+        }
+
+        @Override
+        protected void handleTombstone(OutboxRecord record) throws Exception {
+            via.handleTombstone(record);
+        }
+
+        @Override
+        public List<Outcome> handleBatch(List<OutboxRecord> records) {
+            return batchOnVia ? via.handleBatch(records) : super.handleBatch(records);
+        }
+
+        @Override
+        public String toString() {
+            return handler.toString();
+        }
     }
 
     /**
