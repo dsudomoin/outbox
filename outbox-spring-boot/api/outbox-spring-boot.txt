@@ -1,0 +1,127 @@
+// Signature format: 4.0
+package io.github.dsudomoin.outbox.spring {
+
+  @org.springframework.boot.context.properties.ConfigurationProperties("outbox") public final class OutboxProperties implements io.github.dsudomoin.outbox.OutboxConfig {
+    ctor public OutboxProperties(@org.springframework.boot.context.properties.bind.DefaultValue("outbox") String!, Integer?, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Relay!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Partitions!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Inbox!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.DeadLetters!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Recovery!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Schema!, @org.springframework.boot.context.properties.bind.DefaultValue("true") boolean, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Lifecycle!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Telemetry!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Json!);
+    method public io.github.dsudomoin.outbox.spring.OutboxProperties.DeadLetters! deadLetters();
+    method public boolean enabled();
+    method public io.github.dsudomoin.outbox.spring.OutboxProperties.Inbox! inbox();
+    method public io.github.dsudomoin.outbox.spring.OutboxProperties.Json! json();
+    method public io.github.dsudomoin.outbox.spring.OutboxProperties.Lifecycle! lifecycle();
+    method public io.github.dsudomoin.outbox.spring.OutboxProperties.Partitions! partitions();
+    method public io.github.dsudomoin.outbox.spring.OutboxProperties.Recovery! recovery();
+    method public io.github.dsudomoin.outbox.spring.OutboxProperties.Relay! relay();
+    method public io.github.dsudomoin.outbox.spring.OutboxProperties.Schema! schema();
+    method public Integer? shards();
+    method public String! table();
+    method public io.github.dsudomoin.outbox.spring.OutboxProperties.Telemetry! telemetry();
+  }
+
+  public static final class OutboxProperties.DeadLetters implements io.github.dsudomoin.outbox.OutboxConfig.DeadLettersConfig {
+    ctor public OutboxProperties.DeadLetters(@org.springframework.boot.context.properties.bind.DefaultValue("100") int, @org.springframework.boot.context.properties.bind.DefaultValue("30s") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("0s") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("30d") java.time.Duration!);
+    method public int batchSize();
+    method public java.time.Duration! redriveHistory();
+    method public java.time.Duration! retention();
+    method public java.time.Duration! timeout();
+  }
+
+  public static final class OutboxProperties.Inbox implements io.github.dsudomoin.outbox.OutboxConfig.InboxConfig {
+    ctor public OutboxProperties.Inbox(@org.springframework.boot.context.properties.bind.DefaultValue("inbox") String!, @org.springframework.boot.context.properties.bind.DefaultValue("1h") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("24h") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("24h") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("true") boolean);
+    method public boolean attachOrphans();
+    method public java.time.Duration! partitionInterval();
+    method public java.time.Duration! premake();
+    method public java.time.Duration! retention();
+    method public String! table();
+  }
+
+  public static final class OutboxProperties.Json {
+    ctor public OutboxProperties.Json(@org.springframework.boot.context.properties.bind.DefaultValue("auto") io.github.dsudomoin.outbox.spring.OutboxProperties.Json.Mapper!);
+    method public io.github.dsudomoin.outbox.spring.OutboxProperties.Json.Mapper! mapper();
+  }
+
+  public enum OutboxProperties.Json.Mapper {
+    enum_constant public static final io.github.dsudomoin.outbox.spring.OutboxProperties.Json.Mapper AUTO;
+    enum_constant public static final io.github.dsudomoin.outbox.spring.OutboxProperties.Json.Mapper JACKSON2;
+    enum_constant public static final io.github.dsudomoin.outbox.spring.OutboxProperties.Json.Mapper JACKSON3;
+  }
+
+  public static final class OutboxProperties.Lifecycle {
+    ctor public OutboxProperties.Lifecycle(@org.springframework.boot.context.properties.bind.DefaultValue("2147479551") int);
+    method public int phase();
+  }
+
+  public static final class OutboxProperties.Partitions implements io.github.dsudomoin.outbox.OutboxConfig.PartitionsConfig {
+    ctor public OutboxProperties.Partitions(@org.springframework.boot.context.properties.bind.DefaultValue("16777216") long, @org.springframework.boot.context.properties.bind.DefaultValue("64") int, @org.springframework.boot.context.properties.bind.DefaultValue("30s") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("0s") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("16777216") long, @org.springframework.boot.context.properties.bind.DefaultValue("true") boolean, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.TailConversion!);
+    method public java.time.Duration! maintenanceInterval();
+    method public long maxTailScan();
+    method public int premake();
+    method public boolean restoreOrphans();
+    method public java.time.Duration! swapLockTimeout();
+    method public io.github.dsudomoin.outbox.spring.OutboxProperties.TailConversion! tailConversion();
+    method public long xidsPerPartition();
+  }
+
+  public static final class OutboxProperties.Recovery implements io.github.dsudomoin.outbox.OutboxConfig.RecoveryConfig {
+    ctor public OutboxProperties.Recovery(@org.springframework.boot.context.properties.bind.DefaultValue("auto") String!, @org.springframework.boot.context.properties.bind.DefaultValue("1000000") long, @org.springframework.boot.context.properties.bind.DefaultValue("10m") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("10m") java.time.Duration!);
+    method public java.time.Duration! clockMargin();
+    method public long maxRows();
+    method public java.time.Duration! timeout();
+    method public String! xidRegression();
+  }
+
+  public static final class OutboxProperties.Relay implements io.github.dsudomoin.outbox.OutboxConfig.RelayConfig {
+    ctor public OutboxProperties.Relay(@org.springframework.boot.context.properties.bind.DefaultValue("true") boolean, @org.springframework.boot.context.properties.bind.DefaultValue("4") int, @org.springframework.boot.context.properties.bind.DefaultValue("1000") int, @org.springframework.boot.context.properties.bind.DefaultValue("100") int, @org.springframework.boot.context.properties.bind.DefaultValue("50ms") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("200ms") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("30s") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("30s") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("3") int, @org.springframework.boot.context.properties.bind.DefaultValue("1h") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Retry!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Requeue!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Waiting!);
+    method public int batchSize();
+    method public java.time.Duration! batchTimeout();
+    method public java.time.Duration! cursorAnchorInterval();
+    method public boolean enabled();
+    method public int headFailuresBeforeDivert();
+    method public java.time.Duration! idlePollInterval();
+    method public int maxTicksPerBatch();
+    method public java.time.Duration! minTickInterval();
+    method public io.github.dsudomoin.outbox.spring.OutboxProperties.Requeue! requeue();
+    method public io.github.dsudomoin.outbox.spring.OutboxProperties.Retry! retry();
+    method public java.time.Duration! shutdownTimeout();
+    method public io.github.dsudomoin.outbox.spring.OutboxProperties.Waiting! waiting();
+    method public int workers();
+  }
+
+  public static final class OutboxProperties.Requeue implements io.github.dsudomoin.outbox.OutboxConfig.RequeueConfig {
+    ctor public OutboxProperties.Requeue(@org.springframework.boot.context.properties.bind.DefaultValue("1s") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("0") int);
+    method public java.time.Duration! delay();
+    method public int maxRequeues();
+  }
+
+  public static final class OutboxProperties.Retry implements io.github.dsudomoin.outbox.OutboxConfig.RetryConfig {
+    ctor public OutboxProperties.Retry(@org.springframework.boot.context.properties.bind.DefaultValue("1s") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("5m") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("0") int);
+    method public java.time.Duration! initialDelay();
+    method public int maxAttempts();
+    method public java.time.Duration! maxDelay();
+  }
+
+  public static final class OutboxProperties.Schema implements io.github.dsudomoin.outbox.OutboxConfig.SchemaConfig {
+    ctor public OutboxProperties.Schema(@org.springframework.boot.context.properties.bind.DefaultValue("true") boolean);
+    method public boolean bootstrap();
+  }
+
+  public static final class OutboxProperties.TailConversion implements io.github.dsudomoin.outbox.OutboxConfig.TailConversionConfig {
+    ctor public OutboxProperties.TailConversion(@org.springframework.boot.context.properties.bind.DefaultValue("03:00-05:00") String!, @org.springframework.boot.context.properties.bind.DefaultValue("1s") java.time.Duration!, String?);
+    method public java.time.Duration! maxStall();
+    method public String! window();
+    method public String? zone();
+  }
+
+  public static final class OutboxProperties.Telemetry {
+    ctor public OutboxProperties.Telemetry(@org.springframework.boot.context.properties.bind.DefaultValue("false") boolean);
+    method public boolean observeUnsampled();
+  }
+
+  public static final class OutboxProperties.Waiting implements io.github.dsudomoin.outbox.OutboxConfig.WaitConfig {
+    ctor public OutboxProperties.Waiting(@org.springframework.boot.context.properties.bind.DefaultValue("1s") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("5m") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("15m") java.time.Duration!);
+    method public java.time.Duration! alertAfter();
+    method public java.time.Duration! delay();
+    method public java.time.Duration! maxDelay();
+  }
+
+}
+

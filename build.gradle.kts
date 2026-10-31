@@ -2,6 +2,7 @@ val koraVersion: String by project
 
 val published = listOf(
     "outbox-core", "outbox-kafka", "outbox-micrometer", "outbox-kora", "outbox-kafka-kora", "outbox-admin-kora",
+    "outbox-spring-boot",
 )
 
 configure(published.map { project(":$it") }) {
@@ -144,10 +145,11 @@ configure(published.map { project(":$it") }) {
             from(components["java"])
             pom {
                 name = project.name
-                description = if (project.name.endsWith("-kora")) {
-                    "Transactional outbox for PostgreSQL — Kora 1.x adapter"
-                } else {
-                    "Transactional outbox for PostgreSQL"
+                description = when {
+                    project.name.endsWith("-kora") -> "Transactional outbox for PostgreSQL — Kora 1.x adapter"
+                    project.name.endsWith("-spring-boot") ->
+                        "Transactional outbox for PostgreSQL — Spring Boot 3.5/4.1 adapter"
+                    else -> "Transactional outbox for PostgreSQL"
                 }
                 url = "https://github.com/dsudomoin/outbox"
                 licenses {
@@ -176,11 +178,85 @@ configure(listOf("outbox-kora", "outbox-kafka-kora", "outbox-admin-kora").map { 
     }
 }
 
+// The Spring Boot adapters: one jar for Boot 3.5 and 4.1, compiled against Boot 3.5 with Spring and Boot compileOnly
+// (the application brings its Boot). Their tests run twice: `test` on Boot 3.5, `testBoot4` on Boot 4.1, the same test
+// classes, compiled against Boot 3.5. A dependency both runs need goes to testImplementation, version-less when Boot
+// manages it (each run's platform picks the version); one run's only to boot35Test or boot41Test.
+val bootLines = mapOf("3.5" to "3.5.16", "4.1" to "4.1.2")
+val springBootModules = listOf("outbox-spring-boot") // outbox-kafka-spring-boot and outbox-admin-spring-boot join here
+configure(springBootModules.map { project(":$it") }) {
+    fun bootPlatform(line: String) =
+        dependencies.platform("org.springframework.boot:spring-boot-dependencies:${bootLines[line]}")
+    val boot35Test = configurations.create("boot35Test") { isCanBeConsumed = false; isCanBeResolved = false }
+    val boot41Test = configurations.create("boot41Test") { isCanBeConsumed = false; isCanBeResolved = false }
+    configurations["testCompileClasspath"].extendsFrom(boot35Test)
+    configurations["testRuntimeClasspath"].extendsFrom(boot35Test)
+    val testBoot4RuntimeClasspath = configurations.create("testBoot4RuntimeClasspath") {
+        isCanBeConsumed = false
+        extendsFrom(configurations["implementation"], configurations["runtimeOnly"],
+            configurations["testImplementation"], configurations["testRuntimeOnly"], boot41Test)
+    }
+    // Boot 4.1 manages JUnit 6: the Boot 4.1 run stays on the repository's JUnit, as the Boot 3.5 one
+    testBoot4RuntimeClasspath.resolutionStrategy.eachDependency {
+        if (requested.group == "org.junit.jupiter") useVersion("5.12.2")
+        if (requested.group == "org.junit.platform") useVersion("1.12.2")
+    }
+    // The tests log through slf4j-simple (CapturedStderr reads it); with Logback present too, SpringApplication's
+    // logging system refuses to start ("LoggerFactory is not a Logback LoggerContext")
+    listOf(configurations["testRuntimeClasspath"], testBoot4RuntimeClasspath).forEach {
+        it.exclude(group = "org.springframework.boot", module = "spring-boot-starter-logging")
+    }
+
+    dependencies {
+        "compileOnly"(bootPlatform("3.5"))
+        "annotationProcessor"(bootPlatform("3.5"))
+        "annotationProcessor"("org.springframework.boot:spring-boot-configuration-processor")
+
+        "testImplementation"(testFixtures(project(":outbox-core")))
+        "testImplementation"("org.springframework.boot:spring-boot-starter-jdbc")
+        "testImplementation"("org.springframework.boot:spring-boot-starter-data-jpa")
+        "testImplementation"("org.springframework.boot:spring-boot-starter-actuator")
+        "testImplementation"("org.springframework.boot:spring-boot-starter-test")
+        "testImplementation"("org.flywaydb:flyway-database-postgresql")
+        "testImplementation"("io.micrometer:micrometer-tracing-bridge-otel")
+        "testImplementation"("io.opentelemetry:opentelemetry-sdk-testing")
+        "testImplementation"("com.google.protobuf:protobuf-java:3.25.8")
+
+        "boot35Test"(bootPlatform("3.5"))
+        "boot35Test"("org.springframework.boot:spring-boot-starter-web")
+        "boot35Test"("org.springframework.boot:spring-boot-starter-aop")
+        "boot35Test"("org.flywaydb:flyway-core")
+        "boot35Test"("org.liquibase:liquibase-core")
+        "boot35Test"("tools.jackson.core:jackson-databind:3.1.7")
+
+        // platform, not enforced: the repository's newer Testcontainers and PostgreSQL driver win
+        "boot41Test"(bootPlatform("4.1"))
+        "boot41Test"("org.springframework.boot:spring-boot-starter-webmvc")
+        "boot41Test"("org.springframework.boot:spring-boot-starter-aspectj")
+        "boot41Test"("org.springframework.boot:spring-boot-starter-flyway")
+        "boot41Test"("org.springframework.boot:spring-boot-starter-liquibase")
+        "boot41Test"("org.springframework.boot:spring-boot-starter-jackson")
+        "boot41Test"("org.springframework.boot:spring-boot-jackson2")
+    }
+
+    val sourceSets = the<SourceSetContainer>()
+    tasks.named<Test>("test") { systemProperty("outbox.test.boot", "3.5") }
+    val testBoot4 = tasks.register<Test>("testBoot4") {
+        description = "Runs the tests on Spring Boot ${bootLines["4.1"]}"
+        group = "verification"
+        testClassesDirs = sourceSets["test"].output.classesDirs
+        classpath = sourceSets["main"].output + sourceSets["test"].output + testBoot4RuntimeClasspath
+        systemProperty("outbox.test.boot", "4.1")
+        shouldRunAfter("test")
+    }
+    tasks.named("check") { dependsOn(testBoot4) }
+}
+
 // Fails when a framework reaches a framework-free module's compile or runtime classpath
 mapOf(
-    "outbox-core" to listOf("ru.tinkoff.kora", "io.micrometer", "io.opentelemetry"),
-    "outbox-kafka" to listOf("ru.tinkoff.kora"),
-    "outbox-micrometer" to listOf("ru.tinkoff.kora"),
+    "outbox-core" to listOf("ru.tinkoff.kora", "org.springframework", "io.micrometer", "io.opentelemetry"),
+    "outbox-kafka" to listOf("ru.tinkoff.kora", "org.springframework"),
+    "outbox-micrometer" to listOf("ru.tinkoff.kora", "org.springframework"),
 ).forEach { (name, banned) ->
     project(":$name") {
         val classpaths = listOf("compileClasspath", "runtimeClasspath").map { configurations[it] }
