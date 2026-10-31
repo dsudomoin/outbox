@@ -19,11 +19,14 @@ import io.github.dsudomoin.outbox.internal.Maintenance;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.opentelemetry.api.trace.Tracer;
 import jakarta.annotation.Nullable;
+import org.slf4j.LoggerFactory;
 import ru.tinkoff.kora.application.graph.All;
 import ru.tinkoff.kora.application.graph.LifecycleWrapper;
 import ru.tinkoff.kora.application.graph.TypeRef;
 import ru.tinkoff.kora.common.Tag;
 import ru.tinkoff.kora.common.annotation.Root;
+import ru.tinkoff.kora.config.common.Config;
+import ru.tinkoff.kora.config.common.extractor.ConfigValueExtractor;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 
 /**
@@ -51,14 +54,27 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
  * has a {@link Tracer}. Dead letters go to the app's {@link OutboxDeadLetterHandler} component when it has one, and
  * are kept for humans otherwise. With a {@link OutboxOwner}-tagged {@code JdbcConnectionFactory} the outbox's DDL,
  * session locks and recoveries run through that one ({@code outbox.schema.bootstrap = false}). An app that only
- * deduplicates uses {@link InboxModule} alone.
+ * deduplicates uses {@link InboxModule} alone. The heartbeat, which keeps this instance's row fresh and reads the
+ * reports that guard routed sends, gets a pool of its own, so business load that exhausts the app's pool does not
+ * starve it: one connection, copied from the Hikari pool of the {@code JdbcDatabase} behind the outbox's transactions
+ * and closed after the runtime ({@link OutboxHeartbeatConfig}, at {@code outbox.heartbeat}). An
+ * {@link OutboxHeartbeat}-tagged {@code JdbcConnectionFactory} replaces it, and
+ * {@code outbox.heartbeat.dedicatedConnection = false} keeps the heartbeat on the app's connections.
  */
 public interface OutboxModule extends OutboxCommonModule {
 
+    default OutboxHeartbeatConfig outboxHeartbeatConfig(Config config,
+            ConfigValueExtractor<OutboxHeartbeatConfig> extractor) {
+        return extractor.extract(config.get("outbox.heartbeat"));
+    }
+
+    /** A heartbeat pool derived here closes after the runtime, or as soon as building or starting the runtime fails. */
     @Root
     default LifecycleWrapper<OutboxRuntime> outboxRuntime(OutboxConfig config, OutboxTransactions db,
             @Nullable OutboxHandler handler, All<OutboxTopicHandler> routes, @Nullable OutboxDeadLetterHandler hook,
-            OutboxTelemetry telemetry, @Tag(OutboxOwner.class) @Nullable JdbcConnectionFactory owner) {
+            OutboxTelemetry telemetry, @Tag(OutboxOwner.class) @Nullable JdbcConnectionFactory owner,
+            @Tag(OutboxHeartbeat.class) @Nullable JdbcConnectionFactory heartbeat,
+            OutboxHeartbeatConfig heartbeatConfig) {
         var builder = OutboxRuntime.builder(config, db, handler).telemetry(telemetry);
         routes.forEach(builder::route);
         if (hook != null) {
@@ -67,7 +83,39 @@ public interface OutboxModule extends OutboxCommonModule {
         if (owner != null) {
             builder.ownerConnections(owner::newConnection);
         }
-        return new LifecycleWrapper<>(builder.build(), OutboxRuntime::start, OutboxRuntime::close);
+        var pool = heartbeat == null && heartbeatConfig.dedicatedConnection()
+                ? HeartbeatPool.derive(db, config.partitions().maintenanceInterval()) : null;
+        if (heartbeat != null) {
+            builder.heartbeatConnections(heartbeat::newConnection);
+        } else if (pool != null) {
+            builder.heartbeatConnections(pool::getConnection);
+        } else if (heartbeatConfig.dedicatedConnection()) {
+            LoggerFactory.getLogger(OutboxModule.class).info("outbox heartbeat gets no pool of its own: the outbox's"
+                    + " transactions are not KoraOutboxTransactions over a Hikari-backed JdbcDatabase, whose pool it"
+                    + " would copy; give it one as a JdbcConnectionFactory tagged @Tag(OutboxHeartbeat.class)");
+        }
+        Runnable closePool = pool != null ? pool::close : () -> {};
+        OutboxRuntime runtime;
+        try {
+            runtime = builder.build();
+        } catch (RuntimeException | Error e) {
+            closePool.run();
+            throw e;
+        }
+        return new LifecycleWrapper<>(runtime, r -> {
+            try {
+                r.start();
+            } catch (RuntimeException | Error e) {
+                closePool.run();
+                throw e;
+            }
+        }, r -> {
+            try {
+                r.close(); // deletes this instance's row through the pool first
+            } finally {
+                closePool.run();
+            }
+        });
     }
 
     /**

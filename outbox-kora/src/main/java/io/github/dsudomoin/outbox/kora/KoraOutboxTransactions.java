@@ -20,6 +20,11 @@ public final class KoraOutboxTransactions implements OutboxTransactions {
         this.db = db;
     }
 
+    /** The factory these transactions run on, which {@link HeartbeatPool} derives from. */
+    JdbcConnectionFactory factory() {
+        return db;
+    }
+
     @Override
     public Connection newConnection() {
         return db.newConnection();
