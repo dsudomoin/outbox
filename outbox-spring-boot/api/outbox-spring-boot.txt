@@ -1,6 +1,21 @@
 // Signature format: 4.0
 package io.github.dsudomoin.outbox.spring {
 
+  @org.springframework.boot.autoconfigure.AutoConfiguration(afterName={"org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration", "org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration"}) @org.springframework.boot.autoconfigure.condition.ConditionalOnClass(DataSource.class) public final class OutboxAutoConfiguration {
+    ctor public OutboxAutoConfiguration();
+  }
+
+  public final class OutboxLifecycle implements org.springframework.context.SmartLifecycle {
+    method public boolean isRunning();
+    method public io.github.dsudomoin.outbox.OutboxRuntime! runtime();
+    method public void start();
+    method public void stop();
+    field public static final int DEFAULT_PHASE = 2147479551; // 0x7fffefff
+  }
+
+  @java.lang.annotation.Documented @java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) @java.lang.annotation.Target({java.lang.annotation.ElementType.FIELD, java.lang.annotation.ElementType.METHOD, java.lang.annotation.ElementType.PARAMETER, java.lang.annotation.ElementType.TYPE}) @org.springframework.beans.factory.annotation.Qualifier public @interface OutboxOwner {
+  }
+
   @org.springframework.boot.context.properties.ConfigurationProperties("outbox") public final class OutboxProperties implements io.github.dsudomoin.outbox.OutboxConfig {
     ctor public OutboxProperties(@org.springframework.boot.context.properties.bind.DefaultValue("outbox") String!, Integer?, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Relay!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Partitions!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Inbox!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.DeadLetters!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Recovery!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Schema!, @org.springframework.boot.context.properties.bind.DefaultValue("true") boolean, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Lifecycle!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Telemetry!, @org.springframework.boot.context.properties.bind.DefaultValue io.github.dsudomoin.outbox.spring.OutboxProperties.Json!);
     method public io.github.dsudomoin.outbox.spring.OutboxProperties.DeadLetters! deadLetters();
