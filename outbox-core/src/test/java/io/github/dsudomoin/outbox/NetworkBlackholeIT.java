@@ -53,7 +53,7 @@ class NetworkBlackholeIT {
         var config = new TestOutboxConfig().maintenanceInterval(Duration.ofMillis(500));
         Set<UUID> delivered = ConcurrentHashMap.newKeySet();
         var failures = new AtomicInteger();
-        var relay = OutboxRuntime.builder(config, new JdbcTransactions(throughTheHole(1)),
+        var relay = OutboxRuntime.builder(config, new JdbcTransactions(throughTheHole(3)),
                 record -> delivered.add(record.messageId())).telemetry(new OutboxTelemetry() {
                     @Override
                     public void relayFailed(Throwable error) {
