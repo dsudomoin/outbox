@@ -207,12 +207,12 @@ class TelemetryIT {
 
             await().atMost(WAIT).untilAsserted(() -> {
                 assertThat(count(meters, "outbox.messages.delivered", "orders")).isOne();
-                assertThat(meters.get("outbox.relay.step").timer().count()).isPositive();
+                assertThat(timerCount(meters, "outbox.relay.step")).isPositive();
             });
             assertThat(count(meters, "outbox.messages.enqueued", "orders")).isOne();
             assertThat(meters.get("outbox.delivery.delay").tag("topic", "orders").timer().count()).isOne();
-            assertThat(meters.get("outbox.enqueue").timer().count()).isOne();
-            assertThat(meters.get("outbox.deliver").timer().count()).isOne();
+            assertThat(timerCount(meters, "outbox.enqueue")).isOne();
+            assertThat(timerCount(meters, "outbox.deliver")).isOne();
         });
     }
 
@@ -263,7 +263,7 @@ class TelemetryIT {
             // the step's observation stops after its deliveries': the timer below would be there by then
             await().atMost(WAIT).untilAsserted(() -> {
                 assertThat(count(meters, "outbox.messages.delivered", "orders")).isOne();
-                assertThat(meters.get("outbox.relay.step").timer().count()).isPositive();
+                assertThat(timerCount(meters, "outbox.relay.step")).isPositive();
             });
             assertThat(meters.find("outbox.deliver").timer()).isNull();
         });
@@ -290,7 +290,7 @@ class TelemetryIT {
         send(context, "orders");
 
         await().atMost(WAIT).untilAsserted(
-            () -> assertThat(meters.get("outbox.deliver").timer().count()).isOne());
+            () -> assertThat(timerCount(meters, "outbox.deliver")).isOne());
     }
 
     @Test
@@ -302,9 +302,9 @@ class TelemetryIT {
             send(context, "orders");
 
             await().atMost(WAIT).untilAsserted(() -> {
-                assertThat(meters.get("custom.enqueue").timer().count()).isOne();
-                assertThat(meters.get("custom.deliver").timer().count()).isOne();
-                assertThat(meters.get("custom.step").timer().count()).isPositive();
+                assertThat(timerCount(meters, "custom.enqueue")).isOne();
+                assertThat(timerCount(meters, "custom.deliver")).isOne();
+                assertThat(timerCount(meters, "custom.step")).isPositive();
             });
             assertThat(meters.find("outbox.enqueue").timer()).isNull();
             assertThat(meters.find("outbox.deliver").timer()).isNull();
@@ -388,7 +388,7 @@ class TelemetryIT {
 
                     await().atMost(WAIT).untilAsserted(() -> {
                         assertThat(count(meters, "outbox.messages.delivered", "orders")).isOne();
-                        assertThat(meters.get("outbox.deliver").timer().count()).isOne();
+                        assertThat(timerCount(meters, "outbox.deliver")).isOne();
                     });
                 });
         }
@@ -397,6 +397,12 @@ class TelemetryIT {
     private static double count(MeterRegistry meters, String name, String topic) {
         var counter = meters.find(name).tag("topic", topic).counter();
         return counter == null ? 0 : counter.count();
+    }
+
+    /** 0 while the timer does not exist: {@code meters.get} would throw what {@code untilAsserted} does not retry. */
+    private static long timerCount(MeterRegistry meters, String name) {
+        var timer = meters.find(name).timer();
+        return timer == null ? 0 : timer.count();
     }
 
     private static SpanData awaitSpan(InMemorySpanExporter spans, String name) {
