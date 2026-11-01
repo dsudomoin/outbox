@@ -174,12 +174,13 @@ final class HandlerBeans {
 
     /**
      * Unwraps the proxies to the ultimate target and checks them against the methods the wrapper ({@link #relayed})
-     * really calls on the outermost one, each level passing the call on: {@code handle}, for a typed target the hooks
-     * on a class-based proxy or {@code handle(OutboxRecord)} on an interface-based one, and an overridden
-     * {@code handleBatch}. A class-based proxy must not have one of them final: it would run on the proxy's own
-     * instance, whose fields are unset. An advisor must match one of them, unless it matches no method of the relay's
-     * path at all, an inherited {@code handleBatch} included; advice on another method too, such as an advisor for the
-     * whole class, runs on those it matches.
+     * really calls on the outermost one, each level passing the call on: an overridden {@code handleBatch} alone, as
+     * {@code handle} and the hooks then run only through its own calls, past the proxy; else {@code handle}, for a
+     * typed target the hooks on a class-based proxy or {@code handle(OutboxRecord)} on an interface-based one. A
+     * class-based proxy must not have one of them final: it would run on the proxy's own instance, whose fields are
+     * unset. An advisor must match one of them, unless it matches no method of the relay's path at all, an inherited
+     * {@code handleBatch} included; advice on another method too, such as an advisor for the whole class, runs on
+     * those it matches.
      */
     private static Handler inspect(String name, Object bean) {
         var proxies = new ArrayList<Advised>();
@@ -202,19 +203,18 @@ final class HandlerBeans {
             path.add(AopUtils.getMostSpecificMethod(m, targetClass));
         }
         var batch = method(targetClass, "handleBatch", List.class);
-        var called = new ArrayList<Method>();
-        if (!(target instanceof TypedOutboxTopicHandler<?>)) {
-            called.add(path.get(0));
-        } else if (bean instanceof TypedOutboxTopicHandler<?>) {
-            called.addAll(path.subList(0, 2)); // the hooks
-        } else {
-            called.add(path.get(2)); // handle(OutboxRecord)
-        }
         var relayMethods = new ArrayList<>(path);
         relayMethods.add(batch);
+        List<Method> called;
         if (overrides(batch)) {
+            called = List.of(batch);
             path.add(batch);
-            called.add(batch);
+        } else if (!(target instanceof TypedOutboxTopicHandler<?>)) {
+            called = List.of(path.get(0));
+        } else if (bean instanceof TypedOutboxTopicHandler<?>) {
+            called = List.copyOf(path.subList(0, 2)); // the hooks
+        } else {
+            called = List.of(path.get(2)); // handle(OutboxRecord)
         }
         var handler = new Handler(name, bean, target, List.copyOf(path));
         for (var proxy : proxies) {
@@ -314,7 +314,10 @@ final class HandlerBeans {
     private static IllegalArgumentException unreachable(Handler handler, Advised proxy, Advisor advisor,
             Method method) {
         String why;
-        if (method.getName().equals("handleBatch")) { // an overridden one is among the methods called
+        if (handler.overridesBatch()) {
+            why = "the relay calls only the overridden handleBatch on the proxy, and its own calls of this method"
+                + " bypass the proxy: advise handleBatch, or use a TransactionTemplate inside the override";
+        } else if (method.getName().equals("handleBatch")) {
             why = "the relay runs the default handleBatch itself, over handle: override handleBatch or advise handle";
         } else if (AopUtils.isJdkDynamicProxy(proxy)) {
             why = "the relay calls only handle(OutboxRecord) on an interface-based (JDK) proxy, and the target then"

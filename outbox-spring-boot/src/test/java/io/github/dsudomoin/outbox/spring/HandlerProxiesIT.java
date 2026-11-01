@@ -216,9 +216,43 @@ class HandlerProxiesIT {
         }
     }
 
+    /** The relay enters through its handleBatch: handle runs only through the override's own calls, past the proxy. */
+    static class PlainTxBatch extends PlainTx {
+
+        PlainTxBatch(Calls calls) {
+            super(calls);
+        }
+
+        @Override
+        public List<Outcome> handleBatch(List<OutboxRecord> records) {
+            return super.handleBatch(records);
+        }
+    }
+
+    /** The same for its hook. */
+    static class TypedTxBatch extends TypedTx {
+
+        TypedTxBatch(Calls calls) {
+            super(calls);
+        }
+
+        @Override
+        public List<Outcome> handleBatch(List<OutboxRecord> records) {
+            return super.handleBatch(records);
+        }
+    }
+
     @Target(ElementType.TYPE)
     @Retention(RetentionPolicy.RUNTIME)
     @interface Counted {}
+
+    @Counted
+    static class CountedTypedBatch extends TypedBatch {
+
+        CountedTypedBatch(Calls calls) {
+            super(calls);
+        }
+    }
 
     @Counted
     static class CountedTyped extends Typed {
@@ -434,6 +468,38 @@ class HandlerProxiesIT {
         @Bean
         OutboxTopicHandler typedHandler(Calls calls) {
             return new CountedTyped(calls);
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class CountedTypedBatchApp {
+
+        @Bean
+        static Advisor countingAdvisor(ObjectProvider<Calls> calls) {
+            return CountedTypedApp.countingAdvisor(calls);
+        }
+
+        @Bean
+        OutboxTopicHandler typedHandler(Calls calls) {
+            return new CountedTypedBatch(calls);
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class PlainTxBatchApp {
+
+        @Bean
+        OutboxTopicHandler txBatch(Calls calls) {
+            return new PlainTxBatch(calls);
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class TypedTxBatchApp {
+
+        @Bean
+        OutboxTopicHandler txBatch(Calls calls) {
+            return new TypedTxBatch(calls);
         }
     }
 
@@ -712,6 +778,27 @@ class HandlerProxiesIT {
                 .containsExactly("batch aspect no tx", "fallback no tx"));
             app(TypedBatchApp.class, properties).run(context -> assertThat(seenAfterOne(context, "audit"))
                 .containsExactly("batch aspect no tx", "typed v no tx"));
+        }
+    }
+
+    @Test
+    void adviceOnHandleOfBatchOverrideFailsStart() {
+        for (var properties : List.of(new String[0], new String[] {JDK})) {
+            app(PlainTxBatchApp.class, properties).run(context -> assertThat(failure(context)).contains("txBatch")
+                .contains("handle(OutboxRecord)").contains("TransactionAttributeSourceAdvisor")
+                .contains("advise handleBatch, or use a TransactionTemplate inside the override"));
+            app(TypedTxBatchApp.class, properties).run(context -> assertThat(failure(context)).contains("txBatch")
+                .contains("handle(" + AuditEvent.class.getSimpleName() + ", OutboxRecord)")
+                .contains("TransactionAttributeSourceAdvisor")
+                .contains("advise handleBatch, or use a TransactionTemplate inside the override"));
+        }
+    }
+
+    @Test
+    void classWideAdvisorOnBatchOverrideRuns() {
+        for (var properties : List.of(new String[0], new String[] {JDK})) {
+            app(CountedTypedBatchApp.class, properties).run(context -> assertThat(seenAfterOne(context, "audit"))
+                .containsExactly("advice no tx", "typed v no tx"));
         }
     }
 
