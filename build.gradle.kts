@@ -2,7 +2,7 @@ val koraVersion: String by project
 
 val published = listOf(
     "outbox-core", "outbox-kafka", "outbox-micrometer", "outbox-kora", "outbox-kafka-kora", "outbox-admin-kora",
-    "outbox-spring-boot",
+    "outbox-spring-boot", "outbox-kafka-spring-boot",
 )
 
 configure(published.map { project(":$it") }) {
@@ -183,7 +183,7 @@ configure(listOf("outbox-kora", "outbox-kafka-kora", "outbox-admin-kora").map { 
 // classes, compiled against Boot 3.5. A dependency both runs need goes to testImplementation, version-less when Boot
 // manages it (each run's platform picks the version); one run's only to boot35Test or boot41Test.
 val bootLines = mapOf("3.5" to "3.5.16", "4.1" to "4.1.2")
-val springBootModules = listOf("outbox-spring-boot") // outbox-kafka-spring-boot and outbox-admin-spring-boot join here
+val springBootModules = listOf("outbox-spring-boot", "outbox-kafka-spring-boot") // outbox-admin-spring-boot joins here
 configure(springBootModules.map { project(":$it") }) {
     fun bootPlatform(line: String) =
         dependencies.platform("org.springframework.boot:spring-boot-dependencies:${bootLines[line]}")

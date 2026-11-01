@@ -1,0 +1,76 @@
+package io.github.dsudomoin.outbox.kafka.spring;
+
+import io.github.dsudomoin.outbox.OutboxConfig;
+import io.github.dsudomoin.outbox.OutboxDeadLetterHandler;
+import io.github.dsudomoin.outbox.OutboxHandler;
+import io.github.dsudomoin.outbox.OutboxTopicHandler;
+import io.github.dsudomoin.outbox.kafka.KafkaDeadLetterHandler;
+import io.github.dsudomoin.outbox.kafka.KafkaOutboxConfig;
+import io.github.dsudomoin.outbox.kafka.KafkaOutboxHandler;
+import io.github.dsudomoin.outbox.kafka.KafkaOutboxSender;
+import java.util.Properties;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Lazy;
+
+/**
+ * Relays the outbox to Kafka, settings under {@code outbox.kafka.*}: a {@link KafkaOutboxSender}, a
+ * {@link KafkaOutboxHandler} for every topic no {@link OutboxTopicHandler} bean claims, and a
+ * {@link KafkaDeadLetterHandler}, which publishes dead letters once {@code outbox.kafka.dead-letter-topic} is set. An
+ * app's own {@link KafkaOutboxSender} or {@link OutboxDeadLetterHandler} bean replaces that one. An app's own
+ * {@link OutboxHandler} bean fails the start, so that it cannot take Kafka's topics by accident, unless
+ * {@code outbox.kafka.fallback=false} lets it.
+ * <p>
+ * The beans are lazy, as Kora builds only what the graph's roots reach: {@code bootstrap.servers} is required once
+ * something uses the sender (the outbox's fallback or active dead-letter hook, or an app's bean), and fails the start
+ * then, and not with {@code outbox.enabled=false} or a routes-only outbox.
+ */
+@AutoConfiguration
+@EnableConfigurationProperties(KafkaOutboxProperties.class)
+public final class KafkaOutboxAutoConfiguration {
+
+    /** {@code outbox} is the relay's config, optional as in Kora's module: a Kafka-only app has none. */
+    @Bean(destroyMethod = "close")
+    @Lazy
+    @ConditionalOnMissingBean(KafkaOutboxSender.class)
+    KafkaOutboxSender kafkaOutboxSender(KafkaOutboxProperties properties, ObjectProvider<OutboxConfig> outbox) {
+        var driver = new Properties();
+        driver.putAll(properties.driverProperties());
+        KafkaOutboxConfig config = () -> driver;
+        var sender = new KafkaOutboxSender(config);
+        outbox.ifAvailable(o -> sender.warnIfLongerThan("outbox.relay.batchTimeout", o.relay().batchTimeout(),
+            "The relay interrupts a call at 80% of batchTimeout; the sender then stops at once, keeps acked records as"
+                + " delivered and retries the rest, so slow sends end as retries"));
+        return sender;
+    }
+
+    @Bean
+    @Lazy
+    @ConditionalOnProperty(prefix = "outbox.kafka", name = "fallback", matchIfMissing = true)
+    KafkaOutboxHandler outboxKafkaFallbackHandler(KafkaOutboxSender sender) {
+        return sender.handler();
+    }
+
+    /** Without a dead-letter topic it is inactive and never calls a sender, so none is built for it. */
+    @Bean
+    @Lazy
+    @ConditionalOnMissingBean(OutboxDeadLetterHandler.class)
+    KafkaDeadLetterHandler kafkaDeadLetterHandler(KafkaOutboxProperties properties,
+            ObjectProvider<KafkaOutboxSender> sender, ObjectProvider<OutboxConfig> outbox) {
+        var topic = properties.deadLetterTopic();
+        if (topic == null) {
+            return new KafkaDeadLetterHandler(null, null);
+        }
+        var active = sender.getObject();
+        var hook = new KafkaDeadLetterHandler(active, topic);
+        outbox.ifAvailable(o -> active.warnIfLongerThan("outbox.deadLetters.timeout", o.deadLetters().timeout(),
+            "The dead-letter pass abandons a hook call at its timeout and hands its letters again after a backoff, so"
+                + " slow dead-letter sends end as retries and letters acked meanwhile repeat on their dead-letter"
+                + " topic"));
+        return hook;
+    }
+}
