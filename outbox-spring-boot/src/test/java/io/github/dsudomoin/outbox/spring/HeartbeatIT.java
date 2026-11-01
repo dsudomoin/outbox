@@ -5,6 +5,7 @@ import static org.awaitility.Awaitility.await;
 
 import com.zaxxer.hikari.HikariDataSource;
 import io.github.dsudomoin.outbox.internal.TableNames;
+import io.micrometer.core.instrument.MeterRegistry;
 import io.github.dsudomoin.outbox.spring.TestApps.WithRoute;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
@@ -13,8 +14,6 @@ import java.io.Closeable;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
-import java.util.List;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 import javax.sql.DataSource;
@@ -22,7 +21,6 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.FilteredClassLoader;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.ApplicationContext;
-import org.springframework.context.SmartLifecycle;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.jdbc.datasource.DelegatingDataSource;
@@ -228,34 +226,6 @@ class HeartbeatIT {
         });
     }
 
-    /** Whether the derived pool ran when the lifecycle beans of a lower phase started, just before the outbox. */
-    final class PoolProbe implements SmartLifecycle {
-
-        final List<Boolean> seen = new CopyOnWriteArrayList<>();
-        private volatile boolean running;
-
-        @Override
-        public void start() {
-            seen.add(poolRuns());
-            running = true;
-        }
-
-        @Override
-        public void stop() {
-            running = false;
-        }
-
-        @Override
-        public boolean isRunning() {
-            return running;
-        }
-
-        @Override
-        public int getPhase() {
-            return OutboxLifecycle.DEFAULT_PHASE - 1;
-        }
-    }
-
     @Test
     void aFailedBuildOrStartClosesThePool() {
         TestApps.runner("spring.datasource.hikari.pool-name=" + pool).run(context ->
@@ -263,17 +233,18 @@ class HeartbeatIT {
                 .isInstanceOf(IllegalArgumentException.class));
         await().atMost(WAIT).until(() -> !poolRuns());
 
-        var probe = new PoolProbe();
-        runner("outbox.table=s" + TestSql.uniqueTable() + ".outbox") // in a schema that does not exist
-            .withBean(PoolProbe.class, () -> probe).run(context -> {
-                assertThat(context).hasFailed();
-                assertThat(context.getStartupFailure()).hasStackTraceContaining("does not exist");
-            });
-        assertThat(probe.seen).containsExactly(true);
+        try (var log = new CapturedStderr()) {
+            runner("outbox.table=s" + TestSql.uniqueTable() + ".outbox") // in a schema that does not exist
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure()).hasStackTraceContaining("does not exist");
+                });
+            assertThat(log.text()).as("derived for the start").containsOnlyOnce(derived() + " - Starting...");
+        }
         await().atMost(WAIT).until(() -> !poolRuns());
     }
 
-    /** The lifecycle builds its first runtime, and so the pool, at its creation; the refresh fails before the start. */
+    /** A refresh that fails before the start, after the lifecycle's creation, leaves no pool behind. */
     @Test
     void aRefreshThatFailsBeforeTheStartClosesThePool() {
         runner().withBean(OutboxLifecycleIT.EarlySender.class).run(context -> assertThat(context).hasFailed());
@@ -302,8 +273,24 @@ class HeartbeatIT {
 
                 assertThat(log.text()).as("PGSimpleDataSource is no HikariDataSource")
                     .containsOnlyOnce("give it one as a DataSource bean qualified @OutboxHeartbeat");
+                assertThat(threadRuns("outbox-heartbeat:housekeeper")).as("a pool derived from nothing").isFalse();
             });
         }
+    }
+
+    /** Boot binds the app pool's meters after every singleton is instantiated; the pool is derived after that. */
+    @Test
+    void theDerivedPoolHasTheAppPoolsMetersFromTheFirstStart() {
+        runner().run(context -> {
+            assertThat(context).hasNotFailed();
+            var registry = context.getBean(MeterRegistry.class);
+
+            assertThat(registry.find("hikaricp.connections").tag("pool", pool).gauge()).as("the app pool's")
+                .isNotNull();
+            assertThat(registry.find("hikaricp.connections").tag("pool", derived()).gauge()).as("the derived pool's")
+                .isNotNull();
+            assertThat(registry.find("hikaricp.connections.max").tag("pool", derived()).gauge().value()).isOne();
+        });
     }
 
     @Test
@@ -344,9 +331,17 @@ class HeartbeatIT {
         return context.getBean(OutboxLifecycle.class).runtime().schema().names();
     }
 
+    /** The name of the pool derived from the app's. */
+    private String derived() {
+        return pool + "-outbox-heartbeat";
+    }
+
     /** Whether the pool derived from the app's runs: Hikari names its housekeeper thread after the pool. */
     private boolean poolRuns() {
-        var name = pool + "-outbox-heartbeat:housekeeper";
+        return threadRuns(derived() + ":housekeeper");
+    }
+
+    private static boolean threadRuns(String name) {
         return Thread.getAllStackTraces().keySet().stream().anyMatch(t -> t.getName().equals(name));
     }
 

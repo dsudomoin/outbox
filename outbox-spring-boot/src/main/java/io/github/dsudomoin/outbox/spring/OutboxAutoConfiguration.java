@@ -85,12 +85,18 @@ public final class OutboxAutoConfiguration {
             var binder = Binder.get(environment);
             boolean dedicated = binder.bindOrCreate("outbox.heartbeat", OutboxProperties.Heartbeat.class)
                 .dedicatedConnection();
-            Supplier<OutboxLifecycle.Built> runtimes = () -> {
+            Supplier<OutboxRuntime.Builder> builders = () -> {
                 var builder = OutboxRuntime.builder(config, transactions, handler.getIfUnique())
                     .telemetry(telemetry(telemetry));
                 routes.orderedStream().forEach(builder::route);
                 deadLetterHandler.ifAvailable(builder::deadLetterHandler);
                 owner.ifAvailable(ds -> builder.ownerConnections(SpringOutboxTransactions.autocommit(ds)));
+                return builder;
+            };
+            builders.get().build(); // checks the config and the routes now; touches no database
+            // the heartbeat's pool is derived at each start, from the app pool as it is then, its meters bound
+            Supplier<OutboxLifecycle.Built> runtimes = () -> {
+                var builder = builders.get();
                 HeartbeatPools.Pool pool = null;
                 var own = heartbeat.getIfAvailable();
                 if (own != null) {

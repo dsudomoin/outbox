@@ -28,18 +28,18 @@ public final class OutboxLifecycle implements SmartLifecycle {
 
     private final Supplier<Built> runtimes;
     private final int phase;
-    /** Built, not started: the next start's runtime. */
-    @Nullable
-    private Built next;
     @Nullable
     private volatile Started current;
     private volatile boolean running;
 
-    /** Builds the first runtime at once, so a config error fails the bean's creation. */
+    /**
+     * {@code runtimes} builds each start's runtime (a runtime starts once), at the start, so that what it copies from
+     * the app's beans is complete by then: a pool's meters, which Boot binds after every singleton is instantiated.
+     * The caller checks the config before, so that an error fails the bean's creation.
+     */
     OutboxLifecycle(Supplier<Built> runtimes, int phase) {
         this.runtimes = runtimes;
         this.phase = phase;
-        this.next = runtimes.get();
     }
 
     @Override
@@ -47,8 +47,7 @@ public final class OutboxLifecycle implements SmartLifecycle {
         if (running) {
             return;
         }
-        var built = next != null ? next : runtimes.get(); // a runtime starts once
-        next = null;
+        var built = runtimes.get();
         var runtime = built.runtime();
         try {
             runtime.start();
@@ -60,10 +59,7 @@ public final class OutboxLifecycle implements SmartLifecycle {
         running = true;
     }
 
-    /**
-     * Synchronous: the relay has stopped and the heartbeat row is gone when it returns. Also releases a runtime built
-     * and never started, as on a context whose refresh failed before the start.
-     */
+    /** Synchronous: the relay has stopped and the heartbeat row is gone when it returns. */
     @Override
     public synchronized void stop() {
         if (running) {
@@ -74,9 +70,6 @@ public final class OutboxLifecycle implements SmartLifecycle {
             } finally {
                 started.release.run();
             }
-        } else if (next != null) {
-            next.release().run();
-            next = null;
         }
     }
 
