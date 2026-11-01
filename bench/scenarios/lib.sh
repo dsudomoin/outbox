@@ -15,6 +15,10 @@ METRICS=http://localhost:8085/metrics
 export JAVA_HOME=${JAVA_HOME:-$(/usr/libexec/java_home -v 21)}
 mkdir -p "$LOGS"
 
+# Before anything that touches the stand or sets the traps: a run still waiting for its turn has nothing to clean up.
+source "$(dirname "${BASH_SOURCE[0]}")/stand-lock.sh"
+stand_acquire
+
 # Safety: a process is only ever signalled by the PID this script recorded when it started it, and only while
 # `ours` confirms that PID is still a live direct child of this shell, so a PID the OS has reused cannot be hit. The
 # PIDs are also written to $LOGS/*.pid; to stop a run by hand see bench/README.md (scenario.pid holds this shell's PID
@@ -50,6 +54,7 @@ cleanup() {
       -d "{\"timeEnd\": $(($(now) * 1000)), \"tags\": [\"scenario\", \"$name\", \"aborted\"]}" > /dev/null || true
   done < <(cat "$LOGS/marks.$$" 2> /dev/null)
   rm -f "$LOGS/marks.$$" "$LOGS/scenario.pid"
+  stand_release
   return 0
 }
 

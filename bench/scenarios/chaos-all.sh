@@ -4,6 +4,9 @@
 # failure, keeping that run's tables. Prints the summary. Needs the stack up and the bench built, like run-all.sh.
 set -uo pipefail
 dir=$(cd "$(dirname "$0")" && pwd)
+source "$dir/stand-lock.sh"
+stand_acquire
+trap stand_release EXIT
 summary=$dir/../build/scenarios/chaos-summary.txt
 mkdir -p "$(dirname "$summary")"
 : > "$summary"
