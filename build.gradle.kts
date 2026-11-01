@@ -237,6 +237,8 @@ configure(springBootModules.map { project(":$it") }) {
         "boot41Test"("org.springframework.boot:spring-boot-starter-liquibase")
         "boot41Test"("org.springframework.boot:spring-boot-starter-jackson")
         "boot41Test"("org.springframework.boot:spring-boot-jackson2")
+        // not in Boot 4.1's actuator starter: the tracing observation handlers Boot 3.5 has in its actuator-autoconfigure
+        "boot41Test"("org.springframework.boot:spring-boot-micrometer-tracing")
     }
 
     // Incremental recompiles make the configuration processor lose the properties' descriptions in its metadata

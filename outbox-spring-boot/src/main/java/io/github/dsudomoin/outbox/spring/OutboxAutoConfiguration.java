@@ -16,7 +16,14 @@ import io.github.dsudomoin.outbox.OutboxTopicHandler;
 import io.github.dsudomoin.outbox.OutboxTransactions;
 import io.github.dsudomoin.outbox.TypedOutbox;
 import io.github.dsudomoin.outbox.TypedOutboxTopicHandler;
+import io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry;
+import io.github.dsudomoin.outbox.micrometer.OutboxDeliveryObservationConvention;
+import io.github.dsudomoin.outbox.micrometer.OutboxEnqueueObservationConvention;
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.micrometer.OutboxStepObservationConvention;
 import io.github.dsudomoin.outbox.protobuf.ProtobufOutbox;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.observation.ObservationRegistry;
 import jakarta.annotation.Nullable;
 import java.sql.SQLException;
 import java.time.Duration;
@@ -65,6 +72,11 @@ import org.springframework.core.env.Environment;
  * that {@link TypedOutboxTopicHandler TypedOutboxTopicHandler&lt;T&gt;} and senders need no hand-written codec, the
  * JSON ones over the app's mapper ({@code outbox.json.mapper}). A bean of the app's for a concrete {@code T} wins for
  * that {@code T}. A handler reaches {@code TypedOutbox} through an {@code ObjectProvider}, as it does {@code Outbox}.
+ * <p>
+ * The telemetry is Micrometer's over the context's {@code ObservationRegistry} and {@code MeterRegistry}, each if any,
+ * traced with its {@code Tracer} and {@code Propagator} if both exist, named by its
+ * {@link OutboxEnqueueObservationConvention}, {@link OutboxDeliveryObservationConvention} and
+ * {@link OutboxStepObservationConvention} beans, if any. An app's own {@link OutboxTelemetry} bean replaces it.
  */
 @AutoConfiguration(afterName = {
     "org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration", // Boot 3
@@ -77,6 +89,54 @@ public final class OutboxAutoConfiguration {
     @ConditionalOnMissingBean(OutboxTransactions.class)
     SpringOutboxTransactions outboxTransactions(DataSource dataSource) {
         return new SpringOutboxTransactions(dataSource);
+    }
+
+    /**
+     * The Micrometer beans are looked up at creation, so no ordering after Boot's configurations of them is needed.
+     * Binds the key itself: an app's own OutboxConfig leaves no OutboxProperties bean.
+     */
+    @Bean
+    @ConditionalOnMissingBean(OutboxTelemetry.class)
+    ObservationOutboxTelemetry outboxTelemetry(Environment environment,
+            ObjectProvider<ObservationRegistry> observations, ObjectProvider<MeterRegistry> meters,
+            ObjectProvider<OutboxEnqueueObservationConvention> enqueueConvention,
+            ObjectProvider<OutboxDeliveryObservationConvention> deliveryConvention,
+            ObjectProvider<OutboxStepObservationConvention> stepConvention, ObjectProvider<TelemetryTracing> tracing) {
+        var builder = ObservationOutboxTelemetry.builder(observations.getIfAvailable(() -> ObservationRegistry.NOOP),
+                new OutboxMetrics(meters.getIfAvailable()))
+            .observeUnsampled(Binder.get(environment).bindOrCreate("outbox.telemetry", OutboxProperties.Telemetry.class)
+                .observeUnsampled());
+        enqueueConvention.ifAvailable(builder::enqueueConvention);
+        deliveryConvention.ifAvailable(builder::deliveryConvention);
+        stepConvention.ifAvailable(builder::stepConvention);
+        tracing.ifAvailable(t -> t.apply(builder));
+        return builder.build();
+    }
+
+    /** Traces the telemetry being built, when the context can; a bean only with micrometer-tracing present. */
+    @FunctionalInterface
+    interface TelemetryTracing {
+
+        void apply(ObservationOutboxTelemetry.Builder builder);
+    }
+
+    /** Only with micrometer-tracing present: no class that loads without it names its types. */
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnClass(name = "io.micrometer.tracing.Tracer")
+    static class TracingConfiguration {
+
+        /** Both or none: a Tracer alone, as Boot 4's no-op one without a bridge, cannot write the handed records. */
+        @Bean
+        TelemetryTracing outboxTelemetryTracing(ObjectProvider<io.micrometer.tracing.Tracer> tracer,
+                ObjectProvider<io.micrometer.tracing.propagation.Propagator> propagator) {
+            return builder -> {
+                var t = tracer.getIfAvailable();
+                var p = propagator.getIfAvailable();
+                if (t != null && p != null) {
+                    builder.tracing(t, p);
+                }
+            };
+        }
     }
 
     private static OutboxTelemetry telemetry(ObjectProvider<OutboxTelemetry> telemetry) {
