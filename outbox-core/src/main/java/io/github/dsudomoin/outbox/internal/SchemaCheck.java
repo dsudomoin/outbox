@@ -7,14 +7,15 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * The startup check of base objects the application's migrations own ({@code outbox.schema.bootstrap = false}): every
  * table, column (type, nullability, default expression as {@code pg_get_expr} prints it, identity), index (its table,
- * key and predicate), primary key (its columns) and partition key of {@link SchemaObjects} as this version needs it;
- * DML rights on every table (and {@code SELECT} on
+ * method, key with its order and operator classes, predicate, validity), primary key (its columns, not deferrable) and
+ * partition key of {@link SchemaObjects} as this version needs it; DML rights on every table (and {@code SELECT} on
  * the outbox's id sequence) for the role of {@code app}; and for the role of {@code ddl}, which makes and drops the
  * partitions, membership of the partitioned table's owner and {@code CREATE} on its schema. With an owner source, a
  * WARN when the application role may create where the owner's sessions resolve functions. What it does not know, a
@@ -26,6 +27,8 @@ final class SchemaCheck {
     private static final Logger log = LoggerFactory.getLogger(SchemaCheck.class);
     private static final List<String> DML = List.of("SELECT", "INSERT", "UPDATE", "DELETE");
     private static final String PRIMARY_KEY = "primary key ";
+    /** In what {@code pg_get_indexdef} prints: what the application's migration may choose for an index. */
+    private static final Pattern OPTIONAL = Pattern.compile(" (?:INCLUDE|WITH) \\([^)]*\\)| TABLESPACE \\S+");
 
     private SchemaCheck() {}
 
@@ -192,8 +195,8 @@ final class SchemaCheck {
     }
 
     /**
-     * {@code index} exists, on table {@code oid}, not unique, with the required key and predicate. Storage options and
-     * the tablespace are the migration's to choose, and an INVALID {@code <dead>_due} is {@link DeadIndexBuilder}'s.
+     * {@code index} exists, on table {@code oid}, valid, not unique, with the required method, key and predicate.
+     * Storage options, included columns and the tablespace are the migration's to choose.
      */
     private static void index(Connection c, long oid, SchemaObjects.Table t, SchemaObjects.Index index, String render,
             List<String> problems) throws SQLException {
@@ -203,26 +206,37 @@ final class SchemaCheck {
             return;
         }
         try (var ps = c.prepareStatement("select i.indrelid = ?::oid, i.indrelid::regclass::text, i.indisunique,"
-                + " '(' || " + keyOf("i") + " || ')' || coalesce(' where ' || pg_get_expr(i.indpred, i.indrelid, true),"
-                + " '') from pg_index i where i.indexrelid = ?::oid")) {
+                + " i.indisvalid, pg_get_indexdef(i.indexrelid, 0, true) from pg_index i where i.indexrelid = ?::oid")) {
             ps.setLong(1, oid);
             ps.setLong(2, own);
             try (var rs = ps.executeQuery()) {
                 if (!rs.next()) {
                     problems.add(index.name() + " is no index");
-                } else if (!rs.getBoolean(1)) {
+                    return;
+                }
+                if (!rs.getBoolean(1)) {
                     problems.add("index " + index.name() + " is on " + rs.getString(2) + ", not on " + t.name());
-                } else {
-                    if (rs.getBoolean(3)) {
-                        problems.add("index " + index.name() + " is unique, and this version needs it not to be");
-                    }
-                    if (!sameDefinition(rs.getString(4), index.definition())) {
-                        problems.add("index " + index.name() + " is " + rs.getString(4) + ", not "
-                                + index.definition());
-                    }
+                    return;
+                }
+                if (rs.getBoolean(3)) {
+                    problems.add("index " + index.name() + " is unique, and this version needs it not to be");
+                }
+                if (!rs.getBoolean(4) && !index.rebuilt()) {
+                    problems.add("index " + index.name() + " is INVALID, as an interrupted build leaves it: drop it"
+                            + " and build it again");
+                }
+                var actual = definition(rs.getString(5));
+                var required = "btree " + index.definition();
+                if (!canonical(actual).equals(canonical(required))) {
+                    problems.add("index " + index.name() + " is " + actual + ", not " + required);
                 }
             }
         }
+    }
+
+    /** What {@code pg_get_indexdef} prints after {@code USING}, without what is the migration's to choose. */
+    private static String definition(String indexdef) {
+        return OPTIONAL.matcher(indexdef.substring(indexdef.indexOf(" USING ") + " USING ".length())).replaceAll("");
     }
 
     /** The primary key {@code t} requires, if any, on exactly its columns: an upsert's conflict target needs them. */
@@ -232,27 +246,21 @@ final class SchemaCheck {
         if (required.isEmpty()) {
             return;
         }
-        var actual = string(c, "select (select " + keyOf("i") + " from pg_index i where i.indrelid = ?::oid and"
-                + " i.indisprimary)", oid); // one row, null without a primary key
+        var actual = string(c, "select (select string_agg(pg_get_indexdef(i.indexrelid, k, true), ', ' order by k) from"
+                + " pg_index i, generate_series(1, i.indnkeyatts) k where i.indrelid = ?::oid and i.indisprimary)",
+                oid); // one row, null without a primary key
+        var columns = required.get().substring(PRIMARY_KEY.length());
         if (actual == null) {
             problems.add(t.name() + " has no primary key" + fix(t.since(), render));
-        } else if (!sameDefinition(actual, required.get().substring(PRIMARY_KEY.length()))) {
-            problems.add(t.name() + " has primary key (" + actual + "), not "
-                    + required.get().substring(PRIMARY_KEY.length()));
+        } else if (!canonical(actual).equals(canonical(columns))) {
+            problems.add(t.name() + " has primary key (" + actual + "), not " + columns);
+        } else if (bool(c, "select exists (select 1 from pg_constraint where conrelid = ?::oid and contype = 'p' and"
+                + " condeferrable)", oid)) {
+            problems.add(t.name() + " has a deferrable primary key, which on conflict cannot use");
         }
     }
 
-    /** SQL: the key columns and expressions of the {@code pg_index} row {@code i}, as Postgres prints them. */
-    private static String keyOf(String i) {
-        return "(select string_agg(pg_get_indexdef(" + i + ".indexrelid, k, true), ', ' order by k) from"
-                + " generate_series(1, " + i + ".indnkeyatts) k)";
-    }
-
-    /** Equal but for what Postgres adds when it prints a definition: parentheses, quotes, case and spacing. */
-    private static boolean sameDefinition(String actual, String required) {
-        return canonical(actual).equals(canonical(required));
-    }
-
+    /** But for what Postgres adds when it prints a definition: parentheses, quotes, case and spacing. */
     private static String canonical(String definition) {
         return definition.toLowerCase(Locale.ROOT).replaceAll("[()\"\\s]", "");
     }

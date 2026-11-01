@@ -126,7 +126,7 @@ class SchemaCheckIT {
         assertSchemaProblem((c, n) -> {
             TestSql.execute(c, "drop index " + n.retry() + "_key");
             TestSql.execute(c, "create index " + unqualified(n.retry()) + "_key on " + n.retry() + " (shard, id)");
-        }, n -> "index " + n.retry() + "_key is (shard, id), not (shard, topic, key, id)");
+        }, n -> "index " + n.retry() + "_key is btree (shard, id), not btree (shard, topic, key, id)");
     }
 
     @Test
@@ -135,8 +135,62 @@ class SchemaCheckIT {
             TestSql.execute(c, "drop index " + n.retry() + "_waiting");
             TestSql.execute(c, "create index " + unqualified(n.retry()) + "_waiting on " + n.retry()
                     + " (waiting_since)");
-        }, n -> "index " + n.retry() + "_waiting is (waiting_since), not (waiting_since) where waiting_since is not"
-                + " null");
+        }, n -> "index " + n.retry() + "_waiting is btree (waiting_since), not btree (waiting_since) where"
+                + " waiting_since is not null");
+    }
+
+    @Test
+    void anIndexOfAnotherMethodFails() throws Exception {
+        assertSchemaProblem((c, n) -> {
+            TestSql.execute(c, "drop index " + n.parked() + "_due");
+            TestSql.execute(c, "create index " + unqualified(n.parked()) + "_due on " + n.parked()
+                    + " using brin (shard, due_at)");
+        }, n -> "index " + n.parked() + "_due is brin (shard, due_at), not btree (shard, due_at)");
+    }
+
+    @Test
+    void aDescendingKeyFails() throws Exception {
+        assertSchemaProblem((c, n) -> {
+            TestSql.execute(c, "drop index " + n.parked() + "_due");
+            TestSql.execute(c, "create index " + unqualified(n.parked()) + "_due on " + n.parked()
+                    + " (shard desc, due_at)");
+        }, n -> "index " + n.parked() + "_due is btree (shard DESC, due_at), not btree (shard, due_at)");
+    }
+
+    @Test
+    void anotherOperatorClassFails() throws Exception {
+        assertSchemaProblem((c, n) -> {
+            TestSql.execute(c, "drop index " + n.retry() + "_key");
+            TestSql.execute(c, "create index " + unqualified(n.retry()) + "_key on " + n.retry()
+                    + " (shard, topic text_pattern_ops, key, id)");
+        }, n -> "index " + n.retry() + "_key is btree (shard, topic text_pattern_ops, key, id)");
+    }
+
+    @Test
+    void anInvalidIndexFailsButTheDeadDueOneThatMaintenanceRebuilds() throws Exception {
+        assertSchemaProblem((c, n) -> TestSql.execute(c, "update pg_index set indisvalid = false where indexrelid in"
+                + " (to_regclass('" + n.retry() + "_key'), to_regclass('" + n.dead() + "_due'))"),
+                n -> "index " + n.retry() + "_key is INVALID");
+        var schema = "s" + TestSql.uniqueTable();
+        var config = new TestOutboxConfig().table(schema + ".outbox");
+        var n = TableNames.of(config.table());
+        try (var c = TestDataSources.newDataSource().getConnection()) {
+            TestSql.execute(c, "create schema " + schema);
+            TestSql.execute(c, OutboxSql.outbox(config, null));
+            TestSql.execute(c, "update pg_index set indisvalid = false where indexrelid = to_regclass('" + n.dead()
+                    + "_due')");
+
+            SchemaCheck.run(c, c, SchemaObjects.outbox(n), config.table(), "OutboxSql.outbox");
+        }
+    }
+
+    @Test
+    void aDeferrablePrimaryKeyFails() throws Exception {
+        assertSchemaProblem((c, n) -> {
+            TestSql.execute(c, "alter table " + n.instance() + " drop constraint " + unqualified(n.instance())
+                    + "_pkey");
+            TestSql.execute(c, "alter table " + n.instance() + " add primary key (instance_id) deferrable");
+        }, n -> n.instance() + " has a deferrable primary key");
     }
 
     @Test
