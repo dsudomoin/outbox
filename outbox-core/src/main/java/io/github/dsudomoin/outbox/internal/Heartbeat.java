@@ -31,7 +31,8 @@ import org.slf4j.LoggerFactory;
  * then takes the row's report as written, as the read before it misses the row when it had expired (a pause, an
  * outage). Last, in a transaction of its own, it reads the cursors' shard count into the instance's {@link ShardGuard},
  * so a writer-only instance stops writing within one beat of another instance's reshard. {@link #stop()} deletes the
- * row; a beat that commits after it deletes it again. A failed beat is logged, and the next one retries. A beat waits
+ * row, within {@link #STOP_BUDGET}, or leaves it to expire; a beat that commits after it deletes it again. A failed beat
+ * is logged, and the next one retries. A beat waits
  * at most {@code 100 ms} for a lock: a recovery holds the cursor table for its run, so the shard count then stands as
  * last read, with a one-line WARN; the reports were read and the row refreshed before, so the guards of other instances
  * keep counting this one. With a connection source of its own ({@link OutboxSchema#heartbeatConnections()}) the beats
@@ -42,6 +43,10 @@ public final class Heartbeat {
 
     private static final Logger log = LoggerFactory.getLogger(Heartbeat.class);
     static final Duration FORGET_AFTER = Duration.ofHours(1);
+    /** What {@link #stop()} may spend on a beat in flight and the row's delete, whichever connection each needs. */
+    static final Duration STOP_BUDGET = Duration.ofSeconds(5);
+    /** How long a delete gets past its own SQL timeouts for their cancel to come back, before it counts as stuck. */
+    private static final Duration CANCEL_GRACE = Duration.ofMillis(500);
 
     /** The schema's heartbeat connections, else {@code db}. */
     private final ConnectionSource connections;
@@ -109,23 +114,42 @@ public final class Heartbeat {
         ps.setDouble(before + 8, interval.multipliedBy(OutboxSchema.LIVE_INTERVALS).toNanos() / 1e9);
     }
 
-    /** Deletes the row of {@code id}; a failure is a WARN, as the row expires anyway. */
-    static void delete(ConnectionSource db, TableNames names, String id) {
-        try (var c = db.newConnection()) {
-            delete(c, names, id);
-        } catch (Exception e) {
-            log.warn("outbox instance {} could not delete its row from {}; it expires by itself: {}", id,
-                    names.instance(), e.toString());
+    /**
+     * Deletes the row of {@code id}, waiting about {@code budget} at most, for the connection and the statement alike:
+     * neither a lock on the row nor a source that hands out nothing holds a shutdown. A failure, or a delete given up
+     * on, is a WARN, as the row expires anyway.
+     */
+    static void delete(ConnectionSource db, TableNames names, String id, Duration budget) {
+        boolean ended = Bounded.run("outbox-heartbeat-delete", budget.plus(CANCEL_GRACE), () -> {
+            try (var c = db.newConnection()) {
+                delete(c, names, id, budget);
+            } catch (Exception e) {
+                log.warn("outbox instance {} could not delete its row from {}; it expires by itself: {}", id,
+                        names.instance(), e.toString());
+            }
+        });
+        if (!ended) {
+            log.warn("outbox instance {} gave up deleting its row from {} after {}: no connection or no answer; it"
+                    + " expires by itself", id, names.instance(), budget);
         }
     }
 
-    /** Deletes the row of {@code id} on {@code c}, which it leaves in autocommit. */
-    private static void delete(Connection c, TableNames names, String id) throws SQLException {
+    /**
+     * Deletes the row of {@code id} on {@code c}, in a transaction of its own bounded by {@code budget} (its settings
+     * leak nowhere), and leaves {@code c} in autocommit.
+     */
+    private static void delete(Connection c, TableNames names, String id, Duration budget) throws SQLException {
+        long millis = Math.max(1, budget.toMillis()); // 0 would mean no timeout at all
+        c.setAutoCommit(false);
+        try (var st = c.createStatement()) {
+            st.execute("set local lock_timeout = " + millis + "; set local statement_timeout = " + millis);
+        }
         try (var ps = c.prepareStatement("delete from " + names.instance() + " where instance_id = ?")) {
-            c.setAutoCommit(true);
             ps.setString(1, id);
             ps.executeUpdate();
         }
+        c.commit();
+        c.setAutoCommit(true);
     }
 
     public synchronized void start() {
@@ -140,20 +164,24 @@ public final class Heartbeat {
         scheduler.scheduleWithFixedDelay(this::beat, 0, interval.toNanos(), TimeUnit.NANOSECONDS);
     }
 
-    /** Stops the beats, waiting up to 5 s for one in flight, then deletes the row. */
+    /** Stops the beats, once, waiting for one in flight, then deletes the row, all within {@link #STOP_BUDGET}. */
     public synchronized void stop() {
+        if (stopped) {
+            return;
+        }
         stopped = true;
+        long deadline = System.nanoTime() + STOP_BUDGET.toNanos();
         var s = scheduler;
         scheduler = null;
         if (s != null) {
             s.shutdownNow();
             try {
-                s.awaitTermination(5, TimeUnit.SECONDS);
+                s.awaitTermination(STOP_BUDGET.toNanos(), TimeUnit.NANOSECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         }
-        delete(connections, names, id);
+        delete(connections, names, id, Duration.ofNanos(Math.max(0, deadline - System.nanoTime())));
     }
 
     void beat() { // package-private for a test
@@ -177,7 +205,7 @@ public final class Heartbeat {
                 contracts.renewed(id);
             }
             if (stopped) { // stop() deleted it before this commit; on c, as its source may hold no second connection
-                delete(c, names, id);
+                delete(c, names, id, STOP_BUDGET);
                 return;
             }
             lockTimeout(c);

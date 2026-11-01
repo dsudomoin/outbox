@@ -228,7 +228,9 @@ public final class OutboxRelay implements AutoCloseable {
      * finish, then the workers are interrupted and their uncommitted batches are redelivered later. A dead-letter hook
      * call in flight is interrupted at once ({@link DeadLetterPass#close()}): its letters roll back, costing no
      * attempt, and are handed again later. A dead-letter index build in flight is cancelled
-     * ({@link Maintenance#close}); the next one drops what it left.
+     * ({@link Maintenance#close}); the next one drops what it left. Last, the heartbeat stops and deletes this
+     * instance's row, within its own budget of 5 s ({@link Heartbeat#stop}), so all of it ends about 8 s after
+     * {@code shutdownTimeout} at worst.
      */
     @Override
     public void close() {

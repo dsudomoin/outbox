@@ -18,6 +18,8 @@ import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
@@ -125,6 +127,32 @@ class HeartbeatPoolIT {
         }
         try (var c = TestDb.connect()) {
             assertThat(TestSql.queryLong(c, "select count(*) from " + names.instance())).isZero();
+        }
+        await(() -> !poolRuns());
+    }
+
+    @Test
+    void aLockedRowDoesNotHoldTheReleaseAndThePoolStillCloses() throws Exception {
+        var wrapper = runtime(null, true);
+        wrapper.init();
+        var names = wrapper.value().schema().names();
+        var releasing = new CompletableFuture<Void>();
+        try (var holder = TestDb.connect()) {
+            holder.setAutoCommit(false);
+            TestSql.execute(holder, "select 1 from " + names.instance() + " for update");
+            var thread = new Thread(() -> {
+                try {
+                    wrapper.release();
+                    releasing.complete(null);
+                } catch (Throwable t) {
+                    releasing.completeExceptionally(t);
+                }
+            });
+            thread.setDaemon(true);
+            thread.start();
+
+            releasing.get(20, TimeUnit.SECONDS);
+            holder.rollback();
         }
         await(() -> !poolRuns());
     }

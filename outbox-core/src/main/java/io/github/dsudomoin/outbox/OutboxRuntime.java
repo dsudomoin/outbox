@@ -169,15 +169,15 @@ public final class OutboxRuntime implements AutoCloseable {
     }
 
     /**
-     * Stops the relay within {@code relay.shutdownTimeout}, then deletes this instance's row; nothing without
-     * {@link #start()}.
+     * Stops the relay within {@code relay.shutdownTimeout}, then deletes this instance's row, spending at most about
+     * 5 s more on it: a row it cannot delete in that time, locked or without a connection, is left to expire. Nothing
+     * without {@link #start()}.
      */
     @Override
     public synchronized void close() {
         var p = parts;
         if (p != null) {
-            p.relay.close();
-            p.schema.close();
+            p.relay.close(); // its heartbeat deletes the row, with the relay disabled too
         }
     }
 

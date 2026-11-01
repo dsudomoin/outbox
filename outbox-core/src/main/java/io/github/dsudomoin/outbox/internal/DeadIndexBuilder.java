@@ -38,6 +38,8 @@ final class DeadIndexBuilder {
     private final String index;
     private final Duration interval;
     private final Duration lockTimeout;
+    /** The most {@link #close} waits for a connection and the cancel of a build, on top of its timeout. */
+    private static final Duration CANCEL_WAIT = Duration.ofSeconds(1);
     /** Guards {@link #closed}, {@link #thread} and {@link #inDdl}, so a close either sees the DDL or prevents it. */
     private final Object monitor = new Object();
     private boolean closed;
@@ -94,11 +96,10 @@ final class DeadIndexBuilder {
             // ponytail: a cancel landing just after its DDL ends hits PartitionDdl's restore instead; the thread then
             // aborts the connection (the pool evicts it), so a cancelled build may cost one pooled connection
             if (inDdl != 0) {
-                try (var c = db.newConnection(); var ps = c.prepareStatement("select pg_cancel_backend(?)")) {
-                    ps.setInt(1, inDdl);
-                    ps.execute();
-                } catch (SQLException e) {
-                    log.warn("outbox could not cancel the build of {} at shutdown: {}", index, e.getMessage());
+                int pid = inDdl;
+                if (!Bounded.run(THREAD_NAME + "-cancel", CANCEL_WAIT, () -> cancel(pid))) { // no free connection, say
+                    log.warn("outbox gave up cancelling the build of {} after {} at shutdown; the next build drops"
+                            + " what it leaves", index, CANCEL_WAIT);
                 }
             }
         }
@@ -113,6 +114,15 @@ final class DeadIndexBuilder {
         if (t.isAlive()) {
             log.warn("outbox thread {} still busy {} after shutdown began; it ends with its statement", THREAD_NAME,
                     timeout);
+        }
+    }
+
+    private void cancel(int pid) {
+        try (var c = db.newConnection(); var ps = c.prepareStatement("select pg_cancel_backend(?)")) {
+            ps.setInt(1, pid);
+            ps.execute();
+        } catch (SQLException | RuntimeException e) {
+            log.warn("outbox could not cancel the build of {} at shutdown: {}", index, e.toString());
         }
     }
 

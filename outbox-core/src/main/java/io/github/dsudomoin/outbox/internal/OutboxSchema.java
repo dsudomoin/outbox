@@ -397,12 +397,15 @@ public final class OutboxSchema implements AutoCloseable {
         }
     }
 
-    /** Deletes this instance's row; the relay's {@link Heartbeat} deletes it first when it ran. */
+    /**
+     * Deletes this instance's row, within {@link Heartbeat#STOP_BUDGET}, or leaves it to expire: for a schema without a
+     * relay, whose {@link Heartbeat} does it otherwise.
+     */
     @Override
     public void close() {
         var n = names;
         if (n != null) {
-            Heartbeat.delete(heartbeat != null ? heartbeat : db, n, instanceId);
+            Heartbeat.delete(heartbeat != null ? heartbeat : db, n, instanceId, Heartbeat.STOP_BUDGET);
         }
     }
 

@@ -24,6 +24,7 @@ import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
@@ -34,13 +35,17 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
+import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
+import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
@@ -1748,6 +1753,54 @@ class MaintenanceIT {
             awaitBuildEnd(first);
             assertThat(indexState()).endsWith(":true");
         }
+    }
+
+    @Test
+    void closeDoesNotWaitForAConnectionToCancelABuild() throws Exception {
+        bootstrap();
+        var hanging = new AtomicBoolean();
+        var released = new CountDownLatch(1);
+        var maintenance = new Maintenance(new KoraOutboxTransactions(new JdbcConnectionFactory() {
+            @Override
+            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
+                return db.withConnection(callback);
+            }
+
+            @Override
+            public Connection currentConnection() {
+                return db.currentConnection();
+            }
+
+            @Override
+            public Connection newConnection() {
+                if (hanging.get()) {
+                    try {
+                        released.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                return db.newConnection();
+            }
+
+            @Override
+            public DataBaseTelemetry telemetry() {
+                return db.telemetry();
+            }
+        }), names, config, new OutboxMetrics(null));
+        deadTableWithoutIndex(1);
+        try (var c = TestDb.connect(); var holder = openDeadInsert(2)) {
+            assertThat(maintenance.runOnce()).isTrue();
+            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
+            hanging.set(true);
+
+            CompletableFuture.runAsync(() -> maintenance.close(Duration.ofMillis(100))).get(15, TimeUnit.SECONDS);
+
+            holder.rollback();
+        } finally {
+            released.countDown();
+        }
+        awaitBuildEnd(maintenance);
     }
 
     @Test
