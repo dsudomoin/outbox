@@ -668,7 +668,7 @@ class HandlerProxiesIT {
         return seen;
     }
 
-    private static String failure(AssertableApplicationContext context) {
+    static String failure(AssertableApplicationContext context) {
         assertThat(context).hasFailed();
         var cause = context.getStartupFailure();
         while (cause.getCause() != null) {

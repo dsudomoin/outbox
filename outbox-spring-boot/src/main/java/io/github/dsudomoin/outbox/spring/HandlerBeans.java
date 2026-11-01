@@ -36,7 +36,8 @@ import org.springframework.util.ClassUtils;
  * names the bean. A bean behind a Spring AOP proxy is called through the proxy, its advice running per record: its
  * identity (topics, contract version) comes from the proxy's ultimate target, and an advisor that matches a method on
  * the relay's path but none of those the relay really calls on this proxy fails the start. Unproxied beans go in as
- * they are.
+ * they are. A handler's transaction must not commit a record the relay treats as failed
+ * ({@link TransactionalHandlerCheck}).
  */
 final class HandlerBeans {
 
@@ -44,7 +45,8 @@ final class HandlerBeans {
     static final String KAFKA_FALLBACK = "outboxKafkaFallbackHandler";
 
     private static final Logger log = LoggerFactory.getLogger(HandlerBeans.class);
-    private static final Method HANDLE = method(OutboxTopicHandler.class, "handle", OutboxRecord.class);
+    private static final Method ROUTE_HANDLE = method(OutboxTopicHandler.class, "handle", OutboxRecord.class);
+    private static final Method FALLBACK_HANDLE = method(OutboxHandler.class, "handle", OutboxRecord.class);
     private static final Method TYPED_HANDLE = method(TypedOutboxTopicHandler.class, "handle", OutboxRecord.class);
     private static final Method HOOK = method(TypedOutboxTopicHandler.class, "handle", Object.class,
         OutboxRecord.class);
@@ -90,7 +92,7 @@ final class HandlerBeans {
     /**
      * Collects and checks the handler beans: no bean of both kinds, at most one {@code OutboxHandler}, every route
      * claims topics and no two claim one, proxies with a singleton target whose advice on the relay's path is
-     * reachable.
+     * reachable, transactions on that path that roll back whenever the record fails.
      */
     static HandlerBeans collect(ListableBeanFactory beans, ObjectProvider<OutboxHandler> handlerBeans,
             ObjectProvider<OutboxTopicHandler> routeBeans) {
@@ -145,6 +147,7 @@ final class HandlerBeans {
             }
             routes.add((OutboxTopicHandler) relayed(handler, topics));
         }
+        handlers.forEach(handler -> TransactionalHandlerCheck.check(handler, beans));
         var line = claims.isEmpty() ? "none" : claims.entrySet().stream()
             .map(e -> e.getKey() + " -> " + e.getValue().name()).collect(Collectors.joining(", "));
         return new HandlerBeans(fallback, List.copyOf(routes), List.copyOf(handlers),
@@ -199,7 +202,7 @@ final class HandlerBeans {
         var targetClass = target.getClass();
         var path = new ArrayList<Method>();
         for (var m : target instanceof TypedOutboxTopicHandler<?> ? List.of(HOOK, TOMBSTONE, TYPED_HANDLE)
-                : List.of(HANDLE)) {
+                : List.of(target instanceof OutboxHandler ? FALLBACK_HANDLE : ROUTE_HANDLE)) {
             path.add(AopUtils.getMostSpecificMethod(m, targetClass));
         }
         var batch = method(targetClass, "handleBatch", List.class);
@@ -292,7 +295,7 @@ final class HandlerBeans {
      * invocation exposer, which matches all; the class filter only when the auto-proxy creator did not apply it already
      * (a {@code bean(...)} pointcut matches no class outside the proxy's creation).
      */
-    private static boolean matches(Advised proxy, Advisor advisor, Method method, Class<?> targetClass) {
+    static boolean matches(Advised proxy, Advisor advisor, Method method, Class<?> targetClass) {
         if (advisor.getAdvice() instanceof ExposeInvocationInterceptor || advisor instanceof IntroductionAdvisor) {
             return false;
         }
@@ -331,7 +334,7 @@ final class HandlerBeans {
             + signature(method) + " but no method the relay calls on its proxy, so the advice would never run; " + why);
     }
 
-    private static String signature(Method method) {
+    static String signature(Method method) {
         return method.getName() + Arrays.stream(method.getParameterTypes()).map(Class::getSimpleName)
             .collect(Collectors.joining(", ", "(", ")"));
     }
