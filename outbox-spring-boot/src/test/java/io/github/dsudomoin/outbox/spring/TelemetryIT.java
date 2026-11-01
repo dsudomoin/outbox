@@ -8,6 +8,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 
+import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.OutboxTopicHandler;
@@ -65,6 +66,7 @@ class TelemetryIT {
     private static final Duration WAIT = Duration.ofSeconds(10);
     private static final String UNSAMPLED = "test.unsampled=true";
     private static final String OBSERVE_UNSAMPLED = "outbox.telemetry.observe-unsampled=true";
+    private static final String SINCE_SUCCESS = "outbox.maintenance.since_success";
 
     @Configuration(proxyBeanMethods = false)
     static class Metered {
@@ -136,6 +138,25 @@ class TelemetryIT {
         @Bean
         SpanSeeingRoute spanSeeingRoute(Tracer tracer) {
             return new SpanSeeingRoute(tracer);
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class WithPoisonRoute {
+
+        @Bean
+        OutboxTopicHandler poisonRoute() {
+            return new OutboxTopicHandler() {
+                @Override
+                public Set<String> topics() {
+                    return Set.of("poison");
+                }
+
+                @Override
+                public void handle(OutboxRecord record) {
+                    throw new OutboxPermanentException("poison");
+                }
+            };
         }
     }
 
@@ -293,6 +314,28 @@ class TelemetryIT {
             () -> assertThat(timerCount(meters, "outbox.deliver")).isOne());
     }
 
+    /** The telemetry bean outlives the runtime: a stop and a start build a new one around it. */
+    @Test
+    void gaugesFollowTheNewRuntimeAfterARestart() {
+        runner("outbox.partitions.maintenance-interval=100ms").withUserConfiguration(Metered.class,
+            WithPoisonRoute.class).run(context -> {
+                assertThat(context).hasNotFailed();
+                var meters = context.getBean(MeterRegistry.class);
+                await().atMost(WAIT).until(() -> gauge(meters, SINCE_SUCCESS) < 1.0);
+
+                context.stop();
+                Thread.sleep(1500); // the closed runtime's last run is now older than the limit below
+                context.start();
+
+                await().atMost(WAIT).until(() -> gauge(meters, SINCE_SUCCESS) < 1.0);
+                assertThat(gauge(meters, "outbox.dead.size")).isZero();
+                send(context, "poison");
+                await().atMost(WAIT).until(() -> gauge(meters, "outbox.dead.size") == 1);
+                await().atMost(WAIT).until(() -> gauge(meters, SINCE_SUCCESS) < 1.0);
+                assertThat(meters.find("outbox.dead.size").gauges()).hasSize(1);
+            });
+    }
+
     @Test
     void conventionBeanUsed() {
         traced().withUserConfiguration(TestApps.WithRoute.class, RenamingConventions.class).run(context -> {
@@ -397,6 +440,10 @@ class TelemetryIT {
     private static double count(MeterRegistry meters, String name, String topic) {
         var counter = meters.find(name).tag("topic", topic).counter();
         return counter == null ? 0 : counter.count();
+    }
+
+    private static double gauge(MeterRegistry meters, String name) {
+        return meters.get(name).gauge().value();
     }
 
     /** 0 while the timer does not exist: {@code meters.get} would throw what {@code untilAsserted} does not retry. */

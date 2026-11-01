@@ -24,6 +24,8 @@ public final class OutboxMetrics implements OutboxTelemetry {
 
     private final Map<String, TopicMeters> topics = new ConcurrentHashMap<>();
 
+    private final Map<OutboxGauge, CurrentValue> gauges = new ConcurrentHashMap<>();
+
     public OutboxMetrics(@Nullable MeterRegistry registry) {
         this.registry = registry;
     }
@@ -140,17 +142,38 @@ public final class OutboxMetrics implements OutboxTelemetry {
         }
     }
 
-    /** Registers the gauge under {@link OutboxGauge#metricName()} once; later calls keep the first supplier. */
+    /**
+     * Registers the gauge under {@link OutboxGauge#metricName()} once; a later call on this instance replaces what the
+     * meter reads, so the gauges follow the latest runtime built around this telemetry. Another instance over the same
+     * registry gets the meter already there, and its {@code value} is not read. A scrape costs one volatile read.
+     */
     @Override
     public void gauge(OutboxGauge gauge, DoubleSupplier value) {
         if (registry != null) {
-            Gauge.builder(gauge.metricName(), value::getAsDouble).register(registry);
+            gauges.computeIfAbsent(gauge, g -> {
+                var current = new CurrentValue(value);
+                Gauge.builder(g.metricName(), current::read).register(registry);
+                return current;
+            }).value = value;
         }
     }
 
     private TopicMeters meters(String topic) {
         var m = topics.get(topic); // plain get first: no lambda allocation on the hot path
         return m != null ? m : topics.computeIfAbsent(topic, t -> new TopicMeters(registry, t));
+    }
+
+    /** What a gauge's one meter reads. */
+    private static final class CurrentValue {
+        volatile DoubleSupplier value;
+
+        CurrentValue(DoubleSupplier value) {
+            this.value = value;
+        }
+
+        double read() {
+            return value.getAsDouble();
+        }
     }
 
     private static final class TopicMeters {

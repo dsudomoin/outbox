@@ -42,6 +42,7 @@ class OutboxMetricsTest {
             noop.deadLetterHookFailed();
             noop.relayFailed(new SQLException("x"));
             noop.gauge(OutboxGauge.RETRY_SIZE, () -> 1);
+            noop.gauge(OutboxGauge.RETRY_SIZE, () -> 1);
         }).doesNotThrowAnyException();
     }
 
@@ -101,7 +102,6 @@ class OutboxMetricsTest {
         metrics.shardPaused();
         metrics.inboxOutsideWindow();
         metrics.gauge(OutboxGauge.RETRY_SIZE, () -> 42);
-        metrics.gauge(OutboxGauge.RETRY_SIZE, () -> 99);
 
         assertThat(registry.get("outbox.messages.enqueued").tag("topic", "orders").counter().count()).isEqualTo(1);
         assertThat(registry.get("outbox.messages.failed").tags("topic", "orders", "outcome", "retry").counter().count())
@@ -114,6 +114,27 @@ class OutboxMetricsTest {
         assertThat(registry.get("outbox.shard.paused").counter().count()).isEqualTo(1);
         assertThat(registry.get("outbox.inbox.outside_window").counter().count()).isEqualTo(1);
         assertThat(registry.get("outbox.retry.size").gauges()).hasSize(1);
+        assertThat(registry.get("outbox.retry.size").gauge().value()).isEqualTo(42);
+    }
+
+    @Test
+    void aLaterGaugeCallIsWhatTheMeterReads() {
+        metrics.gauge(OutboxGauge.RETRY_SIZE, () -> 42);
+        var meter = registry.get("outbox.retry.size").gauge();
+
+        metrics.gauge(OutboxGauge.RETRY_SIZE, () -> 99);
+
+        assertThat(registry.find("outbox.retry.size").gauges()).containsExactly(meter);
+        assertThat(meter.value()).isEqualTo(99);
+    }
+
+    @Test
+    void anotherInstanceOverTheSameRegistryLeavesTheGaugeAsItIs() {
+        metrics.gauge(OutboxGauge.RETRY_SIZE, () -> 42);
+
+        new OutboxMetrics(registry).gauge(OutboxGauge.RETRY_SIZE, () -> 99);
+
+        assertThat(registry.find("outbox.retry.size").gauges()).hasSize(1);
         assertThat(registry.get("outbox.retry.size").gauge().value()).isEqualTo(42);
     }
 

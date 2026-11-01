@@ -108,7 +108,10 @@ public interface OutboxTelemetry {
      */
     default void releaseThread() {}
 
-    /** Registers a gauge, once per {@code gauge}; {@code value} is read on the caller's schedule, NaN when unknown. */
+    /**
+     * Registers a gauge; {@code value} is read on the caller's schedule, NaN when unknown. A runtime built later around
+     * the same telemetry calls this again for the same {@code gauge}: its {@code value} replaces the earlier one.
+     */
     default void gauge(OutboxGauge gauge, DoubleSupplier value) {}
 
     /** One {@code send} / {@code sendAll} call. */
