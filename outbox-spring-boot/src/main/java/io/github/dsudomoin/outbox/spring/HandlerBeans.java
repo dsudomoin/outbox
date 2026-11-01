@@ -25,6 +25,7 @@ import org.springframework.aop.framework.Advised;
 import org.springframework.aop.framework.AopProxyUtils;
 import org.springframework.aop.interceptor.ExposeInvocationInterceptor;
 import org.springframework.aop.support.AopUtils;
+import org.springframework.beans.factory.BeanFactoryUtils;
 import org.springframework.beans.factory.ListableBeanFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.util.ClassUtils;
@@ -32,10 +33,10 @@ import org.springframework.util.ClassUtils;
 /**
  * The handler beans as the runtime takes them: the {@link OutboxHandler} bean, if any, for the topics no route claims,
  * and every {@link OutboxTopicHandler} bean as a route, checked before the runtime is built so that every failure
- * names the bean. A bean behind a Spring AOP proxy is called through the proxy, its advice running per record (spec
- * §5.4): its identity (topics, contract version) comes from the proxy's ultimate target, and every advisor that
- * matches a method on the relay's path must be one this proxy can intercept, else the start fails. Unproxied beans go
- * in as they are.
+ * names the bean. A bean behind a Spring AOP proxy is called through the proxy, its advice running per record: its
+ * identity (topics, contract version) comes from the proxy's ultimate target, and an advisor that matches a method on
+ * the relay's path but none of those the relay really calls on this proxy fails the start. Unproxied beans go in as
+ * they are.
  */
 final class HandlerBeans {
 
@@ -96,8 +97,10 @@ final class HandlerBeans {
         var fallbacks = handlerBeans.orderedStream().toList();
         var routeList = routeBeans.orderedStream().toList();
         var names = new IdentityHashMap<Object, String>(); // singletons only: never a scoped target
-        beans.getBeansOfType(OutboxHandler.class, false, true).forEach((name, bean) -> names.put(bean, name));
-        beans.getBeansOfType(OutboxTopicHandler.class, false, true).forEach((name, bean) -> names.put(bean, name));
+        for (var type : List.of(OutboxHandler.class, OutboxTopicHandler.class)) { // what orderedStream() sees
+            BeanFactoryUtils.beansOfTypeIncludingAncestors(beans, type, false, true)
+                .forEach((name, bean) -> names.put(bean, name));
+        }
 
         for (var bean : fallbacks) {
             if (bean instanceof OutboxTopicHandler) {
@@ -169,7 +172,15 @@ final class HandlerBeans {
         log.info("{}", routesLine);
     }
 
-    /** Unwraps the proxies to the ultimate target and checks that each can intercept what its advisors match. */
+    /**
+     * Unwraps the proxies to the ultimate target and checks them against the methods the wrapper ({@link #relayed})
+     * really calls on the outermost one, each level passing the call on: {@code handle}, for a typed target the hooks
+     * on a class-based proxy or {@code handle(OutboxRecord)} on an interface-based one, and an overridden
+     * {@code handleBatch}. A class-based proxy must not have one of them final: it would run on the proxy's own
+     * instance, whose fields are unset. An advisor must match one of them, unless it matches no method of the relay's
+     * path at all, an inherited {@code handleBatch} included; advice on another method too, such as an advisor for the
+     * whole class, runs on those it matches.
+     */
     private static Handler inspect(String name, Object bean) {
         var proxies = new ArrayList<Advised>();
         var target = bean;
@@ -191,16 +202,33 @@ final class HandlerBeans {
             path.add(AopUtils.getMostSpecificMethod(m, targetClass));
         }
         var batch = method(targetClass, "handleBatch", List.class);
+        var called = new ArrayList<Method>();
+        if (!(target instanceof TypedOutboxTopicHandler<?>)) {
+            called.add(path.get(0));
+        } else if (bean instanceof TypedOutboxTopicHandler<?>) {
+            called.addAll(path.subList(0, 2)); // the hooks
+        } else {
+            called.add(path.get(2)); // handle(OutboxRecord)
+        }
+        var relayMethods = new ArrayList<>(path);
+        relayMethods.add(batch);
         if (overrides(batch)) {
             path.add(batch);
+            called.add(batch);
         }
         var handler = new Handler(name, bean, target, List.copyOf(path));
         for (var proxy : proxies) {
-            for (var advisor : proxy.getAdvisors()) {
-                for (var m : handler.relayPath()) {
-                    if (matches(proxy, advisor, m, targetClass) && !reachable(proxy, m)) {
-                        throw unreachable(handler, proxy, advisor, m);
+            if (AopUtils.isCglibProxy(proxy)) {
+                for (var m : called) {
+                    if (Modifier.isFinal(m.getModifiers())) {
+                        throw finalCalled(handler, m);
                     }
+                }
+            }
+            for (var advisor : proxy.getAdvisors()) {
+                var matched = relayMethods.stream().filter(m -> matches(proxy, advisor, m, targetClass)).toList();
+                if (!matched.isEmpty() && called.stream().noneMatch(matched::contains)) {
+                    throw unreachable(handler, proxy, advisor, matched.get(0));
                 }
             }
         }
@@ -228,9 +256,10 @@ final class HandlerBeans {
     }
 
     /**
-     * The hooks of a typed handler behind an interface-based proxy, which only proxies its interface methods: each hook
-     * calls the proxy's {@code handle(OutboxRecord)}, so that advice on it runs; the target decodes again and calls its
-     * own hook, which no advice matches ({@link #inspect}).
+     * The hooks of a typed handler behind an interface-based proxy: each hook calls the proxy's
+     * {@code handle(OutboxRecord)}, so that advice on it runs; the target decodes again and calls its own hook, on
+     * itself. Advice on the hooks alone cannot run, whatever interfaces declare them, and fails the start
+     * ({@link #inspect}).
      */
     // ponytail: such a payload is decoded twice (once here for the contract and decode checks, once by the target)
     private static final class ViaInterface extends TypedOutboxTopicHandler<Object> {
@@ -274,42 +303,44 @@ final class HandlerBeans {
         return true;
     }
 
-    /** An interface-based proxy intercepts the methods of its interfaces, a class-based one those not final. */
-    private static boolean reachable(Advised proxy, Method method) {
-        if (AopUtils.isJdkDynamicProxy(proxy)) {
-            return Arrays.stream(proxy.getProxiedInterfaces())
-                .anyMatch(i -> ClassUtils.hasMethod(i, method.getName(), method.getParameterTypes()));
-        }
-        return !Modifier.isFinal(method.getModifiers());
+    private static IllegalArgumentException finalCalled(Handler handler, Method method) {
+        var fix = method.getDeclaringClass() == TypedOutboxTopicHandler.class
+            ? "give the bean class-based proxies only, or interface-based ones only" : "make it not final";
+        return new IllegalArgumentException("outbox handler bean " + handler + ": " + signature(method) + " is final,"
+            + " and the relay calls it on a class-based proxy, where it would run on the proxy's own instance, whose"
+            + " fields are unset: " + fix);
     }
 
     private static IllegalArgumentException unreachable(Handler handler, Advised proxy, Advisor advisor,
             Method method) {
-        var signature = method.getName() + Arrays.stream(method.getParameterTypes()).map(Class::getSimpleName)
-            .collect(Collectors.joining(", ", "(", ")"));
         String why;
-        String fix;
-        if (AopUtils.isJdkDynamicProxy(proxy)) {
-            why = "an interface-based (JDK) proxy, which intercepts only the methods of the interfaces it implements";
-            fix = "set spring.aop.proxy-target-class=true (class-based proxies, Spring Boot's default), or advise"
-                + " handle(OutboxRecord) instead";
+        if (method.getName().equals("handleBatch")) { // an overridden one is among the methods called
+            why = "the relay runs the default handleBatch itself, over handle: override handleBatch or advise handle";
+        } else if (AopUtils.isJdkDynamicProxy(proxy)) {
+            why = "the relay calls only handle(OutboxRecord) on an interface-based (JDK) proxy, and the target then"
+                + " calls its hooks on itself: set spring.aop.proxy-target-class=true (class-based proxies, Spring"
+                + " Boot's default), or advise handle(OutboxRecord) instead";
         } else {
-            why = "a class-based proxy, which cannot intercept a final method";
-            fix = method.getDeclaringClass() == TypedOutboxTopicHandler.class
-                ? "advise the hook handle(T, OutboxRecord) or handleTombstone instead of the final handle(OutboxRecord)"
-                : "make the method not final";
+            why = "a class-based proxy cannot intercept the final handle(OutboxRecord): advise the hook"
+                + " handle(T, OutboxRecord) or handleTombstone instead";
         }
         return new IllegalArgumentException("outbox handler bean " + handler + ": advisor " + advisor + " matches "
-            + signature + ", which the relay calls but its proxy never runs the advice on: it is " + why + "; " + fix);
+            + signature(method) + " but no method the relay calls on its proxy, so the advice would never run; " + why);
+    }
+
+    private static String signature(Method method) {
+        return method.getName() + Arrays.stream(method.getParameterTypes()).map(Class::getSimpleName)
+            .collect(Collectors.joining(", ", "(", ")"));
     }
 
     /** True when {@code handleBatch}, as the class has it, is not the default of the core's interfaces. */
     private static boolean overrides(Method batch) {
-        return batch.getDeclaringClass() != OutboxTopicHandler.class && batch.getDeclaringClass() != OutboxHandler.class;
+        var declaring = batch.getDeclaringClass();
+        return declaring != OutboxTopicHandler.class && declaring != OutboxHandler.class;
     }
 
     private static String name(Map<Object, String> names, Object bean) {
-        return names.getOrDefault(bean, ClassUtils.getUserClass(bean).getName());
+        return names.getOrDefault(bean, AopProxyUtils.ultimateTargetClass(bean).getName());
     }
 
     private static String describe(Map<Object, String> names, Object bean) {

@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.assertj.AssertableApplicationContext;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
@@ -115,6 +116,33 @@ class HandlerBeansIT {
             .contains("several OutboxHandler beans: ").contains("outboxKafkaFallbackHandler").contains("appHandler")
             .endsWith("; outbox-kafka-spring-boot provides outboxKafkaFallbackHandler while"
                 + " outbox.kafka.fallback=true: set outbox.kafka.fallback=false to let your own handler take them"));
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class KafkaInParent {
+
+        @Bean
+        OutboxHandler outboxKafkaFallbackHandler() {
+            return new Fallback();
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class AppHandlerOnly {
+
+        @Bean
+        OutboxHandler appHandler() {
+            return new Other();
+        }
+    }
+
+    @Test
+    void parentContextHandlerIsNamedToo() {
+        try (var parent = new AnnotationConfigApplicationContext(KafkaInParent.class)) {
+            runner().withParent(parent).withUserConfiguration(AppHandlerOnly.class).run(context ->
+                assertThat(failure(context)).contains("outboxKafkaFallbackHandler (" + Fallback.class.getName() + ")")
+                    .contains("appHandler").contains("outbox.kafka.fallback=false"));
+        }
     }
 
     @Configuration(proxyBeanMethods = false)
