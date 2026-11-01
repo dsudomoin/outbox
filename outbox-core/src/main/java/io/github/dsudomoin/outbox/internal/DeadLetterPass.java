@@ -40,8 +40,9 @@ import org.slf4j.LoggerFactory;
  * letter at once; call the hook, bounded by {@code deadLetters.timeout}, while the claim holds them; commit its
  * decisions, or, after a failed call, a backoff for every letter of it. That transaction takes no key lock: a
  * {@code redrive} commits as {@code redriveAt(now)}, so a decision is never lost and the hook is called once for it.
- * Scheduled letters due are then redriven, a batch per transaction ({@link Resender}, the {@code <redriven>} count,
- * the dead rows deleted). Their key locks are taken without waiting ({@code pg_try_advisory_xact_lock}): a letter
+ * Scheduled letters due are redriven, a batch per transaction ({@link Resender}, the {@code <redriven>} count, the dead
+ * rows deleted), one batch after each full hand-over and the rest once those end, so a steady stream of pending letters
+ * does not hold them back. Their key locks are taken without waiting ({@code pg_try_advisory_xact_lock}): a letter
  * whose key is held, by an open {@code send} of it, is due again after {@code relay.retry.initialDelay} while the
  * others of its batch go on, and the phase ends with that batch. Right after the claim the batch's
  * {@code lock_timeout} becomes {@link XidPartitions#lockWait}: it bounds each lock wait of the batch, not their
@@ -141,10 +142,11 @@ public final class DeadLetterPass {
 
     /**
      * With an active hook, hands due pending letters to it batch after batch, until a batch is not full or a call fails
-     * (its backoff then holds the hook back, not just its letters); without one, makes every pending letter kept,
-     * unless an instance with an active hook is live: its {@link Heartbeat} row has not expired. Then
-     * redrives the due scheduled letters, those just decided {@code redrive} included. Returns the letters this run
-     * redrove: the caller wakes the relay when there are any. One run at a time per pass, so a second caller's hook
+     * (its backoff then holds the hook back, not just its letters), with one batch of due scheduled letters after each
+     * full one; without one, makes every pending letter kept, unless an instance with an active hook is live: its
+     * {@link Heartbeat} row has not expired. Then redrives the due scheduled letters left, those just decided
+     * {@code redrive} included. Returns the letters this run redrove: the caller wakes the relay when there are any,
+     * and until then the relay's idle poll finds them. One run at a time per pass, so a second caller's hook
      * call never waits for the first one's inside its own timeout; the wait for it is interruptible. A run that starts
      * after {@link #close()}, as one queued behind another may, does nothing and returns 0.
      */
@@ -165,8 +167,13 @@ public final class DeadLetterPass {
     /** One run under {@link #running}. */
     private int run() {
         try (var c = db.newConnection()) {
+            int redriven = 0;
             if (active()) {
-                handOver(c);
+                // a redrive batch after each full one, as pending letters may keep coming: due redrives, those just
+                // decided included, would wait for a phase of their own until they stop
+                while (!closed && handOver(c)) {
+                    redriven += redriveScheduled(c, 1);
+                }
             } else {
                 inTx(c, tx -> {
                     try (var st = tx.createStatement()) {
@@ -174,7 +181,7 @@ public final class DeadLetterPass {
                     }
                 });
             }
-            return redriveScheduled(c);
+            return redriven + redriveScheduled(c, Integer.MAX_VALUE);
         } catch (SQLException e) {
             throw db.translate(e);
         }
@@ -210,30 +217,27 @@ public final class DeadLetterPass {
         executor.shutdownNow();
     }
 
-    private void handOver(Connection c) throws SQLException {
-        while (!closed) {
-            var ids = new ArrayList<Long>();
-            Batch batch;
-            try {
-                batch = inTx(c, tx -> handOverBatch(tx, ids));
-            } catch (SQLException | RuntimeException e) {
-                // even a lock timeout: the hook may have answered, so it is called again, and the caller backs off
-                deferStillDue(c, ids, e);
-                throw e;
-            }
-            if (batch.failure() != null) {
-                telemetry.deadLetterHookFailed();
-                hookFailures.warn("outbox dead-letter hook failed on " + batch.claimed() + " letters of " + dead
-                        + "; they stay pending and are handed to it again after a backoff", batch.failure());
-                return;
-            }
-            for (var decision : batch.decisions()) {
-                telemetry.deadLetterDecision(name(decision));
-            }
-            if (batch.claimed() < batchSize) {
-                return;
-            }
+    /** One batch of due pending letters; whether it was full and the hook answered, so more may be due. */
+    private boolean handOver(Connection c) throws SQLException {
+        var ids = new ArrayList<Long>();
+        Batch batch;
+        try {
+            batch = inTx(c, tx -> handOverBatch(tx, ids));
+        } catch (SQLException | RuntimeException e) {
+            // even a lock timeout: the hook may have answered, so it is called again, and the caller backs off
+            deferStillDue(c, ids, e);
+            throw e;
         }
+        if (batch.failure() != null) {
+            telemetry.deadLetterHookFailed();
+            hookFailures.warn("outbox dead-letter hook failed on " + batch.claimed() + " letters of " + dead
+                    + "; they stay pending and are handed to it again after a backoff", batch.failure());
+            return false;
+        }
+        for (var decision : batch.decisions()) {
+            telemetry.deadLetterDecision(name(decision));
+        }
+        return batch.claimed() == batchSize;
     }
 
     /** {@code ids} gets the claimed letters' ids, for {@link #deferStillDue} should the transaction fail later. */
@@ -292,13 +296,13 @@ public final class DeadLetterPass {
     }
 
     /**
-     * Due scheduled letters, batch after batch until one is not full or deferred a held key's letter, which is due
-     * again within {@code initialDelay}: looping on would claim it again and again while the key is held. Returns how
-     * many were redriven.
+     * Due scheduled letters, at most {@code batches} batches, ending early with one that is not full or deferred a held
+     * key's letter, which is due again within {@code initialDelay}: looping on would claim it again and again while the
+     * key is held. Returns how many were redriven.
      */
-    private int redriveScheduled(Connection c) throws SQLException {
+    private int redriveScheduled(Connection c, int batches) throws SQLException {
         int redriven = 0;
-        while (!closed) {
+        for (int batch = 0; batch < batches && !closed; batch++) {
             var ids = new ArrayList<Long>();
             DeadLetters.Split split;
             try {

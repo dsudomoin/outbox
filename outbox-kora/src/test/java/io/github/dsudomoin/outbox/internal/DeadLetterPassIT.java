@@ -737,6 +737,64 @@ class DeadLetterPassIT {
         }
     }
 
+    @Test
+    void aSteadyStreamOfPendingLettersDoesNotHoldBackARedrive() throws Exception {
+        config.deadLettersBatchSize(1);
+        long scheduled = letter("t", "s", "due", List.of());
+        execute("update " + names.dead() + " set status = 'scheduled' where id = " + scheduled);
+        long decided = letter("t", "d", "decided", List.of());
+        var calls = new AtomicInteger();
+        var pass = pass(letters -> {
+            try { // every call brings one more pending letter, until both were redriven or the stream gave up
+                if (calls.incrementAndGet() < 20 && (status(scheduled) != null || status(decided) != null)) {
+                    letter("t", "n" + calls, "p", List.of());
+                }
+            } catch (SQLException e) {
+                throw new IllegalStateException(e);
+            }
+            return letters.stream().map(l -> l.id() == decided ? redrive() : keep()).toList();
+        });
+
+        int redriven = pool.submit(pass::runOnce).get(30, SECONDS);
+
+        assertThat(calls).as("the stream never ran dry: only the redrives could end it").hasValueLessThan(20);
+        assertThat(redriven).isEqualTo(2);
+        assertThat(status(scheduled)).isNull();
+        assertThat(status(decided)).isNull();
+        try (var c = TestDb.connect()) {
+            assertThat(queryLong(c, "select count(*) from " + names.dead() + " where status = 'pending'"))
+                    .as("the backlog goes on to its end").isZero();
+        }
+    }
+
+    @Test
+    void aRedriveBetweenPendingBatchesLeavesAHeldKeyDueWithoutEndingTheHandOver() throws Exception {
+        config.deadLettersBatchSize(1).retry(Duration.ofMillis(1), Duration.ofMillis(500), 0);
+        long scheduled = letter("t", "k", "held", List.of());
+        execute("update " + names.dead() + " set status = 'scheduled' where id = " + scheduled);
+        letter("t", "a", "p", List.of());
+        letter("t", "b", "p", List.of());
+        letter("t", "c", "p", List.of());
+        var commit = new CountDownLatch(1);
+        var sender = openSend("k", "live", commit);
+        var calls = new AtomicInteger();
+        var pass = pass(letters -> {
+            calls.incrementAndGet();
+            return all(letters, keep());
+        });
+        try {
+            assertThat(pool.submit(pass::runOnce).get(10, SECONDS)).isZero();
+        } finally {
+            commit.countDown();
+        }
+        sender.get(10, SECONDS);
+
+        assertThat(calls).as("every pending letter handed").hasValue(3);
+        assertThat(status(scheduled)).as("waits for its key").isEqualTo("scheduled");
+        var redriven = new AtomicInteger();
+        await(Duration.ofSeconds(5), () -> redriven.addAndGet(pass.runOnce()) == 1);
+    }
+
     /** A transaction that has sent {@code payload} with {@code key} on topic t and stays open until {@code commit}. */
     private Future<UUID> openSend(String key, String payload, CountDownLatch commit) throws Exception {
         var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
