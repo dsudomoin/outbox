@@ -227,6 +227,41 @@ class JdbcTransactionsIT {
                 "setAutoCommit(true)").doesNotContain("abort");
     }
 
+    @Test
+    void anErrorFromTheRollbackStillEndsTheConnectionAndLeavesTheCallsFailureOnTop() throws Exception {
+        var table = table();
+        var faulty = new Faulty("rollback");
+        faulty.thrown = new AssertionError("injected error");
+        var db = new JdbcTransactions(faulty.source());
+
+        assertThatThrownBy(() -> db.inTx(c -> {
+            insert(c, table);
+            throw new IllegalStateException("the call failed");
+        })).isInstanceOf(IllegalStateException.class).hasMessage("the call failed")
+                .satisfies(e -> assertThat(e.getSuppressed()).extracting(Throwable::getMessage)
+                        .containsExactly("injected error"));
+
+        assertThat(rows(table)).isZero();
+        assertThat(faulty.calls).contains("abort", "close");
+    }
+
+    @Test
+    void aDriverRethrowingTheCallsFailureFromTheRollbackStillEndsTheConnection() throws Exception {
+        var table = table();
+        var faulty = new Faulty("rollback");
+        var failure = new SQLException("the driver's own");
+        faulty.thrown = failure;
+        var db = new JdbcTransactions(faulty.source());
+
+        assertThatThrownBy(() -> db.inTx(c -> {
+            insert(c, table);
+            throw failure;
+        })).isInstanceOf(OutboxSqlException.class).hasCause(failure);
+
+        assertThat(rows(table)).isZero();
+        assertThat(faulty.calls).contains("abort", "close");
+    }
+
     private static String table() throws SQLException {
         var table = "jt_" + Long.toHexString(System.nanoTime());
         try (var c = TestDataSources.newDataSource().getConnection(); var st = c.createStatement()) {
@@ -257,6 +292,8 @@ class JdbcTransactionsIT {
     private static final class Faulty {
 
         final List<String> calls = new CopyOnWriteArrayList<>();
+        /** What {@code fault} throws, instead of an {@link SQLException} of its own. */
+        Throwable thrown;
         private final String fault;
         private final DataSource real = TestDataSources.newDataSource();
 
@@ -282,7 +319,7 @@ class JdbcTransactionsIT {
                             if (call.equals("close")) {
                                 c.close();
                             }
-                            throw new SQLException("injected " + call);
+                            throw thrown != null ? thrown : new SQLException("injected " + call);
                         }
                         return invoke(method, c, args);
                     });

@@ -63,11 +63,11 @@ public final class JdbcTransactions implements OutboxTransactions {
             c.commit();
         } catch (SQLException e) {
             current.remove();
-            release(c, true, e::addSuppressed);
+            release(c, true, suppressedInto(e));
             throw translate(e);
         } catch (Throwable t) {
             current.remove();
-            release(c, true, t::addSuppressed);
+            release(c, true, suppressedInto(t));
             throw t;
         }
         current.remove();
@@ -118,27 +118,36 @@ public final class JdbcTransactions implements OutboxTransactions {
      * Ends {@code c}'s use: rolls back when {@code rollback}, turns autocommit on and closes it. A connection whose
      * rollback or reset fails is aborted instead, as its state is unknown: with its session alive, turning autocommit
      * on would commit what the rollback left, and a pool would hand it out again. {@code failed} gets every failure,
-     * so none replaces the transaction's outcome, which is known by now.
+     * an {@link Error} too, so none replaces the transaction's outcome, which is known by now, or leaks the connection.
      */
-    private static void release(Connection c, boolean rollback, Consumer<Exception> failed) {
+    private static void release(Connection c, boolean rollback, Consumer<Throwable> failed) {
         try {
             if (rollback) {
                 c.rollback();
             }
             c.setAutoCommit(true);
-        } catch (SQLException | RuntimeException e) {
+        } catch (Throwable e) {
             failed.accept(e);
             try {
                 c.abort(Runnable::run);
-            } catch (SQLException | RuntimeException aborting) {
+            } catch (Throwable aborting) {
                 failed.accept(aborting);
             }
         }
         try {
             c.close();
-        } catch (SQLException | RuntimeException e) {
+        } catch (Throwable e) {
             failed.accept(e);
         }
+    }
+
+    /** Adds a cleanup's failure to {@code failure}, unless a driver threw that very exception again. */
+    private static Consumer<Throwable> suppressedInto(Throwable failure) {
+        return e -> {
+            if (e != failure) {
+                failure.addSuppressed(e);
+            }
+        };
     }
 
     /** A call in a transaction, on its connection. */
