@@ -18,6 +18,7 @@ import java.time.Duration;
 import java.util.function.Supplier;
 import javax.sql.DataSource;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ListableBeanFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
@@ -35,7 +36,9 @@ import org.springframework.core.env.Environment;
  * The outbox over the application's {@code DataSource} (the {@code @Primary} one of several), joining its
  * Spring-managed transactions, with settings under {@code outbox.*}. Records go to the {@link OutboxTopicHandler}
  * beans, each for the topics it claims, and every other topic to the {@link OutboxHandler} bean; dead letters to the
- * {@link OutboxDeadLetterHandler} bean, if any. The outbox runs with the context's lifecycle ({@link OutboxLifecycle}).
+ * {@link OutboxDeadLetterHandler} bean, if any. A handler bean behind a Spring AOP proxy is called through it, so that
+ * its advice ({@code @Transactional}, aspects) runs per record; the start fails when that advice could never run. The
+ * outbox runs with the context's lifecycle ({@link OutboxLifecycle}).
  * With {@code outbox.enabled=false} there is no outbox, the inbox only. {@link Inbox} is built, and its table created,
  * only when a bean injects it. With an {@link OutboxOwner} DataSource the DDL runs on that one. The heartbeat, which
  * keeps this instance's row fresh and reads the reports that guard routed sends, gets a pool of its own, so business
@@ -81,14 +84,15 @@ public final class OutboxAutoConfiguration {
                 ObjectProvider<OutboxHandler> handler, ObjectProvider<OutboxTopicHandler> routes,
                 ObjectProvider<OutboxDeadLetterHandler> deadLetterHandler, ObjectProvider<OutboxTelemetry> telemetry,
                 @OutboxOwner ObjectProvider<DataSource> owner, @OutboxHeartbeat ObjectProvider<DataSource> heartbeat,
-                ObjectProvider<HeartbeatPools> heartbeatPools, Environment environment) {
+                ObjectProvider<HeartbeatPools> heartbeatPools, Environment environment, ListableBeanFactory beans) {
             var binder = Binder.get(environment);
             boolean dedicated = binder.bindOrCreate("outbox.heartbeat", OutboxProperties.Heartbeat.class)
                 .dedicatedConnection();
+            var handlers = HandlerBeans.collect(beans, handler, routes);
             Supplier<OutboxRuntime.Builder> builders = () -> {
-                var builder = OutboxRuntime.builder(config, transactions, handler.getIfUnique())
+                var builder = OutboxRuntime.builder(config, transactions, handlers.fallback())
                     .telemetry(telemetry(telemetry));
-                routes.orderedStream().forEach(builder::route);
+                handlers.routes().forEach(builder::route);
                 deadLetterHandler.ifAvailable(builder::deadLetterHandler);
                 owner.ifAvailable(ds -> builder.ownerConnections(SpringOutboxTransactions.autocommit(ds)));
                 return builder;
@@ -109,7 +113,9 @@ public final class OutboxAutoConfiguration {
                 }
                 Runnable closePool = pool != null ? pool.close() : () -> {};
                 try {
-                    return new OutboxLifecycle.Built(builder.build(), closePool);
+                    var built = new OutboxLifecycle.Built(builder.build(), closePool);
+                    handlers.logRoutes();
+                    return built;
                 } catch (RuntimeException | Error e) {
                     closePool.run();
                     throw e;
