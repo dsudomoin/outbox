@@ -50,7 +50,10 @@ README «Наблюдаемость» → «Контракт по этапам»
 
 Outbox gauges are refreshed by maintenance every `outbox.partitions.maintenanceInterval` on the instance that runs
 it; another instance keeps its previous values (NaN before its first run). `since_success` is read by every instance.
-Gauges register once per name: after a hot config reload that rebuilds outbox components they freeze, so restart.
+Gauges register once per name and read the latest runtime built around the same telemetry, so a hot config reload that
+rebuilds outbox components moves them along. A reload that rebuilds Kora's `Tracer` (a change under `tracing.*`)
+rebuilds the telemetry too: gauges then freeze on the old runtime and `since_success` grows until its alert fires, so
+restart.
 
 Dead letters: `outbox.dead.size` growing while `outbox.dead.pending` does not means kept letters pile up (no hook,
 the hook kept them, or the Kafka DLQ refused them): morning work. `outbox.dead.pending.oldest` above X while
