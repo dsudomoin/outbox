@@ -312,4 +312,76 @@ class HeartbeatConnectionsIT {
             return c;
         }
     }
+
+    @Test
+    void aSourceInAnotherTimeZoneIsCheckedAtStartAsOneDatabase() throws Exception {
+        var lane = new Recorded("lane", inZone("Europe/Moscow"), n -> false);
+        var connections = new HeartbeatConnections(new Recorded("app", MAIN, n -> false), lane);
+
+        try (var reference = inZone("UTC").getConnection()) {
+            connections.start(reference, TABLE);
+        }
+        try (var c = connections.newConnection()) {
+            assertThat(c).isSameAs(lane.opened.get(1));
+        }
+    }
+
+    @Test
+    void aSourceInAnotherTimeZoneFirstReachedByABeatIsOneDatabase() throws Exception {
+        var lane = new Recorded("lane", inZone("Europe/Moscow"), n -> n == 1);
+        var app = new Recorded("app", inZone("UTC"), n -> false);
+        var connections = new HeartbeatConnections(app, lane);
+        try (var reference = MAIN.getConnection()) {
+            connections.start(reference, TABLE);
+        }
+
+        try (var log = new CapturedStderr()) {
+            try (var c = connections.newConnection()) {
+                assertThat(c).isSameAs(lane.opened.get(0));
+            }
+            assertThat(log.text()).doesNotContain("reaches another database");
+        }
+        try (var c = connections.newConnection()) {
+            assertThat(c).isSameAs(lane.opened.get(1));
+        }
+    }
+
+    @Test
+    void anotherDatabaseIsRefusedAcrossTimeZonesToo() throws Exception {
+        var other = new PGSimpleDataSource() {
+            @Override
+            public Connection getConnection() throws SQLException {
+                var c = super.getConnection();
+                TestSql.execute(c, "set time zone 'Europe/Moscow'");
+                return c;
+            }
+        };
+        other.setUrl(TestDataSources.jdbcUrl());
+        other.setUser(TestDataSources.user());
+        other.setPassword(TestDataSources.password());
+        other.setDatabaseName(OTHER);
+        var connections = new HeartbeatConnections(new Recorded("app", MAIN, n -> false),
+                new Recorded("lane", other, n -> false));
+
+        try (var reference = inZone("UTC").getConnection()) {
+            assertThatThrownBy(() -> connections.start(reference, TABLE)).isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("reaches another database than the application's");
+        }
+    }
+
+    /** Connections of the main database whose sessions run in {@code zone}. */
+    private static DataSource inZone(String zone) {
+        var ds = new PGSimpleDataSource() {
+            @Override
+            public Connection getConnection() throws SQLException {
+                var c = super.getConnection();
+                TestSql.execute(c, "set time zone '" + zone + "'");
+                return c;
+            }
+        };
+        ds.setUrl(TestDataSources.jdbcUrl());
+        ds.setUser(TestDataSources.user());
+        ds.setPassword(TestDataSources.password());
+        return ds;
+    }
 }

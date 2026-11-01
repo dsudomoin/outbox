@@ -134,14 +134,19 @@ final class SchemaCheck {
         }
     }
 
+    /**
+     * Where {@code c} reaches, as text two connections compare: the database, the server's start and what
+     * {@code table} resolves to. Only that resolution may differ by session (by its {@code search_path}, on purpose),
+     * so the start is written in UTC: in the session's {@code TimeZone} one server would read as two.
+     */
     static String where(Connection c, String table) throws SQLException {
-        try (var ps = c.prepareStatement("select current_database(), pg_postmaster_start_time(),"
-                + " to_regclass(?)::oid")) {
+        try (var ps = c.prepareStatement("select current_database(), to_char(pg_postmaster_start_time()"
+                + " at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US'), to_regclass(?)::oid")) {
             ps.setString(1, table);
             try (var rs = ps.executeQuery()) {
                 rs.next();
                 var oid = rs.getString(3);
-                return "database " + rs.getString(1) + " of the server started " + rs.getString(2) + ", "
+                return "database " + rs.getString(1) + " of the server started " + rs.getString(2) + " UTC, "
                         + (oid == null ? "no table " + table : "table " + table + " oid " + oid);
             }
         }

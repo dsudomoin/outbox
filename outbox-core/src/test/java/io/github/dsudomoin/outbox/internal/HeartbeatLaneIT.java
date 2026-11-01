@@ -229,4 +229,33 @@ class HeartbeatLaneIT {
         @Override
         public void handle(OutboxRecord record) {}
     }
+
+    @Test
+    void aSourceInAnotherTimeZoneStartsTheRuntime() throws Exception {
+        var config = new TestOutboxConfig().relayEnabled(false);
+        try (var runtime = OutboxRuntime.builder(config, new JdbcTransactions(zoned("UTC")), null).route(new Audit())
+                .heartbeatConnections(zoned("Europe/Moscow")::getConnection).build()) {
+            runtime.start();
+
+            try (var c = DIRECT.getConnection()) {
+                assertThat(TestSql.queryLong(c, "select count(*) from " + runtime.schema().names().instance()))
+                        .isOne();
+            }
+        }
+    }
+
+    private static DataSource zoned(String zone) {
+        var ds = new PGSimpleDataSource() {
+            @Override
+            public Connection getConnection() throws SQLException {
+                var c = super.getConnection();
+                TestSql.execute(c, "set time zone '" + zone + "'");
+                return c;
+            }
+        };
+        ds.setUrl(TestDataSources.jdbcUrl());
+        ds.setUser(TestDataSources.user());
+        ds.setPassword(TestDataSources.password());
+        return ds;
+    }
 }

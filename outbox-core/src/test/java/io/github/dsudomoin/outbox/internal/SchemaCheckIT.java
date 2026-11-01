@@ -87,4 +87,34 @@ class SchemaCheckIT {
                             + " OutboxSql.outbox)");
         }
     }
+
+    @Test
+    void oneDatabaseUnderTwoTimeZonesIsOneDatabase() throws Exception {
+        var source = TestDataSources.newDataSource();
+        var table = "t" + TestSql.uniqueTable();
+        try (var utc = source.getConnection(); var moscow = source.getConnection()) {
+            TestSql.execute(utc, "set time zone 'UTC'");
+            TestSql.execute(moscow, "set time zone 'Europe/Moscow'");
+
+            SchemaCheck.requireSameDatabase(utc, moscow, table);
+        }
+    }
+
+    @Test
+    void aNameResolvedToAnotherTableIsStillRefusedAcrossTimeZones() throws Exception {
+        var source = TestDataSources.newDataSource();
+        var table = "t" + TestSql.uniqueTable();
+        var schema = "s" + TestSql.uniqueTable();
+        try (var utc = source.getConnection(); var moscow = source.getConnection()) {
+            TestSql.execute(utc, "create schema " + schema);
+            TestSql.execute(utc, "create table public." + table + " (id int)");
+            TestSql.execute(utc, "create table " + schema + "." + table + " (id int)");
+            TestSql.execute(utc, "set time zone 'UTC'");
+            TestSql.execute(moscow, "set time zone 'Europe/Moscow'; set search_path = " + schema);
+
+            assertThatThrownBy(() -> SchemaCheck.requireSameDatabase(utc, moscow, table))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("reaches another database than the application's");
+        }
+    }
 }
