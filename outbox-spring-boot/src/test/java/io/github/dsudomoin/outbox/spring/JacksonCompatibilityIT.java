@@ -48,22 +48,18 @@ class JacksonCompatibilityIT {
 
     public record Amount(BigDecimal amount) {}
 
-    /** Not a record: its properties have no creator order. */
+    /** Not a record: its properties have no creator order. Fields, as the order of getters depends on the JVM. */
     public static class Bean {
 
-        public String getZ() {
-            return "z";
-        }
-
-        public String getA() {
-            return "a";
-        }
+        public String z = "z";
+        public String a = "a";
     }
 
     private static final Payload PAYLOAD = new Payload(Instant.parse("2026-11-02T10:15:30.123456789Z"),
         LocalDate.of(2026, 11, 2), Duration.ofSeconds(90, 5), Status.ACTIVE, new BigDecimal("12.50"), null);
     private static final String PAYLOAD_JSON = "{\"instant\":\"2026-11-02T10:15:30.123456789Z\","
-        + "\"date\":\"2026-11-02\",\"duration\":\"PT1M30.000000005S\",\"status\":\"ACTIVE\",\"amount\":12.50,\"note\":null}";
+        + "\"date\":\"2026-11-02\",\"duration\":\"PT1M30.000000005S\",\"status\":\"ACTIVE\",\"amount\":12.50,"
+        + "\"note\":null}";
 
     @BeforeAll
     static void bootsMappers() throws Exception {
@@ -169,9 +165,13 @@ class JacksonCompatibilityIT {
             .hasMessageContaining("from String \"active-label\"");
     }
 
-    /** Difference: a class's properties in Jackson 3 are sorted alphabetically; records keep their order on both. */
+    /**
+     * Difference: a class's fields stay in declaration order on Jackson 2 and are sorted alphabetically on Jackson 3.
+     * Records keep their order on both ({@link #datesEnumDecimalsAndNullsWriteTheSameJson}). Jackson 2's order of
+     * getters follows the JVM's method layout, so no assertion here states one.
+     */
     @Test
-    void beanPropertyOrder() throws Exception {
+    void classFieldOrderIsDeclaredOnJackson2AndSortedOnJackson3() throws Exception {
         assertThat(jackson2.writeValueAsString(new Bean())).isEqualTo("{\"z\":\"z\",\"a\":\"a\"}");
         assertThat(jackson3.writeValueAsString(new Bean())).isEqualTo("{\"a\":\"a\",\"z\":\"z\"}");
     }
