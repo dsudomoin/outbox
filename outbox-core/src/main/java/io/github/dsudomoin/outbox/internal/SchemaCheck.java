@@ -12,8 +12,9 @@ import org.slf4j.LoggerFactory;
 
 /**
  * The startup check of base objects the application's migrations own ({@code outbox.schema.bootstrap = false}): every
- * table, column (type, nullability, default expression as {@code pg_get_expr} prints it, identity), index, primary key
- * and partition key of {@link SchemaObjects} as this version needs it; DML rights on every table (and {@code SELECT} on
+ * table, column (type, nullability, default expression as {@code pg_get_expr} prints it, identity), index (its table,
+ * key and predicate), primary key (its columns) and partition key of {@link SchemaObjects} as this version needs it;
+ * DML rights on every table (and {@code SELECT} on
  * the outbox's id sequence) for the role of {@code app}; and for the role of {@code ddl}, which makes and drops the
  * partitions, membership of the partitioned table's owner and {@code CREATE} on its schema. With an owner source, a
  * WARN when the application role may create where the owner's sessions resolve functions. What it does not know, a
@@ -24,6 +25,7 @@ final class SchemaCheck {
 
     private static final Logger log = LoggerFactory.getLogger(SchemaCheck.class);
     private static final List<String> DML = List.of("SELECT", "INSERT", "UPDATE", "DELETE");
+    private static final String PRIMARY_KEY = "primary key ";
 
     private SchemaCheck() {}
 
@@ -46,14 +48,9 @@ final class SchemaCheck {
             }
             columns(app, oid, t, render, problems);
             for (var index : t.indexes()) {
-                if (oid(app, index.name()) == null) {
-                    problems.add("index " + index.name() + " is missing" + fix(index.since(), render));
-                }
+                index(app, oid, t, index, render, problems);
             }
-            if (!t.constraints().isEmpty() && !bool(app, "select exists (select 1 from pg_index where indrelid ="
-                    + " ?::oid and indisprimary)", oid)) {
-                problems.add(t.name() + " has no primary key" + fix(t.since(), render));
-            }
+            primaryKey(app, oid, t, render, problems);
             var missing = new ArrayList<String>();
             for (var privilege : DML) {
                 if (!bool(app, "select has_table_privilege(?::oid, '" + privilege + "')", oid)) {
@@ -192,6 +189,72 @@ final class SchemaCheck {
                 problems.add("column " + name + " has default " + a.defaultValue() + ", not " + column.defaultValue());
             }
         }
+    }
+
+    /**
+     * {@code index} exists, on table {@code oid}, not unique, with the required key and predicate. Storage options and
+     * the tablespace are the migration's to choose, and an INVALID {@code <dead>_due} is {@link DeadIndexBuilder}'s.
+     */
+    private static void index(Connection c, long oid, SchemaObjects.Table t, SchemaObjects.Index index, String render,
+            List<String> problems) throws SQLException {
+        Long own = oid(c, index.name());
+        if (own == null) {
+            problems.add("index " + index.name() + " is missing" + fix(index.since(), render));
+            return;
+        }
+        try (var ps = c.prepareStatement("select i.indrelid = ?::oid, i.indrelid::regclass::text, i.indisunique,"
+                + " '(' || " + keyOf("i") + " || ')' || coalesce(' where ' || pg_get_expr(i.indpred, i.indrelid, true),"
+                + " '') from pg_index i where i.indexrelid = ?::oid")) {
+            ps.setLong(1, oid);
+            ps.setLong(2, own);
+            try (var rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    problems.add(index.name() + " is no index");
+                } else if (!rs.getBoolean(1)) {
+                    problems.add("index " + index.name() + " is on " + rs.getString(2) + ", not on " + t.name());
+                } else {
+                    if (rs.getBoolean(3)) {
+                        problems.add("index " + index.name() + " is unique, and this version needs it not to be");
+                    }
+                    if (!sameDefinition(rs.getString(4), index.definition())) {
+                        problems.add("index " + index.name() + " is " + rs.getString(4) + ", not "
+                                + index.definition());
+                    }
+                }
+            }
+        }
+    }
+
+    /** The primary key {@code t} requires, if any, on exactly its columns: an upsert's conflict target needs them. */
+    private static void primaryKey(Connection c, long oid, SchemaObjects.Table t, String render, List<String> problems)
+            throws SQLException {
+        var required = t.constraints().stream().filter(constraint -> constraint.startsWith(PRIMARY_KEY)).findFirst();
+        if (required.isEmpty()) {
+            return;
+        }
+        var actual = string(c, "select (select " + keyOf("i") + " from pg_index i where i.indrelid = ?::oid and"
+                + " i.indisprimary)", oid); // one row, null without a primary key
+        if (actual == null) {
+            problems.add(t.name() + " has no primary key" + fix(t.since(), render));
+        } else if (!sameDefinition(actual, required.get().substring(PRIMARY_KEY.length()))) {
+            problems.add(t.name() + " has primary key (" + actual + "), not "
+                    + required.get().substring(PRIMARY_KEY.length()));
+        }
+    }
+
+    /** SQL: the key columns and expressions of the {@code pg_index} row {@code i}, as Postgres prints them. */
+    private static String keyOf(String i) {
+        return "(select string_agg(pg_get_indexdef(" + i + ".indexrelid, k, true), ', ' order by k) from"
+                + " generate_series(1, " + i + ".indnkeyatts) k)";
+    }
+
+    /** Equal but for what Postgres adds when it prints a definition: parentheses, quotes, case and spacing. */
+    private static boolean sameDefinition(String actual, String required) {
+        return canonical(actual).equals(canonical(required));
+    }
+
+    private static String canonical(String definition) {
+        return definition.toLowerCase(Locale.ROOT).replaceAll("[()\"\\s]", "");
     }
 
     /** Partition DDL needs the parent's owner role (or membership of it) and {@code CREATE} on its schema. */
