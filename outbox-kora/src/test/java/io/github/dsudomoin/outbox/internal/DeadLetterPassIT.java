@@ -768,6 +768,35 @@ class DeadLetterPassIT {
     }
 
     @Test
+    void aLockTimeoutBetweenPendingBatchesEndsTheRedrivePhaseOfTheRun() throws Exception {
+        config.deadLettersBatchSize(1).swapLockTimeout(Duration.ofMillis(100))
+                .retry(Duration.ofHours(1), Duration.ofHours(1), 0);
+        long first = letter("t", "s1", "due", List.of());
+        long second = letter("t", "s2", "due", List.of());
+        execute("update " + names.dead() + " set status = 'scheduled' where id in (" + first + ", " + second + ")");
+        letter("t", "a", "p", List.of());
+        letter("t", "b", "p", List.of());
+        letter("t", "c", "p", List.of());
+        var calls = new AtomicInteger();
+        var pass = pass(letters -> {
+            calls.incrementAndGet();
+            return all(letters, keep());
+        });
+
+        try (var locker = TestDb.connect()) {
+            locker.setAutoCommit(false);
+            TestSql.execute(locker, "lock table " + names.base() + " in access exclusive mode");
+            assertThat(pool.submit(pass::runOnce).get(30, SECONDS)).isZero();
+            locker.rollback();
+        }
+
+        assertThat(calls).as("the hand-over goes on").hasValue(3);
+        var now = dbNow();
+        assertThat(dueAt(first)).as("the batch that timed out is due later").isAfter(now);
+        assertThat(dueAt(second)).as("no other batch waited on the lock").isBeforeOrEqualTo(now);
+    }
+
+    @Test
     void aRedriveBetweenPendingBatchesLeavesAHeldKeyDueWithoutEndingTheHandOver() throws Exception {
         config.deadLettersBatchSize(1).retry(Duration.ofMillis(1), Duration.ofMillis(500), 0);
         long scheduled = letter("t", "k", "held", List.of());
@@ -778,8 +807,16 @@ class DeadLetterPassIT {
         var commit = new CountDownLatch(1);
         var sender = openSend("k", "live", commit);
         var calls = new AtomicInteger();
+        var seeded = dueAt(scheduled);
+        var triedBetween = new AtomicBoolean();
         var pass = pass(letters -> {
-            calls.incrementAndGet();
+            try { // by the second call the redrive batch between them has met the key and deferred the letter
+                if (calls.incrementAndGet() == 2) {
+                    triedBetween.set(dueAt(scheduled).isAfter(seeded));
+                }
+            } catch (SQLException e) {
+                throw new IllegalStateException(e);
+            }
             return all(letters, keep());
         });
         try {
@@ -790,6 +827,7 @@ class DeadLetterPassIT {
         sender.get(10, SECONDS);
 
         assertThat(calls).as("every pending letter handed").hasValue(3);
+        assertThat(triedBetween).isTrue();
         assertThat(status(scheduled)).as("waits for its key").isEqualTo("scheduled");
         var redriven = new AtomicInteger();
         await(Duration.ofSeconds(5), () -> redriven.addAndGet(pass.runOnce()) == 1);

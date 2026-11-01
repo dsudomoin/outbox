@@ -94,6 +94,14 @@ public final class DeadLetterPass {
     /** A committed hand-over: the letters claimed; the call's failure, or the decisions it committed. */
     private record Batch(int claimed, @Nullable Throwable failure, List<DeadLetterDecision> decisions) {}
 
+    /** Letters redriven so far in a run; {@code blocked}: a lock timeout ended its redrive phase. */
+    private record Redriven(int count, boolean blocked) {
+
+        Redriven plus(Redriven next) {
+            return new Redriven(count + next.count, next.blocked);
+        }
+    }
+
     public DeadLetterPass(OutboxTransactions db, TableNames names, OutboxConfig config,
             @Nullable OutboxDeadLetterHandler hook, OutboxTelemetry telemetry) {
         OutboxSchema.validate(config);
@@ -167,12 +175,14 @@ public final class DeadLetterPass {
     /** One run under {@link #running}. */
     private int run() {
         try (var c = db.newConnection()) {
-            int redriven = 0;
+            var redriven = new Redriven(0, false);
             if (active()) {
                 // a redrive batch after each full one, as pending letters may keep coming: due redrives, those just
                 // decided included, would wait for a phase of their own until they stop
                 while (!closed && handOver(c)) {
-                    redriven += redriveScheduled(c, 1);
+                    if (!redriven.blocked()) {
+                        redriven = redriven.plus(redriveScheduled(c, 1));
+                    }
                 }
             } else {
                 inTx(c, tx -> {
@@ -181,7 +191,8 @@ public final class DeadLetterPass {
                     }
                 });
             }
-            return redriven + redriveScheduled(c, Integer.MAX_VALUE);
+            return redriven.blocked() ? redriven.count()
+                    : redriven.plus(redriveScheduled(c, Integer.MAX_VALUE)).count();
         } catch (SQLException e) {
             throw db.translate(e);
         }
@@ -298,9 +309,9 @@ public final class DeadLetterPass {
     /**
      * Due scheduled letters, at most {@code batches} batches, ending early with one that is not full or deferred a held
      * key's letter, which is due again within {@code initialDelay}: looping on would claim it again and again while the
-     * key is held. Returns how many were redriven.
+     * key is held.
      */
-    private int redriveScheduled(Connection c, int batches) throws SQLException {
+    private Redriven redriveScheduled(Connection c, int batches) throws SQLException {
         int redriven = 0;
         for (int batch = 0; batch < batches && !closed; batch++) {
             var ids = new ArrayList<Long>();
@@ -311,16 +322,16 @@ public final class DeadLetterPass {
                 deferStillDue(c, ids, e);
                 if (e instanceof SQLException s && blocked(s)) {
                     // no key lock is waited for, so it was a table's lock, which the batches after it would wait for
-                    return redriven;
+                    return new Redriven(redriven, true);
                 }
                 throw e;
             }
             redriven += split.ready().size();
             if (ids.size() < batchSize || !split.held().isEmpty()) {
-                return redriven;
+                return new Redriven(redriven, false);
             }
         }
-        return redriven;
+        return new Redriven(redriven, false);
     }
 
     /**
