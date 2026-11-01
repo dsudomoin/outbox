@@ -57,6 +57,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 class TransactionalHandlerIT {
 
     private static final Duration WAIT = Duration.ofSeconds(20);
+    private static final String JDK = "spring.aop.proxy-target-class=false";
     private static final String ROLLBACK_FIX = "use @Transactional(rollbackFor = Exception.class) without"
         + " noRollbackFor, or @EnableTransactionManagement(rollbackOn = RollbackOn.ALL_EXCEPTIONS)";
     private static final String BATCH_FIX = "put @Transactional(rollbackFor = Exception.class) on handle and keep the"
@@ -195,6 +196,7 @@ class TransactionalHandlerIT {
 
         private final Effects effects;
         private final TransactionTemplate transaction;
+        final List<Integer> calls = new CopyOnWriteArrayList<>();
 
         TemplatePerRecord(Effects effects, TransactionTemplate transaction) {
             this.effects = effects;
@@ -213,6 +215,7 @@ class TransactionalHandlerIT {
 
         @Override
         public List<Outcome> handleBatch(List<OutboxRecord> records) {
+            calls.add(records.size());
             var outcomes = new ArrayList<Outcome>();
             for (var record : records) { // distinct keys here: no failed key to skip
                 try {
@@ -387,6 +390,63 @@ class TransactionalHandlerIT {
         protected void handleTombstone(OutboxRecord record) {}
     }
 
+    static class MandatoryRollbackFor extends Orders {
+
+        @Override
+        @Transactional(rollbackFor = Exception.class, propagation = Propagation.MANDATORY)
+        public void handle(OutboxRecord record) {}
+    }
+
+    /** The only place a typed handler's {@code handle(OutboxRecord)}, which is final, can take an annotation. */
+    interface PlainOnInterface extends OutboxTopicHandler {
+
+        @Override
+        @Transactional
+        void handle(OutboxRecord record) throws Exception;
+    }
+
+    interface RollbackForOnInterface extends OutboxTopicHandler {
+
+        @Override
+        @Transactional(rollbackFor = Exception.class)
+        void handle(OutboxRecord record) throws Exception;
+    }
+
+    static class TypedPlainOnInterface extends TypedOrders implements PlainOnInterface {
+
+        @Override
+        protected void handle(Audit event, OutboxRecord record) {}
+    }
+
+    static class UnrelatedBase {
+
+        public void handle(OutboxRecord record) throws Exception {}
+    }
+
+    /** Its {@code handle} is not declared under the interface. */
+    static class PlainOnInterfaceViaBase extends UnrelatedBase implements PlainOnInterface {
+
+        @Override
+        public Set<String> topics() {
+            return Set.of("orders");
+        }
+    }
+
+    static class TypedRollbackForOnInterface extends TypedOutboxTopicHandler<Audit> implements RollbackForOnInterface {
+
+        private final Effects effects;
+
+        TypedRollbackForOnInterface(Effects effects) {
+            super(Set.of("orders"), (topic, payload) -> new Audit(new String(payload, UTF_8)));
+            this.effects = effects;
+        }
+
+        @Override
+        protected void handle(Audit event, OutboxRecord record) throws Exception {
+            effects.apply(record);
+        }
+    }
+
     static class WovenRollbackFor extends Orders {
 
         @Override
@@ -440,7 +500,7 @@ class TransactionalHandlerIT {
     static class TemplatePerRecordApp {
 
         @Bean
-        OutboxTopicHandler handler(Effects effects, PlatformTransactionManager transactions) {
+        TemplatePerRecord handler(Effects effects, PlatformTransactionManager transactions) {
             return new TemplatePerRecord(effects, new TransactionTemplate(transactions));
         }
     }
@@ -460,6 +520,15 @@ class TransactionalHandlerIT {
         @Bean
         FollowUps followUps() {
             return new FollowUps();
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class TypedRollbackForOnInterfaceApp {
+
+        @Bean
+        OutboxTopicHandler handler(Effects effects) {
+            return new TypedRollbackForOnInterface(effects);
         }
     }
 
@@ -615,7 +684,7 @@ class TransactionalHandlerIT {
 
     @Test
     void plainTransactionalHandleRefusedOnInterfaceProxy() {
-        starting("refused", OutboxTopicHandler.class, new PlainHandle(), "spring.aop.proxy-target-class=false")
+        starting("refused", OutboxTopicHandler.class, new PlainHandle(), JDK)
             .run(context -> assertThat(failure(context)).contains("refused").contains("handle(OutboxRecord)")
                 .contains(ROLLBACK_FIX));
     }
@@ -664,6 +733,25 @@ class TransactionalHandlerIT {
     }
 
     @Test
+    void mandatoryRefused() {
+        starting("refused", OutboxTopicHandler.class, new MandatoryRollbackFor()).run(context ->
+            assertThat(failure(context)).contains("refused").contains("handle(OutboxRecord)").contains("MANDATORY"));
+    }
+
+    @Test
+    void plainOnInterfaceRefusedOnInterfaceProxy() {
+        starting("refused", OutboxTopicHandler.class, new TypedPlainOnInterface(), JDK).run(context ->
+            assertThat(failure(context)).contains("refused").contains("handle(OutboxRecord)").contains(ROLLBACK_FIX));
+        starting("refused", OutboxTopicHandler.class, new PlainOnInterfaceViaBase(), JDK).run(context ->
+            assertThat(failure(context)).contains("refused").contains("handle(OutboxRecord)").contains(ROLLBACK_FIX));
+    }
+
+    @Test
+    void rollbackForOnInterfaceRollsBackOnInterfaceProxy() throws Exception {
+        app(TypedRollbackForOnInterfaceApp.class, JDK).run(context -> assertRetriedFromNothing(context));
+    }
+
+    @Test
     void requiresNewPlainRefused() {
         starting("refused", OutboxTopicHandler.class, new RequiresNewPlain()).run(context ->
             assertThat(failure(context)).contains("refused").contains("handle(OutboxRecord)").contains(ROLLBACK_FIX));
@@ -708,7 +796,7 @@ class TransactionalHandlerIT {
 
     @Test
     void templatePerRecordInBatch() throws Exception {
-        app(TemplatePerRecordApp.class).run(context -> {
+        app(TemplatePerRecordApp.class, "outbox.shards=1").run(context -> { // one shard: one call for the three keys
             var effects = effects(context);
             effects.step = attempt -> {
                 if (attempt == 2) {
@@ -718,7 +806,8 @@ class TransactionalHandlerIT {
             sendThree(context, "a", "b", "c");
             await().atMost(WAIT).until(() -> effects.rows() == 3);
             awaitSettled(context);
-            assertThat(effects.attempts).hasValue(4);
+            assertThat(context.getBean(TemplatePerRecord.class).calls.get(0)).isEqualTo(3);
+            assertThat(effects.rowsBefore).containsExactly(0L, 1L, 1L, 2L); // a and c committed, b rolled back
             assertThat(effects.accepted).containsExactly(true, true, true, true);
         });
     }

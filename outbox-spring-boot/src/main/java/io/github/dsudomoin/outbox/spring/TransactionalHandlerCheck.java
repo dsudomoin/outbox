@@ -24,14 +24,14 @@ import org.springframework.transaction.interceptor.TransactionAttributeSource;
  * Keeps a handler's transaction in line with what the relay records: an exception leaving a method on the relay's path
  * means the record failed, so the transaction must roll back on every exception, or its Inbox marker would commit and
  * skip the retry. An overridden {@code handleBatch} must not run in one transaction: that commits the records it
- * returns as not delivered too. Policies come from the transaction interceptors of the bean's proxies, global rollback
- * rules included; for a bean without one, as under AspectJ weaving, from the context's
- * {@link TransactionAttributeSource} beans. Transactions opened further down, by a service the handler calls, are out
- * of its sight.
+ * returns as not delivered too. Nor can a method require a transaction already bound: the relay's handler thread has
+ * none. Policies come from the transaction interceptors of the bean's proxies, global rollback rules included; for a
+ * bean without one, as under AspectJ weaving, from the context's {@link TransactionAttributeSource} beans. Transactions
+ * opened further down, by a service the handler calls, are out of its sight.
  */
 final class TransactionalHandlerCheck {
 
-    /** The propagations that give a method a transaction; the relay's handler thread has none to join or suspend. */
+    /** The propagations a method runs in a transaction under, or fails without one: the handler thread has none. */
     private static final Set<Integer> BEGINS_OR_JOINS = Set.of(TransactionDefinition.PROPAGATION_REQUIRED,
         TransactionDefinition.PROPAGATION_REQUIRES_NEW, TransactionDefinition.PROPAGATION_NESTED,
         TransactionDefinition.PROPAGATION_MANDATORY);
@@ -51,7 +51,14 @@ final class TransactionalHandlerCheck {
             }
         }
         for (var method : handler.relayPath()) {
-            if (!attributes(handler, method, beans).stream().allMatch(TransactionalHandlerCheck::rollsBackAlways)) {
+            var attributes = attributes(handler, method, beans);
+            if (attributes.stream()
+                    .anyMatch(a -> a.getPropagationBehavior() == TransactionDefinition.PROPAGATION_MANDATORY)) {
+                throw new IllegalArgumentException("outbox handler bean " + handler + ": " + signature(method)
+                    + " has propagation MANDATORY, but the relay calls handlers on a thread with no transaction, so"
+                    + " every attempt would fail with IllegalTransactionStateException: use REQUIRED or REQUIRES_NEW");
+            }
+            if (!attributes.stream().allMatch(TransactionalHandlerCheck::rollsBackAlways)) {
                 throw new IllegalArgumentException("outbox handler bean " + handler + ": " + signature(method)
                     + " runs in a transaction that commits on some exception, while the relay retries the record, and"
                     + " an Inbox marker committed with it would skip the retry and lose the work: use"
@@ -67,28 +74,39 @@ final class TransactionalHandlerCheck {
                 && rules.getRollbackRules().stream().anyMatch(NoRollbackRuleAttribute.class::isInstance));
     }
 
-    /** The transactions {@code method} runs in: one per interceptor applying to it, nested proxies included. */
+    /**
+     * The transactions {@code method} runs in: one per interceptor applying to it, nested proxies included. An
+     * interface-based proxy dispatches the proxied interface's method, and Spring may find the annotation only there.
+     */
     private static List<TransactionAttribute> attributes(Handler handler, Method method, ListableBeanFactory beans) {
         var targetClass = handler.targetClass();
-        var sources = new ArrayList<TransactionAttributeSource>();
+        var attributes = new ArrayList<TransactionAttribute>();
         boolean intercepted = false;
         for (var bean = handler.bean(); AopUtils.isAopProxy(bean); bean = AopProxyUtils.getSingletonTarget(bean)) {
             var proxy = (Advised) bean;
+            var dispatched = new ArrayList<>(List.of(method));
+            if (AopUtils.isJdkDynamicProxy(proxy)) {
+                dispatched.addAll(HandlerBeans.namesakes(proxy.getProxiedInterfaces(), method));
+            }
             for (var advisor : proxy.getAdvisors()) {
                 if (advisor.getAdvice() instanceof TransactionAspectSupport interceptor) {
                     intercepted = true;
-                    if (HandlerBeans.matches(proxy, advisor, method, targetClass)) {
-                        sources.add(interceptor.getTransactionAttributeSource());
+                    var source = interceptor.getTransactionAttributeSource();
+                    for (var m : dispatched) {
+                        if (source != null && HandlerBeans.matches(proxy, advisor, m, targetClass)) {
+                            attributes.add(source.getTransactionAttribute(m, targetClass));
+                        }
                     }
                 }
             }
         }
         if (!intercepted) {
-            sources.addAll(BeanFactoryUtils.beansOfTypeIncludingAncestors(beans, TransactionAttributeSource.class,
-                false, true).values());
+            for (var source : BeanFactoryUtils.beansOfTypeIncludingAncestors(beans, TransactionAttributeSource.class,
+                    false, true).values()) {
+                attributes.add(source.getTransactionAttribute(method, targetClass));
+            }
         }
-        return sources.stream().filter(Objects::nonNull)
-            .map(source -> source.getTransactionAttribute(method, targetClass)).filter(Objects::nonNull)
+        return attributes.stream().filter(Objects::nonNull)
             .filter(attribute -> BEGINS_OR_JOINS.contains(attribute.getPropagationBehavior())).toList();
     }
 }

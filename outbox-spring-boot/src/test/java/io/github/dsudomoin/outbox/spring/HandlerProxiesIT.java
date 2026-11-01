@@ -278,6 +278,38 @@ class HandlerProxiesIT {
         public void handle(AuditEvent event, OutboxRecord record) {}
     }
 
+    interface TxOnInterface extends OutboxTopicHandler {
+
+        @Override
+        @Transactional(rollbackFor = Exception.class)
+        void handle(OutboxRecord record) throws Exception;
+    }
+
+    /** Its {@code handle(OutboxRecord)} is the final one, which a class-based proxy cannot intercept. */
+    static class TypedTxOnInterface extends TypedOutboxTopicHandler<AuditEvent> implements TxOnInterface {
+
+        TypedTxOnInterface() {
+            super(Set.of("audit"), HandlerProxiesIT::decode);
+        }
+
+        @Override
+        protected void handle(AuditEvent event, OutboxRecord record) {}
+    }
+
+    static class UnrelatedBase {
+
+        public void handle(OutboxRecord record) {}
+    }
+
+    /** A class-based proxy calls the base's {@code handle}, in which Spring finds no annotation of the interface. */
+    static class ViaBaseTxOnInterface extends UnrelatedBase implements TxOnInterface {
+
+        @Override
+        public Set<String> topics() {
+            return Set.of("orders");
+        }
+    }
+
     /** Proxied for {@code other}; its final {@code handle} would run on the proxy's own instance. */
     static class FinalHandle implements OutboxTopicHandler {
 
@@ -586,6 +618,24 @@ class HandlerProxiesIT {
     }
 
     @Configuration(proxyBeanMethods = false)
+    static class TypedTxOnInterfaceApp {
+
+        @Bean
+        OutboxTopicHandler typedHandler() {
+            return new TypedTxOnInterface();
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class ViaBaseTxOnInterfaceApp {
+
+        @Bean
+        OutboxTopicHandler ordersRoute() {
+            return new ViaBaseTxOnInterface();
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
     static class FinalHandleApp {
 
         @Bean
@@ -724,6 +774,14 @@ class HandlerProxiesIT {
         app(TypedTxApp.class, JDK).run(context -> assertThat(failure(context)).contains("typedHandler")
             .contains("handle(" + AuditEvent.class.getSimpleName() + ", OutboxRecord)")
             .contains("spring.aop.proxy-target-class=true"));
+    }
+
+    @Test
+    void transactionalOnInterfaceFailsStartOnClassProxy() {
+        app(TypedTxOnInterfaceApp.class).run(context -> assertThat(failure(context)).contains("typedHandler")
+            .contains("handle(OutboxRecord)").contains("advise the hook"));
+        app(ViaBaseTxOnInterfaceApp.class).run(context -> assertThat(failure(context)).contains("ordersRoute")
+            .contains("handle(OutboxRecord)").contains("only through an interface"));
     }
 
     @Test

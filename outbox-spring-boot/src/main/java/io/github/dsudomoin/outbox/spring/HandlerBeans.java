@@ -13,6 +13,7 @@ import java.util.Arrays;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
@@ -183,7 +184,9 @@ final class HandlerBeans {
      * class-based proxy must not have one of them final: it would run on the proxy's own instance, whose fields are
      * unset. An advisor must match one of them, unless it matches no method of the relay's path at all, an inherited
      * {@code handleBatch} included; advice on another method too, such as an advisor for the whole class, runs on
-     * those it matches.
+     * those it matches. As a relay method counts its namesake on any interface of the target, where an advisor can
+     * match when the class's own method it does not; as a called method, on an interface-based proxy only, its namesake
+     * on a proxied interface, which is what that proxy dispatches; a class-based one dispatches the class's method.
      */
     private static Handler inspect(String name, Object bean) {
         var proxies = new ArrayList<Advised>();
@@ -220,7 +223,9 @@ final class HandlerBeans {
             called = List.of(path.get(2)); // handle(OutboxRecord)
         }
         var handler = new Handler(name, bean, target, List.copyOf(path));
+        var interfaces = ClassUtils.getAllInterfacesForClass(targetClass);
         for (var proxy : proxies) {
+            var dispatched = AopUtils.isJdkDynamicProxy(proxy) ? proxy.getProxiedInterfaces() : new Class<?>[0];
             if (AopUtils.isCglibProxy(proxy)) {
                 for (var m : called) {
                     if (Modifier.isFinal(m.getModifiers())) {
@@ -229,8 +234,10 @@ final class HandlerBeans {
                 }
             }
             for (var advisor : proxy.getAdvisors()) {
-                var matched = relayMethods.stream().filter(m -> matches(proxy, advisor, m, targetClass)).toList();
-                if (!matched.isEmpty() && called.stream().noneMatch(matched::contains)) {
+                var matched = relayMethods.stream()
+                    .filter(m -> matchesWith(interfaces, proxy, advisor, m, targetClass)).toList();
+                if (!matched.isEmpty()
+                        && called.stream().noneMatch(m -> matchesWith(dispatched, proxy, advisor, m, targetClass))) {
                     throw unreachable(handler, proxy, advisor, matched.get(0));
                 }
             }
@@ -306,6 +313,19 @@ final class HandlerBeans {
         return true;
     }
 
+    private static boolean matchesWith(Class<?>[] interfaces, Advised proxy, Advisor advisor, Method method,
+            Class<?> targetClass) {
+        return matches(proxy, advisor, method, targetClass) || namesakes(interfaces, method).stream()
+            .anyMatch(namesake -> matches(proxy, advisor, namesake, targetClass));
+    }
+
+    /** The methods of {@code interfaces} with {@code method}'s signature. */
+    static List<Method> namesakes(Class<?>[] interfaces, Method method) {
+        return Arrays.stream(interfaces)
+            .map(type -> ClassUtils.getMethodIfAvailable(type, method.getName(), method.getParameterTypes()))
+            .filter(Objects::nonNull).toList();
+    }
+
     private static IllegalArgumentException finalCalled(Handler handler, Method method) {
         var fix = method.getDeclaringClass() == TypedOutboxTopicHandler.class
             ? "give the bean class-based proxies only, or interface-based ones only" : "make it not final";
@@ -326,9 +346,13 @@ final class HandlerBeans {
             why = "the relay calls only handle(OutboxRecord) on an interface-based (JDK) proxy, and the target then"
                 + " calls its hooks on itself: set spring.aop.proxy-target-class=true (class-based proxies, Spring"
                 + " Boot's default), or advise handle(OutboxRecord) instead";
-        } else {
+        } else if (Modifier.isFinal(method.getModifiers())) {
             why = "a class-based proxy cannot intercept the final handle(OutboxRecord): advise the hook"
                 + " handle(T, OutboxRecord) or handleTombstone instead";
+        } else {
+            why = "a class-based proxy calls the class's own method, which the advisor matches only through an"
+                + " interface: advise the method where the class declares it, or set"
+                + " spring.aop.proxy-target-class=false";
         }
         return new IllegalArgumentException("outbox handler bean " + handler + ": advisor " + advisor + " matches "
             + signature(method) + " but no method the relay calls on its proxy, so the advice would never run; " + why);
