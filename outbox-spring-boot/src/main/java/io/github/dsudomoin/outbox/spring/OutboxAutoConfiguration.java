@@ -39,6 +39,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Fallback;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.context.annotation.Scope;
+import org.springframework.core.ResolvableType;
 import org.springframework.core.env.Environment;
 
 /**
@@ -170,10 +171,21 @@ public final class OutboxAutoConfiguration {
             return new LifecycleOutboxAdmin(lifecycle);
         }
 
-        /** The relay of the runtime current when first injected, after the start: for tests and later code. */
+        /**
+         * The relay of the latest start, per lookup: for tests and later code. Before the first start there is none: an
+         * injection of the relay fails saying so; a scan, or a collection of beans, finds no bean.
+         */
         @Bean(destroyMethod = "") // the lifecycle closes it
-        @Lazy
-        OutboxRelay outboxRelay(OutboxLifecycle lifecycle) {
+        @Scope(ConfigurableBeanFactory.SCOPE_PROTOTYPE)
+        @Nullable
+        OutboxRelay outboxRelay(OutboxLifecycle lifecycle, AutowireCapableBeanFactory factory) {
+            if (!lifecycle.started()) {
+                var injectionPoint = TypedBeans.injectionPoint(factory);
+                if (injectionPoint == null
+                        || injectionPoint.getResolvableType().as(OutboxRelay.class) == ResolvableType.NONE) {
+                    return null;
+                }
+            }
             return lifecycle.runtime().relay();
         }
 

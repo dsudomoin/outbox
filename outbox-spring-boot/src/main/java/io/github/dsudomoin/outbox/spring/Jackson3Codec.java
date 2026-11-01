@@ -27,15 +27,24 @@ final class Jackson3Codec implements JsonCodec {
 
     /**
      * A generic or container type is written as declared, or what it holds would lose its type ids and could never be
-     * read back; any other as the value's own class, or a subclass would lose its fields.
+     * read back; any other as the value's own class, or a subclass would lose its fields. A subclass of a generic type
+     * needs both: its own class, specialized from the declared type. A container's implementation adds no property.
      */
     @Override
     public <T> OutboxSerializer<T> serializer(Type type) {
         var mapper = mappers.getObject();
         var javaType = mapper.constructType(type);
-        var writer = javaType.isContainerType() || javaType.hasGenericTypes()
-            ? mapper.writerFor(javaType) : mapper.writer();
-        return (topic, value) -> writer.writeValueAsBytes(value);
+        if (javaType.isContainerType()) {
+            var writer = mapper.writerFor(javaType);
+            return (topic, value) -> writer.writeValueAsBytes(value);
+        }
+        if (!javaType.hasGenericTypes()) {
+            var writer = mapper.writer();
+            return (topic, value) -> writer.writeValueAsBytes(value);
+        }
+        var declared = mapper.writerFor(javaType);
+        return (topic, value) -> (value.getClass() == javaType.getRawClass() ? declared : mapper.writerFor(
+            mapper.getTypeFactory().constructSpecializedType(javaType, value.getClass()))).writeValueAsBytes(value);
     }
 
     @Override

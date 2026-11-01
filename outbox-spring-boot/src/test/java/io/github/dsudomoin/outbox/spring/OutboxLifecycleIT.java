@@ -11,6 +11,7 @@ import static org.awaitility.Awaitility.await;
 import io.github.dsudomoin.outbox.Outbox;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRecord;
+import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.OutboxTopicHandler;
 import io.github.dsudomoin.outbox.spring.TestApps.OrdersRoute;
 import io.github.dsudomoin.outbox.spring.TestApps.WithRoute;
@@ -19,6 +20,7 @@ import io.github.dsudomoin.outbox.testing.TestSql;
 import jakarta.annotation.PostConstruct;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -27,6 +29,8 @@ import java.util.concurrent.TimeUnit;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.BeanFactory;
+import org.springframework.beans.factory.ListableBeanFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.config.BeanPostProcessor;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.WebApplicationType;
@@ -335,6 +339,63 @@ class OutboxLifecycleIT {
             assertThat(handler.delivered()).isEmpty();
             context.start();
             await().atMost(WAIT).until(() -> handler.delivered().stream().anyMatch(r -> r.messageId().equals(id)));
+        });
+    }
+
+    /** Beans of the app that look at every bean while the context is still being built. */
+    static class EarlyScans {
+
+        @Autowired
+        Map<String, Object> injected;
+        @Autowired
+        ListableBeanFactory beans;
+        Map<String, Object> scanned;
+
+        @PostConstruct
+        void scan() {
+            scanned = beans.getBeansOfType(Object.class);
+        }
+    }
+
+    @Test
+    void scansBeforeTheStartSucceedAndLeaveNoStaleRelay() {
+        runner().withUserConfiguration(WithRoute.class, EarlyScans.class).run(context -> {
+            assertThat(context).hasNotFailed();
+            var early = context.getBean(EarlyScans.class);
+            assertThat(early.injected).containsKey("outbox").doesNotContainKey("outboxRelay");
+            assertThat(early.scanned).containsKey("outbox").doesNotContainKey("outboxRelay");
+            assertThat(context.getBean(OutboxRelay.class))
+                .isSameAs(context.getBean(OutboxLifecycle.class).runtime().relay());
+            assertThat(context.getBeansOfType(OutboxRelay.class)).containsOnlyKeys("outboxRelay");
+        });
+    }
+
+    static class EarlyRelay {
+
+        @Autowired
+        OutboxRelay relay;
+    }
+
+    /** A relay wanted before there is one fails saying so, as a scan's doing without it must not hide. */
+    @Test
+    void relayInjectedBeforeTheStartFails() {
+        runner().withUserConfiguration(WithRoute.class, EarlyRelay.class).run(context ->
+            assertThat(HandlerProxiesIT.failure(context)).isEqualTo(OutboxLifecycle.NOT_STARTED));
+    }
+
+    @Test
+    void relayLookupFollowsARestart() {
+        runner("outbox.relay.enabled=false").withUserConfiguration(WithRoute.class).run(context -> {
+            var first = context.getBean(OutboxRelay.class);
+
+            context.stop();
+            context.start();
+
+            var relay = context.getBean(OutboxRelay.class);
+            assertThat(relay).isNotSameAs(first);
+            var id = send(context, "orders");
+            assertThat(relay.drain()).isOne();
+            assertThat(context.getBean(OrdersRoute.class).delivered()).containsExactly(id);
         });
     }
 }

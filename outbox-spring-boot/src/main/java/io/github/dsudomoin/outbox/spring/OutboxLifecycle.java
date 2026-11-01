@@ -92,6 +92,11 @@ public final class OutboxLifecycle implements SmartLifecycle {
         return current().runtime;
     }
 
+    /** Whether a start has run, whatever has happened since: {@link #runtime()} then answers. */
+    boolean started() {
+        return current != null;
+    }
+
     /** One volatile read per call of the delegates. */
     Started current() {
         var started = current;

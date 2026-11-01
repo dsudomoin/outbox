@@ -475,7 +475,25 @@ class TypedBeansIT {
 
     public record EventA(int n) implements Event {}
 
-    public record Envelope<T>(T value) {}
+    public static class Envelope<T> {
+
+        public T value;
+
+        public Envelope() {}
+
+        Envelope(T value) {
+            this.value = value;
+        }
+    }
+
+    public static class SubEnvelope<T> extends Envelope<T> {
+
+        public String extra = "x";
+
+        SubEnvelope(T value) {
+            super(value);
+        }
+    }
 
     public static class Base {
         public long id = 1;
@@ -515,7 +533,18 @@ class TypedBeansIT {
             var beans = context.getBean(Polymorphic.class);
             var payload = beans.envelopes.message("t", "k", new Envelope<>(new EventA(7))).payload();
             assertThat(new String(payload, UTF_8)).isEqualTo("{\"value\":{\"kind\":\"a\",\"n\":7}}");
-            assertThat(beans.envelopeReader.deserialize("t", payload)).isEqualTo(new Envelope<Event>(new EventA(7)));
+            assertThat(beans.envelopeReader.deserialize("t", payload).value).isEqualTo(new EventA(7));
+        });
+    }
+
+    /** A subclass of a generic declared type keeps both what the declared type gives and its own fields. */
+    @Test
+    void subclassOfAGenericTypeKeepsTypeIdsAndItsFields() {
+        onEachMajor(Polymorphic.class, context -> {
+            var beans = context.getBean(Polymorphic.class);
+            var payload = beans.envelopes.message("t", "k", new SubEnvelope<>(new EventA(7))).payload();
+            assertThat(new String(payload, UTF_8)).contains("\"value\":{\"kind\":\"a\",\"n\":7}", "\"extra\":\"x\"");
+            assertThat(beans.envelopeReader.deserialize("t", payload).value).isEqualTo(new EventA(7));
         });
     }
 
