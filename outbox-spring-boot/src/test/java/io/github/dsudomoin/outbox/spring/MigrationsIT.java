@@ -60,7 +60,11 @@ class MigrationsIT {
 
     @Test
     void flywayMigrationThenStart() throws IOException {
-        flyway().run(this::startedOnTheMigratedSchema);
+        flyway().run(context -> {
+            startedOnTheMigratedSchema(context);
+            assertThat(queryLong("select count(to_regclass('" + schema + ".flyway_schema_history'))"))
+                .as("Flyway ran").isOne();
+        });
     }
 
     @Test
