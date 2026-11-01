@@ -10,6 +10,7 @@ public enum OutboxGauge {
     DEAD_PENDING("outbox.dead.pending"),
     DEAD_PENDING_OLDEST("outbox.dead.pending.oldest"),
     PARKED_SIZE("outbox.parked.size"),
+    HANDLER_THREADS_FREE("outbox.handler.threads.free"),
     PARTITIONS_PREMADE("outbox.partitions.premade"),
     PARTITIONS_OVERFLOW("outbox.partitions.overflow"),
     PARTITIONS_XIDS_LEFT("outbox.partitions.xids_left"),

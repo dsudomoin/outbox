@@ -405,7 +405,7 @@ components:
             $ref: '#/components/schemas/Instance'
     Instance:
       type: object
-      required: [id, shards, lastSeen, hookActive, relay]
+      required: [id, shards, lastSeen, hookActive, relay, live]
       properties:
         id:
           type: string
@@ -423,6 +423,11 @@ components:
         relay:
           type: boolean
           description: The relay runs there
+        live:
+          type: boolean
+          description: >-
+            Its heartbeat has not expired, by the database clock. A live instance may still deliver nothing: it says
+            the process runs, not that its queue moves
         contracts:
           type: object
           description: The highest contract version it reads, by topic; absent when unknown, empty when it reports none

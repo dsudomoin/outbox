@@ -47,11 +47,14 @@ public record OutboxStatus(
     /**
      * A running instance, by its heartbeat: {@code id} {@code <host>/<pid>/<8 hex>}, its shard count, when it was last
      * seen (database clock, every {@code maintenanceInterval}), whether it has an active dead-letter hook, whether the
-     * relay runs there, {@code contracts}: the highest contract version it reads, by topic, null when unknown,
-     * empty when it reports none; a version that is no positive int shows as 0; and {@code routes}: every topic a
-     * route of it claims, typed or plain, sorted, null when unknown, empty when it has none.
+     * relay runs there, {@code live}: its row has not expired, by the database clock, so a deployment gate need not
+     * know each instance's interval; {@code contracts}: the highest contract version it reads, by topic, null when
+     * unknown, empty when it reports none; a version that is no positive int shows as 0; and {@code routes}: every
+     * topic a route of it claims, typed or plain, sorted, null when unknown, empty when it has none. A live instance
+     * may still deliver nothing: a heartbeat says the process runs, not that its queue moves
+     * ({@code outbox.shard.lag} and {@code outbox.handler.threads.free} do).
      */
-    public record Instance(String id, int shards, Instant lastSeen, boolean hookActive, boolean relay,
+    public record Instance(String id, int shards, Instant lastSeen, boolean hookActive, boolean relay, boolean live,
             @Nullable Map<String, Integer> contracts, @Nullable List<String> routes) {
 
         public Instance {

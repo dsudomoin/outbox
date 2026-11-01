@@ -1,6 +1,7 @@
 package io.github.dsudomoin.outbox.internal;
 
 import io.github.dsudomoin.outbox.OutboxConfig;
+import io.github.dsudomoin.outbox.OutboxGauge;
 import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
@@ -39,7 +40,6 @@ import java.util.RandomAccess;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.SynchronousQueue;
@@ -134,7 +134,7 @@ public final class ShardProcessor implements AutoCloseable {
      * chunk such calls. In memory, so a shard new to this processor starts at {@code batchSize}.
      */
     private final AtomicIntegerArray limits;
-    private final ExecutorService executor;
+    private final ThreadPoolExecutor executor;
     /** Per shard, when a step last checked the retry table in full ({@code nanoTime}). */
     private final AtomicLongArray fullChecked;
     /**
@@ -204,6 +204,8 @@ public final class ShardProcessor implements AutoCloseable {
                     t.setDaemon(true);
                     return t;
                 });
+        telemetry.gauge(OutboxGauge.HANDLER_THREADS_FREE,
+                () -> executor.getMaximumPoolSize() - executor.getActiveCount());
     }
 
     /**

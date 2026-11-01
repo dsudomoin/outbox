@@ -131,10 +131,10 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
                 + "\"orphans\":[{\"table\":\"" + orphan + "\",\"kind\":\"foreign\"}],\"tailOverflow\":false,"
                 + "\"premade\":2,\"maintenanceSinceSuccessSeconds\":S,\"shards\":2,\"instances\":[{\"id\":"
                 + "\"host-b/7/0000beef\",\"shards\":2,\"lastSeen\":\"2026-01-15T10:00:00.000Z\","
-                + "\"hookActive\":true,\"relay\":true,\"contracts\":{\"t1\":1,\"t2\":2},\"routes\":[\"t1\",\"t2\"]},"
+                + "\"hookActive\":true,\"relay\":true,\"live\":false,\"contracts\":{\"t1\":1,\"t2\":2},\"routes\":[\"t1\",\"t2\"]},"
                 + "{\"id\":\"host-c/8/0000cafe\",\"shards\":2,\"lastSeen\":\"2026-01-15T10:00:00.000Z\","
-                + "\"hookActive\":false,\"relay\":false},{\"id\":\"host-d/9/0000d00d\",\"shards\":2,"
-                + "\"lastSeen\":\"2026-01-15T10:00:00.000Z\",\"hookActive\":true,\"relay\":true,\"contracts\":{},"
+                + "\"hookActive\":false,\"relay\":false,\"live\":false},{\"id\":\"host-d/9/0000d00d\",\"shards\":2,"
+                + "\"lastSeen\":\"2026-01-15T10:00:00.000Z\",\"hookActive\":true,\"relay\":true,\"live\":false,\"contracts\":{},"
                 + "\"routes\":[]}]}");
     }
 

@@ -579,10 +579,11 @@ class OutboxAdminIT {
                 + " values (3, 0, gen_random_uuid(), 't', now(), now())");
         execute("delete from " + names.instance());
         execute("insert into " + names.instance() + " (instance_id, shards, last_seen, hook_active, relay, contracts,"
-                + " routes) values ('a', 4, '2026-01-15T10:00:00Z', true, true, '{\"t2\": 2, \"t1\": 1}', '{t2,t1}'),"
-                + " ('b', 4, '2026-01-15T10:00:00Z', false, true, null, null),"
-                + " ('c', 4, '2026-01-15T10:00:00Z', false, false, '{}', '{}'),"
-                + " ('d', 4, '2026-01-15T10:00:00Z', false, false, '{}', '{{t2,NULL},{t1,t3}}')");
+                + " routes, expires_at) values ('a', 4, '2026-01-15T10:00:00Z', true, true, '{\"t2\": 2, \"t1\": 1}',"
+                + " '{t2,t1}', now() + interval '1 hour'),"
+                + " ('b', 4, '2026-01-15T10:00:00Z', false, true, null, null, now() - interval '1 second'),"
+                + " ('c', 4, '2026-01-15T10:00:00Z', false, false, '{}', '{}', null),"
+                + " ('d', 4, '2026-01-15T10:00:00Z', false, false, '{}', '{{t2,NULL},{t1,t3}}', null)");
         var now = Instant.now();
         letter("a", "1", "boom", now, KEPT);
         letter("a", "2", "boom", now, KEPT);
@@ -623,10 +624,10 @@ class OutboxAdminIT {
         assertThat(status.shards()).isEqualTo(config.shards());
         var seen = Instant.parse("2026-01-15T10:00:00Z");
         assertThat(status.instances()).containsExactly(
-                new OutboxStatus.Instance("a", 4, seen, true, true, Map.of("t1", 1, "t2", 2), List.of("t1", "t2")),
-                new OutboxStatus.Instance("b", 4, seen, false, true, null, null),
-                new OutboxStatus.Instance("c", 4, seen, false, false, Map.of(), List.of()),
-                new OutboxStatus.Instance("d", 4, seen, false, false, Map.of(), List.of("t1", "t2", "t3")));
+                new OutboxStatus.Instance("a", 4, seen, true, true, true, Map.of("t1", 1, "t2", 2), List.of("t1", "t2")),
+                new OutboxStatus.Instance("b", 4, seen, false, true, false, null, null),
+                new OutboxStatus.Instance("c", 4, seen, false, false, false, Map.of(), List.of()),
+                new OutboxStatus.Instance("d", 4, seen, false, false, false, Map.of(), List.of("t1", "t2", "t3")));
     }
 
     @Test

@@ -239,6 +239,7 @@ package io.github.dsudomoin.outbox {
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge DEAD_PENDING;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge DEAD_PENDING_OLDEST;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge DEAD_SIZE;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge HANDLER_THREADS_FREE;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge INBOX_MAINTENANCE_TRANSACTION_POOLING;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge INBOX_PARTITIONS_ORPHANED;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge MAINTENANCE_SINCE_SUCCESS;
@@ -386,11 +387,12 @@ package io.github.dsudomoin.outbox {
   }
 
   public static final class OutboxStatus.Instance {
-    ctor public OutboxStatus.Instance(String!, int, java.time.Instant!, boolean, boolean, java.util.Map<java.lang.String!,java.lang.Integer!>?, java.util.List<java.lang.String!>?);
+    ctor public OutboxStatus.Instance(String!, int, java.time.Instant!, boolean, boolean, boolean, java.util.Map<java.lang.String!,java.lang.Integer!>?, java.util.List<java.lang.String!>?);
     method public java.util.Map<java.lang.String!,java.lang.Integer!>? contracts();
     method public boolean hookActive();
     method public String! id();
     method public java.time.Instant! lastSeen();
+    method public boolean live();
     method public boolean relay();
     method public java.util.List<java.lang.String!>? routes();
     method public int shards();
