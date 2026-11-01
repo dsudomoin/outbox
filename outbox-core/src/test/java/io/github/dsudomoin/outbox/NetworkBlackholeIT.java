@@ -27,8 +27,9 @@ import org.junit.jupiter.api.Test;
 import org.postgresql.ds.PGSimpleDataSource;
 
 /**
- * The network between the relay and its database goes silent: connections stay open, nothing arrives. With timeouts on
- * the DataSource every wait ends in a failure the relay survives; without them, the shutdown stays bounded all the same.
+ * The relay's database stops answering: the network goes silent, connections staying open and nothing arriving, or a
+ * lock holds its reads. With timeouts on the DataSource every wait ends in a failure the relay survives; without them,
+ * and under the lock, the shutdown stays bounded all the same.
  */
 class NetworkBlackholeIT {
 
@@ -84,6 +85,47 @@ class NetworkBlackholeIT {
         var names = relay.schema().names();
         long seen = lastSeen(names.instance(), relay);
         await(() -> lastSeen(names.instance(), relay) > seen);
+    }
+
+    @Test
+    void aLockHeldOnTheCursorsHoldsTheRelayOnlyWhileItLasts() throws Exception {
+        var config = new TestOutboxConfig();
+        Set<UUID> delivered = ConcurrentHashMap.newKeySet();
+        var transactions = new JdbcTransactions(DIRECT);
+        var runtime = OutboxRuntime.builder(config, transactions, record -> delivered.add(record.messageId())).build();
+        closing.add(runtime);
+        runtime.start();
+        var sent = new HashSet<UUID>();
+        sent.add(send(runtime, transactions, "before"));
+        await(() -> delivered.containsAll(sent));
+
+        try (var locker = DIRECT.getConnection()) {
+            locker.setAutoCommit(false);
+            TestSql.execute(locker, "lock table " + runtime.schema().names().cursor() + " in access exclusive mode");
+            sent.add(send(runtime, transactions, "during"));
+            Thread.sleep(1000);
+            assertThat(delivered.containsAll(sent)).as("what was sent during it waits").isFalse();
+            locker.rollback();
+        }
+
+        await(() -> delivered.containsAll(sent));
+        assertThat(runtime.relay().running()).isTrue();
+    }
+
+    @Test
+    void aLockHeldOnTheCursorsDoesNotHoldTheClose() throws Exception {
+        var config = new TestOutboxConfig().shutdownTimeout(Duration.ofMillis(100));
+        var runtime = OutboxRuntime.builder(config, new JdbcTransactions(DIRECT), record -> {}).build();
+        runtime.start();
+
+        try (var locker = DIRECT.getConnection()) {
+            locker.setAutoCommit(false);
+            TestSql.execute(locker, "lock table " + runtime.schema().names().cursor() + " in access exclusive mode");
+            Thread.sleep(500); // the workers wait on the lock by now
+
+            CompletableFuture.runAsync(runtime::close).get(20, TimeUnit.SECONDS);
+            locker.rollback();
+        }
     }
 
     @Test
