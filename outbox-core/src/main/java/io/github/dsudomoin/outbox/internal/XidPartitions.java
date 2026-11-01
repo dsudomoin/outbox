@@ -335,7 +335,9 @@ public final class XidPartitions {
             return;
         }
         overflow = false;
-        long from = s.upper == null ? floor : s.upper;
+        // the first ranges start at the oldest running transaction's: it holds an xid already, and may send once they
+        // exist, as a request on an instance that started earlier would when another makes the table
+        long from = s.upper == null ? Math.floorDiv(s.oldest, size) * size : s.upper;
         if (from < floor) { // ranges ended below the current xid (maintenance was down): bridge the gap in one range
             create(from, floor, c);
             from = floor;
@@ -1114,10 +1116,13 @@ public final class XidPartitions {
 
     private State state(Connection c) throws SQLException {
         long current;
+        long oldest;
         try (var st = c.createStatement();
-                var rs = st.executeQuery("select pg_snapshot_xmax(pg_current_snapshot())::text::bigint")) {
+                var rs = st.executeQuery("select pg_snapshot_xmax(pg_current_snapshot())::text::bigint,"
+                        + " pg_snapshot_xmin(pg_current_snapshot())::text::bigint")) {
             rs.next();
             current = rs.getLong(1);
+            oldest = rs.getLong(2);
         }
         Long upper = null;
         Long tailLower = null;
@@ -1133,7 +1138,8 @@ public final class XidPartitions {
             long to = Long.parseLong(b.to());
             upper = upper == null ? to : Math.max(upper, to);
         }
-        return new State(current, upper, ahead, PartitionDdl.attachment(c, names.base(), names.tail()), tailLower);
+        return new State(current, oldest, upper, ahead, PartitionDdl.attachment(c, names.base(), names.tail()),
+                tailLower);
     }
 
     /** {@code tailConversion.window}: from (inclusive) to (exclusive), across midnight when to comes first. */
@@ -1176,5 +1182,5 @@ public final class XidPartitions {
     }
 
     private record State(
-            long current, @Nullable Long upper, int ahead, Attachment tail, @Nullable Long tailLower) {}
+            long current, long oldest, @Nullable Long upper, int ahead, Attachment tail, @Nullable Long tailLower) {}
 }
