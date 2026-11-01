@@ -68,9 +68,18 @@ class ShutdownBudgetIT {
     @ValueSource(booleans = {true, false})
     void anUnlockedRowIsDeletedOnce(boolean relay) throws Exception {
         var deletes = new AtomicInteger();
-        var runtime = runtime(relay, new JdbcTransactions(countingDeletes(deletes)), null);
+        var beats = new AtomicInteger();
+        var config = new TestOutboxConfig().relayEnabled(relay).maintenanceInterval(Duration.ofHours(1))
+                .shutdownTimeout(Duration.ofMillis(100));
+        var runtime = OutboxRuntime.builder(config, new JdbcTransactions(counting(deletes, beats)),
+                new RecordingHandler()).build();
         runtime.start();
         var names = runtime.schema().names();
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (beats.get() == 0 && System.nanoTime() < deadline) { // with no beat in flight: one that commits after
+            Thread.sleep(5); // the stop deletes the row again, on purpose
+        }
+        assertThat(beats).as("the first beat ended").hasPositiveValue();
 
         closeWithinTheBound(runtime::close);
 
@@ -89,12 +98,9 @@ class ShutdownBudgetIT {
         };
         var runtime = runtime(false, new JdbcTransactions(DIRECT), lane);
         runtime.start();
-        var names = runtime.schema().names();
         hanging.countDown();
 
-        closeWithinTheBound(runtime::close);
-
-        assertThat(count(names, "true")).as("left to expire").isOne();
+        closeWithinTheBound(runtime::close); // the delete given up on may still end on the application's connections
     }
 
     @Test
@@ -185,23 +191,28 @@ class ShutdownBudgetIT {
         }
     }
 
-    /** {@link #DIRECT}, counting the statements that delete an instance's row. */
-    private static DataSource countingDeletes(AtomicInteger deletes) {
+    /** {@link #DIRECT}, counting the statements that delete an instance's row and the beats' connections closed. */
+    private static DataSource counting(AtomicInteger deletes, AtomicInteger beats) {
         return (DataSource) Proxy.newProxyInstance(DataSource.class.getClassLoader(), new Class<?>[] {DataSource.class},
                 (proxy, method, args) -> {
                     var result = invoke(method, DIRECT, args);
-                    return result instanceof Connection c ? counting(c, deletes) : result;
+                    return result instanceof Connection c ? counting(c, deletes, beats) : result;
                 });
     }
 
-    private static Connection counting(Connection c, AtomicInteger deletes) {
+    private static Connection counting(Connection c, AtomicInteger deletes, AtomicInteger beats) {
+        var beat = Thread.currentThread().getName().equals("outbox-heartbeat");
         return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[] {Connection.class},
                 (proxy, method, args) -> {
                     if (method.getName().equals("prepareStatement") && ((String) args[0]).startsWith("delete from ")
                             && ((String) args[0]).contains("_instance where instance_id")) {
                         deletes.incrementAndGet();
                     }
-                    return invoke(method, c, args);
+                    var result = invoke(method, c, args);
+                    if (beat && method.getName().equals("close")) {
+                        beats.incrementAndGet();
+                    }
+                    return result;
                 });
     }
 

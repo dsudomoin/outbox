@@ -118,7 +118,10 @@ final class DeadIndexBuilder {
     }
 
     private void cancel(int pid) {
-        try (var c = db.newConnection(); var ps = c.prepareStatement("select pg_cancel_backend(?)")) {
+        // only while the backend runs the build: a cancel given up on may get here later, when it runs anything else
+        try (var c = db.newConnection(); var ps = c.prepareStatement("select pg_cancel_backend(pid) from"
+                + " pg_stat_activity where pid = ? and (query like 'create index concurrently%' or query like"
+                + " 'drop index concurrently%')")) {
             ps.setInt(1, pid);
             ps.execute();
         } catch (SQLException | RuntimeException e) {

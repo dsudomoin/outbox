@@ -141,14 +141,20 @@ public final class Heartbeat {
     private static void delete(Connection c, TableNames names, String id, Duration budget) throws SQLException {
         long millis = Math.max(1, budget.toMillis()); // 0 would mean no timeout at all
         c.setAutoCommit(false);
-        try (var st = c.createStatement()) {
+        try (var st = c.createStatement(); var ps = c.prepareStatement("delete from " + names.instance()
+                + " where instance_id = ?")) {
             st.execute("set local lock_timeout = " + millis + "; set local statement_timeout = " + millis);
-        }
-        try (var ps = c.prepareStatement("delete from " + names.instance() + " where instance_id = ?")) {
             ps.setString(1, id);
             ps.executeUpdate();
+            c.commit();
+        } catch (SQLException | RuntimeException e) {
+            try {
+                c.rollback();
+            } catch (SQLException | RuntimeException rollback) {
+                e.addSuppressed(rollback);
+            }
+            throw e;
         }
-        c.commit();
         c.setAutoCommit(true);
     }
 
