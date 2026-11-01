@@ -451,8 +451,8 @@ public final class XidRecovery {
             betweenReads.accept(c);
         }
         long from = Math.floorDiv(xmin, size) * size;
-        // never none: ensurePremade reads the current xid again and, without a range, starts at that one's range, so
-        // a counter crossing a boundary in between would leave the range of xids taken meanwhile uncreated
+        // never none: ensurePremade reads the xids again and, without a range, starts at the oldest running one's range,
+        // so a counter crossing a boundary in between could leave the range of xids taken meanwhile uncreated
         long to = Math.max(Math.floorDiv(current, size) * size, from + size);
         PartitionDdl.createAndAttach(c, names.base(), names.partitionPrefix() + from, Long.toString(from),
                 Long.toString(to), PartitionDdl.CREATE_LOCK_TIMEOUT);

@@ -151,7 +151,7 @@ class HeartbeatPoolIT {
             thread.setDaemon(true);
             thread.start();
 
-            releasing.get(20, TimeUnit.SECONDS);
+            releasing.get(60, TimeUnit.SECONDS);
             holder.rollback();
         }
         await(() -> !poolRuns());

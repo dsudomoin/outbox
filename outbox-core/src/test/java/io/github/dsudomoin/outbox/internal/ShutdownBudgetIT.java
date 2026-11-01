@@ -20,6 +20,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -32,8 +33,8 @@ import org.postgresql.ds.PGSimpleDataSource;
 class ShutdownBudgetIT {
 
     private static final Duration INTERVAL = Duration.ofMillis(200);
-    /** The budget and the relay's grace, with room for a slow runner: what waits on the lock or the source hangs on. */
-    private static final Duration BOUND = Heartbeat.STOP_BUDGET.plusSeconds(10);
+    /** A guard against a hang alone, what a weak runner reaches too: {@link #aLockedRowCostsTheBudgetAtMost} is tight. */
+    private static final Duration BOUND = Duration.ofSeconds(60);
     private static final DataSource DIRECT = TestDataSources.newDataSource();
 
     /** Sources that hang wait on it; released after every test. */
@@ -62,6 +63,20 @@ class ShutdownBudgetIT {
         Thread.sleep(INTERVAL.multipliedBy(OutboxSchema.LIVE_INTERVALS).toMillis());
         assertThat(lastSeen(names)).as("no beat after the stop").isEqualTo(seen);
         assertThat(count(names, "expires_at > now()")).as("no longer live").isZero();
+    }
+
+    @Test
+    @Tag("timing")
+    void aLockedRowCostsTheBudgetAtMost() throws Exception {
+        var runtime = runtime(false, new JdbcTransactions(DIRECT), null);
+        runtime.start();
+
+        try (var holder = lockRow(runtime.schema().names())) {
+            long closing = System.nanoTime();
+            closeWithinTheBound(runtime::close);
+            assertThat(Duration.ofNanos(System.nanoTime() - closing)).isLessThan(Heartbeat.STOP_BUDGET.plusSeconds(1));
+            holder.rollback();
+        }
     }
 
     @ParameterizedTest

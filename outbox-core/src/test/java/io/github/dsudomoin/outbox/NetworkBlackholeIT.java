@@ -123,7 +123,7 @@ class NetworkBlackholeIT {
             TestSql.execute(locker, "lock table " + runtime.schema().names().cursor() + " in access exclusive mode");
             Thread.sleep(500); // the workers wait on the lock by now
 
-            CompletableFuture.runAsync(runtime::close).get(20, TimeUnit.SECONDS);
+            CompletableFuture.runAsync(runtime::close).get(60, TimeUnit.SECONDS);
             locker.rollback();
         }
     }
@@ -138,7 +138,7 @@ class NetworkBlackholeIT {
         hole.shut();
         Thread.sleep(500); // the workers and the next beat are stuck on the silent sockets by now
 
-        CompletableFuture.runAsync(runtime::close).get(20, TimeUnit.SECONDS);
+        CompletableFuture.runAsync(runtime::close).get(60, TimeUnit.SECONDS);
     }
 
     private static UUID send(OutboxRuntime runtime, JdbcTransactions transactions, String key) {

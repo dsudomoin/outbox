@@ -2,6 +2,9 @@ package io.github.dsudomoin.outbox.internal;
 
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.dsudomoin.outbox.InboxRuntime;
+import io.github.dsudomoin.outbox.JdbcTransactions;
+import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.OutboxSql;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -118,6 +121,28 @@ class SchemaCheckIT {
             assertThatThrownBy(() -> SchemaCheck.requireSameDatabase(utc, moscow, table))
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("reaches another database than the application's");
+        }
+    }
+
+    @Test
+    void whatTheBootstrapCreatesPassesTheCheck() throws Exception {
+        var schema = "s" + TestSql.uniqueTable();
+        var config = new TestOutboxConfig().table(schema + ".outbox").inboxTable(schema + ".inbox").relayEnabled(false);
+        var source = TestDataSources.newDataSource();
+        var transactions = new JdbcTransactions(source);
+        try (var c = source.getConnection()) {
+            TestSql.execute(c, "create schema " + schema);
+        }
+        try (var outbox = OutboxRuntime.builder(config, transactions, record -> {}).build();
+                var inbox = InboxRuntime.builder(config, transactions).build();
+                var c = source.getConnection()) {
+            outbox.start();
+            inbox.start();
+
+            SchemaCheck.run(c, c, SchemaObjects.outbox(TableNames.of(config.table())), config.table(),
+                    "OutboxSql.outbox");
+            SchemaCheck.run(c, c, SchemaObjects.inbox(TableNames.of(config.inbox().table())), config.inbox().table(),
+                    "OutboxSql.inbox");
         }
     }
 

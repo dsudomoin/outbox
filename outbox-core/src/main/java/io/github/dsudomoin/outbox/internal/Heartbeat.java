@@ -129,8 +129,8 @@ public final class Heartbeat {
             }
         });
         if (!ended) {
-            log.warn("outbox instance {} gave up deleting its row from {} after {}: no connection or no answer; it"
-                    + " expires by itself", id, names.instance(), budget);
+            log.warn("outbox instance {} stopped waiting for the delete of its row from {}, budget {}: no connection, no"
+                    + " answer or an interrupt; the row expires by itself", id, names.instance(), budget);
         }
     }
 

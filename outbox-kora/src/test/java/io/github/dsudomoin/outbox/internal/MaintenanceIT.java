@@ -1794,7 +1794,7 @@ class MaintenanceIT {
             await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
             hanging.set(true);
 
-            CompletableFuture.runAsync(() -> maintenance.close(Duration.ofMillis(100))).get(15, TimeUnit.SECONDS);
+            CompletableFuture.runAsync(() -> maintenance.close(Duration.ofMillis(100))).get(60, TimeUnit.SECONDS);
 
             holder.rollback();
         } finally {

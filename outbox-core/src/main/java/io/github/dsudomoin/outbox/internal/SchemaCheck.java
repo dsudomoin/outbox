@@ -260,9 +260,9 @@ final class SchemaCheck {
         }
     }
 
-    /** But for what Postgres adds when it prints a definition: parentheses, quotes, case and spacing. */
+    /** But for what Postgres adds when it prints a definition: parentheses, case and spacing. */
     private static String canonical(String definition) {
-        return definition.toLowerCase(Locale.ROOT).replaceAll("[()\"\\s]", "");
+        return definition.toLowerCase(Locale.ROOT).replaceAll("[()\\s]", "");
     }
 
     /** Partition DDL needs the parent's owner role (or membership of it) and {@code CREATE} on its schema. */
