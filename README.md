@@ -1237,7 +1237,9 @@ fun process(records: ConsumerRecords<String, ByteArray>) = db.inTx<Unit> { _: Co
 Ядро `outbox-core`, обработчик Kafka `outbox-kafka` и метры `outbox-micrometer` от фреймворков не зависят (сборка
 проверяет это задачей `verifyFrameworkFree`). `OutboxRuntime` собирает outbox из конфига, привязки к транзакциям
 приложения (`OutboxTransactions`) и обработчика. Для кода без менеджера транзакций есть `JdbcTransactions` поверх
-`DataSource`: `inTx` выполняет вызов в транзакции, привязанной к потоку, и `send` присоединяется к ней.
+`DataSource`: `inTx` выполняет вызов в транзакции, привязанной к потоку, и `send` присоединяется к ней. После
+подтверждённого commit вызов уже не падает: сбой сброса или закрытия соединения пишется в WARN, а after-commit действия
+выполняются. Соединение, на котором не удался rollback или сброс, закрывается через `abort`, в пул оно не возвращается.
 
 ```java
 var transactions = new JdbcTransactions(dataSource);

@@ -5,6 +5,7 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Consumer;
 import javax.sql.DataSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,8 +34,10 @@ public final class JdbcTransactions implements OutboxTransactions {
 
     /**
      * Runs {@code call} in a transaction and commits it, then runs its after-commit actions; any throwable rolls it
-     * back and reaches the caller, an {@link SQLException} as {@link OutboxSqlException}. Inside another {@code inTx}
-     * on this thread, {@code call} joins that transaction.
+     * back and reaches the caller, an {@link SQLException} as {@link OutboxSqlException}. Once the commit is
+     * acknowledged nothing else fails the call: a failed reset or close of the connection is a WARN, and the actions
+     * run. A failed rollback aborts the connection, whose session then ends without committing. Inside another
+     * {@code inTx} on this thread, {@code call} joins that transaction.
      */
     public <T> T inTx(SqlCall<T> call) {
         var outer = current.get();
@@ -45,25 +48,31 @@ public final class JdbcTransactions implements OutboxTransactions {
                 throw translate(e);
             }
         }
-        Transaction tx;
-        T result;
-        try (var c = dataSource.getConnection()) {
-            tx = new Transaction(c);
-            current.set(tx);
-            try {
-                c.setAutoCommit(false);
-                result = call.call(c);
-                c.commit();
-            } catch (Throwable t) {
-                rollback(c, t);
-                throw t;
-            } finally {
-                current.remove();
-                c.setAutoCommit(true);
-            }
+        Connection c;
+        try {
+            c = dataSource.getConnection();
         } catch (SQLException e) {
             throw translate(e);
         }
+        var tx = new Transaction(c);
+        current.set(tx);
+        T result;
+        try {
+            c.setAutoCommit(false);
+            result = call.call(c);
+            c.commit();
+        } catch (SQLException e) {
+            current.remove();
+            release(c, true, e::addSuppressed);
+            throw translate(e);
+        } catch (Throwable t) {
+            current.remove();
+            release(c, true, t::addSuppressed);
+            throw t;
+        }
+        current.remove();
+        release(c, false, e -> log.warn("outbox connection failed its cleanup after a commit; the transaction is"
+                + " committed", e));
         for (var action : tx.afterCommit) {
             try {
                 action.run();
@@ -105,11 +114,30 @@ public final class JdbcTransactions implements OutboxTransactions {
         return "JdbcTransactions.inTx(...)";
     }
 
-    private static void rollback(Connection c, Throwable cause) {
+    /**
+     * Ends {@code c}'s use: rolls back when {@code rollback}, turns autocommit on and closes it. A connection whose
+     * rollback or reset fails is aborted instead, as its state is unknown: with its session alive, turning autocommit
+     * on would commit what the rollback left, and a pool would hand it out again. {@code failed} gets every failure,
+     * so none replaces the transaction's outcome, which is known by now.
+     */
+    private static void release(Connection c, boolean rollback, Consumer<Exception> failed) {
         try {
-            c.rollback();
-        } catch (SQLException e) {
-            cause.addSuppressed(e);
+            if (rollback) {
+                c.rollback();
+            }
+            c.setAutoCommit(true);
+        } catch (SQLException | RuntimeException e) {
+            failed.accept(e);
+            try {
+                c.abort(Runnable::run);
+            } catch (SQLException | RuntimeException aborting) {
+                failed.accept(aborting);
+            }
+        }
+        try {
+            c.close();
+        } catch (SQLException | RuntimeException e) {
+            failed.accept(e);
         }
     }
 
