@@ -3,8 +3,12 @@ package io.github.dsudomoin.outbox.spring;
 import static io.github.dsudomoin.outbox.spring.TestApps.runner;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
+import static org.mockito.Mockito.mock;
 
+import com.fasterxml.jackson.annotation.JsonSubTypes;
+import com.fasterxml.jackson.annotation.JsonTypeInfo;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.StringValue;
 import io.github.dsudomoin.outbox.Outbox;
@@ -19,22 +23,34 @@ import io.github.dsudomoin.outbox.TypedOutboxTopicHandler;
 import io.github.dsudomoin.outbox.protobuf.ProtobufOutbox;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import java.lang.reflect.Method;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
+import org.aopalliance.intercept.MethodInterceptor;
+import org.aopalliance.intercept.MethodInvocation;
 import org.junit.jupiter.api.Test;
+import org.springframework.aop.Advisor;
+import org.springframework.aop.support.DefaultPointcutAdvisor;
+import org.springframework.aop.support.StaticMethodMatcherPointcut;
+import org.springframework.beans.factory.ListableBeanFactory;
+import org.springframework.beans.factory.NoSuchBeanDefinitionException;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.LazyInitializationBeanFactoryPostProcessor;
 import org.springframework.boot.test.context.FilteredClassLoader;
 import org.springframework.boot.test.context.assertj.AssertableApplicationContext;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.boot.test.context.runner.ContextConsumer;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Fallback;
 import org.springframework.context.annotation.Import;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -42,6 +58,7 @@ import tools.jackson.databind.PropertyNamingStrategies;
 import tools.jackson.databind.json.JsonMapper;
 
 /** {@code TypedOutbox<T>}, {@code OutboxSerializer<T>} and {@code OutboxDeserializer<T>} served by T at injection. */
+@SuppressWarnings("unchecked")
 class TypedBeansIT {
 
     private static final Duration WAIT = Duration.ofSeconds(10);
@@ -195,9 +212,10 @@ class TypedBeansIT {
 
     @Test
     void noMapperFailsATypedInjectionNamingTheType() {
-        app(NO_MAPPER_BEANS).withUserConfiguration(OrdersApp.class).run(context -> {
-            assertThat(failure(context)).contains(OutboxDeserializer.class.getName(), OrderCreated.class.getName());
-        });
+        app(NO_MAPPER_BEANS).withUserConfiguration(OrdersHandler.class).run(context ->
+            assertThat(failure(context)).contains(OutboxDeserializer.class.getName(), OrderCreated.class.getName()));
+        app(NO_MAPPER_BEANS).withUserConfiguration(Orders.class).run(context ->
+            assertThat(failure(context)).contains(OutboxSerializer.class.getName(), OrderCreated.class.getName()));
     }
 
     /** With no mapper, a typed injection is all that fails: an explicit codec needs none. */
@@ -449,5 +467,315 @@ class TypedBeansIT {
         app().withUserConfiguration(LazySender.class).run(context ->
             assertThat(new String(context.getBean(LazySender.class).events.getObject()
                 .message("t", "k", new Refund(7)).payload(), UTF_8)).isEqualTo("{\"orderId\":7}"));
+    }
+
+    @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, property = "kind")
+    @JsonSubTypes(@JsonSubTypes.Type(value = EventA.class, name = "a"))
+    public interface Event {}
+
+    public record EventA(int n) implements Event {}
+
+    public record Envelope<T>(T value) {}
+
+    public static class Base {
+        public long id = 1;
+    }
+
+    public static class Sub extends Base {
+        public String extra = "x";
+    }
+
+    static class Polymorphic {
+
+        final TypedOutbox<Envelope<Event>> envelopes;
+        final OutboxDeserializer<Envelope<Event>> envelopeReader;
+        final TypedOutbox<List<Event>> lists;
+        final OutboxDeserializer<List<Event>> listReader;
+        final TypedOutbox<Base> bases;
+
+        Polymorphic(TypedOutbox<Envelope<Event>> envelopes, OutboxDeserializer<Envelope<Event>> envelopeReader,
+                TypedOutbox<List<Event>> lists, OutboxDeserializer<List<Event>> listReader, TypedOutbox<Base> bases) {
+            this.envelopes = envelopes;
+            this.envelopeReader = envelopeReader;
+            this.lists = lists;
+            this.listReader = listReader;
+            this.bases = bases;
+        }
+    }
+
+    private static void onEachMajor(Class<?> beans, ContextConsumer<AssertableApplicationContext> test) {
+        app("outbox.json.mapper=jackson2").withUserConfiguration(beans).run(test);
+        app("outbox.json.mapper=jackson3").withUserConfiguration(beans, Jackson3Bean.class).run(test);
+    }
+
+    /** The declared type is what writes the type id of what a generic class holds. */
+    @Test
+    void genericPayloadKeepsTypeIdsOfWhatItHolds() {
+        onEachMajor(Polymorphic.class, context -> {
+            var beans = context.getBean(Polymorphic.class);
+            var payload = beans.envelopes.message("t", "k", new Envelope<>(new EventA(7))).payload();
+            assertThat(new String(payload, UTF_8)).isEqualTo("{\"value\":{\"kind\":\"a\",\"n\":7}}");
+            assertThat(beans.envelopeReader.deserialize("t", payload)).isEqualTo(new Envelope<Event>(new EventA(7)));
+        });
+    }
+
+    @Test
+    void collectionPayloadKeepsItsElementsTypeIds() {
+        onEachMajor(Polymorphic.class, context -> {
+            var beans = context.getBean(Polymorphic.class);
+            var payload = beans.lists.message("t", "k", List.of(new EventA(7))).payload();
+            assertThat(new String(payload, UTF_8)).isEqualTo("[{\"kind\":\"a\",\"n\":7}]");
+            assertThat(beans.listReader.deserialize("t", payload)).containsExactly(new EventA(7));
+        });
+    }
+
+    /** A plain declared type must not cut a value down to it. */
+    @Test
+    void valueKeepsItsOwnClassFields() {
+        onEachMajor(Polymorphic.class, context -> {
+            var payload = context.getBean(Polymorphic.class).bases.message("t", "k", new Sub()).payload();
+            assertThat(new String(payload, UTF_8)).contains("\"id\":1", "\"extra\":\"x\"");
+        });
+    }
+
+    @Test
+    void ownProtobufOutboxWins() {
+        app().withBean("ownProtobuf", ProtobufOutbox.class, () -> new ProtobufOutbox(mock(Outbox.class)))
+            .run(context -> assertThat(context.getBean(ProtobufOutbox.class))
+                .isSameAs(context.getBean("ownProtobuf")));
+    }
+
+    /** Collections take the app's explicit beans; the generic definitions, with no one T to serve, add nothing. */
+    static class Collections {
+
+        @Autowired
+        List<OutboxSerializer<?>> wildcards;
+        @Autowired
+        List<OutboxSerializer<OrderCreated>> serializers;
+        @Autowired
+        OutboxSerializer<?>[] array;
+        @Autowired
+        Map<String, OutboxSerializer<OrderCreated>> map;
+        @Autowired
+        ObjectProvider<Map<String, Object>> all;
+    }
+
+    @Test
+    void collectionsGetExplicitBeansOnly() {
+        app().withUserConfiguration(Collections.class, ExplicitSerializer.class).run(context -> {
+            var beans = context.getBean(Collections.class);
+            var explicit = context.getBean("explicitSerializer");
+            assertThat(beans.wildcards).containsExactly((OutboxSerializer<?>) explicit);
+            assertThat(beans.serializers).containsExactly((OutboxSerializer<OrderCreated>) explicit);
+            assertThat(beans.array).containsExactly((OutboxSerializer<?>) explicit);
+            assertThat(beans.map).containsOnlyKeys("explicitSerializer");
+            assertThat(beans.all.getObject()).containsKey("explicitSerializer")
+                .doesNotContainKeys("typedOutbox", "outboxJsonSerializer", "outboxJsonDeserializer");
+        });
+    }
+
+    static class TypedOutboxes {
+
+        @Autowired(required = false)
+        List<TypedOutbox<OrderCreated>> events;
+    }
+
+    @Test
+    void typedOutboxCollectionIsNotServedAWrongType() {
+        app().withUserConfiguration(TypedOutboxes.class).run(context ->
+            assertThat(context.getBean(TypedOutboxes.class).events).isNull());
+        app().withUserConfiguration(TypedOutboxes.class, ExplicitTypedOutbox.class).run(context ->
+            assertThat(context.getBean(TypedOutboxes.class).events)
+                .containsExactly((TypedOutbox<OrderCreated>) context.getBean("explicitOrders")));
+    }
+
+    static class OptionalOutbox {
+
+        @Autowired(required = false)
+        TypedOutbox<OrderCreated> field;
+        @Autowired
+        ObjectProvider<TypedOutbox<OrderCreated>> provider;
+    }
+
+    /** An optional TypedOutbox whose serializer is unavailable is absent, as an optional serializer is. */
+    @Test
+    void optionalTypedOutboxWithoutMapperGetsNothing() {
+        app(NO_MAPPER_BEANS).withUserConfiguration(OptionalOutbox.class).run(context -> {
+            assertThat(context).hasNotFailed();
+            var beans = context.getBean(OptionalOutbox.class);
+            assertThat(beans.field).isNull();
+            assertThat(beans.provider.getIfAvailable()).isNull();
+            assertThatThrownBy(() -> beans.provider.getObject())
+                .hasRootCauseInstanceOf(NoSuchBeanDefinitionException.class)
+                .hasMessageContaining(OutboxSerializer.class.getName());
+        });
+    }
+
+    static class ObjectOutbox {
+
+        ObjectOutbox(TypedOutbox<Object> events) {}
+    }
+
+    static class ObjectDeserializer {
+
+        ObjectDeserializer(OutboxDeserializer<Object> deserializer) {}
+    }
+
+    static class WildcardSerializer {
+
+        WildcardSerializer(OutboxSerializer<?> serializer) {}
+    }
+
+    /** {@code Object} decodes to the mapper's maps and carries no contract: as good as no type at all. */
+    @Test
+    void typeArgumentThatSaysNothingFails() {
+        for (var consumer : List.of(ObjectOutbox.class, ObjectDeserializer.class, WildcardSerializer.class)) {
+            app().withUserConfiguration(consumer).run(context ->
+                assertThat(failure(context)).contains("no concrete type argument", consumer.getName()));
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class ExplicitObjectDeserializer {
+
+        @Bean
+        OutboxDeserializer<Object> ownObjectDeserializer() {
+            return (topic, payload) -> payload;
+        }
+    }
+
+    @Test
+    void explicitBeanForObjectStillWins() {
+        app().withUserConfiguration(ObjectDeserializer.class, ExplicitObjectDeserializer.class)
+            .run(context -> assertThat(context).hasNotFailed());
+    }
+
+    static class EveryInjectionPoint {
+
+        final TypedOutbox<OrderCreatedV2> constructor;
+        @Autowired
+        TypedOutbox<OrderCreatedV2> field;
+        @Autowired
+        ObjectProvider<TypedOutbox<OrderCreatedV2>> provider;
+        @Autowired
+        Optional<TypedOutbox<OrderCreatedV2>> optional;
+
+        EveryInjectionPoint(TypedOutbox<OrderCreatedV2> constructor) {
+            this.constructor = constructor;
+        }
+    }
+
+    /** Each carries the contract of its own T. */
+    @Test
+    void typedOutboxGetsItsTypeAtEveryInjectionPoint() {
+        app().withUserConfiguration(EveryInjectionPoint.class).run(context -> {
+            var beans = context.getBean(EveryInjectionPoint.class);
+            for (var events : List.of(beans.constructor, beans.field, beans.provider.getObject(),
+                    beans.provider.getIfAvailable(), beans.optional.orElseThrow())) {
+                assertThat(events.message("t", "k", new OrderCreatedV2(1)).headers())
+                    .containsExactly(new OutboxHeader("outbox-contract", "2".getBytes(UTF_8)));
+            }
+        });
+    }
+
+    private static void assertScansSucceed(ApplicationContext context) {
+        assertThat(context.getBeansOfType(Object.class)).isNotEmpty()
+            .doesNotContainKeys("typedOutbox", "outboxJsonSerializer", "outboxJsonDeserializer");
+        assertThat(context.getBeanProvider(Object.class).stream()).isNotEmpty();
+        assertThat(context.getBeansWithAnnotation(Fallback.class))
+            .doesNotContainKeys("typedOutbox", "outboxJsonSerializer", "outboxJsonDeserializer");
+        assertThat(context.getBeanProvider(TypedOutbox.class).stream()).isEmpty();
+        assertThat(context.getBeansOfType(TypedOutbox.class)).isEmpty();
+        assertThatThrownBy(() -> context.getBean(TypedOutbox.class))
+            .isInstanceOf(NoSuchBeanDefinitionException.class);
+    }
+
+    /** A scan of all beans is not about this adapter: with no injection point the generic beans are just absent. */
+    @Test
+    void scansSucceedWithoutTypedBeans() {
+        app().run(context -> {
+            assertScansSucceed(context);
+            assertThat(context.getBeansOfType(OutboxSerializer.class)).isEmpty();
+        });
+    }
+
+    @Test
+    void scansSucceedWithTypedBeans() {
+        app().withUserConfiguration(OrdersApp.class).run(context -> {
+            assertScansSucceed(context);
+            assertThat(context.getBeansOfType(OutboxSerializer.class)).isEmpty();
+        });
+    }
+
+    @Test
+    void scansFindExplicitBeans() {
+        app().withUserConfiguration(ExplicitSerializer.class).run(context -> {
+            assertScansSucceed(context);
+            assertThat(context.getBeansOfType(OutboxSerializer.class)).containsOnlyKeys("explicitSerializer");
+        });
+    }
+
+    static class Streams {
+
+        @Autowired
+        ObjectProvider<OutboxSerializer<OrderCreated>> serializers;
+        @Autowired
+        ObjectProvider<TypedOutbox<OrderCreated>> outboxes;
+    }
+
+    /** A stream runs its lookups after the injection is over: they find the app's explicit beans only. */
+    @Test
+    void providerStreamsSucceed() {
+        app().withUserConfiguration(Streams.class).run(context -> {
+            var beans = context.getBean(Streams.class);
+            assertThat(beans.serializers.stream()).isEmpty();
+            assertThat(beans.outboxes.stream()).isEmpty();
+        });
+        app().withUserConfiguration(Streams.class, ExplicitSerializer.class).run(context ->
+            assertThat(context.getBean(Streams.class).serializers.stream())
+                .containsExactly((OutboxSerializer<OrderCreated>) context.getBean("explicitSerializer")));
+    }
+
+    static class ScansWhileBuilt {
+
+        final int serializers;
+
+        ScansWhileBuilt(ListableBeanFactory beans) {
+            serializers = beans.getBeansOfType(OutboxSerializer.class).size();
+        }
+    }
+
+    static class TakesScanner {
+
+        TakesScanner(ScansWhileBuilt scanner) {}
+    }
+
+    /** The injection point then in progress is of another type: the generic beans must not read it as theirs. */
+    @Test
+    void scanDuringAnotherInjectionFindsNoGenericBean() {
+        app().withUserConfiguration(ScansWhileBuilt.class, TakesScanner.class).run(context ->
+            assertThat(context.getBean(ScansWhileBuilt.class).serializers).isZero());
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class AdvisesTheHelper {
+
+        /** As a pointcut as broad as {@code execution(* *(..))} does, it matches what the container creates. */
+        @Bean
+        static Advisor adviseTheHelper() {
+            return new DefaultPointcutAdvisor(new StaticMethodMatcherPointcut() {
+                @Override
+                public boolean matches(Method method, Class<?> targetClass) {
+                    return targetClass.getName().endsWith("$InjectionPointHolder");
+                }
+            }, (MethodInterceptor) MethodInvocation::proceed);
+        }
+    }
+
+    /** The helper reading the injection point is created through the container: an aspect must not break it. */
+    @Test
+    void broadAspectDoesNotHideTheInjectionPoint() {
+        app().withUserConfiguration(Orders.class, AdvisesTheHelper.class).run(context ->
+            assertThat(payload(context.getBean(Orders.class).events)).contains("\"userId\":\"u1\""));
     }
 }

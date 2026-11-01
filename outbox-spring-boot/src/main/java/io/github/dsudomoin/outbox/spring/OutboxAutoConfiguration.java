@@ -23,7 +23,6 @@ import java.time.Duration;
 import java.util.function.Supplier;
 import javax.sql.DataSource;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.InjectionPoint;
 import org.springframework.beans.factory.ListableBeanFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.config.AutowireCapableBeanFactory;
@@ -182,11 +181,17 @@ public final class OutboxAutoConfiguration {
         @Bean
         @Scope(ConfigurableBeanFactory.SCOPE_PROTOTYPE)
         @Fallback
+        @Nullable
         @SuppressWarnings("unchecked")
-        <T> TypedOutbox<T> typedOutbox(InjectionPoint injectionPoint, Outbox outbox,
-                AutowireCapableBeanFactory factory) {
-            var type = TypedBeans.typeArgument(injectionPoint);
-            return new TypedOutbox<>(outbox, TypedBeans.serializer(factory, type), (Class<T>) type.toClass());
+        <T> TypedOutbox<T> typedOutbox(ObjectProvider<Outbox> outbox, AutowireCapableBeanFactory factory) {
+            var injectionPoint = TypedBeans.injectionPoint(factory);
+            var type = TypedBeans.typeArgument(injectionPoint, TypedOutbox.class);
+            if (type == null) {
+                return null;
+            }
+            OutboxSerializer<T> serializer = TypedBeans.serializer(factory, type, injectionPoint.isRequired());
+            return serializer != null
+                ? new TypedOutbox<>(outbox.getObject(), serializer, (Class<T>) type.toClass()) : null;
         }
 
         /** Only with protobuf present, though {@link ProtobufOutbox} loads without it. */
@@ -203,9 +208,10 @@ public final class OutboxAutoConfiguration {
     }
 
     /**
-     * The JSON codecs by {@code T} of the injection point. Without a mapper a factory method returns null, Spring's
-     * "no bean": a required injection fails naming the type, an optional one gets nothing. The mapper is chosen by bean
-     * lookup at creation, not by a bean condition, so no ordering after Boot's Jackson configurations is needed.
+     * The JSON codecs by {@code T} of the injection point. With no mapper, no injection point (a scan by type) or one
+     * of a collection, a factory method returns null, Spring's "no bean": a required injection fails naming the type,
+     * an optional one gets nothing, a scan skips it. The mapper is chosen by bean lookup at creation, not by a bean
+     * condition, so no ordering after Boot's Jackson configurations is needed.
      */
     @Configuration(proxyBeanMethods = false)
     static class JsonConfiguration {
@@ -222,18 +228,18 @@ public final class OutboxAutoConfiguration {
         @Scope(ConfigurableBeanFactory.SCOPE_PROTOTYPE)
         @Fallback
         @Nullable
-        <T> OutboxSerializer<T> outboxJsonSerializer(InjectionPoint injectionPoint, TypedBeans.Json json) {
-            var type = TypedBeans.jsonType(TypedBeans.typeArgument(injectionPoint));
-            return json.codec() != null ? json.codec().serializer(type) : null;
+        <T> OutboxSerializer<T> outboxJsonSerializer(AutowireCapableBeanFactory factory, TypedBeans.Json json) {
+            var type = TypedBeans.typeArgument(TypedBeans.injectionPoint(factory), OutboxSerializer.class);
+            return type != null && json.codec() != null ? json.codec().serializer(TypedBeans.jsonType(type)) : null;
         }
 
         @Bean
         @Scope(ConfigurableBeanFactory.SCOPE_PROTOTYPE)
         @Fallback
         @Nullable
-        <T> OutboxDeserializer<T> outboxJsonDeserializer(InjectionPoint injectionPoint, TypedBeans.Json json) {
-            var type = TypedBeans.jsonType(TypedBeans.typeArgument(injectionPoint));
-            return json.codec() != null ? json.codec().deserializer(type) : null;
+        <T> OutboxDeserializer<T> outboxJsonDeserializer(AutowireCapableBeanFactory factory, TypedBeans.Json json) {
+            var type = TypedBeans.typeArgument(TypedBeans.injectionPoint(factory), OutboxDeserializer.class);
+            return type != null && json.codec() != null ? json.codec().deserializer(TypedBeans.jsonType(type)) : null;
         }
 
         /** Only with Jackson 2 present: no class that loads without it names its types. */
