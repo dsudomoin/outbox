@@ -30,6 +30,7 @@ README «Наблюдаемость» → «Контракт по этапам»
 | `outbox.batch.duration` | timer, percentile histogram | | One relay step that found work in at least one of its locked shards; one step may cover several shards. Steps without work are not timed. |
 | `outbox.shard.paused` | counter | | Shard pauses: target down, failing head, no free handler thread. |
 | `outbox.relay.failures` | counter | | Relay failures it logs at WARN: a pass failing outside a step (tick, cursor read, connection, a lost one included) and a rolled-back single-shard step. Not a multi-shard step redone shard by shard, not maintenance, heartbeat, the dead-letter pass or failures while stopping. |
+| `outbox.handler.threads.free` | gauge | | Free handler threads of this instance, of `max(4, 2 × relay.workers)`. 0 for longer than `batchTimeout`: calls hung past it hold them all and this instance delivers nothing, while its heartbeat and `relay.running()` stay fine. |
 | `outbox.shard.lag` | gauge, seconds | | How far the slowest shard's tick is behind the latest tick. |
 | `outbox.retry.size`, `outbox.parked.size`, `outbox.dead.size` | gauges | | Rows in `<table>_retry`, `<table>_parked` (requeued records waiting) and `<table>_dead` (every status). |
 | `outbox.waiting.size` | gauge | | Retry heads waiting for an instance able to handle them; they and their keys' later records also count in `outbox.retry.size`. |
