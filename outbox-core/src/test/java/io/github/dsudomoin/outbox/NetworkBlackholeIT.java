@@ -2,6 +2,7 @@ package io.github.dsudomoin.outbox;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
@@ -29,6 +30,8 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import javax.sql.DataSource;
@@ -230,6 +233,25 @@ class NetworkBlackholeIT {
     }
 
     @Test
+    void aDrainOnASilentSocketFailsItsNetworkTimeoutLater() throws Exception {
+        var config = new TestOutboxConfig().relayEnabled(false).networkTimeout(Duration.ofSeconds(1));
+        var transactions = new JdbcTransactions(intercepting(throughTheHole(3, 0), (c, call, args) -> {
+            if (call.getName().equals("getAutoCommit") && Thread.currentThread().getName().equals("test-drain")) {
+                hole.forget(); // the tick's first call on its connection
+            }
+        }));
+        var relay = OutboxRuntime.builder(config, transactions, record -> {}).build();
+        closing.add(relay);
+        relay.start();
+        var drain = new FutureTask<>(relay.relay()::drain);
+        var thread = new Thread(drain, "test-drain");
+        thread.setDaemon(true);
+        thread.start();
+
+        assertThatThrownBy(() -> drain.get(20, TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class);
+    }
+
+    @Test
     void aConnectionGoesBackWithTheTimeoutItCameWith() throws Exception {
         var atClose = new ConcurrentLinkedQueue<Integer>();
         var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(9));
@@ -307,6 +329,7 @@ class NetworkBlackholeIT {
         var config = new HikariConfig();
         config.setDataSource(source);
         config.setMaximumPoolSize(8);
+        config.setValidationTimeout(250); // sheds the idle connections it finds dead fast: 5 s each by default
         var pool = new HikariDataSource(config);
         closing.add(pool);
         return pool;

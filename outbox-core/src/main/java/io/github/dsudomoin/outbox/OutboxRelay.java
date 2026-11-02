@@ -342,65 +342,74 @@ public final class OutboxRelay implements AutoCloseable {
         requireNotHalted();
         // a swap keeps every step out while it waits for those in flight: no progress for that long is no stall
         var stallAfter = Maintenance.quiesceTimeout(config).multipliedBy(2);
-        long stall = stallAfter.toNanos();
         try (var c = db.newConnection()) {
-            c.setAutoCommit(true);
-            long since = System.nanoTime();
-            Ticks.Made made;
-            while ((made = ticks.tick(c, Duration.ZERO)) != Ticks.Made.INSERTED) { // the 1 s tick lock timeout
-                if (made == Ticks.Made.REGRESSED) { // the halt it recorded; trying again would only burn xids
-                    maintenance.checkHalt();
-                    requireNotHalted();
-                }
-                if (System.nanoTime() - since > stall) {
-                    throw new IllegalStateException("outbox drain could not make a tick for " + stallAfter);
-                }
-            }
-            long target = ticks.latest(c, clock).id();
-            int delivered = 0;
-            List<Cursor> positions = null;
-            long progressed = System.nanoTime();
-            while (true) {
-                requireNotHalted();
-                var now = clock.now();
-                var pending = cursors.positions(c, target).stream().filter(p -> !drained(p, now))
-                        .map(Position::cursor).toList();
-                if (pending.isEmpty()) {
-                    return delivered;
-                }
-                // a position change of a pending shard, by this call or a worker; a pause or due time alone is no
-                // progress (a requeue moves parked_due_at on every step), and drained shards moving under live traffic
-                // must not hide a stuck one
-                var current = pending.stream()
-                        .map(cursor -> cursor.cleared().withRetryDueAt(null).withParkedDueAt(null)).toList();
-                if (!current.equals(positions)) {
-                    positions = current;
-                    progressed = System.nanoTime();
-                } else if (System.nanoTime() - progressed > stall) {
-                    throw new IllegalStateException("outbox drain made no progress for " + stallAfter
-                            + " towards tick " + target + "; pending: " + pending);
-                }
-                boolean worked = false;
-                for (var group : groups(pending.stream().map(Cursor::shard).toList())) {
-                    var results = processInOwnTransaction(c, group, target, now);
-                    learn(group, results);
-                    for (var result : results) {
-                        delivered += result.delivered();
-                        worked |= result.status() == ShardStatus.PROGRESS || result.status() == ShardStatus.PAUSED;
-                        if (result.delivered() > 0) {
-                            progressed = System.nanoTime();
-                        }
-                    }
-                }
-                if (!worked) {
-                    TimeUnit.NANOSECONDS.sleep(idleNanos); // locked by workers, or paused
-                }
+            boolean bound = boundSilentSocket(c);
+            try {
+                return drainOn(c, stallAfter);
+            } finally {
+                unbindSocket(c, bound);
             }
         } catch (SQLException e) {
             throw db.translate(e);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("outbox drain interrupted", e);
+        }
+    }
+
+    private int drainOn(Connection c, Duration stallAfter) throws SQLException, InterruptedException {
+        long stall = stallAfter.toNanos();
+        c.setAutoCommit(true);
+        long since = System.nanoTime();
+        Ticks.Made made;
+        while ((made = ticks.tick(c, Duration.ZERO)) != Ticks.Made.INSERTED) { // the 1 s tick lock timeout
+            if (made == Ticks.Made.REGRESSED) { // the halt it recorded; trying again would only burn xids
+                maintenance.checkHalt();
+                requireNotHalted();
+            }
+            if (System.nanoTime() - since > stall) {
+                throw new IllegalStateException("outbox drain could not make a tick for " + stallAfter);
+            }
+        }
+        long target = ticks.latest(c, clock).id();
+        int delivered = 0;
+        List<Cursor> positions = null;
+        long progressed = System.nanoTime();
+        while (true) {
+            requireNotHalted();
+            var now = clock.now();
+            var pending = cursors.positions(c, target).stream().filter(p -> !drained(p, now))
+                    .map(Position::cursor).toList();
+            if (pending.isEmpty()) {
+                return delivered;
+            }
+            // a position change of a pending shard, by this call or a worker; a pause or due time alone is no
+            // progress (a requeue moves parked_due_at on every step), and drained shards moving under live traffic
+            // must not hide a stuck one
+            var current = pending.stream()
+                    .map(cursor -> cursor.cleared().withRetryDueAt(null).withParkedDueAt(null)).toList();
+            if (!current.equals(positions)) {
+                positions = current;
+                progressed = System.nanoTime();
+            } else if (System.nanoTime() - progressed > stall) {
+                throw new IllegalStateException("outbox drain made no progress for " + stallAfter
+                        + " towards tick " + target + "; pending: " + pending);
+            }
+            boolean worked = false;
+            for (var group : groups(pending.stream().map(Cursor::shard).toList())) {
+                var results = processInOwnTransaction(c, group, target, now);
+                learn(group, results);
+                for (var result : results) {
+                    delivered += result.delivered();
+                    worked |= result.status() == ShardStatus.PROGRESS || result.status() == ShardStatus.PAUSED;
+                    if (result.delivered() > 0) {
+                        progressed = System.nanoTime();
+                    }
+                }
+            }
+            if (!worked) {
+                TimeUnit.NANOSECONDS.sleep(idleNanos); // locked by workers, or paused
+            }
         }
     }
 
