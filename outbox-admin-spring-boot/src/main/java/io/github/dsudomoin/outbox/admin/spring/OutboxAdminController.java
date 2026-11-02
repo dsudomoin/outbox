@@ -58,12 +58,12 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
  * global advice, whatever its order, or Boot's problem details, do not answer for this controller, nor these handlers
  * for any other; they also answer what is thrown before a route's method runs (by an argument, or by a
  * {@code HandlerInterceptor} of its handler). A call's {@link IllegalArgumentException} answers 400, its
- * {@link IllegalStateException} 409, a request MVC could not read 400, any other exception MVC gives a status (a missing
- * parameter) that status, and anything else 500 with the failure's message, for the authenticated operator; a 5xx after
- * one WARN with the exception. Enums are mapped by exhaustive {@code switch}, so a constant added on either side fails
- * the build instead of a request. Every route is a method of this class, so a {@code HandlerInterceptor} that takes the
- * handlers of this bean type sees them all, before any body is read. Not final: an app's aspect over every controller
- * proxies this one too.
+ * {@link IllegalStateException} 409, a request MVC could not read 400, any other exception MVC gives a status (a
+ * missing parameter) that status, and anything else 500 with the failure's message, for the authenticated operator; a
+ * 5xx after one WARN with the exception. Enums are mapped by exhaustive {@code switch}, so a constant added on either
+ * side fails the build instead of a request. Every route is a method of this class, so {@link OutboxAdminGuard}, which
+ * takes the handlers of this bean type, sees them all, before any body is read. Not final: an app's aspect over every
+ * controller proxies this one too.
  */
 @RestController
 class OutboxAdminController implements OutboxAdminApi {
@@ -72,7 +72,8 @@ class OutboxAdminController implements OutboxAdminApi {
 
     /**
      * Request attribute: an operation's arguments for its audit line, a {@code Map<String, String>} by name in order,
-     * values unescaped, set when the operation has some worth logging; there once the call completed.
+     * values unescaped, set when the operation has some worth logging; {@link OutboxAdminGuard} reads it once the call
+     * completed.
      */
     static final String DETAIL = OutboxAdminController.class.getName() + ".detail";
 
@@ -172,6 +173,12 @@ class OutboxAdminController implements OutboxAdminApi {
                 .body(new Error("Content-Type " + contentType + " is not supported: application/json only"));
     }
 
+    /** The guard's answer, as it decided, already in the audit log. */
+    @ExceptionHandler(OutboxAdminGuard.Refused.class)
+    public ResponseEntity<Error> denied(OutboxAdminGuard.Refused e) {
+        return error(e.status, e.getMessage());
+    }
+
     @ExceptionHandler(IllegalArgumentException.class)
     public ResponseEntity<Error> refused(IllegalArgumentException e) {
         return error(HttpStatus.BAD_REQUEST.value(), message(e));
@@ -199,8 +206,7 @@ class OutboxAdminController implements OutboxAdminApi {
     public ResponseEntity<Error> failed(Exception e, HttpServletRequest request) {
         int status = e instanceof ErrorResponse response ? response.getStatusCode().value() : 500;
         if (status >= 500) {
-            log.warn("outbox admin {} \"{}\" failed, answered {}", request.getMethod(), request.getRequestURI(), status,
-                e);
+            log.warn("outbox admin {} failed, answered {}", OutboxAdminGuard.caller(request), status, e);
         }
         // a DataAccessException says "bad SQL grammar []"; the database's own words are the failure
         return error(status, message(e instanceof NestedRuntimeException nested ? nested.getMostSpecificCause() : e));

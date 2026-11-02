@@ -1,0 +1,162 @@
+package io.github.dsudomoin.outbox.admin.spring;
+
+import jakarta.annotation.Nullable;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.util.Map;
+import java.util.Objects;
+import java.util.StringJoiner;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.web.method.HandlerMethod;
+import org.springframework.web.servlet.HandlerInterceptor;
+
+/**
+ * Guards every admin route with the {@link OutboxAdminAuthorizer}, called on the request's thread. MVC runs this after
+ * it has picked the handler and before it resolves the handler's arguments, so before anything reads the body. The
+ * decision follows the handler, not the path: it holds wherever an app moves the routes, and it passes anything but
+ * {@link OutboxAdminController} at once.
+ *
+ * <p>A denied call gets a JSON {@code Error} with the decision's status and never reaches the route; an authorizer that
+ * fails gets a WARN with its exception and the caller a 500 {@code Error} "authorization failed", nothing of why. A
+ * call other than a {@code GET} or {@code HEAD} that a browser marks as sent by another site ({@code Sec-Fetch-Site}
+ * other than {@code same-origin} or {@code none}) gets a 403 {@code Error} "cross-site request refused" without the
+ * authorizer: a page elsewhere cannot change state with what the operator's browser adds by itself. Each is a
+ * {@link Refused} that the controller's own handler answers, so neither an app's advice nor the app's JSON library is
+ * this class's concern.
+ *
+ * <p>Every call leaves one INFO audit line: {@code outbox admin <method> "<path>" by "<identity>": <status>} when
+ * allowed, {@code outbox admin <method> "<path>" denied: <status>} when denied or when the authorizer fails. An allowed
+ * call whose operation put its arguments under {@link OutboxAdminController#DETAIL} has them before the status:
+ * {@code by "<identity>" with <name> "<value>", ...}, a null value as {@code null}. The path (the raw request URI, no
+ * query), the identity (perhaps a token's subject) and each value are quoted, with their quotes, backslashes and
+ * control characters escaped, so no caller can forge a line or a part of one.
+ *
+ * <p>The line of a denial or of a failed authorizer is written here before its response. MVC has already flushed an
+ * allowed call's response when it runs {@link #afterCompletion}, so a client can see that response just before its line
+ * exists, unlike the Kora adapter's, whose line comes before its response completes. The line is still always written:
+ * MVC runs {@link #afterCompletion} for a call {@link #preHandle} let through, whatever became of it.
+ */
+final class OutboxAdminGuard implements HandlerInterceptor {
+
+    private static final Logger log = LoggerFactory.getLogger(OutboxAdminGuard.class);
+    /** Request attribute: who an allowed call is, for its audit line. */
+    private static final String IDENTITY = OutboxAdminGuard.class.getName() + ".identity";
+
+    private final OutboxAdminAuthorizer authorizer;
+
+    OutboxAdminGuard(OutboxAdminAuthorizer authorizer) {
+        this.authorizer = authorizer;
+    }
+
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
+        if (!guards(handler)) {
+            return true;
+        }
+        var call = call(request);
+        var method = request.getMethod();
+        if (!method.equals("GET") && !method.equals("HEAD") && sentByAnotherSite(request)) {
+            log.info("outbox admin {} denied: 403", call);
+            throw new Refused(403, "cross-site request refused");
+        }
+        OutboxAdminAuthorizer.Decision decision;
+        try {
+            decision = Objects.requireNonNull(authorizer.authorize(request), "OutboxAdminAuthorizer returned null");
+        } catch (Throwable e) { // an Error too: the call gets its audit line, the caller nothing of why
+            log.warn("outbox admin {}: the OutboxAdminAuthorizer failed, answered 500", call, e);
+            log.info("outbox admin {} denied: 500", call);
+            throw new Refused(500, "authorization failed");
+        }
+        if (decision instanceof OutboxAdminAuthorizer.Allow allow) {
+            request.setAttribute(IDENTITY, allow.identity());
+            return true;
+        }
+        var deny = (OutboxAdminAuthorizer.Deny) decision;
+        log.info("outbox admin {} denied: {}", call, deny.status());
+        throw new Refused(deny.status(), deny.message());
+    }
+
+    /** Checks the handler too: the attribute outlives the call into the container's error dispatch, if there is one. */
+    @Override
+    public void afterCompletion(HttpServletRequest request, HttpServletResponse response, Object handler,
+            @Nullable Exception ex) {
+        if (guards(handler) && request.getAttribute(IDENTITY) != null) {
+            log.info("outbox admin {}{}: {}", caller(request), detail(request),
+                ex != null ? 500 : response.getStatus());
+        }
+    }
+
+    /** Behind an app's aspect the bean is a subclass, which {@link HandlerMethod#getBeanType} sees through anyway. */
+    private static boolean guards(Object handler) {
+        return handler instanceof HandlerMethod method
+            && OutboxAdminController.class.isAssignableFrom(method.getBeanType());
+    }
+
+    /** {@code <method> "<path>"}, with {@code by "<identity>"} once allowed: how a line about this call names it. */
+    static String caller(HttpServletRequest request) {
+        var identity = request.getAttribute(IDENTITY);
+        return call(request) + (identity == null ? "" : " by \"" + printable(identity.toString()) + "\"");
+    }
+
+    private static String call(HttpServletRequest request) {
+        return request.getMethod() + " \"" + printable(request.getRequestURI()) + "\"";
+    }
+
+    /**
+     * Whether a browser says another site made it send {@code request} ({@code Sec-Fetch-Site}): such a request may
+     * carry what the browser adds by itself (a cookie, an SSO session, the operator's network address), which an
+     * authorizer cannot tell from the operator's own call. Clients other than browsers send no such header.
+     */
+    private static boolean sentByAnotherSite(HttpServletRequest request) {
+        var site = request.getHeader("Sec-Fetch-Site");
+        return site != null && !site.equals("same-origin") && !site.equals("none");
+    }
+
+    /** {@code  with <name> "<value>", ...} of the operation's detail, each value {@link #printable}; else empty. */
+    private static String detail(HttpServletRequest request) {
+        if (!(request.getAttribute(OutboxAdminController.DETAIL) instanceof Map<?, ?> detail)) {
+            return "";
+        }
+        var out = new StringJoiner(", ", " with ", "");
+        detail.forEach((name, value) -> out.add(name + " "
+            + (value == null ? "null" : "\"" + printable(value.toString()) + "\"")));
+        return out.toString();
+    }
+
+    /**
+     * {@code text} with quotes and backslashes escaped and each control character as its Java escape, so it stays one
+     * quoted token on one log line.
+     */
+    private static String printable(String text) {
+        var out = new StringBuilder(text.length());
+        text.chars().forEach(ch -> {
+            switch (ch) {
+                case '"' -> out.append("\\\"");
+                case '\\' -> out.append("\\\\");
+                case '\n' -> out.append("\\n");
+                case '\r' -> out.append("\\r");
+                case '\t' -> out.append("\\t");
+                default -> {
+                    if (Character.isISOControl(ch) || ch == ' ' || ch == ' ') {
+                        out.append(String.format("\\u%04x", ch));
+                    } else {
+                        out.append((char) ch);
+                    }
+                }
+            }
+        });
+        return out.toString();
+    }
+
+    /** What the guard answers instead of the route; its line is written, so its handler only answers. */
+    static final class Refused extends RuntimeException {
+
+        final int status;
+
+        Refused(int status, String message) {
+            super(message, null, false, false);
+            this.status = status;
+        }
+    }
+}

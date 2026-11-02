@@ -94,8 +94,18 @@ class AdminHttpIT {
         }
     }
 
+    /** These tests are about the routes; {@link OutboxAdminGuardIT} is about who gets to them. */
+    @Configuration(proxyBeanMethods = false)
+    static class AllowAll {
+
+        @Bean
+        OutboxAdminAuthorizer authorizer() {
+            return request -> OutboxAdminAuthorizer.allow("tester");
+        }
+    }
+
     /** Boot's datasource keys, no migrations, a fresh outbox table, no relay, a busy shard waited for 5.1 s. */
-    private static String[] properties(String... more) {
+    static String[] properties(String... more) {
         return Stream.concat(Stream.of("spring.datasource.url=" + TestDataSources.jdbcUrl(),
             "spring.datasource.username=" + TestDataSources.user(),
             "spring.datasource.password=" + TestDataSources.password(),
@@ -115,7 +125,7 @@ class AdminHttpIT {
 
     private void app(Class<?>[] configurations, Body body, String... properties) {
         new WebApplicationContextRunner()
-            .withUserConfiguration(Boot.class).withUserConfiguration(configurations)
+            .withUserConfiguration(Boot.class, AllowAll.class).withUserConfiguration(configurations)
             .withPropertyValues(properties(properties)).run(started -> {
                 assertThat(started).hasNotFailed();
                 context = started;
@@ -711,7 +721,7 @@ class AdminHttpIT {
 
             assertJson(response, 500);
             assertThat(response.body).startsWith("{\"message\":\"").contains(names.dead() + "\\\" does not exist");
-            var call = "outbox admin GET \"" + API + "/dead-letters/count\"";
+            var call = "outbox admin GET \"" + API + "/dead-letters/count\" by \"tester\"";
             assertThat(log.lines().filter(l -> l.contains(" WARN ") && l.contains(call + " failed, answered 500")))
                 .as("one WARN").hasSize(1);
             assertThat(log).contains("PSQLException");
