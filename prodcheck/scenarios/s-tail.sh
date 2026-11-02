@@ -14,21 +14,32 @@ tail_batch_stats() { # the mean of outbox.batch.duration over the last N seconds
 s_retry_long_tail() {
   pc_begin retry-long-tail
   pc_target
-  local opts='-Doutbox.relay.batchSize=100' i rows=100000 out=$RESULT_DIR/retry-long-tail.explain
+  local opts='-Doutbox.relay.batchSize=1000' i rows=100000 out=$RESULT_DIR/retry-long-tail.explain
   for i in 1001 1002; do pc_courier "$i" $opts; done
-  hctl 1001 'route=main&failKeys=tail-r&waiting=true'
-  hctl 1002 'route=main&failKeys=tail-r&waiting=true'
+  hctl 1001 'route=main&failKeys=tail-f&waiting=true'
+  hctl 1002 'route=main&failKeys=tail-f&waiting=true'
+  # a failing key's own rows reach the retry table slowly: the shard pauses and its calls halve down to one record
+  pc_load 1001 'rate=3000&writers=1&txMessages=500&bulk=true&bulkKey=tail-f&topics=deliveries'
+  local n0 n1
+  sleep 4
+  pc_unload 1001
+  n0=$(retry_size)
+  sleep 20
+  n1=$(retry_size)
+  log "a failing key moves to the retry table at $(((n1 - n0) / 20)) rows/s, of $(psql_q "select count(*) from pc_sent where key = 'tail-f'") written"
   local t=$(now)
+  # the retry tail behind a waiting head: no pause, whole batches
+  tx_send 1001 'topic=deliveries&key=tail-r&tag=wait' > /dev/null
   # the two keys through sendAll, their seqs consecutive: the order check holds over the whole tail
-  pc_load 1001 'rate=0&writers=1&txMessages=500&bulk=true&bulkKey=tail-r&topics=deliveries'
-  pc_load 1002 'rate=0&writers=1&txMessages=500&bulk=true&bulkKey=tail-p&topics=receipts&tags=hold:1'
+  pc_load 1001 'rate=3000&writers=1&txMessages=500&bulk=true&bulkKey=tail-r&topics=deliveries'
+  pc_load 1002 'rate=3000&writers=1&txMessages=500&bulk=true&bulkKey=tail-p&topics=receipts&tags=hold:1'
   full() { [ "$(psql_q "select count(*) from pc_sent where key = '$1'")" -ge "$rows" ]; }
   wait_for 300 full tail-r
   pc_unload 1001
   wait_for 300 full tail-p
   pc_unload 1002
   log "written in $(($(now) - t)) s"
-  settled() { [ "$(retry_size)" -ge "$((rows - 200))" ] && [ "$(parked_size)" -ge "$((rows - 200))" ]; }
+  settled() { [ "$(psql_q "select count(*) from outbox_retry where key = convert_to('tail-r', 'UTF8')")" -ge "$rows" ] && [ "$(parked_size)" -ge "$((rows - 200))" ]; }
   local fill=$(now)
   check "$(passes wait_for 300 settled)" "хвост на месте через $(($(now) - fill)) с: retry $(retry_size), parked $(parked_size)"
   # others flow beside it
@@ -38,6 +49,10 @@ s_retry_long_tail() {
   local steps1
   steps1=$(tail_batch_stats 1001 30)
   log "beside the tail: $steps1"
+  # the keys that share a shard with a tail wait behind its rows in id order until they are moved: named, apart from the rest
+  local mates
+  mates=$(psql_q "select string_agg(distinct convert_from(key, 'UTF8'), ',') from outbox where shard in (select distinct shard from outbox_retry union select distinct shard from outbox_parked) and convert_from(key, 'UTF8') not like 'tail-%'")
+  log "shard mates of the tails: ${mates:-none}"
   local to=$(now)
   pc_unload 1001
   # the plans, with the tail in place and real values
@@ -78,5 +93,5 @@ s_retry_long_tail() {
     sleep 10
     log "draining: retry $(retry_size), parked $(parked_size), steps of 1001 $(tail_batch_stats 1001 1)"
   done
-  pc_finish --exempt-tags none --slow-keys tail-r,tail-p --slow-from "$from" --slow-to "$to" --timeout 400
+  pc_finish --exempt-tags none --slow-keys "tail-r,tail-p,$mates" --slow-from "$from" --slow-to "$to" --timeout 400
 }

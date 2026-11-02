@@ -79,6 +79,10 @@ prodcheck/scenarios/run-all.sh kill-one admin   # отдельные сцена�
 python3 prodcheck/scenarios/summary.py          # итог по build/results
 ```
 
+Сборка варианта `accounts` с метриками и админ-API: `./gradlew -p prodcheck :accounts:installDist -PaccountsVariant=full`,
+ложится рядом с обычной в `accounts-full`. После правок в `common` собирайте заново все установки, `courier` с `:courier:clean`:
+KSP не перегенерирует граф по изменению контроллера. Другая версия Postgres: `PG_VERSION=17 prodcheck/scenarios/run-all.sh ...`.
+
 Запуск сам занимает общий стенд (`bench/scenarios/stand-lock.sh`), а процессы и контейнеры ведёт теми же помощниками, что и
 хаос-сценарии (`bench/scenarios/chaos-lib.sh`). Базы свои, Kafka не нужна.
 

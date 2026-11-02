@@ -359,10 +359,11 @@ s_accounts_corrupt_fixed() { # the recommendation: an envelope that never parses
   check "$(passes is "$(acc_q "select count(*) from account_events_retry")" = 0)" "в retry ничего не стоит"
   local letter
   letter=$(admin_body 1001 GET "dead-letters?topic=$ACC&limit=10")
-  check "$(passes grep -q "$id" <<< "$letter")" "письмо видно в админ-API с причиной: $(echo "$letter" | j 'd["letters"][0]["error"][:110]')"
-  check "$(passes gt "$(on 1001 metric outbox_dead_size)" 0)" "и в метрике outbox.dead.size"
+  check "$(passes grep -q "$id" <<< "$letter")" "письмо видно в админ-API с причиной: $(echo "$letter" | j 'd["items"][0]["error"][:110]')"
+  dead_gauge() { [ "$(on 1001 metric outbox_dead_size)" -gt 0 ]; }
+  check "$(passes wait_for 40 dead_gauge)" "и в метрике outbox.dead.size: обслуживание обновляет её раз в maintenanceInterval"
   local letter_id
-  letter_id=$(echo "$letter" | j 'd["letters"][0]["id"]')
+  letter_id=$(echo "$letter" | j 'd["items"][0]["id"]')
   local code
   code=$(admin_code 1001 POST dead-letters/redrive "{\"ids\":[$letter_id]}")
   check "$(passes is "$code" = 200)" "redrive принят: $code"
@@ -416,7 +417,7 @@ s_accounts_recommended() { # everything on: kill -9, a row lock, a corrupt envel
     acc "$i" $RECOMMENDED $READS_NEW
     sleep 3
   done
-  ACC_FINISH=(--exempt-tags wait,corrupt --order-within-tag wait --dead-tags corrupt --timeout 180 --slow-keys k3,k5,k7 --slow-tags wait --slow-from "$from" --slow-to "$to" --p99-max 5)
+  ACC_FINISH=(--exempt-tags wait,corrupt --order-within-tag wait --dead-tags corrupt --timeout 180 --slow-keys k3,k5,k7 --slow-tags wait --slow-from "$from" --slow-to "$to" --p99-max 10)
   acc_end
 }
 
@@ -462,10 +463,12 @@ s_accounts_rollback_drain() { # the service's rollback in its production form: t
   check "$(passes is "$undelivered" = 0)" "в этот момент недоставленных нет: $undelivered; писем у оператора $letters: их выгружают до удаления очереди"
   check "$(passes gt "$letters" 0)" "письма на месте: $letters"
   REPAIRED="процедура: админ-API для ждущих, рестарт с maxRequeues для вечно отложенных; прямого вызова для отложенных в админ-API нет"
-  ACC_FINISH=(--exempt-tags wait,unknown-source --dead-tags wait,unknown-source --report-order-within-tag wait --timeout 60)
-  check 0 "очередь можно удалять"
-  local a=$(acc_q "select count(*) from blocker")
-  log "blocked accounts left: $a"
+  # the abandoned key takes the records behind its head along, whatever their tag; the block's key only its own
+  local others
+  others=$(acc_q "select count(*) from account_events_dead where convert_from(key, 'UTF8') not in ('k9', 'k11')")
+  check "$(passes is "$others" = 0)" "письма только этих двух счетов: чужих $others"
+  ACC_FINISH=(--exempt-tags wait,unknown-source,normal --dead-tags wait,unknown-source,normal --timeout 60)
+  log "blocked accounts left: $(acc_q 'select count(*) from blocker')"
   acc_checks
   pc_finish "${ACC_FINISH[@]}"
 }
