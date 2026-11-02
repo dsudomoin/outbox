@@ -27,8 +27,13 @@ acc_begin() { # acc_begin NAME: Postgres 17, the roles, the migration as the own
 acc() { # acc I [-Dkey=value...]: (re)starts instance I; its load comes back with it
   local i=$1
   shift
-  APP=$ACCOUNTS inst_start "$i" "pc-$SCN-$i" POSTGRES_URL="$PC_PG_URL" INSTANCE_NAME="app-$i" "JAVA_OPTS=-Xmx768m $*"
+  APP=${ACC_APP:-$ACCOUNTS} inst_start "$i" "pc-$SCN-$i" POSTGRES_URL="$PC_PG_URL" POSTGRES_OWNER_URL="${ACC_OWNER_URL:-$PC_PG_URL}" INSTANCE_NAME="app-$i" "JAVA_OPTS=-Xmx768m $*"
   if [ -n "${LOADS[$i]:-}" ]; then pc_load "$i" "${LOADS[$i]}"; fi
+}
+
+acc_full() { # the build with metrics and the admin API: /status stands for the ledger's counts
+  ACC_APP=$ACCOUNTS_FULL
+  NO_ADMIN=""
 }
 
 blocked_accounts() { acc_q "select account from blocker"; }
@@ -284,4 +289,183 @@ s_accounts_same_type_held() { # with the README's rule in the handler (hold a ke
   done
   sleep 5
   acc_end --min-dups 1
+}
+
+# The service's recommendations, each with the plain form it replaces. The defaults stay the service's.
+RECOMMENDED='-Daccounts.lockTimeoutMs=2000 -Daccounts.holdSameType=true -Daccounts.unknownSource=wait -Daccounts.corruptPermanent=true'
+READS_NEW='-Daccounts.knownSources=0,99'
+
+s_accounts_unknown_source_ack() { # as the service has it: a source it does not know is acknowledged, the event is gone with no effect
+  acc_begin accounts-unknown-source-ack
+  local i n
+  for i in 1001 1002; do acc "$i"; acc_load "$i" 'rate=50&writers=2&keys=30'; done
+  sleep 3
+  for n in 1 2 3 4 5; do tx_send 1001 "topic=$ACC&key=k7&tag=unknown-source" > /dev/null; done
+  fault "пять событий с неизвестным номером source"
+  sleep 8
+  local arrived applied dead left
+  arrived=$(acc_q "select count(*) from pc_arrival where tag = 'unknown-source'")
+  applied=$(acc_q "select count(*) from pc_effect where tag = 'unknown-source'")
+  dead=$(acc_q "select count(*) from account_events_dead")
+  left=$(acc_q "select (select count(*) from account_events_retry) + (select count(*) from account_events_parked where convert_from(key, 'UTF8') = 'k7' and false)")
+  check "$(passes is "$arrived" = 5)" "все пять дошли до обработчика"
+  check "$(passes is "$applied" = 0)" "эффекта нет: событие подтверждено и исчезло, потеря по коду сервиса ($applied эффектов)"
+  check "$(passes is "$dead" = 0)" "и следов нет: в dead $dead, ждущих $left"
+  REPAIRED="ничего вернуть нельзя: так устроен ACK неизвестного source в сервисе; лечит accounts-unknown-source-wait"
+  acc_end --discard-tags unknown-source --exempt-tags wait,unknown-source
+}
+
+s_accounts_unknown_source_wait() { # the recommendation: wait, no attempt spent, other keys flow, a release that reads it delivers, in order
+  acc_begin accounts-unknown-source-wait
+  local i n opts=-Daccounts.unknownSource=wait
+  for i in 1001 1002; do acc "$i" $opts; acc_load "$i" 'rate=50&writers=2&keys=30'; done
+  sleep 3
+  for n in 1 2 3; do tx_send 1001 "topic=$ACC&key=k7&tag=unknown-source" > /dev/null; done
+  fault "три события с неизвестным номером source на счёте k7"
+  sleep 6
+  check "$(passes is "$(acc_q "select count(*) from account_events_retry where waiting_since is not null and convert_from(key, 'UTF8') = 'k7'")" = 1)" "ключ ждёт: одна ждущая голова"
+  sleep 12
+  check "$(passes is "$(acc_q "select coalesce(max(attempts), 0) from account_events_retry where waiting_since is not null")" = 0)" "попытки не тратятся"
+  check "$(passes is "$(acc_q "select count(*) from pc_effect where tag = 'unknown-source'")" = 0)" "эффекта пока нет"
+  check "$(passes effects_grow 5)" "остальные ключи идут"
+  local behind
+  behind=$(acc_q "select count(*) from account_events_retry where convert_from(key, 'UTF8') = 'k7'")
+  log "k7 holds $behind records behind its waiting head"
+  fault "релиз, который читает этот source: rolling-рестарт"
+  for i in 1001 1002; do
+    inst_stop "$i"
+    acc "$i" $opts $READS_NEW
+    sleep 3
+  done
+  REPAIRED="выкатка релиза, который читает новый source"
+  acc_end
+}
+
+s_accounts_corrupt_fixed() { # the recommendation: an envelope that never parses is a letter at once, the key moves on, an operator decides
+  acc_begin accounts-corrupt-fixed
+  acc_full
+  local i opts=-Daccounts.corruptPermanent=true
+  for i in 1001 1002; do acc "$i" $opts; acc_load "$i" 'rate=50&writers=2&keys=30'; done
+  sleep 3
+  local id t
+  id=$(tx_send 1001 "topic=$ACC&key=k5&tag=corrupt&raw=garbage" | j 'd["id"]')
+  t=$(now)
+  fault "в очереди запись, которая не разбирается: $id"
+  dead_now() { [ "$(acc_q "select count(*) from account_events_dead")" = 1 ]; }
+  check "$(passes wait_for 10 dead_now)" "сразу в dead: через $(($(now) - t)) с"
+  tx_send 1001 "topic=$ACC&key=k5&tag=after" > /dev/null
+  after() { [ "$(acc_q "select count(*) from pc_effect where tag = 'after'")" = 1 ]; }
+  check "$(passes wait_for 10 after)" "следующее событие счёта прошло: ключ идёт дальше"
+  check "$(passes is "$(acc_q "select count(*) from account_events_retry")" = 0)" "в retry ничего не стоит"
+  local letter
+  letter=$(admin_body 1001 GET "dead-letters?topic=$ACC&limit=10")
+  check "$(passes grep -q "$id" <<< "$letter")" "письмо видно в админ-API с причиной: $(echo "$letter" | j 'd["letters"][0]["error"][:110]')"
+  check "$(passes gt "$(on 1001 metric outbox_dead_size)" 0)" "и в метрике outbox.dead.size"
+  local letter_id
+  letter_id=$(echo "$letter" | j 'd["letters"][0]["id"]')
+  local code
+  code=$(admin_code 1001 POST dead-letters/redrive "{\"ids\":[$letter_id]}")
+  check "$(passes is "$code" = 200)" "redrive принят: $code"
+  died_again() { [ "$(acc_q "select redrives from account_events_dead where message_id = '$id'")" = 1 ]; }
+  check "$(passes wait_for 15 died_again)" "снова в dead, redrives = 1: запись та же, разбирать по-прежнему нечего"
+  letter_id=$(acc_q "select id from account_events_dead where message_id = '$id'")
+  code=$(admin_code 1001 POST dead-letters/discard "{\"ids\":[$letter_id]}")
+  check "$(passes is "$code" = 200)" "discard убирает письмо: $code"
+  local d=$LOGS/pc-$SCN-discarded.txt
+  echo "$id" > "$d"
+  REPAIRED="оператор решает через админ-API"
+  ACC_FINISH=(--exempt-tags wait --report-order-within-tag wait --timeout 120 --discarded-file "$d")
+  acc_end
+}
+
+s_accounts_recommended() { # everything on: kill -9, a row lock, a corrupt envelope, an unknown source, Postgres restart
+  acc_begin accounts-recommended
+  acc_full
+  local i n
+  for i in 1001 1002 1003; do acc "$i" $RECOMMENDED; acc_load "$i"; done
+  sleep 8
+  pc_kill 1001
+  sleep 3
+  acc 1001 $RECOMMENDED
+  sleep 3
+  local from=$(now)
+  row_lock 20
+  tx_send 1002 "topic=$ACC&key=k5&tag=corrupt&raw=garbage" > /dev/null
+  tx_send 1002 "topic=$ACC&key=k7&tag=unknown-source" > /dev/null
+  fault "конверт не разбирается на k5, неизвестный source на k7"
+  sleep 22
+  local to=$(now)
+  local status
+  status=$(admin_body 1002 GET status)
+  log "status: $(echo "$status" | j '{k: d[k] for k in ("lagSeconds", "retrySize", "parkedSize", "waitingSize", "deadLetters")}')"
+  check "$(passes is "$(echo "$status" | j 'd["waitingSize"]')" = 1)" "/status показывает ждущую запись"
+  check "$(passes grep -q "$ACC" <<< "$(echo "$status" | j 'd["deadLetters"]')")" "/status показывает письмо"
+  check "$(passes is "$(on 1002 metric outbox_waiting_size)" = 1)" "метрика outbox.waiting.size = 1"
+  check "$(passes gt "$(on 1002 metric outbox_dead_size)" 0)" "метрика outbox.dead.size > 0"
+  check "$(passes gt "$(on 1002 metric outbox_messages_requeued_total)" 0)" "метрика outbox.messages.requeued растёт"
+  docker restart -t 5 "$PG" > /dev/null
+  fault "docker restart Postgres"
+  sleep 15
+  local before back
+  before=$(acc_q "select count(*) from pc_effect")
+  back() { [ "$(acc_q "select count(*) from pc_effect")" -gt "$before" ]; }
+  check "$(passes wait_for 120 back)" "доставка вернулась сама после рестарта Postgres"
+  fault "релиз, который читает новый source: rolling-рестарт"
+  for i in 1001 1002 1003; do
+    inst_stop "$i"
+    acc "$i" $RECOMMENDED $READS_NEW
+    sleep 3
+  done
+  ACC_FINISH=(--exempt-tags wait,corrupt --order-within-tag wait --dead-tags corrupt --timeout 180 --slow-keys k3,k5,k7 --slow-tags wait --slow-from "$from" --slow-to "$to" --p99-max 5)
+  acc_end
+}
+
+s_accounts_rollback_drain() { # the service's rollback in its production form: the queue may go only when /status says there is nothing left
+  acc_begin accounts-rollback-drain
+  acc_full
+  local i opts='-Daccounts.unknownSource=wait'
+  for i in 1001 1002; do acc "$i" $opts; acc_load "$i" 'rate=50&writers=2&keys=30&tags=wait:7&rollbackPercent=3'; done
+  sleep 3
+  # a record that requeues for ever (its account's block never ends, maxRequeues = 0), and one no release reads
+  tx_send 1001 "topic=$ACC&key=k9&tag=block" > /dev/null
+  tx_send 1001 "topic=$ACC&key=k11&tag=unknown-source" > /dev/null
+  sleep 8
+  fault "приём остановлен"
+  for i in 1001 1002; do pc_unload "$i"; done
+  # the procedure: every other wait ends by itself; these two do not
+  local empty='d["lagSeconds"] == 0 and d["retrySize"] == 0 and d["parkedSize"] == 0 and d["waitingSize"] == 0'
+  sleep 20
+  local status
+  status=$(admin_body 1001 GET status)
+  log "20 s after the intake stopped: $(echo "$status" | j '{k: d[k] for k in ("lagSeconds", "retrySize", "parkedSize", "waitingSize", "deadLetters")}')"
+  check "$(passes is "$(echo "$status" | j "$empty")" = False)" "сама очередь не пустеет: запись ждёт релиз, запись откладывается вечно; /status это показывает, удалять нельзя"
+  check "$(passes gt "$(echo "$status" | j 'd["parkedSize"]')" 0)" "отложенные видны: $(echo "$status" | j 'd["parkedSize"]')"
+  check "$(passes gt "$(echo "$status" | j 'd["waitingSize"]')" 0)" "ждущие видны: $(echo "$status" | j 'd["waitingSize"]')"
+  # the waiting one: the admin API. The parked one: the API has nothing, only maxRequeues and a rolling restart
+  local body
+  body=$(admin_body 1001 POST waiting/abandon "{\"topic\":\"$ACC\",\"reason\":\"rollback of the release\",\"dryRun\":false}")
+  log "abandon: $body"
+  check "$(passes is "$(echo "$body" | j 'd["records"] > 0')" = True)" "waiting/abandon перенёс ждущие в dead: $body"
+  fault "rolling-рестарт с relay.requeue.maxRequeues = 1: вечное откладывание становится письмом"
+  for i in 1001 1002; do
+    inst_stop "$i"
+    acc "$i" $opts -Doutbox.relay.requeue.maxRequeues=1
+    sleep 2
+  done
+  emptied() { [ "$(admin_body 1001 GET status | j "$empty")" = True ]; }
+  local t=$(now)
+  check "$(passes wait_for 90 emptied)" "/status пуст через $(($(now) - t)) с: lag, retry, parked, waiting по нулям"
+  # that very moment: everything committed is either applied or a letter an operator holds
+  local undelivered letters
+  undelivered=$(acc_q "select count(*) from pc_sent s where not exists (select 1 from pc_effect e where e.message_id = s.message_id) and not exists (select 1 from account_events_dead d where d.message_id = s.message_id)")
+  letters=$(acc_q "select count(*) from account_events_dead")
+  check "$(passes is "$undelivered" = 0)" "в этот момент недоставленных нет: $undelivered; писем у оператора $letters: их выгружают до удаления очереди"
+  check "$(passes gt "$letters" 0)" "письма на месте: $letters"
+  REPAIRED="процедура: админ-API для ждущих, рестарт с maxRequeues для вечно отложенных; прямого вызова для отложенных в админ-API нет"
+  ACC_FINISH=(--exempt-tags wait,unknown-source --dead-tags wait,unknown-source --report-order-within-tag wait --timeout 60)
+  check 0 "очередь можно удалять"
+  local a=$(acc_q "select count(*) from blocker")
+  log "blocked accounts left: $a"
+  acc_checks
+  pc_finish "${ACC_FINISH[@]}"
 }

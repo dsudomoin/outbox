@@ -46,6 +46,6 @@ tasks.installDist {
 }
 
 application {
-    mainClass = "prodcheck.accounts.AccountsAppKt"
+    mainClass = "prodcheck.accounts.AccountsMainKt"
     applicationDefaultJvmArgs = listOf("-Dfile.encoding=UTF-8")
 }

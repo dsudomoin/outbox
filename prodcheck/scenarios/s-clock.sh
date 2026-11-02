@@ -96,3 +96,95 @@ s_app_clock_retry() { # an instance whose clock runs ahead schedules retries and
   tfault 'mode=ok'
   pc_finish --no-time-checks --timeout 60
 }
+
+# The inbox window goes by the JVM clocks of the sender (the id's time) and the receiver (its partitions): every lost
+# response makes a second delivery, which only the inbox can stop. The target counts a second effect instead of failing.
+skewed_shop() { # skewed_shop OFFSET: the sender in a container on ports 9083 and 9088
+  local name=kora-outbox-prodcheck-skewed
+  docker rm -f "$name" > /dev/null 2>&1 || true
+  docker run -d --name "$name" -p 127.0.0.1:9083:9083 -p 127.0.0.1:9088:9088 -v "$PC/shop/build/install/shop-n:/app:ro" \
+    -e HTTP_PORT=9083 -e METRICS_PORT=9088 -e INSTANCE_NAME="app-skewed$1" \
+    -e POSTGRES_URL=jdbc:postgresql://host.docker.internal:55432/outbox \
+    -e TARGET_DB_URL=jdbc:postgresql://host.docker.internal:55433/outbox -e TARGET_URL=http://host.docker.internal:9090 \
+    -e LD_PRELOAD="$FAKETIME_LIB/libfaketimeMT.so.1" -e FAKETIME="$1" -e FAKETIME_DONT_FAKE_MONOTONIC=1 \
+    -e JAVA_OPTS=-Xmx768m kora-outbox-prodcheck-app /app/bin/shop > /dev/null
+  wait_for 90 curl -sf localhost:9088/system/readiness
+}
+
+skewed_target() { # skewed_target OFFSET: the receiver and its inbox in a container on the target's ports
+  local name=kora-outbox-prodcheck-skewed-target
+  docker rm -f "$name" > /dev/null 2>&1 || true
+  docker run -d --name "$name" -p 127.0.0.1:9090:9090 -p 127.0.0.1:9095:9095 -v "$PC/target/build/install/target:/app:ro" \
+    -e HTTP_PORT=9090 -e METRICS_PORT=9095 -e INSTANCE_NAME="target$1" \
+    -e POSTGRES_URL=jdbc:postgresql://host.docker.internal:55433/outbox \
+    -e LD_PRELOAD="$FAKETIME_LIB/libfaketimeMT.so.1" -e FAKETIME="$1" -e FAKETIME_DONT_FAKE_MONOTONIC=1 \
+    -e JAVA_OPTS=-Xmx768m kora-outbox-prodcheck-app /app/bin/target > /dev/null
+  wait_for 90 curl -sf localhost:9095/system/readiness
+  tfault 'dropPercent=5&countDoubles=true'
+}
+
+doubles() { target_q "select count(*) from pc_double_effect"; }
+inbox_logs() { # the target's or the sender's container log joins the scenario's
+  docker logs "$1" >> "$LOGS/pc-$SCN-$1.log" 2>&1 || true
+}
+
+inbox_verdict() { # stuck keys, 23514, the numbers by offset
+  local c23514
+  c23514=$(cat "$LOGS/pc-$SCN-"*.log | grep -cE '23514|violates partition constraint|no partition of relation' || true)
+  check "$(passes is "$c23514" = 0)" "ни одной вставки inbox мимо партиции (23514): $c23514"
+  check "$(passes is "$(doubles)" = 0)" "ни одного второго эффекта: всего $(doubles); по сдвигам: $1"
+}
+
+s_inbox_clock_sender() { # the sender's clock is off: the ids' time, so the dedupe window; inside and past retention (24 h)
+  pc_begin inbox-clock-sender
+  AFTER='docker rm -f kora-outbox-prodcheck-skewed'
+  pc_target
+  tfault 'dropPercent=5&countDoubles=true'
+  pc_shop 1001
+  pc_load 1001 'rate=20&writers=2&keys=30&topics=payments'
+  local offset per="" a b
+  for offset in +2h -2h +3d -3d; do
+    a=$(doubles)
+    skewed_shop "$offset"
+    pc_load 1004 'rate=100&writers=2&keys=30&topics=payments'
+    fault "отправитель с часами $offset"
+    sleep 15
+    pc_unload 1004
+    sleep 5
+    docker stop -t 20 kora-outbox-prodcheck-skewed > /dev/null
+    inbox_logs kora-outbox-prodcheck-skewed
+    b=$(doubles)
+    per="$per $offset:$((b - a))"
+    log "sender $offset: second effects $((b - a)), outside_window $(curl -s localhost:9095/metrics | grep -E '^outbox_inbox_outside_window' | head -1)"
+  done
+  APP_PIDS[1004]=""
+  docker rm -f kora-outbox-prodcheck-skewed > /dev/null 2>&1 || true
+  tfault 'dropPercent=0'
+  inbox_verdict "$per"
+  pc_finish --no-time-checks --timeout 120
+}
+
+s_inbox_clock_receiver() { # the receiver's clock is off: its partitions and its window; the ids are right
+  pc_begin inbox-clock-receiver
+  AFTER='docker rm -f kora-outbox-prodcheck-skewed-target'
+  pc_shop 1001
+  local offset per="" a b name=kora-outbox-prodcheck-skewed-target
+  skewed_target +0
+  pc_load 1001 'rate=100&writers=2&keys=30&topics=payments'
+  for offset in +2h -2h +3d -3d +0; do
+    a=$(doubles)
+    docker stop -t 10 "$name" > /dev/null
+    inbox_logs "$name"
+    skewed_target "$offset"
+    fault "получатель с часами $offset"
+    sleep 15
+    b=$(doubles)
+    per="$per $offset:$((b - a))"
+    log "receiver $offset: second effects $((b - a)), partitions $(target_q "select count(*) from pg_inherits where inhparent = 'inbox'::regclass"), outside_window $(curl -s localhost:9095/metrics | grep -E '^outbox_inbox_outside_window' | head -1)"
+  done
+  check "$(passes effects_grow 5)" "доставка идёт после всех сдвигов"
+  tfault 'dropPercent=0'
+  inbox_logs "$name"
+  inbox_verdict "$per"
+  pc_finish --no-time-checks --timeout 120
+}
