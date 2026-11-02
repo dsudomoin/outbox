@@ -496,6 +496,37 @@ class StrandedShardsIT {
     }
 
     @Test
+    void aHaltRecordedDuringTheCallLeavesDuplicatesAtMost() throws Exception {
+        leaveTheOtherShardsOnANewerTick();
+        var rows = new ArrayList<UUID>(sendMany(1, 1500)); // two chunks at least: the regression comes between them
+        rows.addAll(sendMany(2, 50));
+        makeATick();
+        deleteTheirTick();
+        startRelay();
+        var once = new AtomicBoolean();
+        admin().afterChunk = c -> {
+            if (once.compareAndSet(false, true)) {
+                try (var other = direct.getConnection()) {
+                    long xmax = queryLong(other, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint")
+                            + 1_000_000_000L;
+                    execute(other, "insert into " + names.tick() + " (snapshot, created_at) values ('" + xmax + ":"
+                            + xmax + ":'::pg_snapshot, now() - interval '1 minute')");
+                    try (var ps = other.prepareStatement(XidRecovery.haltInsert(names))) {
+                        ps.setLong(1, xmax);
+                        ps.executeUpdate();
+                    }
+                }
+            }
+        };
+
+        admin().recoverStrandedShards(); // not re-checked: it goes on, and all its moved rows stay rows
+        admin().afterChunk = null;
+        admin().recoverXidRegression();
+
+        await(() -> delivered.containsAll(rows));
+    }
+
+    @Test
     void logsItsResultInOneLine() throws Exception {
         leaveTheOtherShardsOnANewerTick();
         sendMany(1, 2);
