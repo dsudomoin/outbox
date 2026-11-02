@@ -69,8 +69,8 @@ import org.slf4j.LoggerFactory;
  * a record that fails its whole call deep in a chunk is soon read alone; a requeue or a wait is neither. After
  * {@code headFailuresBeforeDivert} failed attempts in a row the shard probes: it reads the head row alone, in a call
  * of its own, and merges no parked row into it, so a slow or poison head is diverted as a single failing key, and a
- * down target loses at
- * most one row to the retry table per (backed-off) probe. Handler calls run on this processor's own bounded pool of
+ * down target loses at most one row to the retry table per (backed-off) probe; the rows of keys already there, ahead of
+ * that head, follow in the same step, up to {@code batchSize}, as they need no call. Handler calls run on this processor's own bounded pool of
  * daemon threads, each bounded by {@code batchTimeout}. A call that throws (an Error included) or returns an invalid
  * outcome list fails each of its records transiently (a call shared by several shards fails none of them: each is
  * called alone next), so a poison record takes that same path and no handler failure reaches the caller. The caller
@@ -409,6 +409,9 @@ public final class ShardProcessor implements AutoCloseable {
                 // probe mode: after headFailuresBeforeDivert failed attempts in a row, the head row alone
                 s.probe = s.cursor.failures() >= relay.headFailuresBeforeDivert();
                 s.limit = s.probe ? 1 : limits.get(s.shard);
+                s.checkBlocked = s.full ? hasRetryRows(inTx, s.shard) : s.retryDue != null || s.wroteRetry;
+                // a probe tries one row; the rows of keys already in retry before it need no call
+                s.readLimit = s.probe && s.checkBlocked ? relay.batchSize() : s.limit;
                 reads.add(s);
             }
         }
@@ -417,19 +420,28 @@ public final class ShardProcessor implements AutoCloseable {
             for (var s : reads) {
                 // a parked row the retry pass made a retry head blocks its key here too
                 shardReads.add(new BatchReader.ShardRead(s.shard, s.prev.snapshot(), s.target.snapshot(),
-                        s.cursor.lastId(), s.limit,
-                        s.full ? hasRetryRows(inTx, s.shard) : s.retryDue != null || s.wroteRetry));
+                        s.cursor.lastId(), s.readLimit, s.checkBlocked));
             }
             var batch = reader.readMany(inTx, shardReads, relay.batchSize());
             // limits that fit in batchSize read all they asked for: a read of exactly batchSize rows then cuts nothing
-            boolean cut = batch.cut() && reads.stream().mapToLong(s -> s.limit).sum() > relay.batchSize();
+            boolean cut = batch.cut() && reads.stream().mapToLong(s -> s.readLimit).sum() > relay.batchSize();
             var shared = new ArrayList<Step>(reads.size());
             var alone = new ArrayList<Step>();
             for (var s : reads) {
                 s.rows = new ArrayList<>(batch.rows().get(s.shard));
                 s.cut = cut;
-                s.segments.add(new Segment(s.cursor.tickId(), s.target, 0, s.rows.size(),
-                        !cut && s.rows.size() < s.limit));
+                boolean finished = !cut && s.rows.size() < s.readLimit;
+                if (s.probe) { // its head is the first row it can hand, and it stops there
+                    int head = 0;
+                    while (head < s.rows.size() && s.rows.get(head).blocked()) {
+                        head++;
+                    }
+                    if (head + 1 < s.rows.size()) {
+                        s.rows.subList(head + 1, s.rows.size()).clear();
+                        finished = false;
+                    }
+                }
+                s.segments.add(new Segment(s.cursor.tickId(), s.target, 0, s.rows.size(), finished));
             }
             if (!cut) {
                 chain(inTx, reads, latestTickId, started);
@@ -556,6 +568,9 @@ public final class ShardProcessor implements AutoCloseable {
         boolean called;
         boolean probe;
         int limit;
+        /** The rows its read asks for: {@link #limit}, or a batch of a probe that may find rows of keys in retry. */
+        int readLimit;
+        boolean checkBlocked;
         /** Its chunk's rows, batch by batch ({@link #segments}), id order inside each. */
         List<BatchRow> rows = List.of();
         /** The batches its read covers: the first, then the ones {@link #chain} went on into. */
@@ -678,7 +693,7 @@ public final class ShardProcessor implements AutoCloseable {
                 int left = s.limit - s.rows.size();
                 asked += left;
                 shardReads.add(new BatchReader.ShardRead(s.shard, prev.snapshot(), target.snapshot(), 0, left,
-                        s.full ? hasRetryRows(c, s.shard) : s.retryDue != null || s.wroteRetry));
+                        s.checkBlocked));
                 chained.add(s);
                 segmentTargets.add(target);
                 segmentFrom.add(from[i]);

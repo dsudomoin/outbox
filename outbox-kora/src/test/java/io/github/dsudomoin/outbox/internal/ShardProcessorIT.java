@@ -1844,12 +1844,9 @@ class ShardProcessorIT {
             now = cursor().pausedUntil();
         }
 
-        // the probe's head row k#2 follows k#1 unhanded: no delivery, so no reset to full batches
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, false));
-        assertThat(retryRows()).containsExactly("k#1:1:" + later, "k#2:0:-");
-        assertThat(cursor().failures()).isEqualTo(3);
-
+        // k#2 follows k#1 unhanded, and the probe goes on to its head row b#1, in the same step
         assertThat(process()).isEqualTo(new ShardResult(PAUSED, 0, false));
+        assertThat(retryRows()).hasSize(3).startsWith("k#1:1:" + later, "k#2:0:-");
         var batches = handler.batches();
         assertThat(batches.get(batches.size() - 1)).as("still probing").hasSize(1);
         var cursor = cursor();
@@ -2596,6 +2593,43 @@ class ShardProcessorIT {
                 .containsExactly("k#1:2:" + now.plus(Duration.ofMillis(1)), "k#2:2:" + now.plus(REQUEUE_DELAY));
     }
 
+    /** A probing shard hands one row, but the rows of a key already in retry need no call: they move in whole batches. */
+    @Test
+    void aProbingShardMovesTheBacklogOfADivertedKeyInBatches() throws Exception {
+        config.batchSize(10);
+        bootstrap();
+        script = records -> records.stream().map(r -> new String(r.payload(), UTF_8).startsWith("k#")
+                ? (Outcome) Outcome.retry(new RuntimeException("k down")) : Outcome.delivered()).toList();
+        var rows = new ArrayList<OutboxMessage>();
+        for (int i = 1; i <= 35; i++) {
+            rows.add(msg("t", "k", "k#" + i));
+        }
+        rows.add(msg("t", "j", "j#1"));
+        send(rows.toArray(OutboxMessage[]::new));
+        tick();
+        while (retryRows().isEmpty()) {
+            assertThat(process().status()).isEqualTo(PAUSED);
+            now = cursor().pausedUntil();
+        }
+        assertThat(cursor().failures()).as("still probing").isGreaterThanOrEqualTo(config.headFailuresBeforeDivert());
+        int diverted = retryRows().size();
+
+        process();
+        assertThat(retryRows()).as("a whole batch in one step").hasSize(diverted + 10);
+        process();
+        assertThat(retryRows()).hasSize(diverted + 20);
+        calls.clear();
+        while (retryRows().size() < 35) {
+            process();
+        }
+        process();
+
+        assertThat(calls.stream().flatMap(call -> payloads(call).stream()).filter(p -> p.startsWith("j#")))
+                .as("handed alone behind the backlog").containsExactly("j#1");
+        assertThat(calls).filteredOn(call -> payloads(call).contains("j#1")).singleElement()
+                .satisfies(call -> assertThat(payloads(call)).containsExactly("j#1"));
+    }
+
     /** Parked k#1, retry head k#2 with its follower k#3, the head due and k#1 not. */
     private void keyInRetryAboveAParkedRow() throws Exception {
         bootstrap();
@@ -2977,7 +3011,7 @@ class ShardProcessorIT {
         script = answering(Map.of("k#2", Outcome.notAttempted()));
         now = cursor().pausedUntil();
         calls.clear();
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, false));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, true));
         assertThat(calls).extracting(call -> payloads(call)).containsExactly(List.of("k#1", "k#2"), List.of("j#1"));
         assertThat(delivered()).containsExactly("k#1", "j#1");
         assertThat(parkedRows()).isEmpty();
