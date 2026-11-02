@@ -373,10 +373,10 @@ public final class ShardProcessor implements AutoCloseable {
                     ? parked.dueWithOlder(inTx, shard, now, relay.batchSize() - heads.size(), requeue.delay())
                     : ParkedStore.DueRows.NONE;
             var dueParked = dueRows.rows();
-            if (dueRows.putOff()) {
-                s.parkedDue = parked.minDue(inTx, shard); // not due any more, or the shard would be stepped again
-            }
             if (s.target == null && heads.isEmpty() && dueParked.isEmpty()) {
+                if (dueRows.putOff()) {
+                    s.parkedDue = parked.minDue(inTx, shard); // not due any more, or the shard would be stepped again
+                }
                 var checked = cursor.withRetryDueAt(s.full ? retries.minDue(inTx, shard) : s.retryDue)
                         .withParkedDueAt(s.parkedDue);
                 if (!checked.equals(cursor)) {

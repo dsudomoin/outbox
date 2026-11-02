@@ -381,6 +381,49 @@ class ParkedStoreIT {
                 .contains(newerDue.id()).doesNotContain(newerLater.id());
     }
 
+    /** Rows returned and rows the retry table's scans bring back, from the plan of a real run of {@code selectOlder}. */
+    private long[] olderReadCost(OutboxRecord due) throws SQLException {
+        try (var ps = c.prepareStatement("explain (analyze, format json) " + store.selectOlder())) {
+            ps.setArray(1, c.createArrayOf("text", new Object[] {due.topic()}));
+            ps.setArray(2, c.createArrayOf("bytea", new byte[][] {due.key()}));
+            ps.setArray(3, c.createArrayOf("int8", new Object[] {due.id()}));
+            ps.setShort(4, (short) 0);
+            ps.setShort(5, (short) 0);
+            ps.setObject(6, NOW.atOffset(java.time.ZoneOffset.UTC));
+            ps.setInt(7, 1000);
+            ps.setInt(8, 1001);
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                var plan = rs.getString(1);
+                var retry = java.util.regex.Pattern.compile("\"Relation Name\": \"" + names.retry()
+                        + "\"[^}]*?\"Actual Rows\": (\\d+)", java.util.regex.Pattern.DOTALL).matcher(plan);
+                var returned = java.util.regex.Pattern.compile("\"Actual Rows\": (\\d+)").matcher(plan);
+                returned.find();
+                return new long[] {Long.parseLong(returned.group(1)), retry.find() ? Long.parseLong(retry.group(1)) : -1};
+            }
+        }
+    }
+
+    /** Rows the due read brought already are not sent again, and a head costs one row of the retry table. */
+    @Test
+    void theOlderRowsReadCostsNeitherTheDueRowsAgainNorTheKeysRetryRows() throws SQLException {
+        var rows = new ArrayList<BatchClassifier.Action>();
+        OutboxRecord last = null;
+        for (int i = 0; i < 300; i++) {
+            last = record("t", "a");
+            rows.add(new Park(last, 1, NOW));
+        }
+        store.apply(c, 0, rows, Set.of(), NOW);
+        assertThat(olderReadCost(last)[0]).as("all due: none to bring along").isZero();
+
+        var inRetry = new ArrayList<BatchClassifier.Action>();
+        for (int i = 0; i < 300; i++) {
+            inRetry.add(new Follower(record("t", "a")));
+        }
+        retries.apply(c, 0, inRetry, NOW);
+        assertThat(olderReadCost(last)[1]).as("the head alone, of its key's 300 rows").isOne();
+    }
+
     @Test
     void ofKeysMatchesTopicAndKeyExactlyOldestFirst() throws SQLException {
         var k1 = record("t", "k");

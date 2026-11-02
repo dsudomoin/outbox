@@ -92,15 +92,19 @@ public final class ParkedStore {
         selectOfKeys = "select " + RECORD_COLUMNS + " from (select distinct t, b from unnest(?::text[], ?::bytea[])"
                 + " u(t, b)) k cross join lateral (select " + RECORD_COLUMNS + " from " + parked
                 + " where shard = ? and topic = k.t and key = k.b order by id limit ?) p order by id limit ?";
-        // of a key waiting in retry, its lowest row not due; of any other, its rows below the due one, the oldest
-        // first, after those, so that those never cut the others to fewer than the limit
-        selectOlder = "select " + RECORD_COLUMNS + ", due_at, in_retry, head_due"
+        // of a key waiting in retry, its lowest row not due; of any other, its rows not due below the due one (those
+        // due came with it: the due rows are the shard's lowest), the oldest first, after those, so that those never
+        // cut the others to fewer than the limit. The head by the key's lowest id, one index entry and one row, however
+        // many rows it holds: a follower below its head, from a long transaction, reads as no due time, and the head
+        // then brings the rows put off anyway
+        selectOlder = "select " + RECORD_COLUMNS + ", due_at, coalesce(in_retry, false) in_retry, head_due"
                 + " from unnest(?::text[], ?::bytea[], ?::int8[]) u(t, b, below)"
-                + " cross join lateral (select count(*) > 0 in_retry, min(r.next_attempt_at) head_due from " + retry
-                + " r where r.shard = ? and r.topic = u.t and r.key = u.b) k"
+                + " left join lateral (select true in_retry, r.next_attempt_at head_due from " + retry
+                + " r where r.shard = ? and r.topic = u.t and r.key = u.b order by r.id limit 1) k on true"
                 + " cross join lateral (select " + RECORD_COLUMNS + ", due_at from " + parked
-                + " where shard = ? and topic = u.t and key = u.b and id < u.below and (not k.in_retry or due_at > ?)"
-                + " order by id limit case when k.in_retry then 1 else ? end) p order by in_retry desc, id limit ?";
+                + " where shard = ? and topic = u.t and key = u.b and id < u.below and due_at > ?"
+                + " order by id limit case when k.in_retry then 1 else ? end) p"
+                + " order by coalesce(in_retry, false) desc, id limit ?";
         putOff = "update " + parked + " set due_at = ? where id = any(?)";
         postponeNewer = "update " + parked + " p set due_at = ? from unnest(?::text[], ?::bytea[], ?::int8[])"
                 + " k(t, b, above) where p.shard = ? and p.topic = k.t and p.key = k.b and p.id > k.above"
@@ -273,6 +277,11 @@ public final class ParkedStore {
      * the shard is not stepped for them in the meantime: at most one more step per retry attempt. An unkeyed row comes
      * alone.
      */
+    /** The statement {@link #dueWithOlder} reads the older rows with, for a test of its plan. */
+    String selectOlder() {
+        return selectOlder;
+    }
+
     public DueRows dueWithOlder(Connection c, int shard, Instant now, int limit, Duration requeueDelay)
             throws SQLException {
         var due = due(c, shard, now, limit);
@@ -311,25 +320,29 @@ public final class ParkedStore {
                 }
             }
         }
-        boolean putBack = false;
-        var earliest = timestamp(now.plus(requeueDelay));
-        for (var older : notDue.entrySet()) {
-            var ids = new ArrayList<Long>();
-            for (var row : due) {
-                if (row.id() > older.getValue().id() && older.getKey().equals(BatchClassifier.orderingKey(row))) {
-                    rows.remove(row.id());
-                    ids.add(row.id());
-                }
-            }
-            var at = lookAgainAt.get(older.getKey());
-            try (var ps = c.prepareStatement(putOff)) {
-                ps.setObject(1, at.isAfter(earliest) ? at : earliest);
-                ps.setArray(2, c.createArrayOf("int8", ids.toArray()));
-                ps.executeUpdate();
-            }
-            putBack = true;
+        if (notDue.isEmpty()) {
+            return new DueRows(rows.values().stream().limit(limit).toList(), false);
         }
-        return new DueRows(rows.values().stream().limit(limit).toList(), putBack);
+        var above = new HashMap<Object, List<Long>>();
+        for (var row : due) {
+            var key = BatchClassifier.orderingKey(row);
+            var older = notDue.get(key);
+            if (older != null && row.id() > older.id()) {
+                rows.remove(row.id());
+                above.computeIfAbsent(key, k -> new ArrayList<>()).add(row.id());
+            }
+        }
+        var earliest = timestamp(now.plus(requeueDelay));
+        try (var ps = c.prepareStatement(putOff)) {
+            for (var key : notDue.keySet()) {
+                var at = lookAgainAt.get(key);
+                ps.setObject(1, at.isAfter(earliest) ? at : earliest);
+                ps.setArray(2, c.createArrayOf("int8", above.getOrDefault(key, List.of()).toArray()));
+                ps.addBatch();
+            }
+            ps.executeBatch();
+        }
+        return new DueRows(rows.values().stream().limit(limit).toList(), true);
     }
 
     /**
