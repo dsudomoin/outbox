@@ -11,6 +11,8 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
  */
 public final class TestDataSources {
 
+    private static final int CONNECT_SECONDS = 30;
+
     private TestDataSources() {}
 
     private static final class Pg {
@@ -41,12 +43,14 @@ public final class TestDataSources {
         return Pg.INSTANCE.getPassword();
     }
 
-    /** A new physical connection per {@code getConnection()}. */
+    /** A new physical connection per {@code getConnection()}; one the server does not answer fails, not hangs the run. */
     public static DataSource newDataSource() {
         var ds = new PGSimpleDataSource();
         ds.setUrl(jdbcUrl());
         ds.setUser(user());
         ds.setPassword(password());
+        ds.setConnectTimeout(CONNECT_SECONDS);
+        ds.setLoginTimeout(CONNECT_SECONDS);
         return ds;
     }
 }

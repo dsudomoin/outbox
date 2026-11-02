@@ -147,7 +147,7 @@ public final class TestDb {
 
     /** Plain autocommit JDBC connection, outside any Kora pool. */
     public static Connection connect() throws SQLException {
-        return DriverManager.getConnection(jdbcUrl(), user(), password());
+        return connect(new Properties());
     }
 
     /** {@link #connect()} with pgjdbc connection properties, e.g. {@code ApplicationName}, or as another role. */
@@ -155,6 +155,8 @@ public final class TestDb {
         var p = new Properties();
         p.setProperty("user", user());
         p.setProperty("password", password());
+        p.setProperty("connectTimeout", "30"); // a server that does not answer fails the test, not hangs the run
+        p.setProperty("loginTimeout", "30");
         p.putAll(properties);
         return DriverManager.getConnection(jdbcUrl(), p);
     }
