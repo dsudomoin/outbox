@@ -2580,6 +2580,33 @@ class ShardProcessorIT {
         assertThat(delivered()).containsExactly("k#2");
     }
 
+    @Test
+    void aGroupCutToItsOldestRowAfterAWholeFailureWaitsWithIt() throws Exception {
+        bootstrap();
+        parkAll("k#1", "k#2");
+        now = now.plus(REQUEUE_DELAY);
+        setParkedDue("k#1", now.plusSeconds(60));
+        setParkedDue("k#2", now);
+        script = records -> {
+            if (records.size() > 1) {
+                throw new IllegalStateException("the whole call fails");
+            }
+            return records.stream().map(r -> Outcome.requeue()).toList();
+        };
+        calls.clear();
+
+        process();
+
+        assertThat(calls).extracting(ShardProcessorIT::payloads)
+                .containsExactly(List.of("k#1", "k#2"), List.of("k#1"));
+        var due = now.plus(REQUEUE_DELAY);
+        assertThat(parkedRows()).as("k#2 kept, no requeue spent").containsExactly("k#1:2:" + due, "k#2:1:" + due);
+        assertThat(cursor().parkedDueAt()).isEqualTo(due);
+        calls.clear();
+        process();
+        assertThat(calls).as("no call again before the delay").isEmpty();
+    }
+
     /** Sends them with one key {@code k}, in order, and has every one parked. */
     private void parkAll(String... payloads) throws Exception {
         var script = this.script;

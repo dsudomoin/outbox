@@ -1258,18 +1258,25 @@ public final class ShardProcessor implements AutoCloseable {
      * the requeue delay. None of these blocks the rows after it. The first other transient failure becomes the retry
      * head of the key and takes its newer parked rows along as followers ({@link ParkedStore#toRetry}), which ends the
      * group, as does a row not handed; so does the first waiting row, as a waiting head (attempts kept, waiting since
-     * {@code now}). Never promotes. Unparks, re-parks and keeps go to {@link Pass#parkedWrites}: such a row precedes
+     * {@code now}); a row not handed behind a row that stays parked stays too, due no earlier than after the requeue
+     * delay. Never promotes. Unparks, re-parks and keeps go to {@link Pass#parkedWrites}: such a row precedes
      * the group's row that moves, if any, and a move carries only the key's newer parked rows, while no other group of
      * the pass moves a parked row of its key (a retry group writes the parked table only through
      * {@link ParkedStore#fromRetry}, which inserts its own row), so the row is still parked when the pass writes it.
      */
     private void resolveParked(Connection c, int shard, Group group, Map<Long, Outcome> outcomes,
             List<OutboxRecord> delivered, Instant now, Pass pass) throws SQLException {
+        boolean stayed = false;
         for (var row : group.rows()) {
             var outcome = outcomes.get(row.id());
             int attempts = row.attempts() + 1;
-            if (outcome == null) {
-                return;
+            if (outcome == null) { // not handed
+                if (!stayed) {
+                    return;
+                }
+                // a row before it stays parked, due later: this one waits with it, or it would bring that row along
+                // at once, and again after each answer, spending its requeues without a delay
+                pass.parkedWrites.add(new Keep(row, requeueDue(null, now)));
             } else if (outcome instanceof Outcome.Delivered) {
                 delivered.add(row);
                 pass.parkedWrites.add(new Unpark(row));
@@ -1279,6 +1286,7 @@ public final class ShardProcessor implements AutoCloseable {
                 } else {
                     pass.parkedWrites.add(new Park(row, row.requeues() + 1, requeueDue(q.notBefore(), now)));
                     telemetry.requeued(row.topic());
+                    stayed = true;
                 }
             } else if (outcome instanceof Outcome.Permanent p) {
                 deadFromParked(c, pass, row, attempts, p.error().toString());
@@ -1295,6 +1303,7 @@ public final class ShardProcessor implements AutoCloseable {
                 return;
             } else if (outcome instanceof Outcome.NotAttempted n) { // attempts and requeues stay
                 pass.parkedWrites.add(new Keep(row, requeueDue(n.notBefore(), now)));
+                stayed = true;
             } else if (outcome instanceof Outcome.Waiting w) { // a parked row never waited: a first wait
                 var due = now.plus(waitDelay(null, now));
                 parked.toRetry(c, shard, row, row.attempts(), BatchClassifier.dueAt(due, w.notBefore(), now),
