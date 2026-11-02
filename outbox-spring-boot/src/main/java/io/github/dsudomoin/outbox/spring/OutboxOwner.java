@@ -16,7 +16,12 @@ import org.springframework.beans.factory.annotation.Qualifier;
  * @Bean(defaultCandidate = false)
  * @OutboxOwner
  * DataSource outboxOwnerDataSource() {
- *     return DataSourceBuilder.create().url(url).username("outbox_owner").password(password).build();
+ *     var pool = DataSourceBuilder.create().type(HikariDataSource.class)
+ *             .url(url).username("outbox_owner").password(password).build();
+ *     pool.setPoolName("outbox-owner");
+ *     pool.setMaximumPoolSize(4);
+ *     pool.setMinimumIdle(0); // needed rarely: the start, maintenance, recoveries
+ *     return pool;
  * }
  * }</pre>
  */

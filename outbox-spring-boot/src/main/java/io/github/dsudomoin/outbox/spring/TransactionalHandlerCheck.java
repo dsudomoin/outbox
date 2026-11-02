@@ -76,7 +76,8 @@ final class TransactionalHandlerCheck {
 
     /**
      * The transactions {@code method} runs in: one per interceptor applying to it, nested proxies included. An
-     * interface-based proxy dispatches the proxied interface's method, and Spring may find the annotation only there.
+     * interface-based proxy dispatches the method of the first proxied interface having it, and Spring may find the
+     * annotation only there; a later interface's is never asked, and {@code HandlerBeans} refuses one only it matches.
      */
     private static List<TransactionAttribute> attributes(Handler handler, Method method, ListableBeanFactory beans) {
         var targetClass = handler.targetClass();
@@ -86,7 +87,7 @@ final class TransactionalHandlerCheck {
             var proxy = (Advised) bean;
             var dispatched = new ArrayList<>(List.of(method));
             if (AopUtils.isJdkDynamicProxy(proxy)) {
-                dispatched.addAll(HandlerBeans.namesakes(proxy.getProxiedInterfaces(), method));
+                HandlerBeans.dispatched(proxy.getProxiedInterfaces(), method).ifPresent(dispatched::add);
             }
             for (var advisor : proxy.getAdvisors()) {
                 if (advisor.getAdvice() instanceof TransactionAspectSupport interceptor) {

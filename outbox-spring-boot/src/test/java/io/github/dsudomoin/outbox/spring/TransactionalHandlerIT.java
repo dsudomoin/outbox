@@ -447,6 +447,61 @@ class TransactionalHandlerIT {
         }
     }
 
+    /** Declares {@code handle(OutboxRecord)}, inherited, with no annotation: what {@code Proxy} sees of it first. */
+    interface Marker extends OutboxTopicHandler {}
+
+    static class TypedRollbackForListedLater extends TypedOutboxTopicHandler<Audit>
+            implements Marker, RollbackForOnInterface {
+
+        private final Effects effects;
+
+        TypedRollbackForListedLater(Effects effects) {
+            super(Set.of("orders"), (topic, payload) -> new Audit(new String(payload, UTF_8)));
+            this.effects = effects;
+        }
+
+        @Override
+        protected void handle(Audit event, OutboxRecord record) throws Exception {
+            effects.apply(record);
+        }
+    }
+
+    static class TypedRollbackForListedFirst extends TypedOutboxTopicHandler<Audit>
+            implements RollbackForOnInterface, Marker {
+
+        private final Effects effects;
+
+        TypedRollbackForListedFirst(Effects effects) {
+            super(Set.of("orders"), (topic, payload) -> new Audit(new String(payload, UTF_8)));
+            this.effects = effects;
+        }
+
+        @Override
+        protected void handle(Audit event, OutboxRecord record) throws Exception {
+            effects.apply(record);
+        }
+    }
+
+    /** Its own {@code handle} takes the annotation from any interface it implements, which a typed one's cannot. */
+    static class PlainRollbackForListedLater implements Marker, RollbackForOnInterface {
+
+        private final Effects effects;
+
+        PlainRollbackForListedLater(Effects effects) {
+            this.effects = effects;
+        }
+
+        @Override
+        public Set<String> topics() {
+            return Set.of("orders");
+        }
+
+        @Override
+        public void handle(OutboxRecord record) throws Exception {
+            effects.apply(record);
+        }
+    }
+
     static class WovenRollbackFor extends Orders {
 
         @Override
@@ -529,6 +584,33 @@ class TransactionalHandlerIT {
         @Bean
         OutboxTopicHandler handler(Effects effects) {
             return new TypedRollbackForOnInterface(effects);
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class TypedRollbackForListedLaterApp {
+
+        @Bean
+        OutboxTopicHandler handler(Effects effects) {
+            return new TypedRollbackForListedLater(effects);
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class PlainRollbackForListedLaterApp {
+
+        @Bean
+        OutboxTopicHandler handler(Effects effects) {
+            return new PlainRollbackForListedLater(effects);
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class TypedRollbackForListedFirstApp {
+
+        @Bean
+        OutboxTopicHandler handler(Effects effects) {
+            return new TypedRollbackForListedFirst(effects);
         }
     }
 
@@ -749,6 +831,24 @@ class TransactionalHandlerIT {
     @Test
     void rollbackForOnInterfaceRollsBackOnInterfaceProxy() throws Exception {
         app(TypedRollbackForOnInterfaceApp.class, JDK).run(context -> assertRetriedFromNothing(context));
+    }
+
+    /** {@code Proxy} hands over the method of the first listed interface having it, where Spring finds no annotation. */
+    @Test
+    void annotationOnALaterListedInterfaceRefusedForATypedHandler() throws Exception {
+        app(TypedRollbackForListedLaterApp.class, JDK).run(context -> assertThat(failure(context)).contains("handler")
+            .contains("handle(OutboxRecord)")
+            .contains("list RollbackForOnInterface first in the class's implements clause"));
+    }
+
+    @Test
+    void annotationOnTheFirstListedInterfaceRollsBackForATypedHandler() throws Exception {
+        app(TypedRollbackForListedFirstApp.class, JDK).run(context -> assertRetriedFromNothing(context));
+    }
+
+    @Test
+    void annotationOnALaterListedInterfaceRollsBackForAPlainHandler() throws Exception {
+        app(PlainRollbackForListedLaterApp.class, JDK).run(context -> assertRetriedFromNothing(context));
     }
 
     @Test

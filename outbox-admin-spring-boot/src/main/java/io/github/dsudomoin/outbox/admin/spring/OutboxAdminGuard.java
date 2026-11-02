@@ -166,7 +166,7 @@ final class OutboxAdminGuard implements HandlerInterceptor {
      */
     private static String printable(String text) {
         var out = new StringBuilder(text.length());
-        text.chars().forEach(ch -> {
+        text.codePoints().forEach(ch -> {
             switch (ch) {
                 case '"' -> out.append("\\\"");
                 case '\\' -> out.append("\\\\");
@@ -176,9 +176,11 @@ final class OutboxAdminGuard implements HandlerInterceptor {
                 default -> {
                     if (Character.isISOControl(ch) || ch == '\u2028' || ch == '\u2029'
                         || Character.getType(ch) == Character.FORMAT) {
-                        out.append(String.format("\\u%04x", ch));
+                        for (var unit : Character.toChars(ch)) { // beyond U+FFFF, Java's escape is two of them
+                            out.append(String.format("\\u%04x", (int) unit));
+                        }
                     } else {
-                        out.append((char) ch);
+                        out.appendCodePoint(ch);
                     }
                 }
             }

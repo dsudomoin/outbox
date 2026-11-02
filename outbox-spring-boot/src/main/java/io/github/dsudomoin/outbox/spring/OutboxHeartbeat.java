@@ -11,14 +11,19 @@ import org.springframework.beans.factory.annotation.Qualifier;
  * The {@code DataSource} of the outbox's heartbeat, which keeps this instance's row fresh and reads the reports that
  * guard routed sends. With such a bean, the beats take their connections from it, whatever
  * {@code outbox.heartbeat.dedicated-connection} says. An app can so point them past a pooler, run them as another
- * role or give them other timeouts. It must reach the app's database; one connection is all it needs, and its
- * connection timeout should stay well below {@code outbox.partitions.maintenance-interval}. Declared as no default
- * candidate, so Boot keeps its own DataSource and nothing else injects this one:
+ * role or give them other timeouts. It must reach the app's database. Declared as no default candidate, so Boot keeps
+ * its own DataSource and nothing else injects this one; one connection is all it needs, and its connection timeout
+ * should stay well below {@code outbox.partitions.maintenance-interval}:
  * <pre>{@code
  * @Bean(defaultCandidate = false)
  * @OutboxHeartbeat
  * DataSource outboxHeartbeatDataSource() {
- *     return DataSourceBuilder.create().url(directUrl).username(username).password(password).build();
+ *     var pool = DataSourceBuilder.create().type(HikariDataSource.class)
+ *             .url(directUrl).username(username).password(password).build();
+ *     pool.setPoolName("outbox-heartbeat-direct");
+ *     pool.setMaximumPoolSize(1); // Hikari keeps 10 connections open otherwise
+ *     pool.setConnectionTimeout(5_000);
+ *     return pool;
  * }
  * }</pre>
  */

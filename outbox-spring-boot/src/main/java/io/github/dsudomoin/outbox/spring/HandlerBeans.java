@@ -14,6 +14,7 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
@@ -234,7 +235,8 @@ final class HandlerBeans {
      * {@code handleBatch} included; advice on another method too, such as an advisor for the whole class, runs on
      * those it matches. As a relay method counts its namesake on any interface of the target, where an advisor can
      * match when the class's own method it does not; as a called method, on an interface-based proxy only, its namesake
-     * on a proxied interface, which is what that proxy dispatches; a class-based one dispatches the class's method.
+     * on the first proxied interface having it, the one method {@link java.lang.reflect.Proxy} dispatches, whatever
+     * interface the caller holds; a class-based one dispatches the class's method.
      */
     private static Handler inspect(String name, Object bean) {
         var proxies = new ArrayList<Advised>();
@@ -273,7 +275,7 @@ final class HandlerBeans {
         var handler = new Handler(name, bean, target, List.copyOf(path));
         var interfaces = ClassUtils.getAllInterfacesForClass(targetClass);
         for (var proxy : proxies) {
-            var dispatched = AopUtils.isJdkDynamicProxy(proxy) ? proxy.getProxiedInterfaces() : new Class<?>[0];
+            var proxied = AopUtils.isJdkDynamicProxy(proxy) ? proxy.getProxiedInterfaces() : new Class<?>[0];
             if (AopUtils.isCglibProxy(proxy)) {
                 for (var m : called) {
                     if (Modifier.isFinal(m.getModifiers())) {
@@ -284,9 +286,9 @@ final class HandlerBeans {
             for (var advisor : proxy.getAdvisors()) {
                 var matched = relayMethods.stream()
                     .filter(m -> matchesWith(interfaces, proxy, advisor, m, targetClass)).toList();
-                if (!matched.isEmpty()
-                        && called.stream().noneMatch(m -> matchesWith(dispatched, proxy, advisor, m, targetClass))) {
-                    throw unreachable(handler, proxy, advisor, matched.get(0));
+                if (!matched.isEmpty() && called.stream().noneMatch(m -> matches(proxy, advisor, m, targetClass)
+                        || dispatched(proxied, m).filter(d -> matches(proxy, advisor, d, targetClass)).isPresent())) {
+                    throw unreachable(handler, proxy, advisor, matched.get(0), called);
                 }
             }
         }
@@ -368,10 +370,18 @@ final class HandlerBeans {
     }
 
     /** The methods of {@code interfaces} with {@code method}'s signature. */
-    static List<Method> namesakes(Class<?>[] interfaces, Method method) {
+    private static List<Method> namesakes(Class<?>[] interfaces, Method method) {
         return Arrays.stream(interfaces)
             .map(type -> ClassUtils.getMethodIfAvailable(type, method.getName(), method.getParameterTypes()))
             .filter(Objects::nonNull).toList();
+    }
+
+    /**
+     * What a {@link java.lang.reflect.Proxy} of these interfaces, in this order, hands its invocation handler for a call
+     * of {@code method}'s signature, whichever of them the caller holds: the first one's having it.
+     */
+    static Optional<Method> dispatched(Class<?>[] interfaces, Method method) {
+        return namesakes(interfaces, method).stream().findFirst();
     }
 
     private static IllegalArgumentException finalCalled(Handler handler, Method method) {
@@ -382,10 +392,33 @@ final class HandlerBeans {
             + " fields are unset: " + fix);
     }
 
-    private static IllegalArgumentException unreachable(Handler handler, Advised proxy, Advisor advisor,
-            Method method) {
+    /** Why the advice is lost, if for this reason: it matches a called method only on an interface listed too late. */
+    @Nullable
+    private static String listedLater(Handler handler, Advised proxy, Advisor advisor, List<Method> called) {
+        for (var method : called) {
+            Class<?> first = null;
+            for (var type : proxy.getProxiedInterfaces()) {
+                var namesake = ClassUtils.getMethodIfAvailable(type, method.getName(), method.getParameterTypes());
+                if (namesake != null && first == null) {
+                    first = type;
+                } else if (namesake != null && matches(proxy, advisor, namesake, handler.targetClass())) {
+                    return "an interface-based (JDK) proxy dispatches a method that several of its interfaces have as"
+                        + " the first listed one has it, here " + first.getSimpleName() + ", and the advisor matches it"
+                        + " on " + type.getSimpleName() + ": list " + type.getSimpleName()
+                        + " first in the class's implements clause";
+                }
+            }
+        }
+        return null;
+    }
+
+    private static IllegalArgumentException unreachable(Handler handler, Advised proxy, Advisor advisor, Method method,
+            List<Method> called) {
+        var listedLater = AopUtils.isJdkDynamicProxy(proxy) ? listedLater(handler, proxy, advisor, called) : null;
         String why;
-        if (handler.overridesBatch()) {
+        if (listedLater != null) {
+            why = listedLater;
+        } else if (handler.overridesBatch()) {
             why = "the relay calls only the overridden handleBatch on the proxy, and its own calls of this method"
                 + " bypass the proxy: advise handleBatch, or use a TransactionTemplate inside the override";
         } else if (method.getName().equals("handleBatch")) {

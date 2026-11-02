@@ -23,8 +23,10 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * for this DataSource ({@code DataSourceTransactionManager}, {@code JdbcTransactionManager},
  * {@code JpaTransactionManager}), in one PostgreSQL transaction with the business writes. Outside a transaction, or
  * inside a transaction of another DataSource, they are refused; this class never opens a transaction or fetches a
- * connection for them. A {@link TransactionAwareDataSourceProxy} is unwrapped to its target, as Spring's transaction
- * managers do.
+ * connection for them. The exception: inside another DataSource's transaction, after the app itself used this
+ * DataSource through a synchronized connection (as {@code JdbcTemplate} does), a send on a pool with auto-commit off
+ * writes into that connection and rolls back with the app's. A {@link TransactionAwareDataSourceProxy} is unwrapped to
+ * its target, as Spring's transaction managers do.
  */
 public final class SpringOutboxTransactions implements OutboxTransactions {
 

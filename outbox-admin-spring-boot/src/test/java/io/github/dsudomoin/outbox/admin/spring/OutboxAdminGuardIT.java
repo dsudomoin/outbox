@@ -398,11 +398,12 @@ class OutboxAdminGuardIT {
     @Test
     void anAuditLineEscapesFormatCharacters() throws Exception {
         try (var server = AdminServer.start(WithKeys.class); var stderr = new CapturedStderr()) {
-            server.post(API + "/orphans/x%E2%80%AEy%E2%80%8Bz/restore?fromXid=0", null);
+            server.post(API + "/orphans/x%E2%80%AEy%E2%80%8Bz%F3%A0%80%81/restore?fromXid=0", null); // U+E0001 last
 
             assertThat(server.settledAudit(stderr, 1)).singleElement().asString()
-                .endsWith("orphans/x\\u202ey\\u200bz/restore\" denied: 401");
-            assertThat(stderr.text()).doesNotContain("\u202e").doesNotContain("\u200b");
+                .endsWith("orphans/x\\u202ey\\u200bz\\udb40\\udc01/restore\" denied: 401");
+            assertThat(stderr.text()).doesNotContain("\u202e").doesNotContain("\u200b")
+                .doesNotContain(new String(Character.toChars(0xE0001)));
         }
     }
 
