@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
@@ -17,6 +18,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URI;
 import java.sql.Connection;
+import java.sql.SQLFeatureNotSupportedException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -228,19 +230,47 @@ class NetworkBlackholeIT {
     }
 
     @Test
-    void aPoolGivesItsNextBorrowerTheTimeoutOfTheConnection() throws Exception {
-        var config = new HikariConfig();
-        config.setDataSource(DIRECT);
-        config.setMaximumPoolSize(1);
-        try (var pool = new HikariDataSource(config)) {
-            try (var c = pool.getConnection()) {
-                assertThat(c.getNetworkTimeout()).isZero();
-                c.setNetworkTimeout(Runnable::run, 1000);
-                assertThat(c.getNetworkTimeout()).isEqualTo(1000);
+    void aConnectionGoesBackWithTheTimeoutItCameWith() throws Exception {
+        var atClose = new ConcurrentLinkedQueue<Integer>();
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(9));
+        Set<UUID> delivered = ConcurrentHashMap.newKeySet();
+        var transactions = new JdbcTransactions(intercepting(DIRECT, (c, call, args) -> {
+            if (call.getName().equals("close") && Thread.currentThread().getName().startsWith("outbox-relay-")) {
+                atClose.add(c.getNetworkTimeout());
             }
-            try (var c = pool.getConnection()) {
-                assertThat(c.getNetworkTimeout()).as("not left to the next borrower").isZero();
+        }));
+        var relay = OutboxRuntime.builder(config, transactions, record -> delivered.add(record.messageId())).build();
+        closing.add(relay);
+        relay.start();
+
+        var sent = send(relay, transactions, "k");
+        await(() -> delivered.contains(sent));
+        await(() -> !atClose.isEmpty());
+
+        assertThat(atClose).as("a pool that restores nothing passes on what it gets").containsOnly(0);
+    }
+
+    @Test
+    void aConnectionThatTellsNoTimeoutStillDeliversWithOneWarn() throws Exception {
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(9));
+        Set<UUID> delivered = ConcurrentHashMap.newKeySet();
+        var transactions = new JdbcTransactions(intercepting(DIRECT, (c, call, args) -> {
+            if (call.getName().equals("getNetworkTimeout")) {
+                throw new SQLFeatureNotSupportedException("no such thing here");
             }
+        }));
+        try (var err = new CapturedStderr()) {
+            var relay = OutboxRuntime.builder(config, transactions, record -> delivered.add(record.messageId()))
+                    .build();
+            closing.add(relay);
+            relay.start();
+
+            var sent = send(relay, transactions, "k");
+            await(() -> delivered.contains(sent));
+            Thread.sleep(200); // more passes
+
+            assertThat(err.text().lines().filter(line -> line.contains("outbox.relay.networkTimeout")))
+                    .as("once, however many passes").hasSize(1);
         }
     }
 
@@ -284,17 +314,29 @@ class NetworkBlackholeIT {
 
     /** {@code source} whose connections add to {@code calls}, per {@code setNetworkTimeout}: thread name:milliseconds. */
     private static DataSource recordingTimeouts(DataSource source, Queue<String> calls) {
+        return intercepting(source, (c, call, args) -> {
+            if (call.getName().equals("setNetworkTimeout") && !args[1].equals(0)) {
+                calls.add(Thread.currentThread().getName() + ":" + args[1]);
+            }
+        });
+    }
+
+    /** {@code source}, a plain wrapper restoring nothing, with {@code before} run ahead of each connection's call. */
+    private static DataSource intercepting(DataSource source, ConnectionCall before) {
         return (DataSource) Proxy.newProxyInstance(DataSource.class.getClassLoader(), new Class<?>[] {DataSource.class},
                 (ds, method, args) -> {
                     var result = invoke(source, method, args);
                     return !method.getName().equals("getConnection") ? result : Proxy.newProxyInstance(
                             Connection.class.getClassLoader(), new Class<?>[] {Connection.class}, (c, call, values) -> {
-                                if (call.getName().equals("setNetworkTimeout")) {
-                                    calls.add(Thread.currentThread().getName() + ":" + values[1]);
-                                }
+                                before.run((Connection) result, call, values);
                                 return invoke(result, call, values);
                             });
                 });
+    }
+
+    @FunctionalInterface
+    private interface ConnectionCall {
+        void run(Connection real, Method call, Object[] args) throws Exception;
     }
 
     private static Object invoke(Object target, Method method, Object[] args) throws Throwable {

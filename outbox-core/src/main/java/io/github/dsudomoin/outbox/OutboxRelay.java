@@ -30,6 +30,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.atomic.AtomicLong;
@@ -86,6 +87,7 @@ public final class OutboxRelay implements AutoCloseable {
     private final long minTickNanos;
     /** {@code relay.networkTimeout}; 0: none. */
     private final int networkTimeoutMillis;
+    private final AtomicBoolean unboundWarned = new AtomicBoolean();
     /**
      * An idle tick attempt inserts only when the newest tick, any instance's, is older than this: so a cluster makes
      * about one idle tick per {@code idlePollInterval} (at most 4 per 3 intervals with many instances), not one per
@@ -399,6 +401,46 @@ public final class OutboxRelay implements AutoCloseable {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("outbox drain interrupted", e);
+        }
+    }
+
+    /**
+     * {@code relay.networkTimeout} on a connection with no such bound of its own (pgjdbc's default
+     * {@code socketTimeout}): without one, a connection the network dropped silently holds its thread on the socket for
+     * good. Returns whether it set one, which {@link #unbindSocket} takes back. Neither call goes to the database. A
+     * connection that does not take it still delivers: a WARN, once.
+     */
+    private boolean boundSilentSocket(Connection c) {
+        if (networkTimeoutMillis == 0) {
+            return false;
+        }
+        try {
+            if (c.getNetworkTimeout() != 0) {
+                return false;
+            }
+            c.setNetworkTimeout(Runnable::run, networkTimeoutMillis);
+            return true;
+        } catch (SQLException | RuntimeException e) {
+            if (unboundWarned.compareAndSet(false, true)) {
+                log.warn("outbox.relay.networkTimeout could not be set on a connection of this relay ({}), so a"
+                        + " connection the network drops silently holds its worker until the OS closes the socket; give"
+                        + " the DataSource a socketTimeout. Logged once", e.toString());
+            }
+            return false;
+        }
+    }
+
+    /**
+     * Gives {@code c} back as it came, whichever pool it goes back to, when {@link #boundSilentSocket} set its timeout:
+     * another user of the pool may run a longer statement. A dead connection, which does not take it, goes anyway.
+     */
+    private static void unbindSocket(Connection c, boolean bound) {
+        if (bound) {
+            try {
+                c.setNetworkTimeout(Runnable::run, 0);
+            } catch (SQLException | RuntimeException e) {
+                log.debug("outbox relay could not take back the network timeout of a connection", e);
+            }
         }
     }
 
@@ -788,38 +830,35 @@ public final class OutboxRelay implements AutoCloseable {
          */
         private boolean pass(long seen) throws Exception {
             try (var c = db.newConnection()) {
-                boundSilentSocket(c);
-                c.setAutoCommit(true);
-                tickIfDue(c, seen);
-                readRound(c);
-                boolean worked = false;
-                while (!stopping && !maintenance.halted()) {
-                    // the tick attempts of a long pass (a backlog keeps its round from running out), each followed by
-                    // a look at the latest tick: without them ticks would wait for the pass, and each would hold ever
-                    // more rows, read again in full by every chunk of a batch
-                    if (tickIfDue(c, wakeups.get())) {
-                        readRound(c);
-                    }
-                    var r = round; // a sibling may have read a newer tick: its round is the one to work on
-                    var group = r.take();
-                    if (group.isEmpty()) {
-                        break;
-                    }
-                    worked |= step(c, r, group);
+                boolean bound = boundSilentSocket(c);
+                try {
+                    return passOn(c, seen);
+                } finally {
+                    unbindSocket(c, bound);
                 }
-                return worked;
             }
         }
 
-        /**
-         * {@code relay.networkTimeout} on a connection with no such bound of its own (pgjdbc's default
-         * {@code socketTimeout}): without one, a connection the network dropped silently holds this worker on its
-         * socket for good. Neither call goes to the database. A pool gives the connection back with its own value.
-         */
-        private void boundSilentSocket(Connection c) throws SQLException {
-            if (networkTimeoutMillis > 0 && c.getNetworkTimeout() == 0) {
-                c.setNetworkTimeout(Runnable::run, networkTimeoutMillis);
+        private boolean passOn(Connection c, long seen) throws Exception {
+            c.setAutoCommit(true);
+            tickIfDue(c, seen);
+            readRound(c);
+            boolean worked = false;
+            while (!stopping && !maintenance.halted()) {
+                // the tick attempts of a long pass (a backlog keeps its round from running out), each followed by
+                // a look at the latest tick: without them ticks would wait for the pass, and each would hold ever
+                // more rows, read again in full by every chunk of a batch
+                if (tickIfDue(c, wakeups.get())) {
+                    readRound(c);
+                }
+                var r = round; // a sibling may have read a newer tick: its round is the one to work on
+                var group = r.take();
+                if (group.isEmpty()) {
+                    break;
+                }
+                worked |= step(c, r, group);
             }
+            return worked;
         }
 
         /**
