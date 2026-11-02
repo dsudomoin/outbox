@@ -7,6 +7,7 @@ import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.OwnerTransactions;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.PgOutboxAdmin;
+import io.github.dsudomoin.outbox.internal.SocketBound;
 import jakarta.annotation.Nullable;
 import java.sql.SQLException;
 import java.time.InstantSource;
@@ -155,6 +156,7 @@ public final class OutboxRuntime implements AutoCloseable {
         } catch (SQLException e) {
             throw transactions.translate(e);
         }
+        SocketBound.warnIfUnbounded(transactions, config.table());
         try {
             var resolved = schema.config(); // with the shard count the bootstrap resolved
             var names = schema.names();

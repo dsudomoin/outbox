@@ -505,6 +505,52 @@ class NetworkBlackholeIT {
     }
 
     @Test
+    void aPoolWithoutASocketBoundGetsOneWarnAtStart() throws Exception {
+        var config = new TestOutboxConfig().maintenanceInterval(Duration.ofMillis(100));
+        Set<UUID> delivered = ConcurrentHashMap.newKeySet();
+        var transactions = new JdbcTransactions(throughTheHole(3, 0));
+        try (var err = new CapturedStderr()) {
+            var relay = OutboxRuntime.builder(config, transactions, record -> delivered.add(record.messageId())).build();
+            closing.add(relay);
+            relay.start();
+            var sent = send(relay, transactions, "k");
+            await(() -> delivered.contains(sent));
+            Thread.sleep(300); // passes, runs and beats, each on a connection of that pool
+
+            assertThat(err.text().lines().filter(line -> line.contains("WARN")
+                    && line.contains("business transaction"))).hasSize(1);
+        }
+    }
+
+    @Test
+    void aPoolWithASocketBoundGetsNoWarn() throws Exception {
+        try (var err = new CapturedStderr()) {
+            var relay = OutboxRuntime.builder(new TestOutboxConfig(), new JdbcTransactions(throughTheHole(3, 30)),
+                    record -> {}).build();
+            closing.add(relay);
+            relay.start();
+
+            assertThat(err.text()).doesNotContain("business transaction");
+        }
+    }
+
+    @Test
+    void aConnectionThatTellsNoBoundGetsNoWarnAndStarts() throws Exception {
+        try (var err = new CapturedStderr()) {
+            var relay = OutboxRuntime.builder(new TestOutboxConfig(), new JdbcTransactions(intercepting(DIRECT,
+                    (c, call, args) -> {
+                        if (call.getName().equals("getNetworkTimeout")) {
+                            throw new SQLFeatureNotSupportedException("no such thing here");
+                        }
+                    })), record -> {}).build();
+            closing.add(relay);
+            relay.start();
+
+            assertThat(err.text()).doesNotContain("business transaction");
+        }
+    }
+
+    @Test
     void anAdminCallOnASilentSocketFails() throws Exception {
         var config = new TestOutboxConfig().relayEnabled(false).networkTimeout(Duration.ofSeconds(1));
         var transactions = new JdbcTransactions(intercepting(throughTheHole(3, 0), (c, call, args) -> {

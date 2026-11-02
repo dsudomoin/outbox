@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.internal;
 
+import io.github.dsudomoin.outbox.ConnectionSource;
 import io.github.dsudomoin.outbox.internal.Sql.SqlFunction0;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -78,6 +79,24 @@ public final class SocketBound {
                     log.debug("outbox could not take back the network timeout of a connection", e);
                 }
             }
+        }
+    }
+
+    /**
+     * One WARN when connections of {@code application}, whose transactions the library does not own and cannot bound,
+     * have no socket bound. Asks one connection, once; one that does not say is left alone: only pgjdbc's are known.
+     */
+    public static void warnIfUnbounded(ConnectionSource application, String table) {
+        try (var c = application.newConnection()) {
+            if (c.getNetworkTimeout() == 0) {
+                log.warn("outbox {}: the application's connections have no socket timeout (pgjdbc socketTimeout = 0;"
+                        + " in Kora, db.dsProperties.socketTimeout). The library bounds its own threads with"
+                        + " outbox.relay.networkTimeout, but not a business transaction: one on a connection the"
+                        + " network dropped silently waits until the instance restarts. Set socketTimeout, in seconds,"
+                        + " above the longest statement of the service", table);
+            }
+        } catch (SQLException | RuntimeException e) {
+            log.debug("outbox {} could not read the socket bound of the application's connections", table, e);
         }
     }
 
