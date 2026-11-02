@@ -182,7 +182,9 @@ for ops:
 
    Either way: `pg_read_all_stats` recommended for the role that runs maintenance; no role `statement_timeout` of
    seconds.
-3. **Connections**: direct or session-mode pooler, never transaction pooling, the owner database included.
+3. **Connections**: direct or session-mode pooler for whatever runs startup and maintenance. Behind transaction pooling
+   only the app's own `DataSource` may go, with `prepareThreshold=0`, the `search_path` set on the role or a
+   schema-qualified `outbox.table`, and a direct owner database (the split above).
    `db.maxPoolSize` ≥ the service's own peak + `relay.workers` + 3 (+ 1 while `drain()` runs). Leave `outbox.shards`
    unset (256 for a new outbox). The heartbeat's own pool adds one server connection per instance: count it into
    `max_connections`, the role's `CONNECTION LIMIT` and a pooler's per-user pool. A limit sized to exactly instances
