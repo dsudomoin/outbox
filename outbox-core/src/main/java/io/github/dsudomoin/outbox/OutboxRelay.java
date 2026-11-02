@@ -324,7 +324,8 @@ public final class OutboxRelay implements AutoCloseable {
      *
      * @throws IllegalStateException when no shard advanced for {@code 2 × (batchTimeout + 5 s)}, twice the longest a
      *     tail swap waits for relay steps in flight, while work remains (e.g. a shard paused by a down target), or
-     *     while maintenance has halted the relay (xid regression)
+     *     while maintenance has halted the relay (xid regression), or when a lock on the halt table kept the first
+     *     xid check from reading for that long
      */
     public int drain() {
         int delivered = drainShards();
@@ -336,10 +337,14 @@ public final class OutboxRelay implements AutoCloseable {
 
     /** {@link #drain()} but its dead-letter run, on one connection of its own. */
     private int drainShards() {
-        maintenance.checkHalt(); // the recorded halt: maintenance does not run while the relay is disabled
-        requireNotHalted();
         // a swap keeps every step out while it waits for those in flight: no progress for that long is no stall
         var stallAfter = Maintenance.quiesceTimeout(config).multipliedBy(2);
+        try {
+            checkHaltWaiting(stallAfter);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("outbox drain interrupted", e);
+        }
         try (var c = db.newConnection(); var bound = socket.on(c)) {
             return drainOn(c, stallAfter);
         } catch (SQLException e) {
@@ -348,6 +353,17 @@ public final class OutboxRelay implements AutoCloseable {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("outbox drain interrupted", e);
         }
+    }
+
+    /** The recorded halt, as maintenance does not run while the relay is disabled; a lock on it is waited out. */
+    private void checkHaltWaiting(Duration bound) throws InterruptedException {
+        long since = System.nanoTime();
+        maintenance.checkHalt();
+        while (maintenance.unanswered() && System.nanoTime() - since < bound.toNanos()) {
+            TimeUnit.NANOSECONDS.sleep(idleNanos);
+            maintenance.checkHalt();
+        }
+        requireNotHalted();
     }
 
     private int drainOn(Connection c, Duration stallAfter) throws SQLException, InterruptedException {

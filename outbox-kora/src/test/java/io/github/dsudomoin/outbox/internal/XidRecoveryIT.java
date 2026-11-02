@@ -292,6 +292,69 @@ class XidRecoveryIT {
         }
     }
 
+    /** A lock on the halt table for a moment is no regression: the first check has no answer yet, and drain waits. */
+    @Test
+    void aDrainWaitsOutALockOnTheHaltTable() throws Exception {
+        config.relayEnabled(false);
+        bootstrap();
+        send(outbox(null), messages("m", 3));
+        var relay = relay(new RecordingHandler(), maintenance());
+        relay.start();
+        try (var locker = TestDb.connect(); var err = new CapturedStderr()) {
+            locker.setAutoCommit(false);
+            execute(locker, "lock table " + names.halt() + " in access exclusive mode");
+            var release = Executors.newSingleThreadScheduledExecutor();
+            release.schedule(() -> {
+                locker.rollback();
+                return null;
+            }, 1, TimeUnit.SECONDS);
+            try {
+                assertThat(relay.drain()).isEqualTo(3);
+            } finally {
+                release.shutdown();
+            }
+            assertThat(err.text()).doesNotContain("xid regression").doesNotContain("resumed");
+        }
+        assertThat(haltRows()).isZero();
+    }
+
+    /** A lock that outlasts the drain's bound fails it, for what it is. */
+    @Test
+    void aDrainThatCannotCheckNamesTheLockNotARegression() throws Exception {
+        config.relayEnabled(false).batchTimeout(Duration.ofMillis(100));
+        bootstrap();
+        var relay = relay(new RecordingHandler(), maintenance());
+        relay.start();
+        try (var locker = TestDb.connect()) {
+            locker.setAutoCommit(false);
+            execute(locker, "lock table " + names.halt() + " in access exclusive mode");
+            assertThatThrownBy(relay::drain).isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining(names.halt()).hasMessageContaining("lock")
+                    .hasMessageNotContaining("below a tick");
+        }
+    }
+
+    /** The workers of a starting instance wait for the same answer, which maintenance's first run gets them. */
+    @Test
+    void aLockOnTheHaltTableAtStartDelaysTheWorkersOnlyWhileItLasts() throws Exception {
+        config.maintenanceInterval(Duration.ofHours(1));
+        bootstrap();
+        var handler = new RecordingHandler();
+        var maintenance = maintenance();
+        var relay = relay(handler, maintenance);
+        try (var locker = TestDb.connect(); var err = new CapturedStderr()) {
+            locker.setAutoCommit(false);
+            execute(locker, "lock table " + names.halt() + " in access exclusive mode");
+            relay.start();
+            assertThat(maintenance.halted()).as("no answer yet: no worker takes a shard").isTrue();
+            locker.rollback();
+            send(outbox(relay), messages("m", 3));
+            await(Duration.ofSeconds(5), () -> handler.delivered().size() == 3);
+            assertThat(maintenance.halted()).isFalse();
+            assertThat(err.text()).doesNotContain("xid regression").doesNotContain("resumed");
+        }
+    }
+
     /** A check failing past its reads, here at its commit, rolls back: autocommit restored would commit it. */
     @Test
     void aHaltCheckThatFailsUncheckedCommitsNothing() throws Exception {

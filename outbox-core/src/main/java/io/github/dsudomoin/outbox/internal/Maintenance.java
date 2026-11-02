@@ -142,6 +142,8 @@ public final class Maintenance {
     private volatile boolean halted;
     /** Whether a check of the xid counter has answered yet. */
     private volatile boolean xidChecked;
+    /** The first check ran into a lock and has no answer yet: no worker starts, and nothing was found. */
+    private volatile boolean unanswered;
     /** The cursors' shard count when it differs from {@link #shards}, else null. */
     @Nullable
     private volatile Integer mismatch;
@@ -256,12 +258,21 @@ public final class Maintenance {
      * {@code outbox.shards} (see the class comment): its steps would read and write shards that no longer exist.
      */
     public boolean halted() {
-        return halted || mismatch != null;
+        return halted || unanswered || mismatch != null;
+    }
+
+    /** The first check has no answer yet: a lock kept it from reading, so {@link #halted()} says nothing was found. */
+    public boolean unanswered() {
+        return unanswered;
     }
 
     /** Why {@link #halted()}, for the relay's {@code drain()}. */
     public String haltReason() {
         var m = mismatch;
+        if (m == null && !halted && unanswered) {
+            return "outbox could not check for an xid regression: a lock on " + names.halt() + " or on its ticks keeps"
+                    + " the check from reading (a recovery holds one for its run); no regression was found";
+        }
         return m != null ? "outbox halted: " + mismatchText(m)
                 : "outbox halted: maintenance found the xid counter below a tick's xmax (see its ERROR log and README"
                         + " \"xid regression recovery\")";
@@ -271,8 +282,8 @@ public final class Maintenance {
      * The xid-regression check and the shard count check alone, without the maintenance lock: refreshes
      * {@link #halted()} and returns it; never recovers, and leaves the ERROR to the run that says why it did not. Each
      * read waits at most {@link #SHARDS_LOCK_TIMEOUT} for a lock on its table, which a recovery holds for its run:
-     * after that the last answer stands, and before any, the xid check's is halted, so no worker starts on ticks a
-     * recovery is replacing.
+     * after that the last answer stands, and before any, {@link #unanswered()}, so no worker starts on ticks a
+     * recovery is replacing until maintenance's first run or a later check gets through.
      */
     public boolean checkHalt() {
         try (var c = db.newConnection(); var bound = socket.on(c)) {
@@ -292,7 +303,7 @@ public final class Maintenance {
                     throw t;
                 }
                 if (!xidChecked) {
-                    halted = true;
+                    unanswered = true;
                 }
             } finally {
                 c.setAutoCommit(true);
@@ -859,6 +870,7 @@ public final class Maintenance {
     private synchronized XidRecovery.Check checkXidCounter(Connection c) throws SQLException {
         var check = recovery.check(c);
         xidChecked = true;
+        unanswered = false;
         if (!check.halted()) {
             if (check.recorded() != null) { // ticks repaired: the regressed ones are gone
                 execute(c, "delete from " + names.halt());
