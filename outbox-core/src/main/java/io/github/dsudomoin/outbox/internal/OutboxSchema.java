@@ -62,13 +62,17 @@ public final class OutboxSchema implements AutoCloseable {
     /** Bounds every bootstrap statement, and replaces a shorter role default that would cut its lock waits short. */
     private static final Duration STATEMENT_TIMEOUT = Duration.ofMinutes(1);
     /**
-     * Set on the bootstrap's session before the schema lock, so that wait is bounded too; {@code idle_session_timeout}
-     * off, as a role's own value would end the session during the reshard's tick wait.
+     * Set on the bootstrap's session before the schema lock, so that wait is bounded too. {@code idle_session_timeout}
+     * short of the minute other bootstraps wait for the schema lock, so Postgres ends the session of a start the network
+     * cut off and frees its session locks in time for them; not a role's own value, which the reshard's tick wait must
+     * not be cut by ({@link #TICK_RECHECK}).
      */
     private static final Map<String, String> BOOTSTRAP_SETTINGS = Map.of(
             "lock_timeout", String.valueOf(LOCK_TIMEOUT.toMillis()),
             "statement_timeout", String.valueOf(STATEMENT_TIMEOUT.toMillis()),
-            "idle_session_timeout", "0");
+            "idle_session_timeout", "45000");
+    /** How long the reshard's tick wait sleeps at most: its next look keeps the session from going idle for long. */
+    private static final long TICK_RECHECK = TimeUnit.SECONDS.toMillis(10);
     /** {@code LOCK_TIMEOUT} each: a minute for other instances' bootstraps, which take milliseconds each. */
     private static final int SCHEMA_LOCK_ATTEMPTS = 12;
     private static final String LOCK_NOT_AVAILABLE = "55P03";
@@ -717,6 +721,9 @@ public final class OutboxSchema implements AutoCloseable {
                 // the reshard waited for it, and its row would be read under its old shard
                 try (var st = c.createStatement()) {
                     st.execute("set transaction isolation level read committed");
+                    // cut off by the network, it must not hold writers behind its SHARE lock
+                    st.execute("set local idle_in_transaction_session_timeout = "
+                            + Maintenance.ABANDONED_AFTER.toMillis());
                 }
                 try (var ps = c.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {
                     for (int lock : List.of(TableNames.LOCK_MAINTENANCE, TableNames.LOCK_SWAP, TableNames.LOCK_TICK)) {
@@ -796,7 +803,7 @@ public final class OutboxSchema implements AutoCloseable {
             log.info("outbox reshard of {} waits {} ms for the latest tick to be {} ms old: a relay may still run",
                     n.base(), bound - ago, bound);
             try {
-                Thread.sleep(bound - ago + 10);
+                Thread.sleep(Math.min(bound - ago + 10, TICK_RECHECK));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("outbox reshard of " + n.base() + " interrupted", e);

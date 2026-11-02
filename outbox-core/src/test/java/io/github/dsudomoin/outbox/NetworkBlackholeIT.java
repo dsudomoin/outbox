@@ -799,6 +799,82 @@ class NetworkBlackholeIT {
         startFails(inbox::start);
     }
 
+    /** {@code source} cut off at the first statement after {@code lock} was taken. */
+    private DataSource forgottenAfter(String lock, DataSource source) {
+        var locked = new AtomicBoolean();
+        return intercepting(source, (c, call, args) -> {
+            if (call.getName().equals("prepareStatement") || call.getName().equals("createStatement")) {
+                if (locked.get()) {
+                    hole.forget();
+                } else if (args != null && args.length > 0 && args[0].toString().contains(lock)) {
+                    locked.set(true);
+                }
+            }
+        });
+    }
+
+    /** A start cut off holding the schema lock: the next start, on a new instance, waits for it no longer than it may. */
+    @Test
+    void aStartCutOffHoldingTheSchemaLockLetsTheNextStartGoOn() throws Exception {
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(1));
+        var cut = OutboxRuntime.builder(config, new JdbcTransactions(forgottenAfter("pg_advisory_lock",
+                throughTheHole(3, 0))), record -> {}).build();
+        CompletableFuture.runAsync(() -> {
+            try {
+                cut.start();
+            } catch (RuntimeException e) { // cut off, as it should be; the hole's close ends its wait
+            }
+        });
+        await(() -> {
+            try (var c = DIRECT.getConnection()) {
+                return TestSql.queryLong(c, "select count(*) from pg_locks where locktype = 'advisory'"
+                        + " and granted") > 0;
+            }
+        });
+        var next = OutboxRuntime.builder(new TestOutboxConfig().table(config.table()), new JdbcTransactions(DIRECT),
+                record -> {}).build();
+        closing.add(next);
+
+        CompletableFuture.runAsync(next::start).get(60, TimeUnit.SECONDS);
+    }
+
+    /** The inbox's: later starts go on anyway, and its maintenance must not stay locked out for hours. */
+    @Test
+    void anInboxStartCutOffHoldingItsLockLeavesMaintenanceGoingOn() throws Exception {
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(1));
+        var made = InboxRuntime.builder(config, new JdbcTransactions(DIRECT)).build();
+        made.start();
+        made.close();
+        var cut = InboxRuntime.builder(config, new JdbcTransactions(forgottenAfter("pg_advisory_lock",
+                throughTheHole(3, 0)))).build();
+        CompletableFuture.runAsync(() -> {
+            try {
+                cut.start();
+            } catch (RuntimeException e) { // cut off, as it should be; the hole's close ends its wait
+            }
+        });
+        await(() -> {
+            try (var c = DIRECT.getConnection()) {
+                return TestSql.queryLong(c, "select count(*) from pg_locks where locktype = 'advisory' and granted") > 0;
+            }
+        });
+        var next = InboxRuntime.builder(new TestOutboxConfig().inboxTable(config.inbox().table()).maintenanceInterval(
+                Duration.ofMillis(200)), new JdbcTransactions(DIRECT)).build();
+        closing.add(next);
+
+        CompletableFuture.runAsync(next::start).get(60, TimeUnit.SECONDS);
+        var past = config.inbox().table() + "_t2020010100"; // a run drops it, far past retention and empty
+        try (var c = DIRECT.getConnection()) {
+            TestSql.execute(c, "create table " + past + " (like " + config.inbox().table() + " including defaults)");
+        }
+
+        await(Duration.ofSeconds(60), () -> {
+            try (var c = DIRECT.getConnection()) {
+                return TestSql.queryString(c, "select to_regclass(?)::text", past) == null;
+            }
+        });
+    }
+
     /** A lock wait the start's own lock_timeout ends is no silence, however short the bound. */
     @Test
     void aStartWaitingOnALockOutlastsTheNetworkTimeout() throws Exception {
