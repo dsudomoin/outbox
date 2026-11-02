@@ -30,7 +30,8 @@ public sealed interface DeadLetterDecision {
 
     /**
      * The letter is kept ({@link DeadLetter.Status#SCHEDULED}) and redriven as by {@link #redrive()} once {@code at}
-     * comes, without a further call; {@code at} is clamped to [now, now + 7 days].
+     * comes, without a further call; {@code at} is clamped to [now, now + 7 days]. By this JVM's clock, as
+     * {@code Instant.now().plusSeconds(3)}: that delay, counted on the database's clock, however far off this one is.
      */
     static DeadLetterDecision redriveAt(Instant at) {
         return new RedriveAt(at);

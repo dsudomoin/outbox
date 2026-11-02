@@ -9,6 +9,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.within;
 
 import io.github.dsudomoin.outbox.DeadLetter;
 import io.github.dsudomoin.outbox.DeadLetterDecision;
@@ -175,7 +176,8 @@ class DeadLetterPassIT {
         assertThat(pass.runOnce()).as("not redriven before it is due").isZero();
 
         assertThat(status(soon)).isEqualTo("scheduled");
-        assertThat(dueAt(soon)).isEqualTo(at);
+        assertThat(dueAt(soon)).as("the delay it meant, by the database clock")
+                .isCloseTo(at, within(5, ChronoUnit.SECONDS));
         assertThat(status(later)).isEqualTo("scheduled");
         try (var c = TestDb.connect()) {
             assertThat(queryLong(c, "select max(abs(extract(epoch from due_at - (now() + interval '7 days'))))"
@@ -468,7 +470,7 @@ class DeadLetterPassIT {
                 .hasMessageContaining("injected");
 
         assertThat(status(id)).isEqualTo("scheduled");
-        assertThat(dueAt(id)).as("the other pass's decision").isEqualTo(later);
+        assertThat(dueAt(id)).as("the other pass's decision").isCloseTo(later, within(5, ChronoUnit.SECONDS));
         assertThat(handlerAttempts(id)).isZero();
     }
 

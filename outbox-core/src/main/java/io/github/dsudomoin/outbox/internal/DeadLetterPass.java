@@ -12,7 +12,7 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.ZoneOffset;
+import java.time.InstantSource;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -69,6 +69,7 @@ public final class DeadLetterPass {
     private final OutboxDeadLetterHandler hook;
     private final boolean active;
     private final OutboxTelemetry telemetry;
+    private final InstantSource jvmClock;
     private final DeadLetters rows;
     private final String dead;
     private final int batchSize;
@@ -104,7 +105,14 @@ public final class DeadLetterPass {
 
     public DeadLetterPass(OutboxTransactions db, TableNames names, OutboxConfig config,
             @Nullable OutboxDeadLetterHandler hook, OutboxTelemetry telemetry) {
+        this(db, names, config, hook, telemetry, InstantSource.system());
+    }
+
+    /** {@code jvmClock}: the clock the hook reads, another one only in tests. */
+    public DeadLetterPass(OutboxTransactions db, TableNames names, OutboxConfig config,
+            @Nullable OutboxDeadLetterHandler hook, OutboxTelemetry telemetry, InstantSource jvmClock) {
         OutboxSchema.validate(config);
+        this.jvmClock = jvmClock;
         this.db = db;
         this.hook = hook;
         this.active = hook != null && hook.active(); // read once: the relay's steps write by it
@@ -118,8 +126,10 @@ public final class DeadLetterPass {
         claim = "select " + DeadLetters.COLUMNS + " from " + dead + " where status = ? and due_at <= now()"
                 + " order by due_at, id limit ? for update skip locked";
         keep = "update " + dead + " set status = 'kept', due_at = null where id = any(?)";
-        schedule = "update " + dead + " set status = 'scheduled',"
-                + " due_at = least(greatest(?, now()), now() + interval '7 days') where id = ?";
+        // from the hook's time as a delay, the hook's clock being the JVM's: a redriveAt(Instant.now().plusSeconds(3))
+        // is 3 s by the database's clock, every due_at's; clock_timestamp(): the hook's call may have outlasted now()
+        schedule = "update " + dead + " set status = 'scheduled', due_at = least(greatest(clock_timestamp()"
+                + " + make_interval(secs => ?), now()), now() + interval '7 days') where id = ?";
         // from the failure, not the claim (now()): a call cut at the timeout took that long already
         fail = "update " + dead + " set handler_attempts = handler_attempts + 1, last_handler_error = ?,"
                 + " due_at = clock_timestamp() + make_interval(secs => ?) where id = ?";
@@ -287,11 +297,12 @@ public final class DeadLetterPass {
                     discarded.add(letter.letter().id());
                 } else {
                     // the database clamps it to [now, now + 7 days], so redrive = redriveAt(EPOCH) = redriveAt(now);
-                    // Postgres' range first, so Instant.MAX is no failing batch
+                    // a range make_interval takes first, so Instant.MAX is no failing batch
                     var at = decision instanceof DeadLetterDecision.RedriveAt r ? r.at() : Instant.EPOCH;
-                    var ceiling = Instant.now().plus(8, ChronoUnit.DAYS);
-                    ps.setObject(1, (at.isAfter(ceiling) ? ceiling : at.isBefore(Instant.EPOCH) ? Instant.EPOCH : at)
-                            .atOffset(ZoneOffset.UTC));
+                    var jvmNow = jvmClock.instant();
+                    var ceiling = jvmNow.plus(8, ChronoUnit.DAYS);
+                    ps.setDouble(1, Duration.between(jvmNow, at.isAfter(ceiling) ? ceiling
+                            : at.isBefore(Instant.EPOCH) ? Instant.EPOCH : at).toNanos() / 1e9);
                     ps.setLong(2, letter.letter().id());
                     ps.addBatch();
                     scheduled++;

@@ -9,6 +9,7 @@ import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.PgOutboxAdmin;
 import jakarta.annotation.Nullable;
 import java.sql.SQLException;
+import java.time.InstantSource;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -72,6 +73,7 @@ public final class OutboxRuntime implements AutoCloseable {
     private final OutboxTransactions ddl;
     @Nullable
     private final ConnectionSource heartbeat;
+    private final InstantSource jvmClock;
     @Nullable
     private volatile Parts parts;
 
@@ -87,6 +89,7 @@ public final class OutboxRuntime implements AutoCloseable {
         this.telemetry = GuardedTelemetry.of(builder.telemetry);
         this.ddl = OwnerTransactions.of(transactions, builder.owner);
         this.heartbeat = builder.heartbeat;
+        this.jvmClock = builder.jvmClock;
     }
 
     /**
@@ -156,8 +159,10 @@ public final class OutboxRuntime implements AutoCloseable {
             var resolved = schema.config(); // with the shard count the bootstrap resolved
             var names = schema.names();
             var maintenance = new Maintenance(ddl, names, resolved, telemetry);
-            var deadLetters = new DeadLetterPass(transactions, names, resolved, deadLetterHandler, telemetry);
-            var relay = new OutboxRelay(transactions, resolved, schema, handler, telemetry, maintenance, deadLetters);
+            var deadLetters = new DeadLetterPass(transactions, names, resolved, deadLetterHandler, telemetry,
+                    jvmClock);
+            var relay = new OutboxRelay(transactions, resolved, schema, handler, telemetry, maintenance, deadLetters,
+                    jvmClock);
             var outbox = new PgOutbox(transactions, schema, resolved.shards(), relay::wake, telemetry, claimedTopics);
             var admin = new PgOutboxAdmin(transactions, ddl, names, resolved, maintenance, relay::wake);
             relay.start();
@@ -205,6 +210,7 @@ public final class OutboxRuntime implements AutoCloseable {
         private ConnectionSource owner;
         @Nullable
         private ConnectionSource heartbeat;
+        private InstantSource jvmClock = InstantSource.system();
 
         private Builder(OutboxConfig config, OutboxTransactions transactions, @Nullable OutboxHandler handler) {
             this.config = Objects.requireNonNull(config, "config");
@@ -266,6 +272,12 @@ public final class OutboxRuntime implements AutoCloseable {
          */
         public Builder heartbeatConnections(ConnectionSource heartbeat) {
             this.heartbeat = Objects.requireNonNull(heartbeat, "heartbeat");
+            return this;
+        }
+
+        /** The clock handlers read, for a test of a skewed instance. */
+        Builder jvmClock(InstantSource jvmClock) {
+            this.jvmClock = jvmClock;
             return this;
         }
 

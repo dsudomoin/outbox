@@ -119,7 +119,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         this.abandon = tables.stream().map(t -> retries.toDead("delete from " + t + ofHeads + " returning "
                 + RetryStore.COLUMNS + ", attempts", "attempts", "?")).toList();
         this.countAbandoned = tables.stream().map(t -> "select count(*) from " + t + ofHeads).toList();
-        // the relay's clock set waiting_since: it may be ahead of the database's
+        // a relay of an earlier release set waiting_since by its JVM clock: it may be ahead of the database's
         this.waitingOldest = "select greatest(coalesce(extract(epoch from now() - min(waiting_since)), 0), 0)::float8"
                 + " from " + names.retry() + " where waiting_since is not null";
     }

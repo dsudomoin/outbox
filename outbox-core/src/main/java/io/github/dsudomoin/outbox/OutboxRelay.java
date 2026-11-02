@@ -4,6 +4,7 @@ import io.github.dsudomoin.outbox.internal.Backoff;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.internal.Cursors.Position;
 import io.github.dsudomoin.outbox.internal.Cursors;
+import io.github.dsudomoin.outbox.internal.DatabaseClock;
 import io.github.dsudomoin.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.outbox.internal.Heartbeat;
 import io.github.dsudomoin.outbox.internal.Maintenance;
@@ -17,7 +18,7 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
+import java.time.InstantSource;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -79,6 +80,8 @@ public final class OutboxRelay implements AutoCloseable {
     private final OutboxTelemetry telemetry;
     private final DeadLetterPass deadLetters;
     private final Heartbeat heartbeat;
+    /** Every persisted time of a step is by it: see {@link DatabaseClock}. */
+    private final DatabaseClock clock;
     private final long idleNanos;
     private final long minTickNanos;
     /**
@@ -155,7 +158,14 @@ public final class OutboxRelay implements AutoCloseable {
     @InternalApi
     public OutboxRelay(OutboxTransactions db, OutboxConfig config, OutboxSchema schema, OutboxHandler handler,
             OutboxTelemetry telemetry, Maintenance maintenance, DeadLetterPass deadLetters) {
+        this(db, config, schema, handler, telemetry, maintenance, deadLetters, InstantSource.system());
+    }
+
+    /** {@code jvmClock}: the clock handlers read, another one only in tests. */
+    OutboxRelay(OutboxTransactions db, OutboxConfig config, OutboxSchema schema, OutboxHandler handler,
+            OutboxTelemetry telemetry, Maintenance maintenance, DeadLetterPass deadLetters, InstantSource jvmClock) {
         OutboxSchema.validate(config);
+        this.clock = new DatabaseClock(jvmClock);
         this.db = db;
         this.config = config;
         this.relay = config.relay();
@@ -163,7 +173,7 @@ public final class OutboxRelay implements AutoCloseable {
         this.ticks = new Ticks(schema.names(), config.shards());
         this.cursors = new Cursors(schema.names(), config.shards());
         this.deadLetters = deadLetters;
-        this.processor = new ShardProcessor(schema.names(), config, handler, telemetry, deadLetters.active());
+        this.processor = new ShardProcessor(schema.names(), config, handler, telemetry, deadLetters.active(), clock);
         this.telemetry = telemetry;
         // the pass runs only where the relay does
         this.heartbeat = new Heartbeat(db, schema, config, relay.enabled() && deadLetters.active());
@@ -341,13 +351,13 @@ public final class OutboxRelay implements AutoCloseable {
                     throw new IllegalStateException("outbox drain could not make a tick for " + stallAfter);
                 }
             }
-            long target = ticks.latest(c).id();
+            long target = ticks.latest(c, clock).id();
             int delivered = 0;
             List<Cursor> positions = null;
             long progressed = System.nanoTime();
             while (true) {
                 requireNotHalted();
-                var now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+                var now = clock.now();
                 var pending = cursors.positions(c, target).stream().filter(p -> !drained(p, now))
                         .map(Position::cursor).toList();
                 if (pending.isEmpty()) {
@@ -805,10 +815,10 @@ public final class OutboxRelay implements AutoCloseable {
         private void readRound(Connection c) throws SQLException, InterruptedException {
             roundLock.lockInterruptibly();
             try {
-                long latest = ticks.latest(c).id();
+                long latest = ticks.latest(c, clock).id();
                 var r = round;
                 if (r == null || r.latest != latest) {
-                    var selected = Instant.now().truncatedTo(ChronoUnit.MICROS);
+                    var selected = clock.now();
                     long read = System.nanoTime();
                     round = new Round(latest, read, candidates(cursors.positions(c, latest), selected));
                 }
@@ -859,7 +869,7 @@ public final class OutboxRelay implements AutoCloseable {
             }
             // a fresh clock per step: a long pass must not pause shards or schedule retries from a stale one; a later
             // clock keeps a selected shard unpaused or due (a clock stepped back only yields NO_WORK)
-            var now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+            var now = clock.now();
             List<ShardResult> results;
             try {
                 results = processInOwnTransaction(c, group, r.latest, now);

@@ -24,6 +24,7 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.InstantSource;
 import java.time.temporal.ChronoUnit;
 import java.util.AbstractList;
 import java.util.ArrayList;
@@ -118,6 +119,7 @@ public final class ShardProcessor implements AutoCloseable {
     private final OutboxConfig.WaitConfig waiting;
     private final OutboxHandler handler;
     private final OutboxTelemetry telemetry;
+    private final DatabaseClock clock;
     private final Ticks ticks;
     private final Cursors cursors;
     private final BatchReader reader;
@@ -167,7 +169,14 @@ public final class ShardProcessor implements AutoCloseable {
     /** {@code deadLetterHook}: a dead-letter hook is active, so every dead row is written pending for it. */
     public ShardProcessor(TableNames names, OutboxConfig config, OutboxHandler handler, OutboxTelemetry telemetry,
             boolean deadLetterHook) {
+        this(names, config, handler, telemetry, deadLetterHook, new DatabaseClock(InstantSource.system()));
+    }
+
+    /** {@code clock}: what the {@code now} of each step comes from, by which a handler's {@code notBefore} is taken. */
+    public ShardProcessor(TableNames names, OutboxConfig config, OutboxHandler handler, OutboxTelemetry telemetry,
+            boolean deadLetterHook, DatabaseClock clock) {
         OutboxSchema.validate(config);
+        this.clock = clock;
         this.relay = config.relay();
         this.retry = relay.retry();
         this.requeue = relay.requeue();
@@ -1500,6 +1509,7 @@ public final class ShardProcessor implements AutoCloseable {
                 outcomes.set(i, new Outcome.Waiting(e.kind(), e.getMessage(), null));
                 continue;
             }
+            outcomes.set(i, onDatabaseClock(outcome));
             if (error == null && outcome instanceof Outcome.Retry r && r.error() instanceof Error) {
                 error = r.error(); // e.g. thrown by handle(): the default handleBatch retries its record alone
             }
@@ -1508,6 +1518,20 @@ public final class ShardProcessor implements AutoCloseable {
             handlerBug("outbox handler failed a record with an Error; that record is retried", error);
         }
         return outcomes;
+    }
+
+    /** {@code outcome} with its {@code notBefore}, which a handler gives by its JVM clock, on {@link #clock}. */
+    private Outcome onDatabaseClock(Outcome outcome) {
+        if (outcome instanceof Outcome.Retry r && r.notBefore() != null) {
+            return new Outcome.Retry(r.error(), clock.fromJvm(r.notBefore()));
+        } else if (outcome instanceof Outcome.NotAttempted n && n.notBefore() != null) {
+            return new Outcome.NotAttempted(clock.fromJvm(n.notBefore()));
+        } else if (outcome instanceof Outcome.Requeue q && q.notBefore() != null) {
+            return new Outcome.Requeue(clock.fromJvm(q.notBefore()));
+        } else if (outcome instanceof Outcome.Waiting w && w.notBefore() != null) {
+            return new Outcome.Waiting(w.kind(), w.reason(), clock.fromJvm(w.notBefore()));
+        }
+        return outcome;
     }
 
     /**

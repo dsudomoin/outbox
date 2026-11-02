@@ -448,6 +448,18 @@ public final class Ticks {
         return one(c, " order by id desc limit 1", null);
     }
 
+    /** {@link #latest(Connection)}; the statement also brings {@code clock} a reading, with no round trip of its own. */
+    public Tick latest(Connection c, DatabaseClock clock) throws SQLException {
+        try (var ps = c.prepareStatement("select id, snapshot::text, created_at, max_id, clock_timestamp() from "
+                + names.tick() + " order by id desc limit 1"); var rs = ps.executeQuery()) {
+            if (!rs.next()) {
+                throw new IllegalStateException("no tick in " + names.tick());
+            }
+            clock.read(rs.getObject(5, OffsetDateTime.class).toInstant());
+            return tick(rs);
+        }
+    }
+
     public Tick get(Connection c, long id) throws SQLException {
         return one(c, " where id = ?", id);
     }
