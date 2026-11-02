@@ -333,6 +333,11 @@ public final class OutboxSchema implements AutoCloseable {
         }
 
         @Override
+        public Duration networkTimeout() {
+            return config.networkTimeout();
+        }
+
+        @Override
         public RelayConfig relay() {
             return config.relay();
         }
