@@ -1,6 +1,6 @@
 ---
 name: testing-outbox
-description: Use when writing or fixing tests of a Kora 1.x service that uses dsudomoin/outbox or its inbox, such as a @KoraAppTest with Testcontainers Postgres or Kafka that must prove an event was delivered, OutboxRelay.drain(), or existing tests that log Kafka connection errors, hang or slow down after the outbox was added. Also «тест outbox», «интеграционный тест аутбокса», «проверить доставку события».
+description: Use when writing or fixing tests of a Kora 1.x or Spring Boot service that uses dsudomoin/outbox or its inbox (outbox-spring-boot), such as a @KoraAppTest or @SpringBootTest with Testcontainers Postgres or Kafka that must prove an event was delivered, OutboxRelay.drain(), or existing tests that log Kafka connection errors, hang or slow down after the outbox was added. Also «тест outbox», «интеграционный тест аутбокса», «проверить доставку события».
 ---
 
 # Testing a service that uses outbox
@@ -72,6 +72,56 @@ class OrderDeliveryTest implements KoraAppTestConfigModifier {
 ```
 
 Testcontainers 2.x packages: `org.testcontainers.postgresql`, `org.testcontainers.kafka`.
+
+## Spring Boot
+
+The same rules: `outbox.relay.enabled=false`, deliver with `OutboxRelay.drain()`, check the retry table too.
+
+```java
+@SpringBootTest(properties = {"outbox.relay.enabled=false", "outbox.partitions.xids-per-partition=1000000",
+        "outbox.partitions.premake=4"})
+class OrderDeliveryTest {
+
+    static final PostgreSQLContainer PG = new PostgreSQLContainer("postgres:16-alpine"); // Testcontainers 2.x
+
+    static {
+        PG.start();
+    }
+
+    @DynamicPropertySource
+    static void database(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", PG::getJdbcUrl);
+        registry.add("spring.datasource.username", PG::getUsername);
+        registry.add("spring.datasource.password", PG::getPassword);
+    }
+
+    @Autowired
+    Outbox outbox;
+
+    @Autowired
+    OutboxRelay relay;
+
+    @Autowired
+    PlatformTransactionManager transactions;
+
+    @Test
+    void delivers() {
+        new TransactionTemplate(transactions).executeWithoutResult(status ->
+            outbox.send(OutboxMessage.of("orders", "u1", new byte[0])));
+
+        assertThat(relay.drain()).isEqualTo(1);
+    }
+}
+```
+
+- No `@Transactional` on the test method: it rolls back, and `drain()` sees nothing.
+- A test's `OutboxRelay` field is injected after the context started. A bean injecting it before the start fails; use
+  `ObjectProvider<OutboxRelay>` there. A field injected before a `context.stop()`/`start()` keeps the closed relay.
+- With `outbox-kafka-spring-boot`, `bootstrap.servers` is needed with the relay off too
+  (`outbox.kafka.driverProperties: bootstrap.servers is required`). To assert delivery without Kafka: an `OutboxTopicHandler` bean, or an
+  `OutboxHandler` bean with `outbox.kafka.fallback=false`.
+- With `outbox.schema.bootstrap=false`, Flyway or Liquibase run at the context's start, before the check. Keep it so in
+  tests.
 
 ## Other cases
 

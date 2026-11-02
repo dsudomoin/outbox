@@ -2,8 +2,9 @@
 
 HOCON path `outbox` (`OutboxConfig`); every key is optional except `outbox.kafka.driverProperties."bootstrap.servers"`
 when `KafkaOutboxModule` is in the graph. Values are validated at startup, before any DDL; a key that does not exist
-here is silently ignored. Without Kora the same keys are the methods of `OutboxConfig` and `KafkaOutboxConfig`, with
-the same defaults: override the ones you change.
+here is silently ignored. Without a framework the same keys are the methods of `OutboxConfig` and `KafkaOutboxConfig`,
+with the same defaults: override the ones you change. In Spring Boot they are `application.yml` keys: see «Spring Boot»
+at the end.
 
 ```hocon
 outbox {
@@ -123,7 +124,8 @@ The dead-letter hook and the dead table (writing-outbox-handlers, `dead-letter-h
 
 **DML-only application role.** With `bootstrap = false` the runtime DDL can run as the tables' owner while the app's
 own role has DML only: `OutboxRuntime.builder(...).ownerConnections(ownerDataSource::getConnection)` (and the same on
-`InboxRuntime`), or, with Kora, a second `JdbcDatabase` tagged `@Tag(OutboxOwner.class)`. Through the owner go startup,
+`InboxRuntime`), or, with Kora, a second `JdbcDatabase` tagged `@Tag(OutboxOwner.class)`, or, in Spring Boot, a
+`DataSource` bean with `@OutboxOwner`. Through the owner go startup,
 maintenance (partitions, orphans, xid-regression recovery), `OutboxAdmin.status()`, `recoverStrandedShards`, `restoreOrphan` and
 `recoverXidRegression`; through the app's role `send`, `tryAccept`, relay steps, the dead-letter pass, the other admin
 calls. An owner source with `bootstrap = true` fails at build; one reaching another database fails startup before
@@ -156,7 +158,8 @@ must not have `CREATE` on any schema of the owner's `search_path` (startup WARNs
 
 ## `outbox.heartbeat` (`OutboxModule`)
 
-Kora only; without Kora, `OutboxRuntime.builder(...).heartbeatConnections(heartbeatPool::getConnection)`.
+In Kora as below; in Spring Boot `outbox.heartbeat.dedicated-connection` and `@OutboxHeartbeat` («Spring Boot» at the
+end); without a framework, `OutboxRuntime.builder(...).heartbeatConnections(heartbeatPool::getConnection)`.
 
 | Key | Default | Rule and meaning |
 |---|---|---|
@@ -217,3 +220,26 @@ remains on ≤ 4.1: the first call waits for the expiry or the cut, and calls wi
 `max.message.bytes` and `relay.retry.maxDelay` < 10 min.
 
 Producer client metrics are not bound to Micrometer; they are visible through JMX only.
+
+## Spring Boot
+
+The keys above, the same defaults, under `outbox.*` in `application.yml`. Canonical form is kebab-case
+(`outbox.relay.batch-timeout`, `outbox.kafka.driver-properties`, `outbox.kafka.dead-letter-topic`); camelCase binds too.
+The core's validation messages name keys in camelCase. Durations take Spring's formats: `30s`, `1h`, `PT30S`, a bare
+number is milliseconds; HOCON's `30 seconds` fails the start naming the key. Producer properties bind with their dots,
+with or without brackets: `outbox.kafka.driver-properties.max.block.ms=3000`. The adapter does not read
+`spring.kafka.*`: write `bootstrap.servers: ${spring.kafka.bootstrap-servers}`.
+
+| Spring-only key | Default | Meaning |
+|---|---|---|
+| `outbox.enabled` | `true` | `false`: no `Outbox`, `OutboxAdmin`, relay or admin API; `Inbox` stays |
+| `outbox.lifecycle.phase` | `2147479551` (`Integer.MAX_VALUE - 4096`) | `SmartLifecycle` phase: below the web server, the Kafka listener containers and the default phase, so the outbox starts before them and stops after |
+| `outbox.telemetry.observe-unsampled` | `false` | Whether to observe the delivery of a record whose stored trace is not sampled |
+| `outbox.json.mapper` | `auto` | `auto`: Jackson 2's `ObjectMapper` bean if any, else Jackson 3's `JsonMapper`; `jackson2`, `jackson3`: that one, the start failing when absent |
+| `outbox.kafka.fallback` | `true` | `true`: Kafka takes every topic no route claims, and an app's own `OutboxHandler` bean fails the start. `false`: that bean takes them or, with none, a send to such a topic is refused before writing |
+
+`outbox.heartbeat.dedicated-connection` is `dedicatedConnection` above: a copy of the `HikariDataSource` behind the
+outbox, named `<pool>-outbox-heartbeat`, or `outbox-heartbeat` while the app's pool has no name, so set
+`spring.datasource.hikari.pool-name`. A `DataSource` bean with `@OutboxHeartbeat` replaces it whatever the key says. An
+app's own `OutboxConfig` bean replaces the core's settings; the keys of the table and `outbox.heartbeat.*` are still
+read.

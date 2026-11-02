@@ -1,14 +1,14 @@
 ---
 name: operating-outbox
-description: Use when monitoring, alerting on, sizing or troubleshooting dsudomoin/outbox in a running Kora service, such as outbox.* metrics and dashboards, growing outbox.shard.lag, dead letters and the dead-letter hook, the admin API (OutboxAdmin, outbox-admin-kora, /kora-outbox/admin/v1), redrive or discard, tail overflow, orphaned partitions, stranded shards, «outbox relay halted» or «xid regression detected», outbox.shards and the emergency reshard, «refuses this write», records waiting for another release (outbox.waiting.size, outbox.waiting.oldest, «wait for an instance that can handle them», abandoning them), OutboxIncompatibleContractException and outbox.messages.contract_rejected, OutboxMissingRouteException («has a local route here»), outbox.messages.route_rejected and route_unchecked, rolling out a new OutboxTopicHandler route (routes in /status), rolling deploys, upgrades and rollback to the previous release, pg_dump/restore or failover, Kafka delivery slow after RecordTooLargeException or an expired batch. Also «алерты outbox», «dead letters», «лаг аутбокса», «эксплуатация outbox», «админка outbox».
+description: Use when monitoring, alerting on, sizing or troubleshooting dsudomoin/outbox in a running Kora or Spring Boot service, such as outbox.* metrics and dashboards, growing outbox.shard.lag, dead letters and the dead-letter hook, the admin API (OutboxAdmin, outbox-admin-kora, outbox-admin-spring-boot, /kora-outbox/admin/v1), redrive or discard, tail overflow, orphaned partitions, stranded shards, «outbox relay halted» or «xid regression detected», outbox.shards and the emergency reshard, «refuses this write», records waiting for another release (outbox.waiting.size, outbox.waiting.oldest, «wait for an instance that can handle them», abandoning them), OutboxIncompatibleContractException and outbox.messages.contract_rejected, OutboxMissingRouteException («has a local route here»), outbox.messages.route_rejected and route_unchecked, rolling out a new OutboxTopicHandler route (routes in /status), rolling deploys, upgrades and rollback to the previous release, pg_dump/restore or failover, Kafka delivery slow after RecordTooLargeException or an expired batch. Also «алерты outbox», «dead letters», «лаг аутбокса», «эксплуатация outbox», «админка outbox».
 ---
 
 # Operating outbox
 
 ## Overview
 
-Procedures: the library README (https://github.com/dsudomoin/outbox#readme). Act through the admin
-API: `OutboxAdmin` in code or `outbox-admin-kora` over HTTP ([admin-api.md](admin-api.md)). **Never improvise SQL
+Procedures: the library README (https://github.com/dsudomoin/outbox#readme). Act through the admin API: `OutboxAdmin` in
+code or `outbox-admin-kora` / `outbox-admin-spring-boot` over HTTP ([admin-api.md](admin-api.md)). **Never improvise SQL
 against the library's tables**; run only the README's SQL, on a staging copy first.
 
 ## Wake someone: delivery stops
@@ -53,21 +53,38 @@ Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dash
   («Решардинг», [config-reference.md](../using-outbox/config-reference.md)).
 - **Pool:** `db.maxPoolSize` ≥ own peak + `relay.workers` + 3, + 1 while `drain()` runs. Profiles:
   [sizing-examples.md](../using-outbox/sizing-examples.md).
-- **Heartbeat connection:** in Kora the heartbeat takes nothing from `db.maxPoolSize`; it holds a pool of its own,
-  `<db.poolName>-outbox-heartbeat`, one connection always open: +1 server connection per instance. Count it into
-  `max_connections`, the role's `CONNECTION LIMIT` and a pooler's per-user pool. Where that limit is sized to exactly
-  instances × `maxPoolSize`, raise it by 1 per instance BEFORE the upgrade, or set
+- **Heartbeat connection:** in Kora (and in Spring Boot, see below) the heartbeat takes nothing from `db.maxPoolSize`;
+  it holds a pool of its own, `<db.poolName>-outbox-heartbeat`, one connection always open: +1 server connection per
+  instance. Count it into `max_connections`, the role's `CONNECTION LIMIT` and a pooler's per-user pool. Where that
+  limit is sized to exactly instances × `maxPoolSize`, raise it by 1 per instance BEFORE the upgrade, or set
   `outbox.heartbeat.dedicatedConnection = false`. Otherwise not every connection fits: Kora's app pools default to
-  `minIdle = 0` and grow under load, while the heartbeat pool holds its connection from start. Either the heartbeat
-  pool cannot connect, and the heartbeat runs on the app pool as before, with a WARN once a minute («... this beat
-  uses the application's connections ...»); the heartbeat pool retries without end, at most 5 s apart, so with a role
-  limit Postgres logs FATAL «too many connections for role …» about every 5 s per instance, which may fire log-based
-  alerts. Or it connected first, and at peak an app pool cannot reach `maxPoolSize`, so a `getConnection` on it
-  (business code's, the relay's, the admin's) waits up to its `connectionTimeout` and fails if no connection frees.
-  The two can swap as idle app connections close and connections are replaced every `maxLifetime`, but the heartbeat
-  pool takes the first slot freed within 5 s, while an app pool connects only when a connection is wanted, so it
-  tends to settle on the second: the app pool one connection short at peak
-  ([config-reference.md](../using-outbox/config-reference.md)).
+  `minIdle = 0` and grow under load, while the heartbeat pool holds its connection from start. Either the heartbeat pool
+  cannot connect, and the heartbeat runs on the app pool as before, with a WARN once a minute («... this beat uses the
+  application's connections ...»); the heartbeat pool retries without end, at most 5 s apart, so with a role limit
+  Postgres logs FATAL «too many connections for role …» about every 5 s per instance, which may fire log-based alerts.
+  Or it connected first, and at peak an app pool cannot reach `maxPoolSize`, so a `getConnection` on it (business
+  code's, the relay's, the admin's) waits up to its `connectionTimeout` and fails if no connection frees. The two can
+  swap as idle app connections close and connections are replaced every `maxLifetime`, but the heartbeat pool takes the
+  first slot freed within 5 s, while an app pool connects only when a connection is wanted, so it tends to settle on the
+  second: the app pool one connection short at peak ([config-reference.md](../using-outbox/config-reference.md)).
+
+## Spring Boot
+
+Metrics, alerts and procedures are the same. What differs:
+
+- **Pool:** `spring.datasource.hikari.maximum-pool-size` ≥ own peak + `relay.workers` + 3, + 1 while `drain()` runs, +
+  one per concurrent `@Transactional` handler call. Hikari's default of 10 is below that at the default 4 workers with
+  such handlers (11).
+- **Heartbeat:** by default a copy of the app's Hikari pool, one connection always open, named `<pool>-outbox-heartbeat`
+  (`outbox-heartbeat` while the app's pool has no name: set `spring.datasource.hikari.pool-name`). Count it into limits
+  as above. `outbox.heartbeat.dedicated-connection=false` or a `DataSource` bean with `@OutboxHeartbeat`.
+- **Stop:** the web server and the listeners stop first, then the outbox, synchronously, within
+  `outbox.relay.shutdown-timeout`; `spring.lifecycle.timeout-per-shutdown-phase` does not cut it. Set
+  `terminationGracePeriodSeconds` above `preStop` + that phase timeout + `shutdown-timeout`; the default 30 s is too
+  little. SIGKILL loses nothing: unrecorded records are delivered again.
+- **Secrets:** `/actuator/configprops` with `show-values=always` prints `outbox.kafka.driver-properties` values.
+- **Spans:** Boot 4.1 needs `spring-boot-micrometer-tracing` and a bridge, Boot 3.5 a bridge.
+- **Admin HTTP:** [admin-api.md](admin-api.md), «Spring Boot».
 
 ## Deploys and incidents
 

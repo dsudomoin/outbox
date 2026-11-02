@@ -5,7 +5,8 @@ Micrometer meters, registered only when the Kora graph has a `MeterRegistry` (fo
 `_bucket` series (`outbox_messages_delivered_total`, `outbox_delivery_delay_seconds_bucket`); gauges keep the plain
 name (`outbox_shard_lag`, `outbox_dead_size`).
 
-Without Kora the same meters come from `OutboxMetrics` (`outbox-micrometer`) passed to
+In Spring Boot they follow the context's `MeterRegistry` bean, with the observations below. Without a framework the same
+meters come from `OutboxMetrics` (`outbox-micrometer`) passed to
 `OutboxRuntime.builder(...).telemetry(...)`. `ObservationOutboxTelemetry` adds three Micrometer observations on top:
 `outbox.enqueue` per send call, `outbox.relay.step` per relay step that finds work, the steps
 `outbox.batch.duration` times (span `outbox relay step`, a trace root on a relay worker; high-cardinality

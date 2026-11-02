@@ -5,7 +5,8 @@ they all work on the shared database.
 
 ## In code: `OutboxAdmin`
 
-A component of `OutboxModule`. Each call runs its own transactions; inside `inTx` it throws `IllegalStateException`.
+A component of `OutboxModule`, a bean in Spring Boot. Each call runs its own transactions; inside `inTx` it throws
+`IllegalStateException`.
 
 | Method | Does |
 |---|---|
@@ -66,6 +67,53 @@ curl -s -H "$KEY" -H "$JSON" -d '{"topic":"orders","key":"order-42","reason":"ha
   can miss its own letter. Use `ids` for an exact set.
 - Adding the contract to `openapi.management.file` moves the service's own spec from `/openapi` to
   `/openapi/<file name>`: tell whoever downloads it.
+
+## Spring Boot
+
+`outbox-admin-spring-boot` serves the same paths and JSON on Spring MVC, port `server.port`; the calls and answers above
+hold. Without MVC or with `outbox.enabled=false` there are no routes and no authorizer is needed. Otherwise the app
+defines one `OutboxAdminAuthorizer` bean (of `io.github.dsudomoin.outbox.admin.spring`), or the start fails; of several,
+one `@Primary`.
+
+```java
+@Component
+class ApiKeyAuthorizer implements OutboxAdminAuthorizer {
+
+    private final byte[] adminKey;
+
+    ApiKeyAuthorizer(@Value("${outbox-admin.admin-key}") String adminKey) {
+        if (adminKey.isBlank()) {
+            throw new IllegalArgumentException("the outbox admin key must not be blank");
+        }
+        this.adminKey = adminKey.getBytes(UTF_8);
+    }
+
+    @Override
+    public Decision authorize(HttpServletRequest request) {
+        var header = request.getHeader("X-Api-Key");
+        var key = header == null ? new byte[0] : header.getBytes(UTF_8);
+        return MessageDigest.isEqual(key, adminKey) ? OutboxAdminAuthorizer.allow("admin-key")
+                : OutboxAdminAuthorizer.unauthorized("X-Api-Key required");
+    }
+}
+```
+
+- It runs on the request's thread and may block; it must not read the body. Deny with `unauthorized` (401) or
+  `forbidden` (403), never by throwing: any throw or null is a 500 «authorization failed».
+- Decide by a credential sent on purpose (a header), not a cookie. A non-GET/HEAD call with `Sec-Fetch-Site` other than
+  `same-origin`/`none` gets 403 before the authorizer; browsers send no such header on plain HTTP to a non-localhost
+  address.
+- Audit: logger `io.github.dsudomoin.outbox.admin.spring.OutboxAdminGuard` at INFO; keep it on. An allowed call's line
+  comes just after its response is flushed.
+- Differs from Kora: a JSON body with no `Content-Type` gets 400; a blank `key` in a bulk filter or abandon gets 400
+  (use `ids`); a body over 1 MiB gets 400; unmatched 404/405/406 and OPTIONS go to the app's default handling, no route
+  run. A multipart request is parsed ahead of authorization on every path.
+- A 500 «authorization did not run»: something lost the guard (an app's `HandlerMapping` dropping interceptors, the
+  controller scanned without the auto-configuration). It stays closed; the WARN names the cause.
+- App settings that break it, all closed: `spring.aop.proxy-target-class=false` with an aspect over controllers;
+  replaced exception resolvers; Gson as MVC's JSON converter; `use-java-array-for-json-array` or
+  `use-big-integer-for-ints` (valid `ids` refused). A global `ResponseBodyAdvice` wraps its answers: scope it. Spring
+  Security's CSRF applies to these POSTs: exempt the path or use a token.
 
 ## Procedures
 

@@ -1,6 +1,6 @@
 ---
 name: using-outbox
-description: Use when adding dsudomoin/outbox (io.github.dsudomoin:outbox-kora, outbox-kafka-kora, outbox-admin-kora) to a Kora 1.x service, sending events with Outbox, TypedOutbox, ProtobufOutbox or KafkaOutboxPublisher, changing an event's shape or contract version (@OutboxContract, the two-release protocol, OutboxIncompatibleContractException), adding, removing or moving an OutboxTopicHandler route's topic (the outbox-local marker, OutboxMissingRouteException), editing outbox.* or outbox.kafka.driverProperties, or preparing the Postgres role, the schema migration (outbox.schema.bootstrap, OutboxSql, OutboxOwner) and Kafka topics for it. Also «аутбокс», «outbox», «transactional outbox», «отправить событие в Kafka в одной транзакции с БД».
+description: Use when adding dsudomoin/outbox (io.github.dsudomoin:outbox-kora, outbox-kafka-kora, outbox-admin-kora, or outbox-spring-boot, outbox-kafka-spring-boot, outbox-admin-spring-boot) to a Kora 1.x or Spring Boot 3.5/4.1 service, sending events with Outbox, TypedOutbox, ProtobufOutbox or KafkaOutboxPublisher, changing an event's shape or contract version (@OutboxContract, the two-release protocol, OutboxIncompatibleContractException), adding, removing or moving an OutboxTopicHandler route's topic (the outbox-local marker, OutboxMissingRouteException), editing outbox.* or outbox.kafka.driverProperties, or preparing the Postgres role, the schema migration (outbox.schema.bootstrap, OutboxSql, OutboxOwner) and Kafka topics for it. Also «аутбокс», «outbox», «transactional outbox», «отправить событие в Kafka в одной транзакции с БД».
 ---
 
 # Using outbox
@@ -11,13 +11,16 @@ description: Use when adding dsudomoin/outbox (io.github.dsudomoin:outbox-kora, 
   `outbox-kora` brings `platform("ru.tinkoff.kora:kora-parent:1.2.23")`, which raises every Kora module and HikariCP
   (7.1.0) on the runtime classpath, so set the service's own `kora-parent` and its annotation or symbol processors to
   1.2.23 too.
+- **Spring Boot 3.5 or 4.1**: one jar for both lines, see «Spring Boot» below; the rest of this skill says `db.inTx` and
+  HOCON, and applies with the mapping given there.
 - **Any send**: inside the same `db.inTx(...)` as the business writes; exceptions propagate.
 - **`null` `TypedOutbox` value** = Kafka tombstone: deletes the key on compacted topics.
 - **Kotlin**: `db.inTx<Unit> { _: Connection -> ... }`; blocking, no coroutines.
 - **Sizing**: [sizing-examples.md](sizing-examples.md); every key and producer rule:
   [config-reference.md](config-reference.md).
 - **Tests that boot the graph**: `outbox.relay.enabled = false` unless they assert delivery (testing-outbox).
-- **Admin API**: `outbox-admin-kora` (`OutboxAdminHttpModule`) needs one `OutboxAdminAuthorizer` (operating-outbox).
+- **Admin API**: `outbox-admin-kora` (`OutboxAdminHttpModule`) or `outbox-admin-spring-boot` needs one
+  `OutboxAdminAuthorizer` (operating-outbox).
 
 ## Keys and sendAll
 
@@ -144,9 +147,10 @@ no route check.
   load that exhausts the app pool does not starve it (nothing to copy: a startup INFO names the tag below, and the
   heartbeat shares the app's connections). It does not take from `db.maxPoolSize`, but each instance holds one more
   server connection. `outbox.heartbeat.dedicatedConnection = false` turns it off; a `JdbcConnectionFactory` tagged
-  `@Tag(OutboxHeartbeat.class)` replaces it whatever the key says (to bypass a pooler, or for other timeouts). Without
-  Kora, pass a pool of one connection on the app's database (another role needs the app role's DML rights on the outbox
-  tables and `USAGE` on their schema), its connection and validation timeouts together well below `maintenanceInterval`:
+  `@Tag(OutboxHeartbeat.class)` replaces it whatever the key says (to bypass a pooler, or for other timeouts). Without a
+  framework, pass a pool of one connection on the app's database (another role needs the app role's DML rights on the
+  outbox tables and `USAGE` on their schema), its connection and validation timeouts together well below
+  `maintenanceInterval`:
 
   ```java
   var runtime = OutboxRuntime.builder(config, new JdbcTransactions(appDataSource), handler)
@@ -160,6 +164,118 @@ no route check.
   A heartbeat source that hands out no connection makes that beat use the app's, with a WARN at most once a minute;
   one unreachable at start does not fail the start; one on another database fails the start when seen there, else
   logs an ERROR and the heartbeat keeps the app's connections until restart.
+
+## Spring Boot
+
+README «Spring Boot» is the reference; its refusal table quotes every start failure. Spring and Boot are the app's own:
+it needs `spring-boot-starter-jdbc` or `-data-jpa` and the Postgres driver.
+
+```kotlin
+implementation("io.github.dsudomoin:outbox-spring-boot:0.1.0-SNAPSHOT")
+implementation("io.github.dsudomoin:outbox-kafka-spring-boot:0.1.0-SNAPSHOT") // the Kafka handler
+implementation("io.github.dsudomoin:outbox-admin-spring-boot:0.1.0-SNAPSHOT") // admin API; needs Spring MVC and an authorizer
+```
+
+```yaml
+spring:
+  datasource:
+    hikari:
+      pool-name: app            # the heartbeat pool's name derives from it
+      maximum-pool-size: 20     # own peak + relay.workers + 3; more with @Transactional handlers
+  kafka:
+    bootstrap-servers: kafka-1:9092
+outbox:
+  table: app.outbox
+  kafka:
+    driver-properties:
+      bootstrap.servers: ${spring.kafka.bootstrap-servers}   # the adapter does not read spring.kafka.*
+```
+
+```java
+@Service
+class Orders {
+
+    private final JdbcTemplate jdbc;
+    private final Outbox outbox;
+    private final TypedOutbox<OrderCreated> events; // JSON by the app's mapper, for the T of the injection point
+
+    Orders(JdbcTemplate jdbc, Outbox outbox, TypedOutbox<OrderCreated> events) {
+        this.jdbc = jdbc;
+        this.outbox = outbox;
+        this.events = events;
+    }
+
+    @Transactional
+    public UUID create(UUID orderId, String userId) {
+        jdbc.update("insert into orders (id, user_id) values (?, ?)", orderId, userId);
+        return events.send("orders", userId, new OrderCreated(orderId, userId));
+    }
+
+    @Transactional
+    public UUID raw(String userId, byte[] payload) {
+        return outbox.send(OutboxMessage.of("orders", userId, payload));
+    }
+}
+
+record OrderCreated(UUID orderId, String userId) {}
+```
+
+- **Transactions**: `@Transactional` or `TransactionTemplate`; one Postgres transaction with the business writes.
+  Outside one, or in a transaction of another `DataSource`:
+  `Outbox.send must be called inside @Transactional or TransactionTemplate`. A self-invoked `@Transactional` method has
+  no transaction. Exception, undetected: in another `DataSource`'s transaction, after the app used this `DataSource`
+  through `JdbcTemplate`, a send on an `auto-commit=false` pool returns normally and rolls back with those writes,
+  whatever that transaction does.
+- **Keys**: as in [config-reference.md](config-reference.md), in kebab-case (camelCase binds too); durations in Spring's
+  formats (`30s`, `PT30S`, a bare number is ms; `30 seconds` fails naming the key). Spring-only keys are at its end.
+- **Mapping for the rest of this skill**: `db.inTx` → `@Transactional`; `db.maxPoolSize` →
+  `spring.datasource.hikari.maximum-pool-size` (Hikari's default is 10); a `JdbcDatabase` tagged
+  `@Tag(OutboxOwner.class)` → a `DataSource` bean with `@OutboxOwner`; `@Tag(OutboxHeartbeat.class)` →
+  `@OutboxHeartbeat`; a `@Component` → a bean; `MetricsModule` → Actuator's `MeterRegistry`.
+- **Before the start**: `Outbox` refuses (`send from an ApplicationRunner or later, not from @PostConstruct`). After a
+  stop a send still writes its row.
+- **Several `DataSource`s**: the `@Primary` one; none is Spring's ambiguity error.
+- **Typed beans serve injection points only**: `getBean(TypedOutbox.class)` and collections see the app's explicit beans
+  only; raw, `?` or `Object` fail. `outbox.json.mapper`: `auto` (Jackson 2's `ObjectMapper` bean if any, else Jackson
+  3's `JsonMapper`), `jackson2`, `jackson3`. Moving between majors: README «Переход с Jackson 2 на Jackson 3».
+- **Schema**: `outbox.schema.bootstrap: false`, the output of `OutboxSql` as a Flyway file or a Liquibase `sqlFile`;
+  they run before the check. A hand-written changeset uses exactly README «Ожидаемые default», never
+  `defaultValueComputed="CURRENT_TIMESTAMP"`. The owner, declared so that Boot keeps its own `DataSource`:
+
+```java
+@Configuration(proxyBeanMethods = false)
+class OutboxDataSources {
+
+    @Bean(defaultCandidate = false)
+    @OutboxOwner
+    DataSource outboxOwnerDataSource(@Value("${spring.datasource.url}") String url,
+            @Value("${outbox-owner.password}") String password) {
+        var pool = DataSourceBuilder.create().type(HikariDataSource.class)
+                .url(url).username("outbox_owner").password(password).build();
+        pool.setMaximumPoolSize(4);
+        pool.setMinimumIdle(0);
+        return pool;
+    }
+
+    @Bean(defaultCandidate = false)
+    @OutboxHeartbeat
+    DataSource outboxHeartbeatDataSource(@Value("${outbox-heartbeat.url}") String directUrl,
+            @Value("${spring.datasource.username}") String username,
+            @Value("${spring.datasource.password}") String password) {
+        var pool = DataSourceBuilder.create().type(HikariDataSource.class)
+                .url(directUrl).username(username).password(password).build();
+        pool.setMaximumPoolSize(1);
+        return pool;
+    }
+}
+```
+
+- **Heartbeat**: by default a copy of the app's Hikari pool, one connection always open: count it into limits as «Before
+  deploy» 3 says. `outbox.heartbeat.dedicated-connection=false` turns it off; `@OutboxHeartbeat` above replaces it, only
+  for a pooler bypass, another role or other timeouts. Set `spring.datasource.hikari.pool-name` so dashboards see a
+  stable `<pool>-outbox-heartbeat`.
+- **Before deploy, Kubernetes**: `terminationGracePeriodSeconds` > `preStop` +
+  `spring.lifecycle.timeout-per-shutdown-phase` + `outbox.relay.shutdown-timeout`; the default 30 s is too little.
 
 ## Before deploy
 

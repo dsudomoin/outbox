@@ -20,7 +20,7 @@ import java.util.Set;
 
 /**
  * POSTs the records of topic "audit" to an audit API; every other topic goes to the app's OutboxHandler (Kafka).
- * In Kora make it a @Component (with a constructor taking its config); without Kora
+ * In Kora or Spring Boot make it a @Component (with a constructor taking its config); without a framework
  * OutboxRuntime.builder(config, transactions, kafka.handler()).route(new AuditHandler(url)).
  *
  * handle() alone is enough for status mapping (the default handleBatch does the rest). handleBatch is overridden

@@ -1,6 +1,6 @@
 ---
 name: consuming-with-outbox-inbox
-description: Use when a Kora 1.x Kafka consumer reads messages published through dsudomoin/outbox and must apply each one once, or when touching Inbox, tryAccept / tryAcceptAll, inbox.scope, KafkaOutboxHeaders.messageId, the outbox-message-id header, outbox.inbox.* settings, duplicates after redelivery or a replay. Also «inbox», «дедупликация», «идемпотентный консьюмер», «повторы сообщений из Kafka».
+description: Use when a Kora 1.x or Spring Boot (outbox-spring-boot) Kafka consumer reads messages published through dsudomoin/outbox and must apply each one once, or when touching Inbox, tryAccept / tryAcceptAll, inbox.scope, KafkaOutboxHeaders.messageId, the outbox-message-id header, outbox.inbox.* settings, duplicates after redelivery or a replay. Also «inbox», «дедупликация», «идемпотентный консьюмер», «повторы сообщений из Kafka».
 ---
 
 # Consuming with the outbox inbox
@@ -40,6 +40,46 @@ public void process(ConsumerRecords<String, byte[]> records) {
 | Accept and writes in one `inTx`, exceptions propagate | A rollback records no id, so the redelivered poll is applied. |
 | `inbox.scope("orders-projection")` and its own `group.id` per independent consumer | A shared scope shares ids: the second consumer skips what the first accepted. 1–64 chars of `A-Z a-z 0-9 _ . : -`; never rename it. |
 | The consumer also sends outbox messages | All keyed sends of the transaction in one `sendAll` (using-outbox). |
+
+## Spring Boot
+
+The same pattern with `@Transactional`, called from a batch `@KafkaListener` of another bean (a call within one class
+has no transaction, and `tryAcceptAll` refuses:
+`Inbox.tryAccept and tryAcceptAll must be called inside @Transactional or TransactionTemplate`). `Inbox` is a lazy bean:
+its table appears when a bean injects it. `outbox.enabled=false` leaves the inbox alone in a consume-only service; a
+scan of every bean by type also creates the table. The owner is a `DataSource` bean with `@OutboxOwner` (using-outbox).
+
+```java
+@Service
+class OrdersConsumer {
+
+    private final Inbox inbox;
+    private final JdbcTemplate jdbc;
+
+    OrdersConsumer(Inbox inbox, JdbcTemplate jdbc) {
+        this.inbox = inbox.scope("orders-projection");
+        this.jdbc = jdbc;
+    }
+
+    @Transactional(rollbackFor = Exception.class)
+    public void process(List<ConsumerRecord<String, byte[]>> records) {
+        var ids = new ArrayList<UUID>();
+        for (var record : records) {
+            var id = KafkaOutboxHeaders.messageId(record);
+            if (id != null) {
+                ids.add(id);
+            }
+        }
+        var fresh = new HashSet<>(inbox.tryAcceptAll(ids));
+        for (var record : records) {
+            var id = KafkaOutboxHeaders.messageId(record);
+            if (id == null || fresh.remove(id)) {
+                jdbc.update("insert into order_views (order_key) values (?)", record.key());
+            }
+        }
+    }
+}
+```
 
 ## Missing header: apply without dedup, never throw
 

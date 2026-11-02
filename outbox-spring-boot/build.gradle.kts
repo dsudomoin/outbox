@@ -16,3 +16,23 @@ dependencies {
     compileOnly("com.google.protobuf:protobuf-java:3.25.8")
     compileOnly("jakarta.annotation:jakarta.annotation-api:2.1.1")
 }
+
+// ReadmeExamplesTest compiles the docs' snippets against these and starts the smallest app with them. Not on the test
+// classpath: there they would auto-configure into every other test of this module.
+val readmeExamples by configurations.creating {
+    isCanBeConsumed = false
+}
+
+dependencies {
+    readmeExamples(project(":outbox-kafka-spring-boot"))
+    readmeExamples(project(":outbox-admin-spring-boot"))
+}
+
+tasks.withType<Test>().configureEach {
+    inputs.files(readmeExamples).withNormalizer(ClasspathNormalizer::class)
+    inputs.files(rootProject.file("README.md"), rootProject.fileTree("skills"))
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+    jvmArgumentProviders.add(CommandLineArgumentProvider {
+        listOf("-Doutbox.test.readme.classpath=${readmeExamples.asPath}")
+    })
+}

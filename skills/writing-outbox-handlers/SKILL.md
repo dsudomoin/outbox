@@ -1,6 +1,6 @@
 ---
 name: writing-outbox-handlers
-description: Use when writing or reviewing an OutboxTopicHandler, TypedOutboxTopicHandler (with OutboxDeserializer), OutboxHandler or an OutboxDeadLetterHandler (dead-letter hook) for dsudomoin/outbox (delivering outbox records of some topics to an HTTP API, another database or several targets next to Kafka, decoding payloads to typed values, OutboxHandler.byTopic next to kafka.handler(), a wrapper around the Kafka handler), or when choosing outbox.relay.batchSize, batchTimeout or retry.maxAttempts for a slow target, or delivering concurrently inside handleBatch, or setting a record aside with Outcome.requeue so the rest of its key goes on (a running process of the same account blocks it), or making a record wait for an instance of another release (Outcome.waitFor, OutboxWaitException, Outcome.Waiting), or reading contract versions (@OutboxContract, record.contractVersion()). Also «свой обработчик outbox», «доставка из аутбокса в HTTP», «dead letters», «Retry-After», «отложить событие», «requeue», «хук dead letters», «DLQ», «версия контракта», outbox.kafka.deadLetterTopic.
+description: Use when writing or reviewing an OutboxTopicHandler, TypedOutboxTopicHandler (with OutboxDeserializer), OutboxHandler or an OutboxDeadLetterHandler (dead-letter hook) for dsudomoin/outbox, in Kora or Spring Boot (outbox-spring-boot, @Transactional on a handler, proxies, outbox.kafka.fallback) (delivering outbox records of some topics to an HTTP API, another database or several targets next to Kafka, decoding payloads to typed values, OutboxHandler.byTopic next to kafka.handler(), a wrapper around the Kafka handler), or when choosing outbox.relay.batchSize, batchTimeout or retry.maxAttempts for a slow target, or delivering concurrently inside handleBatch, or setting a record aside with Outcome.requeue so the rest of its key goes on (a running process of the same account blocks it), or making a record wait for an instance of another release (Outcome.waitFor, OutboxWaitException, Outcome.Waiting), or reading contract versions (@OutboxContract, record.contractVersion()). Also «свой обработчик outbox», «доставка из аутбокса в HTTP», «dead letters», «Retry-After», «отложить событие», «requeue», «хук dead letters», «DLQ», «версия контракта», outbox.kafka.deadLetterTopic.
 ---
 
 # Writing outbox handlers
@@ -64,12 +64,12 @@ bound redrive loops with `letter.redrives()`; `active()` false (as `NONE`) keeps
 
 ## Wiring
 
-- A target for some topics is an `OutboxTopicHandler`: `topics()` (read once at build) plus `handle`, and
-  `handleBatch` as above. In Kora it is a plain `@Component`: `OutboxModule` collects every untagged one, no
-  factory, no `Map`, no tag. Without Kora: `OutboxRuntime.builder(config, tx, kafka.handler()).route(new
-  AuditHandler(url))`. Every other topic goes to the graph's one `OutboxHandler` (Kafka by default). Two handlers
-  claiming one topic, or one claiming none, fail the start naming the classes. Different topics are different
-  (topic, key) pairs: no order between them.
+- A target for some topics is an `OutboxTopicHandler`: `topics()` (read once at build) plus `handle`, and `handleBatch`
+  as above. In Kora it is a plain `@Component`: `OutboxModule` collects every untagged one, no factory, no `Map`, no
+  tag. In Spring Boot a bean («Spring Boot» below). Without a framework:
+  `OutboxRuntime.builder(config, tx, kafka.handler()).route(new AuditHandler(url))`. Every other topic goes to the
+  graph's one `OutboxHandler` (Kafka by default). Two handlers claiming one topic, or one claiming none, fail the start
+  naming the classes. Different topics are different (topic, key) pairs: no order between them.
 - Do not make a per-topic target an `OutboxHandler` `@Component`: it replaces the Kafka handler, and next to another
   one Kora 1.2.23 fails with «More than one component matches dependency type: OutboxHandler (no tags)».
 - Typed values: extend `TypedOutboxTopicHandler<T>`, constructor `(OutboxDeserializer<T> deserializer, ...)` calling
@@ -97,6 +97,72 @@ bound redrive loops with `letter.redrives()`; `active()` false (as `NONE`) keeps
   topics are part of the handler behind the routes, not routes: unmarked and unchecked. Moving one to an
   `OutboxTopicHandler` is a move between the fallback and a route (using-outbox).
 - A wrapper around `kafka.handler()` delegates `handleBatch` too (else one acks=all round trip per record).
+
+## Spring Boot
+
+Everything above holds; what differs is wiring, proxies and transactions (README «Обработчики за прокси»,
+«`@Transactional` на обработчике»).
+
+- **Beans**: an `OutboxTopicHandler` bean is a route, the one `OutboxHandler` bean takes the rest, an
+  `OutboxDeadLetterHandler` bean is the hook. `OutboxDeserializer<T>` is injected per `T`, JSON by the app's mapper; an
+  explicit bean wins. A startup INFO lists them:
+  `outbox routes: audit -> auditHandler; other topics -> outboxKafkaFallbackHandler`.
+- **`outbox.kafka.fallback`** (default `true`): with `outbox-kafka-spring-boot` an app's own `OutboxHandler` bean fails
+  the start naming the key, where Kora would replace Kafka silently. Write an `OutboxTopicHandler`, or set `false`.
+- **A handler cannot inject `Outbox`** or `TypedOutbox<T>` (a bean cycle): take an `ObjectProvider`. `Inbox` injects as
+  usual.
+- **Proxies**: the relay calls through the proxy, so advice runs per record. On it the relay calls `handle` (plain); the
+  hooks `handle(T, OutboxRecord)` and `handleTombstone` (typed, class-based proxy, Boot's default);
+  `handle(OutboxRecord)` (typed, JDK proxy: the payload decodes twice, and an aspect there never sees records that fail
+  to decode or wait on a newer contract); only `handleBatch` when overridden. Advice that could never run fails the
+  start with the fix. A scoped or `@RefreshScope` bean fails too. Broad pointcuts: add
+  `!within(io.github.dsudomoin..*)`, the library's beans are final.
+
+**The guarantee**: if the handler ends with an error, Retry/Permanent/Waiting, its transaction rolls back; if the
+handler committed but the relay did not record Delivered, the re-hand is safe thanks to Inbox dedup. So the marker
+shares the effects' transaction:
+
+```java
+@Component
+class OrderProjection implements OutboxTopicHandler {
+
+    private final Inbox inbox;
+    private final JdbcTemplate jdbc;
+
+    OrderProjection(Inbox inbox, JdbcTemplate jdbc) {
+        this.inbox = inbox;
+        this.jdbc = jdbc;
+    }
+
+    @Override
+    public Set<String> topics() {
+        return Set.of("order-projection");
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void handle(OutboxRecord record) {
+        if (inbox.tryAccept(record.messageId())) {
+            jdbc.update("insert into projection (message_id) values (?)", record.messageId());
+        }
+    }
+}
+```
+
+- **Checked at start**, on the effective policy: plain `@Transactional` and any `noRollbackFor` fail (Spring commits on
+  a checked exception); `rollbackFor = Exception.class` or global
+  `@EnableTransactionManagement(rollbackOn = RollbackOn.ALL_EXCEPTIONS)` pass; `MANDATORY` fails; `@Transactional` on an
+  overridden `handleBatch`, or on its class, fails. In `handleBatch` use a `TransactionTemplate` per record
+  (`Outcome.delivered()` only for committed ones, by the contract above) or one around the batch that throws on any
+  failure.
+- **Not detectable, your job**: a `@Transactional` service the handler calls follows the same rule
+  (`rollbackFor = Exception.class`, no `noRollbackFor`, the marker with its effects, never in its own `REQUIRES_NEW`),
+  or a committed marker skips the retry and the work is lost. A handler that catches and returns reports `Delivered`. A
+  raw `Throwable` that is neither `Exception` nor `Error` commits. A class-level `@Transactional` on a subclass whose
+  `handle` comes from an unannotated base runs no transaction.
+- **Pool**: the transaction takes a second connection while the relay holds the step's: + one per concurrent handler
+  call, so `2 × relay.workers + 3` plus own peak for sequential handlers (11 at the defaults, Hikari's default is 10).
+- An `outbox.send` inside it joins it: the follow-up commits with the effects.
 
 ## Waiting and contract versions
 
