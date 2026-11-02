@@ -16,6 +16,7 @@ import org.springframework.boot.test.context.assertj.AssertableApplicationContex
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.context.annotation.Primary;
 
 /** How the handler beans become the runtime's handler and routes, and the start failures that name them. */
@@ -165,6 +166,66 @@ class HandlerBeansIT {
         runner().withUserConfiguration(BothRoles.class, KafkaInParent.class).run(context -> assertThat(failure(context))
             .contains("both (" + Both.class.getName() + ")").contains("implement OutboxTopicHandler only")
             .doesNotContain("several OutboxHandler beans"));
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class BothRolesByInterface {
+
+        @Bean
+        @Lazy
+        OutboxHandler both() {
+            return new Both();
+        }
+    }
+
+    @Test
+    void bothRolesDeclaredByInterfaceBesideKafkaKeepTheirOwnMessage() {
+        runner().withUserConfiguration(BothRolesByInterface.class, KafkaInParent.class).run(context ->
+            assertThat(failure(context)).contains("implement OutboxTopicHandler only")
+                .doesNotContain("several OutboxHandler beans"));
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class NullHandlerBesideKafka {
+
+        @Bean
+        OutboxHandler maybe() {
+            return null;
+        }
+    }
+
+    @Test
+    void aHandlerFactoryReturningNullIsNoConflict() {
+        runner().withUserConfiguration(NullHandlerBesideKafka.class, KafkaInParent.class).run(context ->
+            assertThat(context).hasNotFailed());
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class UnbuildableKafkaBesideAppHandler {
+
+        @Bean
+        @Lazy // as the Kafka module's is, so its failure reaches the handler lookup
+        OutboxHandler outboxKafkaFallbackHandler() {
+            throw new IllegalArgumentException("bootstrap.servers is required");
+        }
+
+        @Bean
+        OutboxHandler appHandler() {
+            return new Other();
+        }
+    }
+
+    @Test
+    void aFallbackThatCannotBuildStillNamesTheConflict() {
+        runner().withUserConfiguration(UnbuildableKafkaBesideAppHandler.class).run(context -> {
+            assertThat(failure(context)).contains("several OutboxHandler beans: ")
+                .contains("outboxKafkaFallbackHandler").contains("appHandler").contains("outbox.kafka.fallback=false");
+            var conflict = context.getStartupFailure();
+            while (conflict.getCause() != null) {
+                conflict = conflict.getCause();
+            }
+            assertThat(conflict.getSuppressed()).isNotEmpty();
+        });
     }
 
     @Configuration(proxyBeanMethods = false)

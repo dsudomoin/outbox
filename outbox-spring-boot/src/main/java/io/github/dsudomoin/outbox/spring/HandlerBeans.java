@@ -26,6 +26,7 @@ import org.springframework.aop.framework.Advised;
 import org.springframework.aop.framework.AopProxyUtils;
 import org.springframework.aop.interceptor.ExposeInvocationInterceptor;
 import org.springframework.aop.support.AopUtils;
+import org.springframework.beans.BeansException;
 import org.springframework.beans.factory.BeanFactoryUtils;
 import org.springframework.beans.factory.ListableBeanFactory;
 import org.springframework.beans.factory.NoSuchBeanDefinitionException;
@@ -100,8 +101,13 @@ final class HandlerBeans {
      */
     static HandlerBeans collect(ListableBeanFactory beans, ObjectProvider<OutboxHandler> handlerBeans,
             ObjectProvider<OutboxTopicHandler> routeBeans) {
-        refuseBesideKafka(beans);
-        var fallbacks = handlerBeans.orderedStream().toList();
+        List<OutboxHandler> fallbacks;
+        try {
+            fallbacks = handlerBeans.orderedStream().toList();
+        } catch (BeansException e) {
+            refuseBesideKafka(beans, e);
+            throw e;
+        }
         var routeList = routeBeans.orderedStream().toList();
         var names = new IdentityHashMap<Object, String>(); // singletons only: never a scoped target
         for (var type : List.of(OutboxHandler.class, OutboxTopicHandler.class)) { // what orderedStream() sees
@@ -156,19 +162,23 @@ final class HandlerBeans {
     }
 
     /**
-     * Refuses the Kafka fallback beside another {@code OutboxHandler} by bean names, which instantiates no lazy bean:
-     * building the fallback builds its sender, whose own failure ({@code bootstrap.servers} unset, {@code acks=1})
-     * would hide the conflict behind advice to configure Kafka when the fix may be {@code outbox.kafka.fallback=false}.
-     * Counts what the handler lookup sees, and leaves a bean of both kinds to its own message.
+     * When a handler bean failed to build, refuses the Kafka fallback beside another {@code OutboxHandler} by bean
+     * names: building the fallback builds its sender, whose own failure ({@code bootstrap.servers} unset,
+     * {@code acks=1}) would hide the conflict behind advice to configure Kafka when the fix may be
+     * {@code outbox.kafka.fallback=false}. Counts what the handler lookup sees, and leaves a bean of both kinds to its
+     * own message. Without a failure the built beans decide, which also knows a factory method that returned null and
+     * a bean of both kinds declared by interface; {@code failure} stays as a suppressed exception.
      */
-    private static void refuseBesideKafka(ListableBeanFactory beans) {
+    private static void refuseBesideKafka(ListableBeanFactory beans, BeansException failure) {
         var names = Arrays.stream(BeanFactoryUtils.beanNamesForTypeIncludingAncestors(beans, OutboxHandler.class, true,
                 true))
             .filter(name -> autowireCandidate(beans, name) && !beans.isTypeMatch(name, OutboxTopicHandler.class))
             .toList();
         if (names.size() > 1 && names.contains(KAFKA_FALLBACK)) {
-            throw several(names.stream().map(name -> describeByName(beans, name)).collect(Collectors.joining(", ")),
-                true);
+            var conflict = several(names.stream().map(name -> describeByName(beans, name))
+                .collect(Collectors.joining(", ")), true);
+            conflict.addSuppressed(failure);
+            throw conflict;
         }
     }
 
