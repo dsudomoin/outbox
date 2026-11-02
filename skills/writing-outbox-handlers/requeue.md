@@ -8,7 +8,7 @@ another process of the same account running, a process that ends on its own.
 |---|---|---|
 | Means | the target failed | the record is not ready; the target is fine |
 | Its key | waits: later records queue behind it in `<table>_retry` | goes on: later records are delivered while it waits |
-| Comes back | after backoff (1 s doubling to 5 min), or at `notBefore` if later | whichever comes first: right before the next new record of its key (in the same call), or its due time `now + outbox.relay.requeue.delay` (1 s); with `requeue(notBefore)`, `max(now + delay, notBefore)`, at most 24 h ahead |
+| Comes back | after backoff (1 s doubling to 5 min), or at `notBefore` if later | whichever comes first: right before the next new record of its key (in the same call), or its due time `now + outbox.relay.requeue.delay` (1 s); with `requeue(notBefore)`, `max(now + delay, notBefore)`, at most 24 h ahead. A record whose time comes brings the older parked records of its key along, not yet due as they may be, so `notBefore` is no lower bound |
 | Counts | `record.attempts()`, `relay.retry.maxAttempts` | `record.requeues()`, `relay.requeue.maxRequeues` |
 | Shard | pauses and backs off when nothing was delivered | no pause, no backoff, chunk size unchanged |
 
@@ -88,11 +88,14 @@ public final class AccountJobsHandler implements OutboxTopicHandler {
 - Once a record of a key is requeued in a call, requeue that key's later records of the same type in the call too, or
   FEE_RELEASE#2 overtakes a requeued FEE_RELEASE#1 when the blocking process ends mid-call; other types still go
   through (a requeued SYNCHRONIZE#2 does not hold back FEE_RELEASE).
-- Use `requeue(notBefore)` when the handler knows when the blocking process ends.
+- Use `requeue(notBefore)` when the handler knows when the blocking process ends. `notBefore` is by the JVM's clock
+  (`Instant.now().plusSeconds(3)` means 3 s on the database's clock, however far off this instance's is), and it is no
+  lower bound: a newer record of the key, or its due time, can bring the record back sooner.
 - Give up either in the handler (`Outcome.permanent(e)` past a `record.requeues()` bound, per route) or globally
   with `outbox.relay.requeue.maxRequeues` (default 0 = unlimited): the requeue past it moves the record to
   `<table>_dead` with the error «requeue limit reached», attempts unchanged. Every hand-back answered with `requeue`
-  counts, a merge ahead of a new record of the key included, so a busy key spends requeues faster than one per
+  counts, a merge ahead of a new record of the key and an early offer ahead of a newer due record of the key included,
+  so a busy key spends requeues faster than one per
   `delay`, at a rate you cannot predict. To give up after a time instead, use `record.createdAt()`:
   `Duration.between(record.createdAt(), Instant.now())` past a limit → `Outcome.permanent(e)`.
 
@@ -100,8 +103,11 @@ public final class AccountJobsHandler implements OutboxTopicHandler {
 
 Per key, first delivery follows commit order, except that a requeued record is delivered after the records of its key
 that were delivered while it was parked. Parked records of a key come back in their original order, ahead of the
-newer record that brings them: FEE_RELEASE#1 requeued, then FEE_RELEASE#2 arrives → one call [#1, #2]. An unkeyed
-record comes back only at its due time, and so does a record whose key waits in `<table>_retry`, while it waits.
+newer record that brings them: FEE_RELEASE#1 requeued, then FEE_RELEASE#2 arrives → one call [#1, #2]. The same when a
+parked record's time comes: the older parked records of its key come first in its call, due or not; past `batchSize`
+of them, the newer ones wait with the older ones and spend no requeue. An unkeyed record comes back only at its due
+time, alone. So does a record whose key waits in `<table>_retry`, while it waits, and it stays behind an older parked
+record of its key that is not due yet.
 
 ## When a parked record is handed back
 

@@ -15,7 +15,7 @@ against the library's tables**; run only the README's SQL, on a staging copy fir
 
 | Signal | Meaning | README section |
 |---|---|---|
-| `outbox.shard.lag` growing | Target down, slow handler, too few workers; ERROR «outbox shards [...] start from ticks [...] that no longer exist»: stranded shards | «Обработка сбоев», «Застрявшие шарды» |
+| `outbox.shard.lag` growing | Target down, slow handler, too few workers; ERROR «outbox shards [...] start from ticks [...] that no longer exist»: stranded shards, one `POST /recovery/stranded-shards` | «Обработка сбоев», «Застрявшие шарды» |
 | `outbox.maintenance.since_success` > 5 × `maintenanceInterval` | No maintenance anywhere; `transaction_pooling` = 1: a pooler | «Обслуживание работает там же, где relay» |
 | `outbox.partitions.xids_left` not NaN | Tail detached: inserts fail at 0 | «Партиции» |
 | `outbox.dead.pending.oldest` > X (X > `relay.retry.maxDelay`) and `outbox.dead.hook.failures` growing | Hook failing: letters wait | «Dead letters» |

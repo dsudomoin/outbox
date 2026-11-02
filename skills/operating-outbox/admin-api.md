@@ -15,6 +15,7 @@ A component of `OutboxModule`. Each call runs its own transactions; inside `inTx
 | `discardDeadLetters(ids)` / `(filter)` | Delete; returns the count. |
 | `restoreOrphan(table, fromXid)` | Rows at `fromXid` and above back to the outbox, the rest dropped with the table. |
 | `recoverXidRegression()` | The xid regression recovery now, in any mode and for any `maxRows`. |
+| `recoverStrandedShards()` | Repairs shards whose starting tick, or their batch's target tick, no longer exists, on running instances; returns the rows re-sent. Refused while an xid regression halt is recorded. |
 | `abandonWaiting(topic, key, reason, dryRun)` | Records of `topic` (of `key` only unless null) waiting for an instance able to handle them, the whole key each (waiting head, its followers, its parked records; an unkeyed head alone), to the dead table as `kept` (the hook is not asked) with error `abandoned: <reason>`. Returns `Abandoned(keys, records)`; `dryRun` counts only. Shard by shard, chunks of 1 000 keys, each under the shard's lock, waited up to `batchTimeout` + 5 s, then `IllegalStateException` «... busy, retry» (done chunks stay done; call again). Later records of the key are delivered ahead of the abandoned ones. |
 
 - Bulk calls take letters dead when the call starts, in chunks of 1 000 by id, one transaction per chunk. Letters
@@ -43,6 +44,7 @@ curl -s -H "$KEY" -H "$JSON" -d '{"ids":[1001,1002]}' $API/dead-letters/redrive
 curl -s -H "$KEY" -H "$JSON" -d '{"filter":{"topic":"orders","error":"timeout"}}' $API/dead-letters/redrive
 curl -s -H "$KEY" -H "$JSON" -d '{"ids":[1003]}' $API/dead-letters/discard
 curl -s -X POST -H "$KEY" "$API/orphans/outbox_x83886080/restore?fromXid=83900000"
+curl -s -X POST -H "$KEY" $API/recovery/stranded-shards                         # {"count": N}
 curl -s -X POST -H "$KEY" $API/recovery/xid-regression
 curl -s -H "$KEY" -H "$JSON" -d '{"topic":"orders","reason":"v2 rolled back for good","dryRun":true}' \
     $API/waiting/abandon                                                       # {"keys":3,"records":5}
@@ -71,8 +73,10 @@ curl -s -H "$KEY" -H "$JSON" -d '{"topic":"orders","reason":"v2 rolled back for 
   writers wait about 2.5–3 s per million rows re-sent. On a large outbox, or after the ERROR «failed after it locked
   the outbox», first raise `outbox.recovery.timeout` on the calling instance and restart it. Never delete the
   `<table>_halt` row.
-- **Stranded shards** («Застрявшие шарды»): no admin call. Stop all instances and run the README's single
-  transaction exactly as printed, shard numbers from the ERROR, on a copy first; consumers get the shards' rows again.
+- **Stranded shards** («Застрявшие шарды»): one `POST /recovery/stranded-shards` on the running instances; stop
+  nothing, the other shards keep flowing. 409: nothing is stranded, or something holds a lock (call again, what moved
+  stays moved), or an xid regression halt is recorded (recover that first). Consumers get those shards' rows again,
+  delivered ones too: all of them when the starting tick is gone, those it does not see when only the batch's target is.
 - **Waiting records after a final rollback** («Версии контрактов и откат»): `waitingSize` in `/status`, the topic and
   cause in the ERROR line or `outbox.messages.waiting{kind}`. If the release that reads them will not return,
   `waiting/abandon` with `dryRun: true`, then without; body `{"topic", "key"?, "reason", "dryRun"?}`, `key` as UTF-8.

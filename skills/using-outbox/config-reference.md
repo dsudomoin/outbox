@@ -32,6 +32,7 @@ outbox {
 | `minTickInterval` | `50ms` | ≥ 0. Under load, at most one tick per interval. |
 | `idlePollInterval` | `200ms` | > 0. Idle tick rate; how fast a commit on another instance is noticed. |
 | `batchTimeout` | `30s` | > 0. Bound of one handler call: wind-down at 80 %, abandoned (all records retried) at 100 %. With Kafka ≥ `delivery.timeout.ms + 5 s + max.block.ms`. `drain()` gives up after 2 × this without progress. |
+| `networkTimeout` | `5m` | 0 or from 1 ms. How long a relay worker or `drain()` waits on a silent socket when the connection has no bound of its own (pgjdbc's `socketTimeout`, 0 by default, which wins when set): a connection the network dropped silently fails, and the worker goes on with a new one. Taken back before the connection goes back to its pool. Above the longest statement of a step, or the step fails and is tried again. `0` = not set. Maintenance, dead letters and the heartbeat do not get it: set `socketTimeout` for those. |
 | `shutdownTimeout` | `30s` | ≥ 0. Grace for in-flight batches at shutdown; then they are interrupted and redelivered later. `close()` spends up to about 8 s more: interrupted workers and the instance row's delete (a locked row or an exhausted pool is left to expire). |
 | `headFailuresBeforeDivert` | `3` | ≥ 1. Consecutive failures before a shard isolates a single failing key. |
 | `cursorAnchorInterval` | `1h` | > 0 and ≥ `partitions.maintenanceInterval`. Maintenance writes an idle shard one cursor row this often; ticks are kept about this long (at most about 10 000: a shard that far behind is anchored at the next run), so a rollback to the previous release resumes from these anchors. |
@@ -50,8 +51,8 @@ Records a `handleBatch` override set aside with `Outcome.requeue()` (writing-out
 
 | Key | Default | Rule and meaning |
 |---|---|---|
-| `delay` | `1s` | > 0. A requeued record comes back after this unless a new record of its key brings it back first; `requeue(notBefore)` not before `notBefore` (capped at 24 h). A parked record handed back and not attempted waits at least this too. |
-| `maxRequeues` | `0` | ≥ 0. The requeue past this moves the record to `<table>_dead` with «requeue limit reached», attempts unchanged. Every hand-back answered with `requeue` counts, merges ahead of a new record of the key included. `0` = unlimited. Global; a handler can bound per route with `record.requeues()`, or by time, since merges spend requeues at an unpredictable rate: `Duration.between(record.createdAt(), now)` past a limit → `permanent`. |
+| `delay` | `1s` | > 0. A requeued record comes back after this unless a new record of its key, or a newer parked record of its key whose time has come, brings it back first; `requeue(notBefore)` due not before `notBefore` (capped at 24 h). A parked record handed back and not attempted waits at least this too. |
+| `maxRequeues` | `0` | ≥ 0. The requeue past this moves the record to `<table>_dead` with «requeue limit reached», attempts unchanged. Every hand-back answered with `requeue` counts, merges ahead of a new record of the key and early offers ahead of a newer due record of the key included. `0` = unlimited. Global; a handler can bound per route with `record.requeues()`, or by time, since merges spend requeues at an unpredictable rate: `Duration.between(record.createdAt(), now)` past a limit → `permanent`. |
 
 ## `outbox.relay.waiting`
 
@@ -123,7 +124,7 @@ The dead-letter hook and the dead table (writing-outbox-handlers, `dead-letter-h
 **DML-only application role.** With `bootstrap = false` the runtime DDL can run as the tables' owner while the app's
 own role has DML only: `OutboxRuntime.builder(...).ownerConnections(ownerDataSource::getConnection)` (and the same on
 `InboxRuntime`), or, with Kora, a second `JdbcDatabase` tagged `@Tag(OutboxOwner.class)`. Through the owner go startup,
-maintenance (partitions, orphans, xid-regression recovery), `OutboxAdmin.status()`, `restoreOrphan` and
+maintenance (partitions, orphans, xid-regression recovery), `OutboxAdmin.status()`, `recoverStrandedShards`, `restoreOrphan` and
 `recoverXidRegression`; through the app's role `send`, `tryAccept`, relay steps, the dead-letter pass, the other admin
 calls. An owner source with `bootstrap = true` fails at build; one reaching another database fails startup before
 any DDL. Render the grants with `OutboxSql.outbox(config, "app_role")`; the role also needs `USAGE` on the schema, and
