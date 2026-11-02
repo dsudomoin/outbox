@@ -1051,6 +1051,51 @@ class MaintenanceIT {
     }
 
     @Test
+    void fewPremadeRangesAreAWarnOnceAMinute() throws Exception {
+        var config = new TestOutboxConfig().relayEnabled(false).xidsPerPartition(1000).premake(4);
+        var schema = new OutboxSchema(db, config);
+        schema.start();
+        var names = schema.names();
+        var partitions = new XidPartitions(names, config.partitions());
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null));
+        // a lock awaited on the parent, which defers every swap at any age; rows go on into the tail once they get in
+        try (var holder = TestDb.connect(); var waiter = TestDb.connect(); var c = TestDb.connect()) {
+            holder.setAutoCommit(false);
+            execute(holder, "lock table " + names.base() + " in row exclusive mode");
+            waiter.setAutoCommit(false);
+            var awaited = CompletableFuture.runAsync(() -> {
+                try {
+                    execute(waiter, "lock table " + names.base() + " in access exclusive mode");
+                } catch (SQLException e) {
+                    throw new IllegalStateException(e);
+                }
+            });
+            long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+            while (queryLong(c, "select count(*) from pg_locks where relation = to_regclass('" + names.base()
+                    + "') and not granted") == 0) {
+                assertThat(System.nanoTime()).isLessThan(deadline);
+                Thread.sleep(10);
+            }
+            while (partitions.premadeAhead(c) >= 2) {
+                TestDb.burnXids(500);
+            }
+
+            try (var err = new CapturedStderr()) {
+                assertThat(maintenance.runOnce()).isTrue();
+                assertThat(maintenance.runOnce()).isTrue();
+                assertThat(maintenance.runOnce()).isTrue();
+
+                var lines = err.text().lines().filter(line -> line.contains("premade xid partitions")).toList();
+                assertThat(lines).as("once, however many runs").hasSize(1);
+                assertThat(lines.get(0)).as("nothing fails: rows go on into the tail").contains("WARN");
+            }
+            holder.rollback();
+            awaited.get(10, TimeUnit.SECONDS);
+            waiter.rollback();
+        }
+    }
+
+    @Test
     void theOrphanGaugeKeepsItsLastValueWhileTheStepRuns() throws Exception {
         bootstrap();
         var range = ranges().stream()

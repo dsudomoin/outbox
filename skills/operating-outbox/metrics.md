@@ -70,7 +70,7 @@ Kafka producer client metrics of the outbox are not bound to Micrometer (JMX onl
 
 Logs: logger `io.github.dsudomoin.outbox`, repeated lines rate-limited. INFO for start, stop, partition DDL and each
 changing admin call; WARN for diverted keys, shard pauses, deferred partition extensions, tail swaps without their lock
-(55P03), a window tail conversion that did not fit `maxStall`, tail overflow, stale maintenance, dead-letter hook
+(55P03), a window tail conversion that did not fit `maxStall`, `premade < 2` (at most once a minute), tail overflow, stale maintenance, dead-letter hook
 failures, letters the Kafka DLQ kept, failed heartbeats («outbox heartbeat of instance ... failed»), a heartbeat
 connection source unreachable at start («... unreachable at start ...») or failing a beat («... this beat uses the
 application's connections ...», once a minute), waiting records («outbox: N keys of ... wait for an instance that can
@@ -79,7 +79,7 @@ or let through unchecked («... through unchecked ...»), and unmarked writes to
 («... wrote to topic ... unmarked ...»); ERROR for records waiting past `relay.waiting.alertAfter` (the same line), dead
 letters, handler errors, stranded shards, the shard-count mismatch after a reshard («... holds cursors for N shards, but
 this instance runs with outbox.shards = M ...»), a heartbeat connection source on another database, seen after startup
-(«outbox heartbeat connection source reaches another database ...»), the xid regression, `premade < 2`, a detached tail,
+(«outbox heartbeat connection source reaches another database ...»), the xid regression, a detached tail,
 a swap not run on 10 due runs or with ranges running out (hourly, names the cause), a hot tail over `maxTailScan`
 outside the window (hourly), a window that ended without converting it («... ended without a conversion», once), orphans
 and transaction pooling. WARN «outbox tick made without its shard set» (at most once a minute): a partition is held by

@@ -127,6 +127,7 @@ public final class Maintenance {
     private final AtomicLong checkpointLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong strandedLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong mismatchLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
+    private final AtomicLong premadeLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     /** One each, so the first ERROR past {@code alertAfter} is not held back by a WARN just before it. */
     private final AtomicLong waitingWarned = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong waitingAlerted = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
@@ -781,9 +782,9 @@ public final class Maintenance {
                     + " or make a new one; a long transaction or snapshot (pg_dump, a repeatable-read report) blocks"
                     + " that until it ends: see pg_stat_activity, oldest xact_start with backend_xmin set",
                     names.tail(), names.base(), left);
-        } else if (ahead < 2) {
-            log.error("only {} premade xid partitions of {} left; inserts reach the tail soon,"
-                    + " see README \"tail overflow\"", ahead, names.base());
+        } else if (ahead < 2 && due(premadeLogged)) { // a tail takes the rows, so nothing fails: not an ERROR
+            log.warn("only {} premade xid partitions of {} left; inserts reach the tail soon, see README \"tail"
+                    + " overflow\"; this WARN repeats at most once a minute", ahead, names.base());
         }
     }
 
