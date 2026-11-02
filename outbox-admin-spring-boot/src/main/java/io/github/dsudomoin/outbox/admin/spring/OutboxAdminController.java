@@ -51,6 +51,7 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.context.request.RequestAttributes;
 import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 /**
@@ -64,7 +65,7 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
  * with the failure's message, for the authenticated operator; a 5xx after one WARN with the exception. Enums are mapped
  * by exhaustive {@code switch}, so a constant added on either side fails the build instead of a request. Every route is
  * a method of this class, so {@link OutboxAdminGuard}, which takes the handlers of this bean type, sees them all,
- * before any body is read, and each refuses a call the guard did not allow, should a mapping have lost it. Not final:
+ * before it reads a JSON body, and each refuses a call the guard did not allow, should a mapping have lost it. Not final:
  * an app's aspect over every controller proxies this one too.
  */
 @RestController
@@ -92,12 +93,21 @@ class OutboxAdminController implements OutboxAdminApi {
     }
 
     /**
-     * Runs ahead of each route's arguments, so before any body is read: losing the guard must not open a route, by any
-     * path. Holds with the guard on the mapping too, where the guard has already refused anyone it did not allow.
+     * Runs ahead of each route's arguments, so before this controller reads a JSON body: losing the guard must not open
+     * a route, by any path. Holds with the guard on the mapping too, where the guard has already refused anyone it did
+     * not allow. An app can skip this (its own {@code HandlerAdapter}, an aspect swallowing the refusal, a model entry
+     * under this method's empty name), so {@link #admin} checks again.
      */
     @ModelAttribute
     public void guardRan(HttpServletRequest request) {
         OutboxAdminGuard.requireAllowed(request);
+    }
+
+    /** The one way to the admin, for every route: nothing an app does around a route's method gets past this. */
+    private OutboxAdmin admin() {
+        OutboxAdminGuard.requireAllowed(
+            ((ServletRequestAttributes) RequestContextHolder.currentRequestAttributes()).getRequest());
+        return admin;
     }
 
     /** The query parameter by the contract's value, "pending"; MVC's own conversion takes the constant's name. */
@@ -113,14 +123,14 @@ class OutboxAdminController implements OutboxAdminApi {
 
     @Override
     public ResponseEntity<Status> getStatus() {
-        return ResponseEntity.ok(status(admin.status()));
+        return ResponseEntity.ok(status(admin().status()));
     }
 
     @Override
     public ResponseEntity<DeadLetterPage> findDeadLetters(@Nullable String topic, @Nullable String key,
             @Nullable String error, @Nullable String failedFrom, @Nullable String failedTo,
             @Nullable DeadLetterStatus status, @Nullable Long afterId, Integer limit) {
-        var page = admin.findDeadLetters(filter(topic, key, error, failedFrom, failedTo, status), afterId, limit);
+        var page = admin().findDeadLetters(filter(topic, key, error, failedFrom, failedTo, status), afterId, limit);
         return ResponseEntity.ok(new DeadLetterPage(page.letters().stream().map(OutboxAdminController::letter).toList())
             .nextAfterId(page.nextAfterId()));
     }
@@ -128,32 +138,32 @@ class OutboxAdminController implements OutboxAdminApi {
     @Override
     public ResponseEntity<Count> countDeadLetters(@Nullable String topic, @Nullable String key, @Nullable String error,
             @Nullable String failedFrom, @Nullable String failedTo, @Nullable DeadLetterStatus status) {
-        return ResponseEntity.ok(new Count(admin.countDeadLetters(filter(topic, key, error, failedFrom, failedTo,
+        return ResponseEntity.ok(new Count(admin().countDeadLetters(filter(topic, key, error, failedFrom, failedTo,
             status))));
     }
 
     @Override
     public ResponseEntity<Count> redriveDeadLetters(Selection selection) {
         var ids = ids(selection);
-        return ResponseEntity.ok(new Count(ids != null ? admin.redriveDeadLetters(ids)
-            : admin.redriveDeadLetters(filter(selection.getFilter()))));
+        return ResponseEntity.ok(new Count(ids != null ? admin().redriveDeadLetters(ids)
+            : admin().redriveDeadLetters(filter(selection.getFilter()))));
     }
 
     @Override
     public ResponseEntity<Count> discardDeadLetters(Selection selection) {
         var ids = ids(selection);
-        return ResponseEntity.ok(new Count(ids != null ? admin.discardDeadLetters(ids)
-            : admin.discardDeadLetters(filter(selection.getFilter()))));
+        return ResponseEntity.ok(new Count(ids != null ? admin().discardDeadLetters(ids)
+            : admin().discardDeadLetters(filter(selection.getFilter()))));
     }
 
     @Override
     public ResponseEntity<Count> restoreOrphan(String table, Long fromXid) {
-        return ResponseEntity.ok(new Count(admin.restoreOrphan(table, fromXid)));
+        return ResponseEntity.ok(new Count(admin().restoreOrphan(table, fromXid)));
     }
 
     @Override
     public ResponseEntity<Count> recoverXidRegression() {
-        return ResponseEntity.ok(new Count(admin.recoverXidRegression()));
+        return ResponseEntity.ok(new Count(admin().recoverXidRegression()));
     }
 
     @Override
@@ -165,7 +175,7 @@ class OutboxAdminController implements OutboxAdminApi {
         detail.put("reason", body.getReason());
         detail.put("dryRun", String.valueOf(dryRun));
         RequestContextHolder.currentRequestAttributes().setAttribute(DETAIL, detail, RequestAttributes.SCOPE_REQUEST);
-        var abandoned = admin.abandonWaiting(body.getTopic(),
+        var abandoned = admin().abandonWaiting(body.getTopic(),
             body.getKey() == null ? null : body.getKey().getBytes(UTF_8), body.getReason(), dryRun);
         return ResponseEntity.ok(new Abandoned(abandoned.keys(), abandoned.records()));
     }

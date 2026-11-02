@@ -35,9 +35,10 @@ import org.springframework.web.servlet.HandlerInterceptor;
  * <p>Every call leaves one INFO audit line: {@code outbox admin <method> "<path>" by "<identity>": <status>} when
  * allowed, {@code outbox admin <method> "<path>" denied: <status>} when denied or when the authorizer fails. An allowed
  * call whose operation put its arguments under {@link OutboxAdminController#DETAIL} has them before the status:
- * {@code by "<identity>" with <name> "<value>", ...}, a null value as {@code null}. The path (decoded, without the
- * context path, the query or a {@code ;} part), the identity (perhaps a token's subject) and each value are quoted,
- * with their quotes, backslashes and control characters escaped, so no caller can forge an audit line or a part of one.
+ * {@code by "<identity>" with <name> "<value>", ...}, a null value as {@code null}. The path (decoded and normalized
+ * by the container, without the context path, the query or a {@code ;} part), the identity (perhaps a token's subject)
+ * and each value are quoted, with their quotes, backslashes, control and format characters escaped, so no caller can
+ * forge an audit line or a part of one.
  * The text of an exception an authorizer or a route throws goes to its WARN line as it is.
  *
  * <p>The line of a denial or of a failed authorizer is written here before its response. MVC has already flushed an
@@ -50,6 +51,9 @@ final class OutboxAdminGuard implements HandlerInterceptor {
     private static final Logger log = LoggerFactory.getLogger(OutboxAdminGuard.class);
     /** Request attribute: who an allowed call is, for its audit line. */
     private static final String IDENTITY = OutboxAdminGuard.class.getName() + ".identity";
+
+    /** A type of its own: an app's filter copying a parameter into the attributes must not pass for an allowed call. */
+    private record Allowed(String identity) {}
 
     private final Supplier<OutboxAdminAuthorizer> authorizer;
 
@@ -79,7 +83,7 @@ final class OutboxAdminGuard implements HandlerInterceptor {
             throw new Refused(500, "authorization failed");
         }
         if (decision instanceof OutboxAdminAuthorizer.Allow allow) {
-            request.setAttribute(IDENTITY, allow.identity());
+            request.setAttribute(IDENTITY, new Allowed(allow.identity()));
             return true;
         }
         var deny = (OutboxAdminAuthorizer.Deny) decision;
@@ -105,7 +109,7 @@ final class OutboxAdminGuard implements HandlerInterceptor {
 
     /** Whether this guard let the call through. */
     static boolean allowed(HttpServletRequest request) {
-        return request.getAttribute(IDENTITY) != null;
+        return request.getAttribute(IDENTITY) instanceof Allowed;
     }
 
     /** Refuses a call this guard did not let through: whatever lost the guard, it must not open a route. */
@@ -126,8 +130,8 @@ final class OutboxAdminGuard implements HandlerInterceptor {
 
     /** {@code <method> "<path>"}, with {@code by "<identity>"} once allowed: how a line about this call names it. */
     static String caller(HttpServletRequest request) {
-        var identity = request.getAttribute(IDENTITY);
-        return call(request) + (identity == null ? "" : " by \"" + printable(identity.toString()) + "\"");
+        return call(request) + (request.getAttribute(IDENTITY) instanceof Allowed allowed
+            ? " by \"" + printable(allowed.identity()) + "\"" : "");
     }
 
     private static String call(HttpServletRequest request) {
@@ -157,8 +161,8 @@ final class OutboxAdminGuard implements HandlerInterceptor {
     }
 
     /**
-     * {@code text} with quotes and backslashes escaped and each control character as its Java escape, so it stays one
-     * quoted token on one log line.
+     * {@code text} with quotes and backslashes escaped and each control or format character (a bidi override reorders
+     * a line on screen) as its Java escape, so it stays one quoted token on one log line.
      */
     private static String printable(String text) {
         var out = new StringBuilder(text.length());
@@ -170,7 +174,8 @@ final class OutboxAdminGuard implements HandlerInterceptor {
                 case '\r' -> out.append("\\r");
                 case '\t' -> out.append("\\t");
                 default -> {
-                    if (Character.isISOControl(ch) || ch == '\u2028' || ch == '\u2029') {
+                    if (Character.isISOControl(ch) || ch == '\u2028' || ch == '\u2029'
+                        || Character.getType(ch) == Character.FORMAT) {
                         out.append(String.format("\\u%04x", ch));
                     } else {
                         out.append((char) ch);

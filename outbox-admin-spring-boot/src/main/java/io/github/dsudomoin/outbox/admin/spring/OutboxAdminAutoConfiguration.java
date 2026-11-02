@@ -11,7 +11,6 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Lazy;
 import org.springframework.util.function.SingletonSupplier;
 import org.springframework.web.servlet.handler.MappedInterceptor;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter;
@@ -54,11 +53,10 @@ public final class OutboxAdminAutoConfiguration {
     }
 
     /**
-     * Fails the start without an authorizer, once the mappings are up and before the server takes calls. Not lazy, so
-     * {@code spring.main.lazy-initialization} keeps the failure.
+     * Fails the start without an authorizer, once the mappings are up and before the server takes calls. Under
+     * {@code spring.main.lazy-initialization} too: Boot keeps this type of bean out of it.
      */
     @Bean
-    @Lazy(false)
     static SmartInitializingSingleton outboxAdminAuthorizerCheck(ObjectProvider<OutboxAdminAuthorizer> authorizers) {
         return () -> authorizer(authorizers);
     }

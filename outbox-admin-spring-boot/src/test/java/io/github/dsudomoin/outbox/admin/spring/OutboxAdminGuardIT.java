@@ -52,6 +52,9 @@ import org.springframework.core.Ordered;
 import org.springframework.http.HttpStatus;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
+import org.springframework.ui.Model;
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.bind.annotation.ModelAttribute;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.filter.OncePerRequestFilter;
 import org.springframework.web.method.HandlerMethod;
@@ -391,6 +394,18 @@ class OutboxAdminGuardIT {
         }
     }
 
+    /** Decoded, a path carries what a caller sends: a bidi override must not reorder the line on an operator's screen. */
+    @Test
+    void anAuditLineEscapesFormatCharacters() throws Exception {
+        try (var server = AdminServer.start(WithKeys.class); var stderr = new CapturedStderr()) {
+            server.post(API + "/orphans/x%E2%80%AEy%E2%80%8Bz/restore?fromXid=0", null);
+
+            assertThat(server.settledAudit(stderr, 1)).singleElement().asString()
+                .endsWith("orphans/x\\u202ey\\u200bz/restore\" denied: 401");
+            assertThat(stderr.text()).doesNotContain("\u202e").doesNotContain("\u200b");
+        }
+    }
+
     /** Quoted, its quotes and backslashes escaped, a path cannot end early and pass for the rest of a line. */
     @Test
     void anAuditLineQuotesThePath() throws Exception {
@@ -411,9 +426,9 @@ class OutboxAdminGuardIT {
             var stderr = new CapturedStderr()) {
             server.get("/ctx" + STATUS + "?token=s");
             server.get("/ctx" + STATUS + ";jsessionid=s;token=s");
+            server.get("/ctx" + STATUS); // so a late duplicate of those two shows too
 
-            assertThat(audit(stderr)).containsExactly("outbox admin GET \"" + STATUS + "\" denied: 401",
-                "outbox admin GET \"" + STATUS + "\" denied: 401");
+            assertThat(audit(stderr)).hasSize(3).containsOnly("outbox admin GET \"" + STATUS + "\" denied: 401");
         }
     }
 
@@ -617,6 +632,59 @@ class OutboxAdminGuardIT {
         }
     }
 
+    /** An app's advice whose model entry has the name of {@code guardRan}, so MVC skips that method. */
+    @ControllerAdvice
+    static class SkipsGuardRan {
+
+        @ModelAttribute
+        public void add(Model model) {
+            model.addAttribute("", "x");
+        }
+    }
+
+    /** Past {@code guardRan}, each route still has to ask for the admin. */
+    @Test
+    void aSkippedGuardRanStillReachesNoAdmin() throws Exception {
+        try (var server = AdminServer.start(WithKeys.class, DropsTheInterceptors.class, SkipsGuardRan.class)) {
+            letter(server);
+
+            assertError(server.post(DISCARD, "{\"ids\":[1]}"), 500, "authorization did not run");
+
+            assertThat(letters(server)).as("the letter stays").isEqualTo(1);
+        }
+    }
+
+    /** An app's filter that copies parameters into the attributes hands a caller any attribute name. */
+    @Configuration(proxyBeanMethods = false)
+    static class ForgesTheIdentity {
+
+        @Bean
+        OncePerRequestFilter copiesParameters() {
+            return new OncePerRequestFilter() {
+                @Override
+                protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
+                        FilterChain chain) throws ServletException, IOException {
+                    request.setAttribute(OutboxAdminGuard.class.getName() + ".identity", "forged");
+                    chain.doFilter(request, response);
+                }
+            };
+        }
+    }
+
+    @Test
+    void anAttributeACallerCanSetPassesForNoIdentity() throws Exception {
+        try (var server = AdminServer.start(WithKeys.class, DropsTheInterceptors.class, ForgesTheIdentity.class)) {
+            letter(server);
+
+            assertError(server.post(DISCARD, "{\"ids\":[1]}"), 500, "authorization did not run");
+
+            assertThat(letters(server)).as("the letter stays").isEqualTo(1);
+        }
+        try (var server = AdminServer.start(WithKeys.class, ThrowsAheadOfTheGuard.class, ForgesTheIdentity.class)) {
+            assertError(server.post(DISCARD, "{}", "X-Kind", "iae"), 500, "authorization failed");
+        }
+    }
+
     /** {@code @RestController} makes the controller a scan's find: a route with no auto-configuration to guard it. */
     @Configuration(proxyBeanMethods = false)
     @ComponentScan(basePackages = "io.github.dsudomoin.outbox.admin.spring", excludeFilters = {
@@ -670,9 +738,9 @@ class OutboxAdminGuardIT {
 
             assertError(failed, 500, "authorization failed");
             assertThat(server.bean(Keys.class).threads).isEmpty();
-            assertThat(audit(stderr)).containsExactly("outbox admin POST \"" + DISCARD + "\" denied: 500");
             assertThat(warnings(stderr)).singleElement().asString().contains("failed, answered 500");
             assertThat(stderr.text()).as("the WARN has the exception").contains("secret text");
+            assertThat(server.settledAudit(stderr, 1)).containsExactly("outbox admin POST \"" + DISCARD + "\" denied: 500");
         }
     }
 
