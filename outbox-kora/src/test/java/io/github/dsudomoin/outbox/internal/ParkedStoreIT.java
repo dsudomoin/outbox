@@ -356,7 +356,7 @@ class ParkedStoreIT {
     }
 
     @Test
-    void postponeNewerPutsOffTheDueRowsAboveAKeysHandedRowThatStays() throws SQLException {
+    void settleTailHoldsTheDueRowsAboveAKeysHandedRowThatStaysAndReleasesThemWhenItGoes() throws SQLException {
         var handed = record("t", "a");
         var newerDue = record("t", "a");
         var newerLater = record("t", "a");
@@ -366,14 +366,19 @@ class ParkedStoreIT {
                 new Park(goneHanded, 1, NOW), new Park(goneNewerDue, 1, NOW)), Set.of(), NOW);
         var until = NOW.plusSeconds(5);
 
-        store.postponeNewer(c, 0, List.of(new Park(handed, 2, until), new Unpark(goneHanded)),
-                List.of(handed, goneHanded), NOW, until);
+        store.settleTail(c, 0, List.of(new Park(handed, 2, until), new Unpark(goneHanded)),
+                List.of(handed, goneHanded), NOW, true);
 
         assertThat(store.due(c, 0, NOW, 10)).extracting(OutboxRecord::id)
                 .as("a key whose handed row left goes on").containsExactly(handed.id(), goneHanded.id(),
                         goneNewerDue.id());
-        assertThat(store.due(c, 0, until, 10)).extracting(OutboxRecord::id).contains(newerDue.id())
-                .doesNotContain(newerLater.id());
+        assertThat(store.due(c, 0, NOW.plus(Duration.ofDays(2)), 10)).extracting(OutboxRecord::id)
+                .doesNotContain(newerDue.id());
+
+        store.settleTail(c, 0, List.of(new Unpark(handed)), List.of(handed), until, false);
+
+        assertThat(store.due(c, 0, until, 10)).extracting(OutboxRecord::id).as("released")
+                .contains(newerDue.id()).doesNotContain(newerLater.id());
     }
 
     @Test

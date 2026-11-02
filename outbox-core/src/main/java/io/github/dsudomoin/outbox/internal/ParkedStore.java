@@ -37,6 +37,15 @@ import java.util.TreeMap;
  */
 public final class ParkedStore {
 
+    /**
+     * How far ahead the rows behind a key's older parked rows are put off ({@link #settleTail}), which their release
+     * ends: written once, not on each of the older rows' delays. Past any time a handler can set, so that a row is told
+     * from one with its own {@code notBefore}, and it is the most a row waits if no step sees the older rows go.
+     */
+    private static final Duration HOLD = Duration.ofDays(7);
+    /** A row due further ahead than this is held: above the 24 h a {@code notBefore} is capped at. */
+    private static final Duration HELD_ABOVE = Duration.ofHours(25);
+
     private final String insert;
     private final String repark;
     private final String keep;
@@ -49,6 +58,7 @@ public final class ParkedStore {
     private final String selectOlder;
     private final String putOff;
     private final String postponeNewer;
+    private final String release;
     private final String minDue;
     private final String size;
 
@@ -58,7 +68,8 @@ public final class ParkedStore {
         insert = "insert into " + parked + " (" + COLUMNS + ", attempts, requeues, due_at)"
                 + " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         repark = "update " + parked + " set requeues = ?, due_at = ? where id = ?";
-        keep = "update " + parked + " set due_at = greatest(due_at, ?) where id = ?";
+        keep = "update " + parked + " set due_at = case when due_at > ? then ? else greatest(due_at, ?) end"
+                + " where id = ?";
         delete = "delete from " + parked + " where id = any(?)";
         // every part sees the tables as before the statement; key = null matches nothing, so an unkeyed row moves alone
         toRetry = "with moved as (delete from " + parked + " where id = ? or (shard = ? and topic = ? and key = ?"
@@ -94,6 +105,9 @@ public final class ParkedStore {
         postponeNewer = "update " + parked + " p set due_at = ? from unnest(?::text[], ?::bytea[], ?::int8[])"
                 + " k(t, b, above) where p.shard = ? and p.topic = k.t and p.key = k.b and p.id > k.above"
                 + " and p.due_at <= ?";
+        release = "update " + parked + " p set due_at = ? from unnest(?::text[], ?::bytea[], ?::int8[])"
+                + " k(t, b, above) where p.shard = ? and p.topic = k.t and p.key = k.b and p.id > k.above"
+                + " and p.due_at > ?";
         minDue = "select min(due_at) from " + parked + " where shard = ?";
         size = "select count(*) from " + parked;
     }
@@ -161,8 +175,10 @@ public final class ParkedStore {
         if (!keeps.isEmpty()) {
             try (var ps = inTx.prepareStatement(keep)) {
                 for (var k : keeps) {
-                    ps.setObject(1, timestamp(k.dueAt()));
-                    ps.setLong(2, k.r().id());
+                    ps.setObject(1, timestamp(now.plus(HELD_ABOVE))); // a held row is due when kept: nothing else ends it
+                    ps.setObject(2, timestamp(k.dueAt()));
+                    ps.setObject(3, timestamp(k.dueAt()));
+                    ps.setLong(4, k.r().id());
                     ps.addBatch();
                 }
                 ps.executeBatch();
@@ -317,14 +333,16 @@ public final class ParkedStore {
     }
 
     /**
-     * After a due pass that may have left due rows of a key unhanded, {@code handed} being as many as it could take:
-     * for each key one of whose handed rows stays parked ({@code writes}: its {@link Park} or {@link Keep}), its due
-     * rows above the highest handed one are due at {@code until}. They could not go before that row anyway, and each
-     * would bring the older rows along again ({@link #dueWithOlder}) right after they were put off, in a loop of calls
-     * that spends their requeues without waiting. A key whose handed rows all left goes on with its next step.
+     * After a call that handed {@code handed}, the oldest parked rows of their keys, and wrote {@code writes}: a key one
+     * of whose handed rows stays ({@link Park} or {@link Keep}) with {@code cut} (due rows may be left unhanded) gets
+     * its due rows above the highest handed one held. They could not go before that row anyway, and each would bring
+     * the older rows along again ({@link #dueWithOlder}), in a loop of calls that spends their requeues without
+     * waiting. Held, they are written once however long the older rows keep requeueing, and not looked at. A key whose
+     * handed rows all left gets its held rows back, due now, in one statement: its next step goes on at once. Rows with
+     * a {@code notBefore} of their own keep it either way. Returns whether it wrote a row.
      */
-    public void postponeNewer(Connection c, int shard, List<Action> writes, List<OutboxRecord> handed, Instant now,
-            Instant until) throws SQLException {
+    public boolean settleTail(Connection c, int shard, List<Action> writes, List<OutboxRecord> handed, Instant now,
+            boolean cut) throws SQLException {
         var highest = new LinkedHashMap<Object, OutboxRecord>();
         for (var row : handed) {
             if (row.key() != null) {
@@ -333,21 +351,33 @@ public final class ParkedStore {
         }
         var stay = new LinkedHashMap<Object, OutboxRecord>();
         for (var write : writes) {
-            var row = highest.get(BatchClassifier.orderingKey(write.r()));
+            var key = BatchClassifier.orderingKey(write.r());
+            var row = highest.get(key);
             if (row != null && (write instanceof Park || write instanceof Keep)) {
-                stay.put(BatchClassifier.orderingKey(row), row);
+                stay.put(key, row);
             }
         }
-        if (stay.isEmpty()) {
-            return;
+        highest.keySet().removeAll(stay.keySet());
+        int written = 0;
+        if (cut && !stay.isEmpty()) {
+            try (var ps = c.prepareStatement(postponeNewer)) {
+                ps.setObject(1, timestamp(now.plus(HOLD)));
+                bindKeys(c, ps, 2, stay.values());
+                ps.setShort(5, (short) shard);
+                ps.setObject(6, timestamp(now));
+                written += ps.executeUpdate();
+            }
         }
-        try (var ps = c.prepareStatement(postponeNewer)) {
-            ps.setObject(1, timestamp(until));
-            bindKeys(c, ps, 2, stay.values());
-            ps.setShort(5, (short) shard);
-            ps.setObject(6, timestamp(now));
-            ps.executeUpdate();
+        if (!highest.isEmpty()) {
+            try (var ps = c.prepareStatement(release)) {
+                ps.setObject(1, timestamp(now));
+                bindKeys(c, ps, 2, highest.values());
+                ps.setShort(5, (short) shard);
+                ps.setObject(6, timestamp(now.plus(HELD_ABOVE)));
+                written += ps.executeUpdate();
+            }
         }
+        return written > 0;
     }
 
     /** Parameters {@code first..first+2} of a statement per (topic, key) and an id: each of {@code rows}'. */

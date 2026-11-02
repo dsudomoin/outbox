@@ -840,6 +840,9 @@ public final class ShardProcessor implements AutoCloseable {
             var parkedIds = new HashSet<Long>();
             s.parkedRows.forEach(row -> parkedIds.add(row.id()));
             s.wroteParked |= apply(inTx, shard, decision.actions(), parkedIds, now);
+            if (!s.parkedRows.isEmpty()) { // the older rows gone: the rows behind them come back
+                s.wroteParked |= parked.settleTail(inTx, shard, decision.actions(), s.parkedRows, now, false);
+            }
             s.wroteRetry |= decision.actions().stream()
                     .anyMatch(action -> action instanceof Head || action instanceof Follower);
             s.deadLettered |= decision.actions().stream().anyMatch(action -> action instanceof Dead);
@@ -963,7 +966,7 @@ public final class ShardProcessor implements AutoCloseable {
     /**
      * Each due head with its followers, in id order, in one handler call together with the other due heads and, in the
      * first round, the due parked rows with the older ones of their keys ({@code dueParked}, a group per key;
-     * {@link ParkedStore#dueWithOlder}, {@link ParkedStore#postponeNewer}), at most {@code batchSize} rows in all; the
+     * {@link ParkedStore#dueWithOlder}, {@link ParkedStore#settleTail}), at most {@code batchSize} rows in all; the
      * followers of keyed heads that do not wait share what the heads and parked rows leave of it, and a waiting head
      * is handed alone. In each round the parked rows of a key that come before its handed retry rows are offered ahead
      * of them, due or not, as the main pass offers them ahead of a new record of their key
@@ -1038,8 +1041,9 @@ public final class ShardProcessor implements AutoCloseable {
             writes.forEach(write -> written.add(write.r().id()));
             parked.apply(c, shard, writes, written, now);
             pass.wroteParked |= !writes.isEmpty();
-            if (firstRound && parkedCut) {
-                parked.postponeNewer(c, shard, writes, dueParked, now, now.plus(requeue.delay()));
+            if (!offered.isEmpty()) {
+                pass.wroteParked |= parked.settleTail(c, shard, writes, List.copyOf(offered.values()), now,
+                        firstRound && parkedCut);
             }
             firstRound = false;
             if (probe && !pass.failed && !pass.busy) {

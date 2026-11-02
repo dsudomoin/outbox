@@ -61,6 +61,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.AbstractList;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -2536,6 +2537,113 @@ class ShardProcessorIT {
         assertThat(delivered()).containsExactly(all);
     }
 
+    /** The parked rows above {@code above}, by id, each with its version: another xmin is another written version. */
+    private Map<Long, String> tailVersions(long above) throws SQLException {
+        var versions = new HashMap<Long, String>();
+        for (var row : rows("select id, xmin::text from " + names.parked() + " where id > " + above,
+                rs -> rs.getLong(1) + ":" + rs.getString(2))) {
+            var parts = row.split(":");
+            versions.put(Long.parseLong(parts[0]), parts[1]);
+        }
+        return versions;
+    }
+
+    /** Disk: the rows behind a head that keeps requeueing are written once, not on each of its delays. */
+    @Test
+    void aTailBehindAHeadThatKeepsRequeueingIsWrittenOnce() throws Exception {
+        config.batchSize(3);
+        bootstrap();
+        parkAll(IntStream.rangeClosed(1, 20).mapToObj(i -> "k#" + i).toArray(String[]::new));
+        script = records -> records.stream().map(r -> Outcome.requeue()).toList();
+        long above = Long.parseLong(rows("select id from " + names.parked() + " order by id offset 2 limit 1",
+                rs -> rs.getString(1)).get(0));
+        now = now.plus(REQUEUE_DELAY);
+
+        long written = 0;
+        var before = tailVersions(above);
+        for (int delay = 0; delay < 6; delay++) {
+            process();
+            var after = tailVersions(above);
+            for (var row : after.entrySet()) {
+                written += row.getValue().equals(before.get(row.getKey())) ? 0 : 1;
+            }
+            before = after;
+            now = now.plus(REQUEUE_DELAY);
+        }
+
+        assertThat(written).as("17 rows behind the head, over 6 delays").isEqualTo(17);
+    }
+
+    /** No wait for the rows behind once the head goes, whatever came before. */
+    @Test
+    void aTailComesBackInTheStepAfterItsHeadGoes() throws Exception {
+        config.batchSize(3);
+        bootstrap();
+        var all = IntStream.rangeClosed(1, 8).mapToObj(i -> "k#" + i).toArray(String[]::new);
+        parkAll(all);
+        script = records -> records.stream().map(r -> Outcome.requeue()).toList();
+        now = now.plus(REQUEUE_DELAY);
+        process();
+        now = now.plus(REQUEUE_DELAY);
+        process();
+        script = answering(Map.of()); // the block ends
+        now = now.plus(REQUEUE_DELAY);
+        calls.clear();
+
+        process();
+        assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(List.of("k#1", "k#2", "k#3"));
+        process();
+
+        assertThat(calls).as("at the same now").extracting(ShardProcessorIT::payloads)
+                .containsExactly(List.of("k#1", "k#2", "k#3"), List.of("k#4", "k#5", "k#6"));
+    }
+
+    /** A record's own notBefore is no part of the hold: the rows put off come back, it stays. */
+    @Test
+    void aTailsOwnNotBeforeOutlivesTheHold() throws Exception {
+        config.batchSize(2);
+        bootstrap();
+        parkAll("k#1", "k#2", "k#3", "k#4");
+        script = records -> records.stream().map(r -> Outcome.requeue()).toList();
+        now = now.plus(REQUEUE_DELAY);
+        var later = now.plus(Duration.ofHours(23));
+        setParkedDue("k#4", later);
+        process();
+        script = answering(Map.of());
+        now = now.plus(REQUEUE_DELAY);
+        calls.clear();
+
+        process();
+        process();
+
+        assertThat(calls).extracting(ShardProcessorIT::payloads)
+                .containsExactly(List.of("k#1", "k#2"), List.of("k#3"));
+        assertThat(parkedRows()).singleElement().satisfies(row -> assertThat(row).startsWith("k#4:"));
+        assertThat(parkedRows().get(0)).endsWith(later.toString());
+    }
+
+    /** A new record of the key takes the head out in the main pass: the tail comes back there too. */
+    @Test
+    void aTailComesBackWhenItsHeadGoesInTheMainPass() throws Exception {
+        config.batchSize(3);
+        bootstrap();
+        var all = IntStream.rangeClosed(1, 8).mapToObj(i -> "k#" + i).toArray(String[]::new);
+        parkAll(all);
+        script = records -> records.stream().map(r -> Outcome.requeue()).toList();
+        now = now.plus(REQUEUE_DELAY);
+        process();
+        assertThat(parkedRows().get(3)).as("held").doesNotEndWith(now.plus(REQUEUE_DELAY).toString());
+        script = answering(Map.of());
+        send(msg("t", "k", "k#9"));
+        tick();
+        calls.clear();
+
+        processUntilNoWork();
+
+        assertThat(delivered()).containsSubsequence("k#1", "k#2", "k#3", "k#4", "k#5", "k#6", "k#7", "k#8");
+        assertThat(parkedRows()).isEmpty();
+    }
+
     @Test
     void aDueParkedRowWhoseKeyWaitsInRetryWaitsForItsOlderRowThatIsNotDue() throws Exception {
         bootstrap();
@@ -3584,7 +3692,7 @@ class ShardProcessorIT {
                 "e:1:" + due);
         assertThat(delivered()).containsExactly("f");
         assertThat(statements).as("one re-park and one keep statement, each a JDBC batch")
-                .filteredOn(sql -> sql.startsWith("update " + names.parked())).hasSize(2);
+                .filteredOn(sql -> sql.startsWith("update " + names.parked() + " set")).hasSize(2);
         assertThat(statements).filteredOn(sql -> sql.startsWith("delete from " + names.parked())).hasSize(1);
     }
 
