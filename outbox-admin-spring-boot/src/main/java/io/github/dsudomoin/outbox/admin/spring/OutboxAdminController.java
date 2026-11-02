@@ -255,7 +255,7 @@ class OutboxAdminController implements OutboxAdminApi {
         return ids;
     }
 
-    /** A bulk call's filter; {@link RequestReaders} has refused a blank field, as dropped it would widen the call. */
+    /** A bulk call's filter, as {@link RequestReaders} read it from the body: no field of it is a mapper's. */
     private static DeadLetterFilter filter(Filter f) {
         return filter(f.getTopic(), f.getKey(), f.getError(), f.getFailedFrom(), f.getFailedTo(), f.getStatus());
     }

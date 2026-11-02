@@ -21,6 +21,7 @@ import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.sql.Connection;
@@ -43,6 +44,7 @@ import org.aspectj.lang.annotation.Aspect;
 import org.json.JSONException;
 import org.junit.jupiter.api.Test;
 import org.skyscreamer.jsonassert.JSONAssert;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.test.context.FilteredClassLoader;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -73,7 +75,7 @@ import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandl
 
 /**
  * Every admin operation over MockMvc against the real {@code OutboxAdmin}, the relay disabled so nothing moves by
- * itself, on Boot's default (lenient) mappers. Each test has its own outbox table and context.
+ * itself, on Boot's default (lenient) mappers unless a test sets its own. Each test has its own outbox table and context.
  */
 class AdminHttpIT {
 
@@ -429,26 +431,39 @@ class AdminHttpIT {
         });
     }
 
-    /** An app's empty-to-null or trimming String deserializer would read these as absent, which widens the call. */
+    /** As on Kora: a blank topic or error would match everything, the dates and status do not parse, a key is a key. */
     @Test
-    void blankValuesAMapperMayDropAreRefusedBeforeBinding() {
+    void blankValuesAreRefusedUnlessTheyAreAKey() {
         app(() -> {
             long id = letter(1, "t", "k", "boom", T0, KEPT);
             seedWaiting();
 
-            for (var field : List.of("key", "failedFrom", "failedTo", "error")) {
-                for (var blank : List.of("", " ")) {
-                    var response = call("POST", "/dead-letters/discard",
-                        "{\"filter\":{\"topic\":\"t\",\"" + field + "\":\"" + blank + "\"}}");
+            for (var blank : List.of("", " ")) {
+                for (var field : List.of("topic", "error")) {
+                    var response = call("POST", "/dead-letters/discard", "{\"filter\":{\"" + field + "\":\"" + blank
+                        + "\"}}");
 
                     assertJson(response, 400);
-                    assertThat(response.body).as(field).startsWith("{\"message\":\"a blank " + field + " in a filter");
+                    assertThat(response.body).isEqualTo("{\"message\":\"a blank " + field + " in a filter matches every "
+                        + field + ": leave it out, or name one\"}");
                 }
-            }
-            var response = call("POST", "/waiting/abandon", "{\"topic\":\"t\",\"key\":\"\",\"reason\":\"r\"}");
+                for (var field : List.of("failedFrom", "failedTo")) {
+                    var response = call("POST", "/dead-letters/discard", "{\"filter\":{\"topic\":\"t\",\"" + field
+                        + "\":\"" + blank + "\"}}");
 
-            assertJson(response, 400);
-            assertThat(response.body).startsWith("{\"message\":\"a blank key matches");
+                    assertJson(response, 400);
+                    assertThat(response.body).startsWith("{\"message\":\"" + field + " is no date-time");
+                }
+                var status = call("POST", "/dead-letters/discard", "{\"filter\":{\"topic\":\"t\",\"status\":\"" + blank
+                    + "\"}}");
+                assertJson(status, 400);
+                assertThat(status.body).startsWith("{\"message\":\"Unexpected value");
+
+                assertThat(call("POST", "/dead-letters/discard", "{\"filter\":{\"topic\":\"t\",\"key\":\"" + blank
+                    + "\"}}").body).as("no letter has that key").isEqualTo("{\"count\":0}");
+                assertSameJson(call("POST", "/waiting/abandon", "{\"topic\":\"t\",\"key\":\"" + blank
+                    + "\",\"reason\":\"r\"}").body, "{\"keys\":0,\"records\":0}");
+            }
             assertThat(deadIds()).containsExactly(id);
             assertThat(retryCount()).isEqualTo(4);
         });
@@ -745,6 +760,155 @@ class AdminHttpIT {
             "spring.jackson.time-zone=Asia/Tokyo", "spring.jackson.date-format=yyyy");
     }
 
+    /** A String deserializer of the app's reads every string under Jackson's untyped Map too, the tree included. */
+    @Test
+    void anAppsTrimmingDeserializerCannotWidenACall() throws Exception {
+        appWithStrings("trim", server -> {
+            assertThat(server.post("/app/echo", "{\"name\":\" a \"}").body()).as("the app's mapper").isEqualTo("a");
+            long first = letter(1, "t", "k", "boom", T0, KEPT);
+            long second = letter(2, "t", "k", "disk full", T0, KEPT);
+            long spaces = letter(3, "t", "  ", "boom", T0, KEPT);
+            seedWaiting();
+
+            for (var operation : List.of("redrive", "discard")) {
+                var path = API + "/dead-letters/" + operation;
+                AdminServer.assertError(server.post(path, "{\"filter\":{\"topic\":\"t\",\"error\":\"  \"}}"), 400,
+                    "a blank error in a filter matches every error: leave it out, or name one");
+                AdminServer.assertError(server.post(path, "{\"filter\":{\"topic\":\"  \",\"status\":\"kept\"}}"), 400,
+                    "a blank topic in a filter matches every topic: leave it out, or name one");
+                for (var field : List.of("failedFrom", "failedTo", "status")) {
+                    assertThat(server.post(path, "{\"filter\":{\"topic\":\"t\",\"" + field + "\":\"  \"}}").statusCode())
+                        .as(field).isEqualTo(400);
+                }
+            }
+            assertThat(deadIds()).containsExactly(first, second, spaces);
+            assertThat(outboxMessageIds()).isEmpty();
+
+            assertThat(server.post(API + "/dead-letters/discard", "{\"filter\":{\"topic\":\"t\",\"error\":\" boom \"}}")
+                .body()).as("the value as sent, no trimmed one").isEqualTo("{\"count\":0}");
+            assertThat(server.post(API + "/dead-letters/discard", "{\"filter\":{\"topic\":\"t\",\"key\":\"  \"}}").body())
+                .isEqualTo("{\"count\":1}");
+            assertThat(deadIds()).containsExactly(first, second);
+
+            assertSameJson(server.post(API + "/waiting/abandon", "{\"topic\":\"t\",\"key\":\"  \",\"reason\":\"r\"}")
+                .body(), "{\"keys\":0,\"records\":0}");
+            assertThat(retryCount()).isEqualTo(4);
+        });
+    }
+
+    /** A visible value read as absent is the same widening, which no check of the body's text can see. */
+    @Test
+    void anAppsSanitisingDeserializerCannotWidenACall() throws Exception {
+        appWithStrings("sanitise", server -> {
+            assertThat(server.post("/app/echo", "{\"name\":\"x\"}").body()).as("the app's mapper").isNullOrEmpty();
+            long other = letter(1, "t", "k", "boom", T0, KEPT);
+            long byError = letter(2, "t", "k", "x failed", T0, KEPT);
+            long byKey = letter(3, "t", "x", "boom", T0, KEPT);
+            long byTopic = letter(4, "xt", "k", "boom", T0, KEPT);
+            seedWaiting();
+            execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, created_at, next_attempt_at,"
+                + " waiting_since) values (40, 0, gen_random_uuid(), 't', 'x', now(), now(), now())");
+
+            var discard = API + "/dead-letters/discard";
+            for (var body : List.of("{\"filter\":{\"topic\":\"t\",\"failedTo\":\"2026-01-15T10:00:00.000Zx\"}}",
+                "{\"filter\":{\"topic\":\"t\",\"failedFrom\":\"x\"}}", "{\"filter\":{\"topic\":\"t\",\"status\":\"xkept\"}}")) {
+                assertThat(server.post(discard, body).statusCode()).as(body).isEqualTo(400);
+            }
+            assertThat(deadIds()).containsExactly(other, byError, byKey, byTopic);
+
+            assertThat(server.post(discard, "{\"filter\":{\"topic\":\"t\",\"error\":\"x\"}}").body())
+                .isEqualTo("{\"count\":1}");
+            assertThat(deadIds()).containsExactly(other, byKey, byTopic);
+            assertThat(server.post(discard, "{\"filter\":{\"topic\":\"t\",\"key\":\"x\"}}").body())
+                .isEqualTo("{\"count\":1}");
+            assertThat(deadIds()).containsExactly(other, byTopic);
+            assertThat(server.post(discard, "{\"filter\":{\"topic\":\"xt\"}}").body()).isEqualTo("{\"count\":1}");
+            assertThat(deadIds()).containsExactly(other);
+
+            assertSameJson(server.post(API + "/waiting/abandon", "{\"topic\":\"t\",\"key\":\"x\",\"reason\":\"r\"}")
+                .body(), "{\"keys\":1,\"records\":1}");
+            assertThat(deadIds()).containsExactly(other, 40L);
+            assertThat(retryCount()).isEqualTo(4);
+        });
+    }
+
+    /** Neither setting changes the tree the body is checked by. */
+    @Test
+    void theAppsMapperSettingsDoNotChangeWhatAnIdsCallIs() throws Exception {
+        for (var setting : List.of("use-java-array-for-json-array", "use-big-integer-for-ints")) {
+            onServer(server -> {
+                long id = letter(1, "t", "k", "boom", T0, KEPT);
+                long other = letter(2, "t", "k", "boom", T0, KEPT);
+
+                var response = server.post(API + "/dead-letters/discard", "{\"ids\":[" + id + "]}");
+
+                assertThat(response.statusCode()).as(response.body()).isEqualTo(200);
+                assertThat(response.body()).isEqualTo("{\"count\":1}");
+                assertThat(deadIds()).containsExactly(other);
+            }, List.of("spring.jackson.deserialization." + setting + "=true"));
+        }
+    }
+
+    /** An empty key is a key, as on Kora; a JSON null is no value at all. */
+    @Test
+    void anEmptyKeyActsOnThatKeyAndNullIsAbsent() throws Exception {
+        onServer(server -> {
+            long empty = letter(1, "t", "", "boom", T0, KEPT);
+            long keyed = letter(2, "t", "k", "boom", T0, KEPT);
+            seedWaiting();
+            execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, created_at, next_attempt_at,"
+                + " waiting_since) values (50, 0, gen_random_uuid(), 't', ''::bytea, now(), now(), now())");
+            var discard = API + "/dead-letters/discard";
+
+            assertThat(server.post(discard, "{\"filter\":{\"topic\":\"t\",\"key\":\"\"}}").body())
+                .isEqualTo("{\"count\":1}");
+            assertThat(deadIds()).doesNotContain(empty).contains(keyed);
+
+            assertThat(server.post(discard, "{\"filter\":{\"error\":null}}").statusCode())
+                .as("a filter of nothing").isEqualTo(400);
+            assertThat(server.post(discard, "{\"filter\":{\"topic\":\"t\",\"error\":null}}").body())
+                .isEqualTo("{\"count\":1}");
+            assertThat(deadIds()).isEmpty();
+
+            assertSameJson(server.post(API + "/waiting/abandon", "{\"topic\":\"t\",\"key\":\"\",\"reason\":\"r\"}").body(),
+                "{\"keys\":1,\"records\":1}");
+            assertThat(deadIds()).containsExactly(50L);
+            assertSameJson(server.post(API + "/waiting/abandon",
+                "{\"topic\":\"t\",\"key\":null,\"reason\":\"r\",\"dryRun\":true}").body(), "{\"keys\":3,\"records\":5}");
+        }, List.of());
+    }
+
+    /** Whatever the app's mapper does with them: what follows the value could be another call, or a truncated one. */
+    @Test
+    void trailingTokensAreRefused() throws Exception {
+        onServer(server -> {
+            long id = letter(1, "t", "k", "boom", T0, KEPT);
+            var ids = "{\"ids\":[" + id + "]}";
+
+            for (var body : List.of(ids + " " + ids, ids + " x", ids + "}", "{\"filter\":{\"topic\":\"t\"}} 1")) {
+                var response = server.post(API + "/dead-letters/discard", body);
+
+                assertThat(response.statusCode()).as(body + ": " + response.body()).isEqualTo(400);
+                assertThat(response.body()).startsWith("{\"message\":\"");
+            }
+            assertThat(server.post(API + "/waiting/abandon", "{\"topic\":\"t\",\"reason\":\"r\"} 1").statusCode())
+                .isEqualTo(400);
+            assertThat(deadIds()).containsExactly(id);
+            assertThat(server.post(API + "/dead-letters/discard", ids + " \n").body()).isEqualTo("{\"count\":1}");
+        }, List.of());
+    }
+
+    /** {@link RequestReadersTest} has what a classpath does to it; this, that the check is not left for the first call. */
+    @Test
+    void theReaderIsNotLazy() {
+        new WebApplicationContextRunner().withUserConfiguration(Boot.class, AllowAll.class)
+            .withInitializer(context -> context.addBeanFactoryPostProcessor(
+                new org.springframework.boot.LazyInitializationBeanFactoryPostProcessor()))
+            .withPropertyValues(properties())
+            .run(started -> assertThat(started.getBeanFactory().getBeanDefinition("outboxAdminRequestReaders")
+                .isLazyInit()).isFalse());
+    }
+
     /** Boot 4.1 can keep MVC on Jackson 2, as an app in the middle of its migration does. */
     @Test
     void jackson2OnBoot41() {
@@ -936,6 +1100,74 @@ class AdminHttpIT {
             .withClassLoader(new FilteredClassLoader(RequestMappingHandlerAdapter.class))
             .withUserConfiguration(Boot.class).withPropertyValues(properties())
             .run(c -> assertThat(c).hasNotFailed().doesNotHaveBean(OutboxAdminController.class));
+    }
+
+    // -------------------------------------------------------------------------------- an app on a real server
+
+    private interface OnServer {
+        void run(AdminServer server) throws Exception;
+    }
+
+    private void onServer(OnServer body, List<String> properties, Class<?>... configurations) throws Exception {
+        var all = new ArrayList<Class<?>>(List.of(AllowAll.class, App.class));
+        all.addAll(List.of(configurations));
+        try (var server = AdminServer.start(properties, all.toArray(Class<?>[]::new))) {
+            names = server.names;
+            body.run(server);
+        }
+    }
+
+    /** The body on an app per Jackson its Boot line's MVC can read with, its String deserializer {@code shape}. */
+    private void appWithStrings(String shape, OnServer body) throws Exception {
+        var strings = "app.strings=" + shape;
+        if ("4.1".equals(System.getProperty("outbox.test.boot"))) {
+            onServer(body, List.of(strings), Jackson3Strings.class);
+            onServer(body, List.of(strings, "spring.http.converters.preferred-json-mapper=jackson2"),
+                Jackson2Strings.class);
+        } else {
+            onServer(body, List.of(strings), Jackson2Strings.class);
+        }
+    }
+
+    /** What an app's deserializer may make of a string: {@code null} is a value it read as absent. */
+    private static String appRead(String shape, String text) {
+        return switch (shape) {
+            case "trim" -> text.isBlank() ? null : text.trim();
+            case "sanitise" -> text.contains("x") ? null : text;
+            default -> throw new IllegalArgumentException(shape);
+        };
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class Jackson2Strings {
+
+        @Bean
+        com.fasterxml.jackson.databind.Module appStrings(@Value("${app.strings}") String shape) {
+            return new com.fasterxml.jackson.databind.module.SimpleModule().addDeserializer(String.class,
+                new com.fasterxml.jackson.databind.deser.std.StdDeserializer<String>(String.class) {
+                    @Override
+                    public String deserialize(com.fasterxml.jackson.core.JsonParser parser,
+                            com.fasterxml.jackson.databind.DeserializationContext context) throws IOException {
+                        return appRead(shape, parser.getText());
+                    }
+                });
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class Jackson3Strings {
+
+        @Bean
+        tools.jackson.databind.JacksonModule appStrings(@Value("${app.strings}") String shape) {
+            return new tools.jackson.databind.module.SimpleModule().addDeserializer(String.class,
+                new tools.jackson.databind.deser.std.StdDeserializer<String>(String.class) {
+                    @Override
+                    public String deserialize(tools.jackson.core.JsonParser parser,
+                            tools.jackson.databind.DeserializationContext context) {
+                        return appRead(shape, parser.getString());
+                    }
+                });
+        }
     }
 
     // ---------------------------------------------------------------------------------------------------- fixtures

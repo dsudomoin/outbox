@@ -48,6 +48,9 @@ dependencies {
     compileOnly("org.springframework:spring-webmvc")
     compileOnly("jakarta.servlet:jakarta.servlet-api")
     compileOnly("com.fasterxml.jackson.core:jackson-annotations")
+    // optional: Jackson3Tree and Jackson2Tree read the bodies, by the major the app's classpath has
+    compileOnly("com.fasterxml.jackson.core:jackson-databind")
+    compileOnly("tools.jackson.core:jackson-databind:3.1.7")
     compileOnly("jakarta.annotation:jakarta.annotation-api:2.1.1")
     // an import and @NotNull the generator writes into the models whatever useBeanValidation says; nothing validates
     compileOnly("jakarta.validation:jakarta.validation-api")

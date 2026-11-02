@@ -11,6 +11,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.util.function.SingletonSupplier;
 import org.springframework.web.servlet.handler.MappedInterceptor;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter;
@@ -32,9 +33,11 @@ public final class OutboxAdminAutoConfiguration {
         return new OutboxAdminController(admin);
     }
 
+    /** Never lazy: it fails the start without a Jackson, under {@code spring.main.lazy-initialization} too. */
     @Bean
-    RequestReaders outboxAdminRequestReaders(ObjectProvider<RequestMappingHandlerAdapter> adapters) {
-        return new RequestReaders(adapters);
+    @Lazy(false)
+    RequestReaders outboxAdminRequestReaders() {
+        return new RequestReaders();
     }
 
     /**
