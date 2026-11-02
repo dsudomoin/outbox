@@ -265,7 +265,8 @@ class NetworkBlackholeIT {
         hole.forget();
 
         long seen = lastSuccess(names.maintenance());
-        await(() -> lastSuccess(names.maintenance()) > seen);
+        // a run cut off holds the maintenance lock till idle_session_timeout (60 s) ends its backend
+        await(Duration.ofSeconds(90), () -> lastSuccess(names.maintenance()) > seen);
     }
 
     @Test
@@ -287,7 +288,8 @@ class NetworkBlackholeIT {
         hole.forget();
 
         long seen = lastSuccess(names.maintenance());
-        await(() -> lastSuccess(names.maintenance()) > seen);
+        // a run cut off holds the maintenance lock till idle_session_timeout (60 s) ends its backend
+        await(Duration.ofSeconds(90), () -> lastSuccess(names.maintenance()) > seen);
     }
 
     @Test
@@ -305,7 +307,8 @@ class NetworkBlackholeIT {
         try (var c = DIRECT.getConnection()) {
             TestSql.execute(c, "create table " + past + " (like " + config.inbox().table() + " including defaults)");
         }
-        await(() -> {
+        // a run cut off holds the maintenance lock till idle_session_timeout (60 s) ends its backend
+        await(Duration.ofSeconds(90), () -> {
             try (var c = DIRECT.getConnection()) {
                 return TestSql.queryString(c, "select to_regclass(?)::text", past) == null;
             }
@@ -818,10 +821,14 @@ class NetworkBlackholeIT {
     }
 
     private static void await(Check condition) throws Exception {
-        long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+        await(Duration.ofSeconds(30), condition);
+    }
+
+    private static void await(Duration bound, Check condition) throws Exception {
+        long deadline = System.nanoTime() + bound.toNanos();
         while (!condition.met()) {
             if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within 30 s");
+                throw new AssertionError("condition not met within " + bound);
             }
             Thread.sleep(20);
         }
