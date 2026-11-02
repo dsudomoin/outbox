@@ -388,6 +388,84 @@ class StrandedShardsIT {
     }
 
     @Test
+    void aShardThatAStepHoldsLeavesTheRunWithoutACheckpointAndAMidBatchOneKeepsItsBatch() throws Exception {
+        int stranded = 1;
+        int idle = 3;
+        int midBatch = 5;
+        var cursors = new Cursors(names, SHARDS);
+        var ticks = new Ticks(names, SHARDS);
+        var maintenance = writer.maintenance();
+        long gone;
+        try (var c = direct.getConnection()) {
+            sendMany(stranded, 1);
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            gone = ticks.latest(c).id();
+            cursors.append(c, new Cursor(stranded, gone, null, 0, null, 0, null, null));
+            sendMany(stranded, 1);
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+        }
+        assertThat(maintenance.runOnce()).isTrue();
+        long oldTick = cursors(cursors, midBatch).tickId();
+        var checkpoint = "select tick_id from " + names.checkpoint();
+        long before;
+        long target;
+        long lastId;
+        var idleRow = sendMany(idle, 1);
+        var read = sendMany(midBatch, 1); // delivered before, in the batch in progress
+        var unread = sendMany(midBatch, 1);
+        try (var c = direct.getConnection()) {
+            before = queryLong(c, checkpoint);
+            execute(c, "delete from " + names.tick() + " where id = " + gone);
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            target = ticks.latest(c).id();
+            lastId = idOf(read.get(0));
+            // written by a step that read its cursor before the checkpoint: below its effective tick
+            cursors.append(c, new Cursor(midBatch, oldTick, target, lastId, null, 0, null, null));
+        }
+
+        try (var holder = direct.getConnection()) { // what a step of the idle shard holds
+            holder.setAutoCommit(false);
+            try (var ps = holder.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {
+                ps.setInt(1, names.internalNamespace());
+                ps.setInt(2, TableNames.LOCK_SHARD_BASE + idle);
+                ps.execute();
+            }
+
+            assertThat(maintenance.runOnce()).isTrue();
+
+            try (var c = direct.getConnection()) {
+                assertThat(queryLong(c, checkpoint)).as("no checkpoint this run").isEqualTo(before);
+                assertThat(maintenance.strandedShards(c)).as("and no other shard stranded").containsOnlyKeys(stranded);
+                var anchored = cursors.latest(c, midBatch).cursor();
+                assertThat(anchored.tickId()).as("at its effective tick").isEqualTo(before);
+                assertThat(anchored.targetTickId()).as("its batch goes on").isEqualTo(target);
+                assertThat(anchored.lastId()).isEqualTo(lastId);
+            }
+            holder.rollback();
+        }
+
+        assertThat(maintenance.runOnce()).isTrue();
+
+        try (var c = direct.getConnection()) {
+            assertThat(queryLong(c, checkpoint)).as("the next run writes it").isGreaterThan(before);
+            assertThat(maintenance.strandedShards(c)).containsOnlyKeys(stranded);
+            assertThat(cursors.latest(c, idle).cursor().tickId()).as("anchored in its turn").isEqualTo(before);
+        }
+        startRelay();
+        await(() -> delivered.containsAll(idleRow) && delivered.containsAll(unread));
+        Thread.sleep(300);
+        assertThat(times.get(idleRow.get(0))).isEqualTo(1);
+        assertThat(times.get(unread.get(0))).isEqualTo(1);
+        assertThat(delivered).as("past its last id").doesNotContainAnyElementsOf(read);
+    }
+
+    private Cursor cursors(Cursors cursors, int shard) throws Exception {
+        try (var c = direct.getConnection()) {
+            return cursors.latest(c, shard).cursor();
+        }
+    }
+
+    @Test
     void refusesWhenNoShardIsStranded() throws Exception {
         startRelay();
 

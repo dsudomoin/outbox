@@ -2639,6 +2639,35 @@ class ShardProcessorIT {
     }
 
     @Test
+    void aPutOffRowInAStepWithOtherWorkLeavesTheCursorNotDue() throws Exception {
+        bootstrap();
+        parkAll("k#1", "k#2");
+        script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.requeue(),
+                "k#3", Outcome.retry(new RuntimeException("k#3 down"))));
+        send(msg("t", "k", "k#3"), msg("t", "j", "j#1"));
+        tick();
+        process();
+        now = now.plus(REQUEUE_DELAY);
+        var later = now.plusSeconds(60);
+        setParkedDue("k#1", later);
+        setParkedDue("k#2", now);
+        try (var c = TestDb.connect()) {
+            execute(c, "update " + names.retry() + " set next_attempt_at = now() + interval '1 hour'");
+        }
+        script = answering(Map.of());
+        send(msg("t", "other", "o#1")); // the step has work of its own
+        tick();
+        calls.clear();
+
+        process();
+
+        assertThat(delivered()).contains("o#1");
+        assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("o#1"));
+        assertThat(cursor().parkedDueAt()).as("not the old due time, or the shard is stepped again at once")
+                .isEqualTo(later);
+    }
+
+    @Test
     void anEarlyOfferCountsAgainstMaxRequeues() throws Exception {
         config.maxRequeues(1);
         bootstrap();
