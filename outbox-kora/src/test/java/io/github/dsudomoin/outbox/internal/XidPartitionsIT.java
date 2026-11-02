@@ -1684,8 +1684,12 @@ class XidPartitionsIT {
             }
             var errors = new ConcurrentLinkedQueue<Throwable>();
             var commitLater = new Thread(() -> {
-                try {
-                    Thread.sleep(1000);
+                // once the extension waits for it: a fixed sleep raced the extension's own lock timeout
+                try (var watcher = TestDb.connect()) {
+                    while (queryLong(watcher, "select count(*) from pg_locks where not granted and relation = '"
+                            + names.tail() + "'::regclass") == 0) {
+                        Thread.sleep(10);
+                    }
                     racer.commit();
                 } catch (Throwable e) {
                     errors.add(e);

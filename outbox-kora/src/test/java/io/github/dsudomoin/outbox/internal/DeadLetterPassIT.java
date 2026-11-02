@@ -176,8 +176,10 @@ class DeadLetterPassIT {
         assertThat(pass.runOnce()).as("not redriven before it is due").isZero();
 
         assertThat(status(soon)).isEqualTo("scheduled");
-        assertThat(dueAt(soon)).as("the delay it meant, by the database clock")
-                .isCloseTo(at, within(5, ChronoUnit.SECONDS));
+        try (var c = TestDb.connect()) { // the database's own clock: a container's lags the host after a sleep
+            assertThat(queryLong(c, "select abs(extract(epoch from due_at - now()))::bigint from " + names.dead()
+                    + " where id = " + soon)).as("the delay it meant, by the database clock").isLessThanOrEqualTo(5);
+        }
         assertThat(status(later)).isEqualTo("scheduled");
         try (var c = TestDb.connect()) {
             assertThat(queryLong(c, "select max(abs(extract(epoch from due_at - (now() + interval '7 days'))))"
