@@ -475,6 +475,61 @@ class DeadLetterPassIT {
     }
 
     @Test
+    void aFailedRollbackCommitsNothingOfItsBatch() throws Exception {
+        long id = letter("t", "k", "p", List.of());
+        execute("update " + names.dead() + " set status = 'scheduled'");
+        var failed = new AtomicBoolean();
+        var rollbackFailed = new AtomicBoolean();
+        var factory = new JdbcConnectionFactory() {
+            @Override
+            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
+                return db.withConnection(callback);
+            }
+
+            @Override
+            public Connection currentConnection() {
+                return db.currentConnection();
+            }
+
+            @Override
+            public Connection newConnection() {
+                var c = db.newConnection();
+                return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
+                        new Class<?>[] {Connection.class}, (proxy, method, args) -> {
+                            if (method.getName().equals("prepareStatement") && args[0].toString()
+                                    .startsWith("delete from " + names.dead()) && failed.compareAndSet(false, true)) {
+                                throw new SQLException("injected: its insert is done, its delete is not");
+                            }
+                            if (method.getName().equals("rollback") && rollbackFailed.compareAndSet(false, true)) {
+                                throw new SQLException("injected: the rollback did not happen");
+                            }
+                            try {
+                                return method.invoke(c, args);
+                            } catch (InvocationTargetException e) {
+                                throw e.getCause();
+                            }
+                        });
+            }
+
+            @Override
+            public DataBaseTelemetry telemetry() {
+                return db.telemetry();
+            }
+        };
+        var pass = new DeadLetterPass(new KoraOutboxTransactions(factory), names, config, null,
+                new OutboxMetrics(registry));
+        passes.add(pass);
+
+        assertThatThrownBy(pass::runOnce).isInstanceOf(RuntimeSqlException.class).hasMessageContaining("injected");
+
+        assertThat(status(id)).isEqualTo("scheduled");
+        try (var c = TestDb.connect()) {
+            assertThat(queryLong(c, "select count(*) from " + names.base()))
+                    .as("half a batch not committed by what comes after it on the connection").isZero();
+        }
+    }
+
+    @Test
     void aBatchThatDeferredAHeldKeyEndsTheRedrivePhase() throws Exception {
         // a deferred letter is due again at once: a phase that looped on full batches would claim it until the send
         // ends, holding the run lock drain() waits for

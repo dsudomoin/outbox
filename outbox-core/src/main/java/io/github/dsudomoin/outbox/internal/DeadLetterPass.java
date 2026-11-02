@@ -88,6 +88,8 @@ public final class DeadLetterPass {
     private final ReentrantLock running = new ReentrantLock();
     private final Warnings hookFailures = new Warnings();
     private final Warnings lockTimeouts = new Warnings();
+    /** The last {@link #inTx} could not roll back; under {@link #running}. */
+    private boolean rollbackFailed;
     private volatile boolean closed;
     /** A cut call outlived {@link #INTERRUPT_GRACE} and its ERROR is out; cleared once a call returns in time. */
     private final AtomicBoolean ignoresInterrupts = new AtomicBoolean();
@@ -367,10 +369,11 @@ public final class DeadLetterPass {
      * After a batch rolled back on {@code failure}: its claimed letters, if any, that are still due are due again
      * after {@code initialDelay}, set in a fresh transaction, so they hold back no letter behind them and
      * {@link #untilNextDue} finds them; one another pass has decided since the rollback keeps that decision. A failure
-     * of that is added to {@code failure}, which the caller handles.
+     * of that is added to {@code failure}, which the caller handles. Nothing when the rollback failed: the next pass
+     * finds them due.
      */
     private void deferStillDue(Connection c, List<Long> ids, Exception failure) {
-        if (ids.isEmpty()) {
+        if (ids.isEmpty() || rollbackFailed) { // its commit would commit what is left of the batch on c, too
             return;
         }
         try {
@@ -476,6 +479,7 @@ public final class DeadLetterPass {
 
     /** {@code body} in one transaction on {@code c}, committed, or rolled back on any failure. */
     private <T> T inTx(Connection c, SqlFunction1<Connection, T> body) throws SQLException {
+        rollbackFailed = false;
         ShardProcessor.prepareTransaction(c, timeout); // the claim stays idle while the hook runs
         try {
             T result = body.apply(c);
@@ -486,6 +490,7 @@ public final class DeadLetterPass {
             try {
                 c.rollback();
             } catch (SQLException | RuntimeException e) {
+                rollbackFailed = true;
                 t.addSuppressed(e);
             }
             throw t;
