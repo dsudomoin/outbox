@@ -5,11 +5,14 @@ import io.github.dsudomoin.outbox.spring.OutboxAutoConfiguration;
 import org.springframework.beans.factory.NoSuchBeanDefinitionException;
 import org.springframework.beans.factory.NoUniqueBeanDefinitionException;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.util.function.SingletonSupplier;
 import org.springframework.web.servlet.handler.MappedInterceptor;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter;
 
@@ -40,22 +43,37 @@ public final class OutboxAdminAutoConfiguration {
      * {@code WebMvcConfigurer.addInterceptors} is ignored for an app extending {@code WebMvcConfigurationSupport},
      * which still maps the controller, and that would leave the routes open. No path patterns: the guard goes by the
      * handler.
+     *
+     * <p>Needs nothing to be made, this configuration included, and takes the authorizer at its first call: the mapping
+     * makes this bean during its own start and drops it, silently, if making it comes back to a bean in creation, which
+     * an authorizer with the mapping or {@code HandlerMappingIntrospector} among its dependencies would.
      */
     @Bean
-    MappedInterceptor outboxAdminGuard(ObjectProvider<OutboxAdminAuthorizer> authorizers) {
-        return new MappedInterceptor(null, new OutboxAdminGuard(authorizer(authorizers)));
+    static MappedInterceptor outboxAdminGuard(ObjectProvider<OutboxAdminAuthorizer> authorizers) {
+        return new MappedInterceptor(null, new OutboxAdminGuard(SingletonSupplier.of(() -> authorizer(authorizers))));
     }
 
+    /**
+     * Fails the start without an authorizer, once the mappings are up and before the server takes calls. Not lazy, so
+     * {@code spring.main.lazy-initialization} keeps the failure.
+     */
+    @Bean
+    @Lazy(false)
+    static SmartInitializingSingleton outboxAdminAuthorizerCheck(ObjectProvider<OutboxAdminAuthorizer> authorizers) {
+        return () -> authorizer(authorizers);
+    }
+
+    /** No cause on these: with one, Boot's failure analyzer reports the cause in place of this advice. */
     private static OutboxAdminAuthorizer authorizer(ObjectProvider<OutboxAdminAuthorizer> authorizers) {
         try {
             return authorizers.getObject();
         } catch (NoUniqueBeanDefinitionException e) {
             throw new IllegalStateException("several OutboxAdminAuthorizer beans: " + e.getBeanNamesFound()
-                + "; the admin API takes one: keep one or mark one @Primary", e);
+                + "; the admin API takes one: keep one or mark one @Primary");
         } catch (NoSuchBeanDefinitionException e) {
             throw new IllegalStateException("no OutboxAdminAuthorizer bean: the admin API has no other protection, so"
                 + " it does not start without one; define a bean that checks the caller's credentials, or remove"
-                + " outbox-admin-spring-boot from the app", e);
+                + " outbox-admin-spring-boot from the app");
         }
     }
 }

@@ -23,7 +23,9 @@ import jakarta.servlet.http.HttpServletResponse;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.lang.reflect.Proxy;
+import java.sql.SQLException;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
@@ -33,13 +35,20 @@ import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.autoconfigure.AutoConfigurationExcludeFilter;
 import org.springframework.boot.test.context.runner.WebApplicationContextRunner;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.ComponentScan;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.FilterType;
 import org.springframework.context.annotation.Primary;
+import org.springframework.core.Ordered;
 import org.springframework.http.HttpStatus;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
@@ -49,11 +58,15 @@ import org.springframework.web.method.HandlerMethod;
 import org.springframework.web.method.HandlerTypePredicate;
 import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.servlet.HandlerExceptionResolver;
+import org.springframework.web.servlet.HandlerExecutionChain;
 import org.springframework.web.servlet.HandlerInterceptor;
+import org.springframework.web.servlet.HandlerMapping;
 import org.springframework.web.servlet.config.annotation.PathMatchConfigurer;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurationSupport;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
+import org.springframework.web.servlet.handler.HandlerMappingIntrospector;
 import org.springframework.web.servlet.handler.MappedInterceptor;
+import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
 
 /**
  * Who gets to the admin routes, on a real Tomcat. The {@link Spy} sees which handler each call was mapped to, ahead of
@@ -68,13 +81,15 @@ class OutboxAdminGuardIT {
     @Aspect
     static class Spy {
 
+        private static final Set<String> NO_ROUTES = Set.of("denied", "guardRan");
+
         final List<String> mapped = new CopyOnWriteArrayList<>();
         final List<String> ran = new CopyOnWriteArrayList<>();
         final List<String> threads = new CopyOnWriteArrayList<>();
 
         @Around("within(io.github.dsudomoin.outbox.admin.spring.OutboxAdminController)")
         Object around(ProceedingJoinPoint call) throws Throwable {
-            if (!call.getSignature().getName().equals("denied")) { // the guard's answer, not a route
+            if (!NO_ROUTES.contains(call.getSignature().getName())) {
                 ran.add(call.getSignature().getName());
             }
             return call.proceed();
@@ -255,7 +270,8 @@ class OutboxAdminGuardIT {
             assertError(refused, 403, "cross-site request refused");
             assertThat(server.bean(Keys.class).threads).as("the authorizer never ran").isEmpty();
             assertThat(server.bean(Spy.class).ran).isEmpty();
-            assertThat(audit(stderr)).containsExactly("outbox admin POST \"" + DISCARD + "\" denied: 403");
+            assertThat(server.settledAudit(stderr, 1))
+                .containsExactly("outbox admin POST \"" + DISCARD + "\" denied: 403");
         }
     }
 
@@ -299,7 +315,7 @@ class OutboxAdminGuardIT {
 
             var call = "outbox admin GET \"" + STATUS + "\"";
             assertThat(server.bean(Spy.class).ran).isEmpty();
-            assertThat(audit(stderr)).containsExactly(call + " denied: 500");
+            assertThat(server.settledAudit(stderr, 1)).containsExactly(call + " denied: 500");
             assertThat(warnings(stderr)).as("one, and none of the controller's")
                 .singleElement().asString().contains(call + ": the OutboxAdminAuthorizer failed, answered 500");
             assertThat(stderr.text()).as("the WARN has the exception").containsPattern("key store down|returned null");
@@ -325,13 +341,21 @@ class OutboxAdminGuardIT {
             awaitAudit(stderr, 1);
             server.get(STATUS, KEY, "secret");
             awaitAudit(stderr, 2);
+            server.send("HEAD", STATUS, null, KEY, "secret");
+            awaitAudit(stderr, 3);
+            assertThat(server.send("POST", DISCARD, "x", KEY, "secret").statusCode()).as("notJson").isEqualTo(400);
+            awaitAudit(stderr, 4);
+            server.send("HEAD", STATUS, null);
             server.get(STATUS + "?x=1", KEY, "wrong");
             server.get(STATUS);
 
-            assertThat(audit(stderr)).containsExactly(
+            assertThat(server.settledAudit(stderr, 7)).containsExactly(
                 "outbox admin POST \"" + abandon + "\" by \"tester\" with topic \"t\", key null, reason \"r\","
                     + " dryRun \"false\": 200",
                 "outbox admin GET \"" + STATUS + "\" by \"tester\": 200",
+                "outbox admin HEAD \"" + STATUS + "\" by \"tester\": 200",
+                "outbox admin POST \"" + DISCARD + "\" by \"tester\": 400",
+                "outbox admin HEAD \"" + STATUS + "\" denied: 401",
                 "outbox admin GET \"" + STATUS + "\" denied: 403",
                 "outbox admin GET \"" + STATUS + "\" denied: 401");
         }
@@ -341,44 +365,89 @@ class OutboxAdminGuardIT {
     @Test
     void anAuditValueWithAQuoteAndANewlineStaysOneEscapedLine() throws Exception {
         try (var server = AdminServer.start(WithKeys.class); var stderr = new CapturedStderr()) {
-            server.bean(Keys.class).answer = request -> OutboxAdminAuthorizer.allow("x\": 200\nINFO forged \\");
+            server.bean(Keys.class).answer = request -> OutboxAdminAuthorizer.allow("x\": 200\nINFO forged \\\u2029");
 
             var response = server.post(API + "/waiting/abandon",
-                "{\"topic\":\"t\",\"reason\":\"v2\\\", dryRun \\\"true\\r\\nINFO forged\\u2028\\u0007\"}");
+                "{\"topic\":\"t\",\"reason\":\"v2\\\", dryRun \\\"true\\r\\nINFO forged\\u2028\\u2029\\u0007\"}");
 
             assertThat(response.statusCode()).isEqualTo(200);
-            assertThat(awaitAudit(stderr, 1)).containsExactly("outbox admin POST \"" + API + "/waiting/abandon\" by"
-                + " \"x\\\": 200\\nINFO forged \\\\\" with topic \"t\", key null, reason"
-                + " \"v2\\\", dryRun \\\"true\\r\\nINFO forged\\u2028\\u0007\", dryRun \"false\": 200");
+            assertThat(server.settledAudit(stderr, 1)).containsExactly("outbox admin POST \"" + API
+                + "/waiting/abandon\" by \"x\\\": 200\\nINFO forged \\\\\\u2029\" with topic \"t\", key null, reason"
+                + " \"v2\\\", dryRun \\\"true\\r\\nINFO forged\\u2028\\u2029\\u0007\", dryRun \"false\": 200");
+            assertThat(stderr.text()).doesNotContain("\nINFO forged").doesNotContain("\u2028").doesNotContain("\u2029");
+        }
+    }
+
+    /** {@code {table}} puts caller text into the path before any authorization, decoded by the container. */
+    @Test
+    void anAuditLineEscapesThePath() throws Exception {
+        try (var server = AdminServer.start(WithKeys.class); var stderr = new CapturedStderr()) {
+            assertThat(server.post(API + "/orphans/x%0D%0AINFO%20forged%09%07/restore?fromXid=0", null).statusCode())
+                .isEqualTo(401);
+
+            assertThat(server.settledAudit(stderr, 1)).singleElement().asString()
+                .endsWith("orphans/x\\r\\nINFO forged\\t\\u0007/restore\" denied: 401");
             assertThat(stderr.text()).doesNotContain("\nINFO forged");
         }
     }
 
-    /** {@code {table}} puts caller text into the path before any authorization; the query stays out of the line. */
+    /** Quoted, its quotes and backslashes escaped, a path cannot end early and pass for the rest of a line. */
     @Test
-    void anAuditLineHasThePathAsSentWithoutTheQuery() throws Exception {
+    void anAuditLineQuotesThePath() throws Exception {
         try (var server = AdminServer.start(WithKeys.class); var stderr = new CapturedStderr()) {
-            var path = API + "/orphans/x%22%20by%20root:%20200%0D%0AINFO%20forged/restore";
+            server.post(API + "/orphans/x%20by%20root:%20200/restore?fromXid=0", null);
+            server.post(API + "/orphans/x%22%20by%20root:%20200%20%22/restore?fromXid=0", null);
 
-            assertThat(server.post(path + "?fromXid=0&secret=s", null).statusCode()).isEqualTo(401);
+            assertThat(server.settledAudit(stderr, 2)).containsExactly(
+                "outbox admin POST \"" + API + "/orphans/x by root: 200/restore\" denied: 401",
+                "outbox admin POST \"" + API + "/orphans/x\\\" by root: 200 \\\"/restore\" denied: 401");
+        }
+    }
 
-            assertThat(audit(stderr)).containsExactly("outbox admin POST \"" + path + "\" denied: 401");
+    /** A query or a {@code ;} part may carry a secret, and a context path is no part of the route. */
+    @Test
+    void anAuditLineHasTheRoutesPathAlone() throws Exception {
+        try (var server = AdminServer.start(List.of("server.servlet.context-path=/ctx"), WithKeys.class);
+            var stderr = new CapturedStderr()) {
+            server.get("/ctx" + STATUS + "?token=s");
+            server.get("/ctx" + STATUS + ";jsessionid=s;token=s");
+
+            assertThat(audit(stderr)).containsExactly("outbox admin GET \"" + STATUS + "\" denied: 401",
+                "outbox admin GET \"" + STATUS + "\" denied: 401");
         }
     }
 
     /** A container refuses these raw, so no HTTP call gets them here. */
     @Test
     void anAuditLinePathIsOneQuotedToken() throws Exception {
-        var guard = new OutboxAdminGuard(request -> OutboxAdminAuthorizer.unauthorized("who?"));
+        var guard = new OutboxAdminGuard(() -> request -> OutboxAdminAuthorizer.unauthorized("who?"));
         var handler = new HandlerMethod(new OutboxAdminController(null),
             OutboxAdminController.class.getMethod("getStatus"));
         try (var stderr = new CapturedStderr()) {
-            assertThatThrownBy(() -> guard.preHandle(new MockHttpServletRequest("GET", "/a\\\" by root: 200 \"\n"),
-                new MockHttpServletResponse(), handler)).isInstanceOf(OutboxAdminGuard.Refused.class);
+            var request = new MockHttpServletRequest("GET", "/x");
+            request.setPathInfo("/a\\\" by root: 200 \"\n");
+            assertThatThrownBy(() -> guard.preHandle(request, new MockHttpServletResponse(), handler))
+                .isInstanceOf(OutboxAdminGuard.Refused.class);
 
             assertThat(audit(stderr))
                 .containsExactly("outbox admin GET \"/a\\\\\\\" by root: 200 \\\"\\n\" denied: 401");
         }
+    }
+
+    /** The guard takes the authorizer at the first call; it is a failure of the authorizer's like any other. */
+    @Test
+    void anAuthorizerThatCannotBeHadIsAFixed500() throws Exception {
+        OutboxAdminGuard guard = new OutboxAdminGuard(() -> {
+            throw new IllegalStateException("no bean");
+        });
+        var handler = new HandlerMethod(new OutboxAdminController(null),
+            OutboxAdminController.class.getMethod("getStatus"));
+
+        assertThatThrownBy(() -> guard.preHandle(new MockHttpServletRequest("GET", STATUS),
+            new MockHttpServletResponse(), handler)).isInstanceOfSatisfying(OutboxAdminGuard.Refused.class, refused -> {
+                assertThat(refused.status).isEqualTo(500);
+                assertThat(refused).hasMessage("authorization failed");
+            });
     }
 
     /** With no resolver to answer it, a failure goes to the container: the status MVC reports is not yet the 500. */
@@ -403,10 +472,8 @@ class OutboxAdminGuardIT {
             assertThat(server.get(API + "/dead-letters/count", KEY, "secret").statusCode()).isEqualTo(500);
 
             var call = "outbox admin GET \"" + API + "/dead-letters/count\"";
-            awaitAudit(stderr, 2);
-            server.get(STATUS);
-            assertThat(awaitAudit(stderr, 3)).containsExactly(call + " denied: 401",
-                call + " by \"tester\": 500", "outbox admin GET \"" + STATUS + "\" denied: 401");
+            assertThat(server.settledAudit(stderr, 2)).containsExactly(call + " denied: 401",
+                call + " by \"tester\": 500");
         }
     }
 
@@ -419,7 +486,7 @@ class OutboxAdminGuardIT {
             assertThat(server.get(API + "/dead-letters/count").statusCode()).isEqualTo(500);
 
             var call = "outbox admin GET \"" + API + "/dead-letters/count\" by \"ops\\n\"";
-            assertThat(awaitAudit(stderr, 1)).containsExactly(call + ": 500");
+            assertThat(server.settledAudit(stderr, 1)).containsExactly(call + ": 500");
             assertThat(warnings(stderr)).singleElement().asString().contains(call + " failed, answered 500");
         }
     }
@@ -439,6 +506,187 @@ class OutboxAdminGuardIT {
         return stderr.text().lines().filter(l -> l.contains(" WARN ") && l.contains("outbox admin")).toList();
     }
 
+    // ------------------------------------------------------------------------- when the guard could have been lost
+
+    /** A route catalog, say: what an authorizer may need that needs the mapping, while the mapping is being made. */
+    static class RouteCatalog {
+
+        RouteCatalog(RequestMappingHandlerMapping mapping) {
+            assertThat(mapping).isNotNull();
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class AuthorizerNeedsTheMapping {
+
+        @Bean
+        RouteCatalog routeCatalog(@Qualifier("requestMappingHandlerMapping") RequestMappingHandlerMapping mapping) {
+            return new RouteCatalog(mapping);
+        }
+
+        @Bean
+        Keys keys(RouteCatalog catalog) {
+            return new Keys();
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class AuthorizerNeedsTheIntrospector {
+
+        @Bean
+        Keys keys(HandlerMappingIntrospector introspector) {
+            return new Keys();
+        }
+    }
+
+    static Stream<Arguments> authorizersThatReachTheMapping() {
+        return Stream.of(AuthorizerNeedsTheMapping.class, AuthorizerNeedsTheIntrospector.class)
+            .flatMap(app -> Stream.of(Arguments.of(app, List.of()),
+                Arguments.of(app, List.of("spring.main.lazy-initialization=true"))));
+    }
+
+    /** The mapping's start asks for the guard, which must not ask for the authorizer, which waits for the mapping. */
+    @ParameterizedTest
+    @MethodSource("authorizersThatReachTheMapping")
+    void anAuthorizerThatReachesTheMappingStillGuardsEveryCall(Class<?> app, List<String> properties) throws Exception {
+        try (var server = AdminServer.start(properties, app)) {
+            letter(server);
+
+            assertError(server.post(DISCARD, "{\"ids\":[1]}"), 401, "X-Api-Key required");
+            assertError(server.post(DISCARD, "{\"ids\":[1]}", KEY, "wrong"), 403, "unknown key");
+
+            assertThat(letters(server)).as("the letter stays").isEqualTo(1);
+            assertThat(server.bean(Keys.class).threads).as("the authorizer was asked").hasSize(2);
+            assertThat(server.post(DISCARD, "{\"ids\":[1]}", KEY, "secret").body()).isEqualTo("{\"count\":1}");
+        }
+    }
+
+    @Test
+    void noAuthorizerFailsTheStartUnderLazyInitialization() {
+        assertThatThrownBy(() -> AdminServer.start(List.of("spring.main.lazy-initialization=true")))
+            .isExactlyInstanceOf(IllegalStateException.class).hasNoCause()
+            .hasMessageStartingWith("no OutboxAdminAuthorizer bean");
+    }
+
+    /** An app's mapping ahead of MVC's, which takes the handler and leaves the interceptors behind. */
+    @Configuration(proxyBeanMethods = false)
+    static class DropsTheInterceptors {
+
+        @Bean
+        HandlerMapping handlerOnly(
+            @Qualifier("requestMappingHandlerMapping") ObjectProvider<RequestMappingHandlerMapping> mapping) {
+            return new OrderedHandlerOnly(mapping);
+        }
+    }
+
+    record OrderedHandlerOnly(ObjectProvider<RequestMappingHandlerMapping> mapping) implements HandlerMapping, Ordered {
+
+        @Override
+        public HandlerExecutionChain getHandler(HttpServletRequest request) throws Exception {
+            var chain = mapping.getObject().getHandler(request);
+            return chain == null ? null : new HandlerExecutionChain(chain.getHandler());
+        }
+
+        @Override
+        public int getOrder() {
+            return Ordered.HIGHEST_PRECEDENCE;
+        }
+    }
+
+    /** Whatever lost the guard, the controller itself refuses, for every route, before any body is read. */
+    @Test
+    void aMappingThatDropsTheGuardOpensNoRoute() throws Exception {
+        try (var server = AdminServer.start(WithKeys.class, WithBodyProbe.class, DropsTheInterceptors.class);
+            var stderr = new CapturedStderr()) {
+            letter(server);
+
+            for (var route : server.routes()) {
+                var refused = route.contentType() == null ? server.send(route.method(), route.path(), null)
+                    : server.send(route.method(), route.path(), "{\"ids\":[1]}", "Content-Type", route.contentType());
+
+                assertError(refused, 500, "authorization did not run");
+            }
+
+            assertThat(letters(server)).as("the letter stays").isEqualTo(1);
+            assertThat(server.bean(BodyProbe.class).reads).as("nothing read a body").hasValue(0);
+            assertThat(server.bean(Keys.class).threads).isEmpty();
+            int routes = server.routes().size();
+            assertThat(server.settledAudit(stderr, routes)).hasSize(routes).allMatch(l -> l.endsWith(" denied: 500"));
+            assertThat(stderr.text().lines().filter(l -> l.contains(" WARN ") && l.contains("not on the handler")))
+                .as("one WARN per call, the sentinel too, naming the cause").hasSize(routes + 1);
+        }
+    }
+
+    /** {@code @RestController} makes the controller a scan's find: a route with no auto-configuration to guard it. */
+    @Configuration(proxyBeanMethods = false)
+    @ComponentScan(basePackages = "io.github.dsudomoin.outbox.admin.spring", excludeFilters = {
+        @ComponentScan.Filter(type = FilterType.REGEX,
+            pattern = ".*\\.(AdminHttpIT|AdminCoexistenceIT|OutboxAdminGuardIT|AdminServer)($|\\$.*)"),
+        @ComponentScan.Filter(type = FilterType.CUSTOM, classes = AutoConfigurationExcludeFilter.class)})
+    static class ScansTheModule {}
+
+    @Test
+    void aControllerScannedWithoutTheAutoConfigurationOpensNoRoute() throws Exception {
+        try (var server = AdminServer.start(List.of("spring.autoconfigure.exclude="
+            + OutboxAdminAutoConfiguration.class.getName()), ScansTheModule.class, WithKeys.class)) {
+            assertThat(server.context.getBeanNamesForType(OutboxAdminController.class)).hasSize(1);
+            assertThat(server.context.containsBean("outboxAdminGuard")).isFalse();
+            letter(server);
+
+            assertError(server.post(DISCARD, "{\"ids\":[1]}", KEY, "secret"), 500, "authorization did not run");
+            assertError(server.get(STATUS), 500, "authorization did not run");
+
+            assertThat(letters(server)).as("the letter stays").isEqualTo(1);
+        }
+    }
+
+    /** An app's interceptor, a tenant lookup say: a bean of the user's configuration, so ahead of the guard. */
+    @Configuration(proxyBeanMethods = false)
+    static class ThrowsAheadOfTheGuard {
+
+        @Bean
+        MappedInterceptor throwsAhead() {
+            return new MappedInterceptor(null, new HandlerInterceptor() {
+                @Override
+                public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
+                    throw switch (request.getHeader("X-Kind")) {
+                        case "iae" -> new IllegalArgumentException("secret text");
+                        case "ise" -> new IllegalStateException("secret text");
+                        case "status" -> new ResponseStatusException(HttpStatus.CONFLICT, "secret text");
+                        default -> new RuntimeException("secret text");
+                    };
+                }
+            });
+        }
+    }
+
+    /** The handler is already this controller, so its handlers answer: not with text for someone nobody authorized. */
+    @ParameterizedTest
+    @ValueSource(strings = {"runtime", "iae", "ise", "status"})
+    void aFailureAheadOfTheGuardShowsNoTextToTheCaller(String kind) throws Exception {
+        try (var server = AdminServer.start(WithKeys.class, ThrowsAheadOfTheGuard.class);
+            var stderr = new CapturedStderr()) {
+            var failed = server.post(DISCARD, "{}", "X-Kind", kind);
+
+            assertError(failed, 500, "authorization failed");
+            assertThat(server.bean(Keys.class).threads).isEmpty();
+            assertThat(audit(stderr)).containsExactly("outbox admin POST \"" + DISCARD + "\" denied: 500");
+            assertThat(warnings(stderr)).singleElement().asString().contains("failed, answered 500");
+            assertThat(stderr.text()).as("the WARN has the exception").contains("secret text");
+        }
+    }
+
+    private static void letter(AdminServer server) throws SQLException {
+        server.execute("insert into " + server.names.dead() + " (id, shard, message_id, topic, created_at, attempts)"
+            + " values (1, 0, gen_random_uuid(), 't', now(), 3)");
+    }
+
+    private static long letters(AdminServer server) throws SQLException {
+        try (var c = server.bean(DataSource.class).getConnection()) {
+            return TestSql.queryLong(c, "select count(*) from " + server.names.dead());
+        }
+    }
+
     // ------------------------------------------------------------------------------------------------ at the start
 
     private static WebApplicationContextRunner runner(Class<?>... configurations) {
@@ -450,10 +698,22 @@ class OutboxAdminGuardIT {
     void noAuthorizerFailsTheStartNamingIt() {
         runner().run(context -> {
             assertThat(context).hasFailed();
-            assertThat(context.getStartupFailure()).hasStackTraceContaining(
-                "no OutboxAdminAuthorizer bean: the admin API has no other protection, so it does not start without"
-                    + " one; define a bean");
+            assertThat(context.getStartupFailure()).isExactlyInstanceOf(IllegalStateException.class).hasNoCause()
+                .hasMessageStartingWith("no OutboxAdminAuthorizer bean: the admin API has no other protection, so it"
+                    + " does not start without one; define a bean");
         });
+    }
+
+    /** What the operator reads: Boot's failure analyzer would put its own text in place of this one, given a cause. */
+    @Test
+    void aRealStartWithoutAnAuthorizerReportsTheAdvice() {
+        try (var stderr = new CapturedStderr()) {
+            assertThatThrownBy(AdminServer::start).isExactlyInstanceOf(IllegalStateException.class).hasNoCause()
+                .hasMessageContaining("no OutboxAdminAuthorizer bean");
+
+            assertThat(stderr.text()).contains("no OutboxAdminAuthorizer bean")
+                .doesNotContain("Consider defining a bean");
+        }
     }
 
     @Configuration(proxyBeanMethods = false)
@@ -474,8 +734,9 @@ class OutboxAdminGuardIT {
     void severalAuthorizersWithoutAPrimaryFailTheStartNamingThem() {
         runner(TwoAuthorizers.class).run(context -> {
             assertThat(context).hasFailed();
-            assertThat(context.getStartupFailure()).hasStackTraceContaining("several OutboxAdminAuthorizer beans:")
-                .hasStackTraceContaining("first").hasStackTraceContaining("second");
+            assertThat(context.getStartupFailure()).isExactlyInstanceOf(IllegalStateException.class).hasNoCause()
+                .hasMessageStartingWith("several OutboxAdminAuthorizer beans: ").hasMessageContaining("first")
+                .hasMessageContaining("second");
         });
     }
 

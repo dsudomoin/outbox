@@ -6,9 +6,10 @@ import java.util.Objects;
 /**
  * Decides who may call the admin API; the app provides one as a bean, an app with the admin API and without it does not
  * start. Runs before every admin route: {@link Deny} answers with its status and an {@code Error} body, the route never
- * runs. It runs on the request's own servlet thread, once MVC has picked the route and before anything reads the
- * request's body, so it may block (a database or remote lookup), and it must not read the body: the route could not
- * read it after that.
+ * runs. It runs on the request's own servlet thread, once MVC has picked the route, so it may block (a database or
+ * remote lookup). The admin API has read no JSON body by then, and this must not read one: the route could not read it
+ * after that. A multipart request is another matter: {@code DispatcherServlet.checkMultipart} parses one ahead of the
+ * handler lookup, on every path of the app.
  *
  * <p>Refuse with {@link Deny}, never by throwing: any exception {@link #authorize} throws, even a
  * {@code ResponseStatusException} 401 or 403, answers 500 {@code "authorization failed"}, and the exception goes to a
@@ -17,7 +18,8 @@ import java.util.Objects;
  * <p>Base the decision on a credential the client sends on purpose (a header such as an API key or a bearer token), not
  * on one a browser adds by itself (a cookie, Basic or SSO credentials it remembers, a client certificate, the caller's
  * address): a page on another site can make the operator's browser send those. The admin API refuses state changes a
- * browser marks as cross-site before this runs, but a browser too old to mark them gets through.
+ * browser marks as cross-site before this runs, but a browser too old to mark them gets through, and so does one on
+ * plain HTTP to an address other than localhost, where browsers do not send {@code Sec-Fetch-Site} at all.
  */
 public interface OutboxAdminAuthorizer {
 

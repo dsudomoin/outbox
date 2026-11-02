@@ -176,6 +176,18 @@ final class AdminServer implements AutoCloseable {
     }
 
     /**
+     * The lines of the calls so far, once there are {@code lines} of them and after one more call, so that a late
+     * duplicate of the last line shows too. That call is refused as cross-site, whose line comes before its response.
+     */
+    List<String> settledAudit(CapturedStderr stderr, int lines) throws Exception {
+        awaitAudit(stderr, lines);
+        send("POST", API + "/orphans/sentinel/restore", null, "Sec-Fetch-Site", "cross-site");
+        var all = audit(stderr);
+        assertThat(all).last().asString().contains("/orphans/sentinel/");
+        return all.subList(0, all.size() - 1);
+    }
+
+    /**
      * Waits for {@code lines} of them: MVC flushes an allowed call's response before the guard writes its line, so the
      * line can come just after the client has its response. Call it before the next call, or two lines may swap.
      */

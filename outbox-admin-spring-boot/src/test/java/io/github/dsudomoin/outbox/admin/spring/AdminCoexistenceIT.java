@@ -2,7 +2,6 @@ package io.github.dsudomoin.outbox.admin.spring;
 
 import static io.github.dsudomoin.outbox.admin.spring.AdminServer.API;
 import static io.github.dsudomoin.outbox.admin.spring.AdminServer.assertError;
-import static io.github.dsudomoin.outbox.admin.spring.AdminServer.audit;
 import static io.github.dsudomoin.outbox.admin.spring.AdminServer.awaitAudit;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -189,7 +188,7 @@ class AdminCoexistenceIT {
             try (var stderr = new CapturedStderr()) {
                 noKey = call(server, route, null);
                 wrongKey = call(server, route, "wrong");
-                lines = audit(stderr);
+                lines = server.settledAudit(stderr, 2);
             }
 
             assertError(noKey, 401, "X-Api-Key required");
@@ -297,7 +296,8 @@ class AdminCoexistenceIT {
                     ? " with topic \"t\", key null, reason \"test\", dryRun \"false\"" : "") + ": 200";
                 expected.addAll(List.of(call + " denied: 401", call + " denied: 403", allowed));
             }
-            assertThat(audit(stderr)).as("one INFO line per call").containsExactlyElementsOf(expected);
+            assertThat(server.settledAudit(stderr, lines)).as("one INFO line per call")
+                .containsExactlyElementsOf(expected);
         }
     }
 

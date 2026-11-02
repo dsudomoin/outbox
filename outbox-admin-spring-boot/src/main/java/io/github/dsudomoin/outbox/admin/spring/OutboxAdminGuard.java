@@ -6,6 +6,7 @@ import jakarta.servlet.http.HttpServletResponse;
 import java.util.Map;
 import java.util.Objects;
 import java.util.StringJoiner;
+import java.util.function.Supplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.web.method.HandlerMethod;
@@ -13,9 +14,15 @@ import org.springframework.web.servlet.HandlerInterceptor;
 
 /**
  * Guards every admin route with the {@link OutboxAdminAuthorizer}, called on the request's thread. MVC runs this after
- * it has picked the handler and before it resolves the handler's arguments, so before anything reads the body. The
- * decision follows the handler, not the path: it holds wherever an app moves the routes, and it passes anything but
- * {@link OutboxAdminController} at once.
+ * it has picked the handler and before it resolves the handler's arguments, so before the controller reads a JSON body
+ * (a multipart request is another matter: {@code DispatcherServlet.checkMultipart} parses one ahead of the handler
+ * lookup, on every path of the app). The decision follows the handler, not the path: it holds wherever an app moves the
+ * routes, and it passes anything but {@link OutboxAdminController} at once.
+ *
+ * <p>Should a handler mapping leave this out (an app's own mapping that keeps the handler alone, or the controller
+ * scanned without the auto-configuration), the controller calls {@link #requireAllowed} before anything else of the
+ * route, so a call nobody allowed gets a 500 {@code Error} "authorization did not run", a WARN naming the cause and a
+ * {@code denied: 500} audit line, never the route.
  *
  * <p>A denied call gets a JSON {@code Error} with the decision's status and never reaches the route; an authorizer that
  * fails gets a WARN with its exception and the caller a 500 {@code Error} "authorization failed", nothing of why. A
@@ -28,9 +35,10 @@ import org.springframework.web.servlet.HandlerInterceptor;
  * <p>Every call leaves one INFO audit line: {@code outbox admin <method> "<path>" by "<identity>": <status>} when
  * allowed, {@code outbox admin <method> "<path>" denied: <status>} when denied or when the authorizer fails. An allowed
  * call whose operation put its arguments under {@link OutboxAdminController#DETAIL} has them before the status:
- * {@code by "<identity>" with <name> "<value>", ...}, a null value as {@code null}. The path (the raw request URI, no
- * query), the identity (perhaps a token's subject) and each value are quoted, with their quotes, backslashes and
- * control characters escaped, so no caller can forge a line or a part of one.
+ * {@code by "<identity>" with <name> "<value>", ...}, a null value as {@code null}. The path (decoded, without the
+ * context path, the query or a {@code ;} part), the identity (perhaps a token's subject) and each value are quoted,
+ * with their quotes, backslashes and control characters escaped, so no caller can forge an audit line or a part of one.
+ * The text of an exception an authorizer or a route throws goes to its WARN line as it is.
  *
  * <p>The line of a denial or of a failed authorizer is written here before its response. MVC has already flushed an
  * allowed call's response when it runs {@link #afterCompletion}, so a client can see that response just before its line
@@ -43,9 +51,10 @@ final class OutboxAdminGuard implements HandlerInterceptor {
     /** Request attribute: who an allowed call is, for its audit line. */
     private static final String IDENTITY = OutboxAdminGuard.class.getName() + ".identity";
 
-    private final OutboxAdminAuthorizer authorizer;
+    private final Supplier<OutboxAdminAuthorizer> authorizer;
 
-    OutboxAdminGuard(OutboxAdminAuthorizer authorizer) {
+    /** A supplier, so that making this guard, which a handler mapping's start does, needs nothing of the app's. */
+    OutboxAdminGuard(Supplier<OutboxAdminAuthorizer> authorizer) {
         this.authorizer = authorizer;
     }
 
@@ -62,7 +71,8 @@ final class OutboxAdminGuard implements HandlerInterceptor {
         }
         OutboxAdminAuthorizer.Decision decision;
         try {
-            decision = Objects.requireNonNull(authorizer.authorize(request), "OutboxAdminAuthorizer returned null");
+            decision = Objects.requireNonNull(authorizer.get().authorize(request),
+                "OutboxAdminAuthorizer returned null");
         } catch (Throwable e) { // an Error too: the call gets its audit line, the caller nothing of why
             log.warn("outbox admin {}: the OutboxAdminAuthorizer failed, answered 500", call, e);
             log.info("outbox admin {} denied: 500", call);
@@ -81,7 +91,7 @@ final class OutboxAdminGuard implements HandlerInterceptor {
     @Override
     public void afterCompletion(HttpServletRequest request, HttpServletResponse response, Object handler,
             @Nullable Exception ex) {
-        if (guards(handler) && request.getAttribute(IDENTITY) != null) {
+        if (guards(handler) && allowed(request)) {
             log.info("outbox admin {}{}: {}", caller(request), detail(request),
                 ex != null ? 500 : response.getStatus());
         }
@@ -93,6 +103,27 @@ final class OutboxAdminGuard implements HandlerInterceptor {
             && OutboxAdminController.class.isAssignableFrom(method.getBeanType());
     }
 
+    /** Whether this guard let the call through. */
+    static boolean allowed(HttpServletRequest request) {
+        return request.getAttribute(IDENTITY) != null;
+    }
+
+    /** Refuses a call this guard did not let through: whatever lost the guard, it must not open a route. */
+    static void requireAllowed(HttpServletRequest request) {
+        if (!allowed(request)) {
+            log.warn("outbox admin {}: authorization did not run, answered 500: the guard is not on the handler mapping"
+                + " that picked this route (an app's own HandlerMapping dropping interceptors, or the controller"
+                + " scanned without OutboxAdminAutoConfiguration)", call(request));
+            auditDenied(request);
+            throw new Refused(500, "authorization did not run");
+        }
+    }
+
+    /** The audit line of a call refused with a 500 outside {@link #preHandle}. */
+    static void auditDenied(HttpServletRequest request) {
+        log.info("outbox admin {} denied: 500", call(request));
+    }
+
     /** {@code <method> "<path>"}, with {@code by "<identity>"} once allowed: how a line about this call names it. */
     static String caller(HttpServletRequest request) {
         var identity = request.getAttribute(IDENTITY);
@@ -100,7 +131,8 @@ final class OutboxAdminGuard implements HandlerInterceptor {
     }
 
     private static String call(HttpServletRequest request) {
-        return request.getMethod() + " \"" + printable(request.getRequestURI()) + "\"";
+        var path = request.getServletPath() + Objects.requireNonNullElse(request.getPathInfo(), "");
+        return request.getMethod() + " \"" + printable(path) + "\"";
     }
 
     /**
@@ -138,7 +170,7 @@ final class OutboxAdminGuard implements HandlerInterceptor {
                 case '\r' -> out.append("\\r");
                 case '\t' -> out.append("\\t");
                 default -> {
-                    if (Character.isISOControl(ch) || ch == ' ' || ch == ' ') {
+                    if (Character.isISOControl(ch) || ch == '\u2028' || ch == '\u2029') {
                         out.append(String.format("\\u%04x", ch));
                     } else {
                         out.append((char) ch);

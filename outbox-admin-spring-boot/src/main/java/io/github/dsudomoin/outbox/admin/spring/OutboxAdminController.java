@@ -45,6 +45,7 @@ import org.springframework.web.ErrorResponse;
 import org.springframework.web.bind.WebDataBinder;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.InitBinder;
+import org.springframework.web.bind.annotation.ModelAttribute;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestController;
@@ -57,13 +58,14 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
  * JSON {@code Error} bodies by this class's own exception handlers, which Spring tries before any advice, so an app's
  * global advice, whatever its order, or Boot's problem details, do not answer for this controller, nor these handlers
  * for any other; they also answer what is thrown before a route's method runs (by an argument, or by a
- * {@code HandlerInterceptor} of its handler). A call's {@link IllegalArgumentException} answers 400, its
- * {@link IllegalStateException} 409, a request MVC could not read 400, any other exception MVC gives a status (a
- * missing parameter) that status, and anything else 500 with the failure's message, for the authenticated operator; a
- * 5xx after one WARN with the exception. Enums are mapped by exhaustive {@code switch}, so a constant added on either
- * side fails the build instead of a request. Every route is a method of this class, so {@link OutboxAdminGuard}, which
- * takes the handlers of this bean type, sees them all, before any body is read. Not final: an app's aspect over every
- * controller proxies this one too.
+ * {@code HandlerInterceptor} of its handler), then a fixed 500 for a caller the guard has not let through, whatever the
+ * failure. A call's {@link IllegalArgumentException} answers 400, its {@link IllegalStateException} 409, a request MVC
+ * could not read 400, any other exception MVC gives a status (a missing parameter) that status, and anything else 500
+ * with the failure's message, for the authenticated operator; a 5xx after one WARN with the exception. Enums are mapped
+ * by exhaustive {@code switch}, so a constant added on either side fails the build instead of a request. Every route is
+ * a method of this class, so {@link OutboxAdminGuard}, which takes the handlers of this bean type, sees them all,
+ * before any body is read, and each refuses a call the guard did not allow, should a mapping have lost it. Not final:
+ * an app's aspect over every controller proxies this one too.
  */
 @RestController
 class OutboxAdminController implements OutboxAdminApi {
@@ -87,6 +89,15 @@ class OutboxAdminController implements OutboxAdminApi {
 
     OutboxAdminController(OutboxAdmin admin) {
         this.admin = admin;
+    }
+
+    /**
+     * Runs ahead of each route's arguments, so before any body is read: losing the guard must not open a route, by any
+     * path. Holds with the guard on the mapping too, where the guard has already refused anyone it did not allow.
+     */
+    @ModelAttribute
+    public void guardRan(HttpServletRequest request) {
+        OutboxAdminGuard.requireAllowed(request);
     }
 
     /** The query parameter by the contract's value, "pending"; MVC's own conversion takes the constant's name. */
@@ -179,31 +190,28 @@ class OutboxAdminController implements OutboxAdminApi {
         return error(e.status, e.getMessage());
     }
 
-    @ExceptionHandler(IllegalArgumentException.class)
-    public ResponseEntity<Error> refused(IllegalArgumentException e) {
-        return error(HttpStatus.BAD_REQUEST.value(), message(e));
-    }
-
-    @ExceptionHandler(IllegalStateException.class)
-    public ResponseEntity<Error> conflict(IllegalStateException e) {
-        return error(HttpStatus.CONFLICT.value(), message(e));
-    }
-
-    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
-    public ResponseEntity<Error> badParameter(MethodArgumentTypeMismatchException e) {
-        return error(HttpStatus.BAD_REQUEST.value(),
-            "Query parameter '" + e.getName() + "' has invalid value: " + e.getValue());
-    }
-
-    /** The parser's own words; Spring's for a missing body would name this controller's method. */
-    @ExceptionHandler(HttpMessageNotReadableException.class)
-    public ResponseEntity<Error> unreadable(HttpMessageNotReadableException e) {
-        return error(HttpStatus.BAD_REQUEST.value(),
-            e.getCause() == null ? "a request body is required" : message(e.getMostSpecificCause()));
-    }
-
+    /** One way out for every failure, so that none shows its text to a caller the guard has not let through. */
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Error> failed(Exception e, HttpServletRequest request) {
+        if (!OutboxAdminGuard.allowed(request)) { // an app's interceptor ahead of the guard threw
+            log.warn("outbox admin {} failed, answered 500", OutboxAdminGuard.caller(request), e);
+            OutboxAdminGuard.auditDenied(request);
+            return error(500, "authorization failed");
+        }
+        if (e instanceof IllegalArgumentException) {
+            return error(HttpStatus.BAD_REQUEST.value(), message(e));
+        }
+        if (e instanceof IllegalStateException) {
+            return error(HttpStatus.CONFLICT.value(), message(e));
+        }
+        if (e instanceof MethodArgumentTypeMismatchException mismatch) {
+            return error(HttpStatus.BAD_REQUEST.value(),
+                "Query parameter '" + mismatch.getName() + "' has invalid value: " + mismatch.getValue());
+        }
+        if (e instanceof HttpMessageNotReadableException unreadable) { // the parser's words; Spring's name this method
+            return error(HttpStatus.BAD_REQUEST.value(),
+                e.getCause() == null ? "a request body is required" : message(unreadable.getMostSpecificCause()));
+        }
         int status = e instanceof ErrorResponse response ? response.getStatusCode().value() : 500;
         if (status >= 500) {
             log.warn("outbox admin {} failed, answered {}", OutboxAdminGuard.caller(request), status, e);
