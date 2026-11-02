@@ -88,10 +88,11 @@ public interface OutboxAdmin {
     long recoverXidRegression();
 
     /**
-     * Repairs the stranded shards, those starting from a tick that no longer exists (the ERROR "outbox shards ... start
-     * from ticks ... that no longer exist"), on a running fleet: the other shards keep flowing and nothing has to stop.
-     * Which of a stranded shard's rows went through the relay is gone with its tick, so each of its rows still in the
-     * outbox goes back as a new message, with a new id and xid and the same message id, delivered after later messages
+     * Repairs the stranded shards, those starting from a tick that no longer exists or with a batch in progress running
+     * to one (the ERROR "outbox shards ... start from ticks ... that no longer exist"), on a running fleet: the other
+     * shards keep flowing and nothing has to stop. Which of a stranded shard's rows went through the relay is gone with
+     * its tick, so each of its rows still in the outbox (when its starting tick is left, each that tick does not see)
+     * goes back as a new message, with a new id and xid and the same message id, delivered after later messages
      * of its key: consumers get as duplicates the ones delivered before, and only those inside their inbox window are
      * dropped for them. Rows in the retry, parked and dead tables stay there. Then the shard's cursor moves to the
      * latest tick. A transaction committing meanwhile loses nothing: what the tick does not cover the relay delivers.

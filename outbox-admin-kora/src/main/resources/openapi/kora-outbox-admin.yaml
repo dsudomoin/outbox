@@ -209,10 +209,10 @@ paths:
     post:
       operationId: recoverStrandedShards
       tags: [OutboxAdmin]
-      summary: Repairs the shards that start from a tick that no longer exists, on running instances
+      summary: Repairs the shards a tick of which, their start or their batch's target, no longer exists, on running instances
       description: >-
-        Re-sends the stranded shards' rows still in the outbox but those in the retry, parked and dead tables, as new
-        messages with the same message ids, delivered before or not, then moves each shard's cursor to the latest tick.
+        Re-sends the stranded shards' rows still in the outbox but those in the retry, parked and dead tables and those
+        a starting tick still there sees, as new messages with the same message ids, delivered before or not, then moves each shard's cursor to the latest tick.
         The other shards keep flowing. Answers 409 when no shard is stranded, or, the rows moved so far staying moved
         and calling again going on, when a maintenance run held its lock for 60 s or a lock on a shard or key was held
         for too long.

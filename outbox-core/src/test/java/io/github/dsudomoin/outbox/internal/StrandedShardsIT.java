@@ -232,6 +232,49 @@ class StrandedShardsIT {
     }
 
     @Test
+    void aShardMidBatchWhoseTargetTickIsGoneIsStuckUntilTheCallAndGetsOnlyItsNewRowsBack() throws Exception {
+        config.maintenanceInterval(Duration.ofMillis(100));
+        leaveTheOtherShardsOnANewerTick();
+        var relayed = sendMany(1, 3);
+        var cursors = new Cursors(names, SHARDS);
+        var ticks = new Ticks(names, SHARDS);
+        long from;
+        long target;
+        var rows = new ArrayList<UUID>();
+        try (var c = direct.getConnection()) {
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            from = ticks.latest(c).id();
+            cursors.append(c, new Cursor(1, from, null, 0, null, 0, null, null)); // what is sent so far went through
+            rows.addAll(sendMany(1, 5));
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            target = ticks.latest(c).id();
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            cursors.append(c, new Cursor(1, from, target, idOf(rows.get(0)), null, 0, null, null));
+            execute(c, "delete from " + names.tick() + " where id = " + target);
+            execute(c, "delete from " + names.checkpoint());
+        }
+        var after = new ArrayList<UUID>();
+        String log;
+        try (var err = new CapturedStderr()) {
+            startRelay();
+            after.addAll(sendMany(1, 1));
+            Thread.sleep(2000); // steps and maintenance runs: nothing moves it by itself
+            log = err.text();
+        }
+        assertThat(delivered).doesNotContainAnyElementsOf(rows).doesNotContainAnyElementsOf(after);
+        assertThat(log).contains("no tick " + target);
+        assertThat(log.contains("start from ticks [" + target + "]")).as("the ERROR names the tick").isTrue();
+
+        assertThat(admin().recoverStrandedShards()).as("the rows its tick does not see, read or not").isEqualTo(6);
+
+        rows.addAll(after);
+        await(() -> delivered.containsAll(rows));
+        Thread.sleep(300);
+        assertThat(delivered).as("what its tick sees went through before").doesNotContainAnyElementsOf(relayed);
+        assertThatThrownBy(() -> admin().recoverStrandedShards()).hasMessageStartingWith("no stranded shards");
+    }
+
+    @Test
     void refusesWhenNoShardIsStranded() throws Exception {
         startRelay();
 

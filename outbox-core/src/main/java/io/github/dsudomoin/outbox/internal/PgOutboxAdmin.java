@@ -398,7 +398,8 @@ public final class PgOutboxAdmin implements OutboxAdmin {
 
     /**
      * Repairs one stranded shard: its rows the latest tick L covers are moved back into the outbox, then its cursor
-     * goes to L, due as its retry and parked tables say. L is read first, so what its snapshot covers had committed
+     * goes to L, due as its retry and parked tables say, with no batch in progress. When only its batch's target is
+     * gone, those its effective tick sees stay: they went through the relay ({@link Cursors}). L is read first, so what its snapshot covers had committed
      * before the read of the rows, which so finds all of it. What it does not cover is the relay's from the new cursor
      * on and is not touched: a transaction committing at any point of this, the re-sent rows included, whose xids L
      * cannot cover, as they were taken after it. The rows move rather than copy, the insert and the delete in one
@@ -413,7 +414,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
      */
     private void recoverStranded(Connection c, int shard, AtomicLong moved) throws SQLException {
         var latest = ticks.latest(c);
-        var pending = coveredRows(c, shard, latest);
+        var pending = coveredRows(c, shard, latest, cursors.latest(c, shard).tick());
         try {
             Integer waitFor = null;
             for (int waits = 0; !pending.isEmpty(); waits++) {
@@ -458,12 +459,17 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     /** A row of a stranded shard, as much of it as finds it again: the outbox has an index on (shard, xid) alone. */
     private record CoveredRow(long id, long xid) {}
 
-    /** The rows of {@code shard} that {@code tick}'s snapshot covers, in id order. */
-    private List<CoveredRow> coveredRows(Connection c, int shard, Ticks.Tick tick) throws SQLException {
+    /** The rows of {@code shard} that {@code tick}'s snapshot covers and {@code relayed}'s, if any, does not, by id. */
+    private List<CoveredRow> coveredRows(Connection c, int shard, Ticks.Tick tick, @Nullable Ticks.Tick relayed)
+            throws SQLException {
         try (var ps = c.prepareStatement("select id, xid::text from " + names.base() + " where shard = ?"
-                + " and pg_visible_in_snapshot(xid, ?::pg_snapshot) order by id")) {
+                + " and pg_visible_in_snapshot(xid, ?::pg_snapshot)"
+                + (relayed == null ? "" : " and not pg_visible_in_snapshot(xid, ?::pg_snapshot)") + " order by id")) {
             ps.setShort(1, (short) shard);
             ps.setString(2, tick.snapshot().text());
+            if (relayed != null) {
+                ps.setString(3, relayed.snapshot().text());
+            }
             var rows = new ArrayList<CoveredRow>();
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
