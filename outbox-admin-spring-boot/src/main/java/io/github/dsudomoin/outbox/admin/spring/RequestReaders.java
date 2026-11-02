@@ -104,7 +104,10 @@ class RequestReaders extends RequestBodyAdviceAdapter {
                 throw new IllegalArgumentException("Expecting an object for field 'filter'");
             }
             known(map, "Filter", FILTER, "topic, key, error, failedFrom, failedTo, status");
-            FILTER.forEach(field -> string(map, field));
+            FILTER.forEach(field -> {
+                string(map, field);
+                notBlank(map, field, " in a filter");
+            });
             if (map.get("status") instanceof String status) {
                 DeadLetterStatus.fromValue(status); // refuses what a mapper may read as absent
             }
@@ -116,6 +119,7 @@ class RequestReaders extends RequestBodyAdviceAdapter {
         for (var field : List.of("topic", "key", "reason")) {
             string(body, field);
         }
+        notBlank(body, "key", "");
         for (var field : List.of("topic", "reason")) {
             if (body.get(field) == null) {
                 throw new IllegalArgumentException("missing field '" + field + "' in AbandonWaiting");
@@ -140,6 +144,14 @@ class RequestReaders extends RequestBodyAdviceAdapter {
         var value = body.get(field);
         if (value != null && !(value instanceof String)) {
             throw new IllegalArgumentException("Expecting a string for field '" + field + "', got " + value);
+        }
+    }
+
+    /** An app's empty-to-null or trimming String deserializer would read it as absent, which widens the call. */
+    private static void notBlank(Map<?, ?> body, String field, String where) {
+        if (body.get(field) instanceof String value && value.isBlank()) {
+            throw new IllegalArgumentException("a blank " + field + where + " matches every " + field
+                + ": leave it out, or name one");
         }
     }
 }

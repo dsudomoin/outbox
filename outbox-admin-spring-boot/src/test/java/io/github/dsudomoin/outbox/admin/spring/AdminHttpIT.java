@@ -419,6 +419,31 @@ class AdminHttpIT {
         });
     }
 
+    /** An app's empty-to-null or trimming String deserializer would read these as absent, which widens the call. */
+    @Test
+    void blankValuesAMapperMayDropAreRefusedBeforeBinding() {
+        app(() -> {
+            long id = letter(1, "t", "k", "boom", T0, KEPT);
+            seedWaiting();
+
+            for (var field : List.of("key", "failedFrom", "failedTo", "error")) {
+                for (var blank : List.of("", " ")) {
+                    var response = call("POST", "/dead-letters/discard",
+                        "{\"filter\":{\"topic\":\"t\",\"" + field + "\":\"" + blank + "\"}}");
+
+                    assertJson(response, 400);
+                    assertThat(response.body).as(field).startsWith("{\"message\":\"a blank " + field + " in a filter");
+                }
+            }
+            var response = call("POST", "/waiting/abandon", "{\"topic\":\"t\",\"key\":\"\",\"reason\":\"r\"}");
+
+            assertJson(response, 400);
+            assertThat(response.body).startsWith("{\"message\":\"a blank key matches");
+            assertThat(deadIds()).containsExactly(id);
+            assertThat(retryCount()).isEqualTo(4);
+        });
+    }
+
     /** Read as absent, a misspelt status would widen the call to every letter of the topic. */
     @Test
     void misspeltStatusIsRefusedWhenTheMapperReadsUnknownEnumsAsNull() {

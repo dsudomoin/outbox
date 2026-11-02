@@ -231,23 +231,9 @@ class OutboxAdminController implements OutboxAdminApi {
         return ids;
     }
 
-    /**
-     * A bulk call's filter: a blank {@code topic} or {@code error} is refused, as dropped it would widen the call to
-     * every letter the rest of the filter matches; here, so the 400 names the contract's field ({@link OutboxAdmin}
-     * refuses it too).
-     */
+    /** A bulk call's filter; {@link RequestReaders} has refused a blank field, as dropped it would widen the call. */
     private static DeadLetterFilter filter(Filter f) {
-        return filter(notBlank("topic", f.getTopic()), f.getKey(), notBlank("error", f.getError()), f.getFailedFrom(),
-            f.getFailedTo(), f.getStatus());
-    }
-
-    @Nullable
-    private static String notBlank(String field, @Nullable String value) {
-        if (value != null && value.isBlank()) {
-            throw new IllegalArgumentException("a blank " + field + " in a filter matches every " + field
-                + ": leave it out, or name one");
-        }
-        return value;
+        return filter(f.getTopic(), f.getKey(), f.getError(), f.getFailedFrom(), f.getFailedTo(), f.getStatus());
     }
 
     private static DeadLetterFilter filter(@Nullable String topic, @Nullable String key, @Nullable String error,
