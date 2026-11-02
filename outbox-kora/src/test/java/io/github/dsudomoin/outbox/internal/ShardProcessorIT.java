@@ -2596,6 +2596,99 @@ class ShardProcessorIT {
                 .containsExactly("k#1:2:" + now.plus(Duration.ofMillis(1)), "k#2:2:" + now.plus(REQUEUE_DELAY));
     }
 
+    /** Parked k#1, retry head k#2 with its follower k#3, the head due and k#1 not. */
+    private void keyInRetryAboveAParkedRow() throws Exception {
+        bootstrap();
+        parkAll("k#1");
+        script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.retry(new RuntimeException("k#2 down"))));
+        send(msg("t", "k", "k#2"), msg("t", "k", "k#3"));
+        tick();
+        process();
+        assertThat(retryRows()).hasSize(2);
+        now = now.plus(Duration.ofMinutes(1));
+        setParkedDue("k#1", now.plus(Duration.ofHours(24)));
+        calls.clear();
+    }
+
+    @Test
+    void aDueRetryHeadBringsTheOlderParkedRowsOfItsKey() throws Exception {
+        keyInRetryAboveAParkedRow();
+        script = answering(Map.of());
+
+        process();
+
+        assertThat(calls).as("the parked row ahead of the head and its follower, in one call")
+                .singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("k#1", "k#2", "k#3"));
+        assertThat(parkedRows()).isEmpty();
+        assertThat(retryRows()).isEmpty();
+    }
+
+    @Test
+    void aParkedRowRequeuedAgainDoesNotHoldTheRetryRowsAfterIt() throws Exception {
+        keyInRetryAboveAParkedRow();
+        script = answering(Map.of("k#1", Outcome.requeue()));
+
+        process();
+
+        assertThat(delivered()).contains("k#2", "k#3");
+        assertThat(retryRows()).isEmpty();
+        assertThat(parkedRows()).singleElement().satisfies(row -> assertThat(row).startsWith("k#1:"));
+    }
+
+    @Test
+    void aParkedRowThatFailsAheadOfItsRetryHeadTakesItsPlace() throws Exception {
+        keyInRetryAboveAParkedRow();
+        script = answering(Map.of("k#1", Outcome.retry(new RuntimeException("k#1 down")), "k#2", Outcome.notAttempted(),
+                "k#3", Outcome.notAttempted()));
+
+        process();
+
+        assertThat(parkedRows()).isEmpty();
+        assertThat(retryRows()).as("one head, the lowest row").hasSize(3);
+        assertThat(retryRows().stream().filter(row -> !row.endsWith(":-"))).singleElement()
+                .satisfies(head -> assertThat(head).startsWith("k#1:"));
+    }
+
+    /** A wait keeps later rows of the key out, so the waiting head is alone but for what must come before it. */
+    @Test
+    void aWaitingHeadBringsTheOlderParkedRowsOfItsKeyToo() throws Exception {
+        bootstrap();
+        parkAll("k#1");
+        script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.waitFor("v2 not here")));
+        send(msg("t", "k", "k#2"), msg("t", "k", "k#3"));
+        tick();
+        process();
+        now = now.plus(Duration.ofHours(2));
+        setParkedDue("k#1", now.plus(Duration.ofHours(24)));
+        calls.clear();
+        script = answering(Map.of());
+
+        process();
+
+        assertThat(payloads(calls.get(0))).containsExactly("k#1", "k#2");
+        assertThat(delivered()).containsSubsequence("k#1", "k#2", "k#3");
+    }
+
+    /** A second round of the pass, for the rows after the batch: a parked row left by the first comes before them. */
+    @Test
+    void eachRoundOfThePassBringsTheParkedRowsItStillHas() throws Exception {
+        config.batchSize(3);
+        bootstrap();
+        parkAll("k#1");
+        script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.retry(new RuntimeException("k#2 down"))));
+        send(msg("t", "k", "k#2"), msg("t", "k", "k#3"), msg("t", "k", "k#4"), msg("t", "k", "k#5"));
+        tick();
+        process();
+        now = now.plus(Duration.ofMinutes(1));
+        setParkedDue("k#1", now.plus(Duration.ofHours(24)));
+        calls.clear();
+        script = answering(Map.of("k#1", Outcome.requeue()));
+
+        process();
+
+        assertThat(calls).isNotEmpty().allSatisfy(call -> assertThat(payloads(call).get(0)).isEqualTo("k#1"));
+    }
+
     @Test
     void aPutOffParkedRowIsLookedAtAgainWhenItsRetryHeadComesUp() throws Exception {
         bootstrap();
@@ -2624,17 +2717,11 @@ class ShardProcessorIT {
         assertThat(parkedRows()).as("until its head comes up, not k#1's 24 h")
                 .containsExactly("k#1:2:" + farOff, "k#2:2:" + headDue);
 
-        now = headDue; // the head goes first and leaves; k is in retry when the step reads the parked rows
-        process();
-        assertThat(delivered()).contains("k#3");
-        assertThat(parkedRows()).containsExactly("k#1:2:" + farOff, "k#2:2:" + headDue.plus(REQUEUE_DELAY));
-
-        now = headDue.plus(REQUEUE_DELAY);
-        calls.clear();
+        now = headDue;
         process();
 
-        assertThat(calls).as("out of retry: its own time, bringing the older one along")
-                .singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("k#1", "k#2"));
+        assertThat(calls).as("the head brings the older rows of its key")
+                .singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("k#1", "k#2", "k#3"));
         assertThat(parkedRows()).isEmpty();
     }
 
@@ -2886,14 +2973,14 @@ class ShardProcessorIT {
         assertThat(retryRows()).containsExactly("k#2:0:" + now.plus(INITIAL));
         assertThat(parkedRows()).containsExactly("k#1:1:" + later);
 
-        // k blocked in the retry table hands no record, so k#1 is no longer merged, and the shard goes on with j#1
+        // k's retry head comes with k#1 ahead of it; the main pass hands k nothing more, and goes on with j#1
         script = answering(Map.of("k#2", Outcome.notAttempted()));
         now = cursor().pausedUntil();
         calls.clear();
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, false));
-        assertThat(calls).extracting(call -> payloads(call)).containsExactly(List.of("k#2"), List.of("j#1"));
-        assertThat(delivered()).containsExactly("j#1");
-        assertThat(parkedRows()).containsExactly("k#1:1:" + later);
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, false));
+        assertThat(calls).extracting(call -> payloads(call)).containsExactly(List.of("k#1", "k#2"), List.of("j#1"));
+        assertThat(delivered()).containsExactly("k#1", "j#1");
+        assertThat(parkedRows()).isEmpty();
     }
 
     @Test

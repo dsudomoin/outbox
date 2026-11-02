@@ -103,9 +103,8 @@ public final class ParkedStore {
      * {@link Park}: a main-stream record is inserted, a parked one gets its new {@code requeues} and due time.
      * {@link Keep}: the due time moves later, never earlier. {@link Unpark}: {@link #unpark}. A parked {@link Head}:
      * {@link #toRetry}, a waiting one waiting since {@code now}; a parked {@link Dead}: {@link #toDead}. A parked
-     * follower: nothing, as a row before it in the call blocks its key: a parked head, whose {@link #toRetry} carries
-     * it, or, in the retry pass (retry heads first), a retry head of its key, whose id is higher, so the row stays
-     * parked below every retry row of its key. Other actions of main-stream rows belong to {@link RetryStore#apply}.
+     * follower: nothing, as a parked head before it in the call blocks its key, and its {@link #toRetry} carries it.
+     * Other actions of main-stream rows belong to {@link RetryStore#apply}.
      *
      * <p>Precondition: {@code actions} are in the call's order, where every parked row precedes the newer main-stream
      * rows of its key (the relay builds its calls that way). A parked head turns the later rows of its key into
