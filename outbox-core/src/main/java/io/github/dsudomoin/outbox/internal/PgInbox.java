@@ -313,7 +313,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
                 step("partition drop", () -> partitions.dropExpired(c, now, timeout));
                 // before the orphan check: a table of the next range whose attach was cut off is attached, not reported
                 step("partition premake", () -> partitions.ensurePremade(c, now));
-                orphaned = Double.NaN; // unknown unless the step completes
+                var stale = new boolean[] {true}; // set when the step ends: a read mid-step sees the last count
                 step("orphan drop", () -> {
                     int kept = 0;
                     for (var orphan : partitions.dropOrphans(c, now, timeout)) {
@@ -329,7 +329,11 @@ public final class PgInbox implements Inbox, AutoCloseable {
                                 + " outbox.inbox.partitions.orphaned); {}", orphan.table(), names.base(), advice);
                     }
                     orphaned = kept;
+                    stale[0] = false;
                 });
+                if (stale[0]) {
+                    orphaned = Double.NaN; // the step failed: unknown, not the old count
+                }
             }
         } catch (Throwable t) {
             failure = t;

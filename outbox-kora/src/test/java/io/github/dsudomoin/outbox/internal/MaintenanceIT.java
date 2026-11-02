@@ -1051,6 +1051,47 @@ class MaintenanceIT {
     }
 
     @Test
+    void theOrphanGaugeKeepsItsLastValueWhileTheStepRuns() throws Exception {
+        bootstrap();
+        var range = ranges().stream()
+                .filter(b -> b.to() != null)
+                .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
+                .orElseThrow();
+        try (var c = TestDb.connect()) {
+            execute(c, "insert into " + range.name() + " (id, shard, xid, message_id, topic) overriding system value"
+                    + " values (1000000, 0, '" + range.from() + "', gen_random_uuid(), 't')");
+            while (currentXid() < Long.parseLong(range.to())) {
+                TestDb.burnXids(200);
+            }
+            execute(c, "alter table " + names.base() + " detach partition " + range.name() + " concurrently");
+        }
+        var registry = new SimpleMeterRegistry();
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry), Duration.ofSeconds(30));
+        assertThat(maintenance.runOnce()).isTrue();
+        assertThat(gauge(registry, "outbox.partitions.orphaned")).isEqualTo(1);
+
+        try (var operator = TestDb.connect()) {
+            operator.setAutoCommit(false);
+            execute(operator, "lock table " + range.name() + " in access exclusive mode");
+            var run = CompletableFuture.supplyAsync(maintenance::runOnce);
+            try (var c = TestDb.connect()) { // the step waits for the operator's lock on the orphan
+                long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+                while (queryLong(c, "select count(*) from pg_locks where relation = to_regclass('" + range.name()
+                        + "') and not granted") == 0) {
+                    assertThat(System.nanoTime()).as("the step reaches the orphan").isLessThan(deadline);
+                    Thread.sleep(10);
+                }
+            }
+
+            assertThat(gauge(registry, "outbox.partitions.orphaned")).as("mid-run, on a healthy system").isEqualTo(1);
+
+            operator.rollback();
+            assertThat(run.get(30, TimeUnit.SECONDS)).isTrue();
+        }
+        assertThat(gauge(registry, "outbox.partitions.orphaned")).isEqualTo(1);
+    }
+
+    @Test
     void keptOrphanIsNotLockedExclusivelyAndAFailedSweepIsUnknown() throws Exception {
         bootstrap();
         var range = ranges().stream()

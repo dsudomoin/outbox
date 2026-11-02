@@ -641,6 +641,41 @@ class PgInboxIT {
     }
 
     @Test
+    void theOrphanGaugeKeepsItsLastValueWhileTheStepRuns() throws Exception {
+        start();
+        long hour = lowest() + 2 * HOUR;
+        var expired = table() + "_t" + DateTimeFormatter.ofPattern("yyyyMMddHH").withZone(ZoneOffset.UTC)
+                .format(Instant.ofEpochMilli(hour - 5 * HOUR));
+        var registry = new SimpleMeterRegistry();
+        var maintaining = new PgInbox(db, config, new OutboxMetrics(registry));
+        maintaining.runMaintenance();
+        assertThat(registry.get("outbox.inbox.partitions.orphaned").gauge().value()).isZero();
+        try (var c = TestDb.connect()) {
+            execute(c, "create table " + expired + " (like " + table() + " including defaults)");
+        }
+
+        try (var operator = TestDb.connect()) {
+            operator.setAutoCommit(false);
+            execute(operator, "lock table " + expired + " in access exclusive mode");
+            var run = pool.submit(maintaining::runMaintenance);
+            try (var c = TestDb.connect()) { // the step waits for the operator's lock on the orphan
+                long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+                while (queryLong(c, "select count(*) from pg_locks where relation = to_regclass('" + expired
+                        + "') and not granted") == 0) {
+                    assertThat(System.nanoTime()).as("the step reaches the orphan").isLessThan(deadline);
+                    Thread.sleep(10);
+                }
+            }
+
+            assertThat(registry.get("outbox.inbox.partitions.orphaned").gauge().value()).as("mid-run").isZero();
+
+            operator.rollback();
+            run.get(30, TimeUnit.SECONDS);
+        }
+        assertThat(registry.get("outbox.inbox.partitions.orphaned").gauge().value()).isZero();
+    }
+
+    @Test
     void orphanInsideTheWindowIsAttachedBack() throws Exception {
         start();
         var id = UuidV7.next();

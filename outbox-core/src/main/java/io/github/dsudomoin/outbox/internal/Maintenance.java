@@ -574,10 +574,11 @@ public final class Maintenance {
             return read.slowest();
         });
         step("cursor anchors", () -> anchor(c));
-        orphaned = Double.NaN; // unknown unless the orphan step completes
-        if (slowest != null) {
+        if (slowest == null) {
+            orphaned = Double.NaN; // no orphan step this run: unknown, not the old count
+        } else {
             step("partition drop", () -> partitions.dropProcessed(c, slowest.snapshot().xmin(), detachLockTimeout));
-            step("orphan drop", () -> {
+            var kept = step("orphan drop", () -> {
                 long horizon = slowest.snapshot().xmin();
                 int left = 0;
                 for (var orphan : partitions.dropOrphans(c, horizon, detachLockTimeout)) {
@@ -610,9 +611,9 @@ public final class Maintenance {
                                 orphan.table(), orphan.table());
                     }
                 }
-                orphaned = left;
-                return null;
+                return left;
             });
+            orphaned = kept == null ? Double.NaN : kept; // set when the step ends: a read mid-step sees the last count
             // not below a latest cursor row's tick either, where the previous release starts its steps
             step("tick cleanup", () -> {
                 var lowest = cursors.lowestTick(c);
