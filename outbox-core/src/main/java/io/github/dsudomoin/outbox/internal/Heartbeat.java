@@ -156,7 +156,8 @@ public final class Heartbeat {
         c.setAutoCommit(false);
         try (var st = c.createStatement(); var ps = c.prepareStatement("delete from " + names.instance()
                 + " where instance_id = ?")) {
-            st.execute("set local lock_timeout = " + millis + "; set local statement_timeout = " + millis);
+            st.execute("set local lock_timeout = " + millis + "; set local statement_timeout = " + millis
+                    + "; set local idle_in_transaction_session_timeout = " + Maintenance.ABANDONED_AFTER.toMillis());
             ps.setString(1, id);
             ps.executeUpdate();
             c.commit();
@@ -264,10 +265,15 @@ public final class Heartbeat {
         }
     }
 
-    /** Bounds the lock waits of the transaction in progress; a transaction's setting, so none leaks. */
+    /**
+     * Bounds the lock waits of the transaction in progress, and how long it may idle: a client whose connection the
+     * network dropped has moved on, and a backend left in it would hold the instance's row against every later beat.
+     * A transaction's settings, so none leaks.
+     */
     private static void lockTimeout(Connection c) throws SQLException {
         try (var st = c.createStatement()) {
-            st.execute("set local lock_timeout = " + Maintenance.SHARDS_LOCK_TIMEOUT.toMillis());
+            st.execute("set local lock_timeout = " + Maintenance.SHARDS_LOCK_TIMEOUT.toMillis()
+                    + "; set local idle_in_transaction_session_timeout = " + Maintenance.ABANDONED_AFTER.toMillis());
         }
     }
 

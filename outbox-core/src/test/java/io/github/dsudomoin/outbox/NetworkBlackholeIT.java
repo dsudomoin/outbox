@@ -446,6 +446,65 @@ class NetworkBlackholeIT {
     }
 
     @Test
+    void aBeatCutBeforeItsCommitDoesNotHoldTheInstancesRow() throws Exception {
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(1))
+                .maintenanceInterval(Duration.ofMillis(100));
+        var armed = new AtomicBoolean();
+        var source = intercepting(pool(throughTheHole(3, 0)), (c, call, args) -> {
+            if (call.getName().equals("commit") && Thread.currentThread().getName().equals("outbox-heartbeat")
+                    && armed.compareAndSet(true, false)) {
+                hole.forget(); // its commit goes nowhere: the backend sits in its transaction, the row locked
+            }
+        });
+        var relay = OutboxRuntime.builder(config, new JdbcTransactions(source), record -> {}).build();
+        closing.add(relay);
+        relay.start();
+        var names = relay.schema().names();
+        armed.set(true);
+        await(() -> !armed.get());
+
+        Thread.sleep(1500); // the client has given that beat up
+        long seen = lastSeen(names.instance(), relay);
+        await(() -> lastSeen(names.instance(), relay) > seen);
+    }
+
+    @Test
+    void anAnchorCutBeforeItsCommitDoesNotHoldItsShards() throws Exception {
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(1))
+                .maintenanceInterval(Duration.ofMillis(100)).cursorAnchorInterval(Duration.ofMillis(100));
+        var locking = new AtomicBoolean();
+        var cut = new AtomicBoolean();
+        Set<UUID> delivered = ConcurrentHashMap.newKeySet();
+        var source = intercepting(pool(throughTheHole(3, 0)), (c, call, args) -> {
+            if (!Thread.currentThread().getName().equals("outbox-maintenance")) {
+                return;
+            }
+            if (call.getName().equals("prepareStatement") && args[0].toString().contains("pg_try_advisory_xact_lock")) {
+                locking.set(true);
+            } else if (call.getName().equals("commit") && locking.get() && cut.compareAndSet(false, true)) {
+                hole.forget(); // the anchors' commit goes nowhere: the backend sits there, holding the shards' locks
+            }
+        });
+        var relay = OutboxRuntime.builder(config, new JdbcTransactions(source),
+                record -> delivered.add(record.messageId())).build();
+        closing.add(relay);
+        relay.start();
+        var writerTransactions = new JdbcTransactions(DIRECT);
+        var writer = OutboxRuntime.builder(new TestOutboxConfig().table(config.table()).relayEnabled(false),
+                writerTransactions, record -> {}).build();
+        closing.add(writer);
+        writer.start();
+        await(cut::get);
+
+        var sent = new HashSet<UUID>();
+        for (int i = 0; i < 64; i++) { // on every shard
+            sent.add(send(writer, writerTransactions, "k" + i));
+        }
+
+        await(() -> delivered.containsAll(sent));
+    }
+
+    @Test
     void anAdminCallOnASilentSocketFails() throws Exception {
         var config = new TestOutboxConfig().relayEnabled(false).networkTimeout(Duration.ofSeconds(1));
         var transactions = new JdbcTransactions(intercepting(throughTheHole(3, 0), (c, call, args) -> {

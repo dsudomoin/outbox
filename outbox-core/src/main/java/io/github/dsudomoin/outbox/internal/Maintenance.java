@@ -87,6 +87,12 @@ public final class Maintenance {
     static final int ANCHOR_CHUNK = 128;
     /** How long a read outside the maintenance lock waits for a table a recovery holds; also the heartbeat's. */
     static final Duration SHARDS_LOCK_TIMEOUT = Duration.ofMillis(100);
+    /**
+     * How long a short transaction of the library may idle before Postgres ends its session: none has a reason to wait
+     * between its statements, while a backend whose client the network cut off holds what it locked until TCP gives up,
+     * hours later, as no client-side bound reaches it.
+     */
+    static final Duration ABANDONED_AFTER = Duration.ofSeconds(5);
     private static final String LOCK_NOT_AVAILABLE = "55P03";
 
     private final OutboxTransactions db;
@@ -272,7 +278,8 @@ public final class Maintenance {
         try (var c = db.newConnection(); var bound = socket.on(c)) {
             c.setAutoCommit(false);
             try (var st = c.createStatement()) {
-                st.execute("set local lock_timeout = " + SHARDS_LOCK_TIMEOUT.toMillis()); // a transaction's: no leak
+                st.execute("set local lock_timeout = " + SHARDS_LOCK_TIMEOUT.toMillis() // a transaction's: no leak
+                        + "; set local idle_in_transaction_session_timeout = " + ABANDONED_AFTER.toMillis());
                 checkXidCounter(c);
                 c.commit();
             } catch (Throwable t) { // an Error or RuntimeException too: setAutoCommit(true) would commit a half check
@@ -307,7 +314,8 @@ public final class Maintenance {
         int present;
         c.setAutoCommit(false);
         try (var st = c.createStatement()) {
-            st.execute("set local lock_timeout = " + SHARDS_LOCK_TIMEOUT.toMillis()); // a transaction's: no leak
+            st.execute("set local lock_timeout = " + SHARDS_LOCK_TIMEOUT.toMillis() // a transaction's: no leak
+                    + "; set local idle_in_transaction_session_timeout = " + ABANDONED_AFTER.toMillis());
             try (var rs = st.executeQuery(cursorShards)) {
                 rs.next();
                 present = rs.getInt(1);
@@ -728,6 +736,7 @@ public final class Maintenance {
         c.setAutoCommit(false);
         try {
             execute(c, "set transaction isolation level read committed");
+            execute(c, "set local idle_in_transaction_session_timeout = " + ABANDONED_AFTER.toMillis());
             List<Integer> locked;
             try (var ps = c.prepareStatement("select array(select s from unnest(?::int[]) s"
                     + " where pg_try_advisory_xact_lock(?, ? + s))")) {
