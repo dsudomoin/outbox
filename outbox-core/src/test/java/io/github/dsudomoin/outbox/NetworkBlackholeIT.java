@@ -31,6 +31,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
@@ -411,6 +412,54 @@ class NetworkBlackholeIT {
         var after = send(writer, writerTransactions, "after");
 
         await(() -> handed.contains(after));
+    }
+
+    /** Cut off while the hook runs: the same letter comes back, once the server ends the abandoned claim. */
+    @Test
+    void aLetterCutOffInsideItsHookIsHandedAgain() throws Exception {
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(1)).deadLettersTimeout(Duration.ofSeconds(1))
+                .maintenanceInterval(Duration.ofMillis(100)).retry(Duration.ofMillis(100), Duration.ofSeconds(1), 1);
+        var calls = new AtomicInteger();
+        var inHook = new CountDownLatch(1);
+        var transactions = new JdbcTransactions(pool(throughTheHole(3, 0)));
+        var relay = OutboxRuntime.builder(config, transactions, new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {}
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                return records.stream().map(r -> Outcome.permanent(new IOException("never"))).toList();
+            }
+        }).deadLetterHandler(letters -> {
+            if (calls.getAndIncrement() == 0) {
+                inHook.countDown();
+                try {
+                    Thread.sleep(Long.MAX_VALUE); // a hanging call: past the hook's timeout
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return letters.stream().map(letter -> DeadLetterDecision.keep()).toList();
+        }).build();
+        closing.add(relay);
+        relay.start();
+        var writerTransactions = new JdbcTransactions(DIRECT);
+        var writer = OutboxRuntime.builder(new TestOutboxConfig().table(config.table()).relayEnabled(false),
+                writerTransactions, record -> {}).build();
+        closing.add(writer);
+        writer.start();
+        send(writer, writerTransactions, "cut");
+        assertThat(inHook.await(30, TimeUnit.SECONDS)).isTrue();
+
+        hole.forget();
+
+        var dead = relay.schema().names().dead();
+        // the abandoned claim holds the letter for the hook's timeout + 30 s
+        await(Duration.ofSeconds(60), () -> {
+            try (var c = DIRECT.getConnection()) {
+                return "kept".equals(TestSql.queryString(c, "select status from " + dead));
+            }
+        });
     }
 
     @Test
