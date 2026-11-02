@@ -79,7 +79,7 @@ Metrics, alerts and procedures are the same. What differs:
   (`outbox-heartbeat` while the app's pool has no name: set `spring.datasource.hikari.pool-name`). Count it into limits
   as above. `outbox.heartbeat.dedicated-connection=false` or a `DataSource` bean with `@OutboxHeartbeat`.
 - **Stop:** the web server and the listeners stop first, then the outbox, synchronously, within
-  `outbox.relay.shutdown-timeout` and about a second more; `spring.lifecycle.timeout-per-shutdown-phase` does not cut
+  `outbox.relay.shutdown-timeout` and about a second more on a live database (longer on a hung one, up to SIGKILL); `spring.lifecycle.timeout-per-shutdown-phase` does not cut
   it. Set `terminationGracePeriodSeconds` above `preStop` + that phase timeout per phase + `shutdown-timeout` + a couple
   of seconds; the default 30 s is too little. SIGKILL loses nothing: unrecorded records are delivered again.
 - **Secrets:** `/actuator/configprops` with `show-values=always` prints `outbox.kafka.driver-properties` values.

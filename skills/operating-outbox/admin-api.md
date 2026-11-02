@@ -113,7 +113,8 @@ class ApiKeyAuthorizer implements OutboxAdminAuthorizer {
 - A 500 «authorization did not run»: something lost the guard (an app's `HandlerMapping` dropping interceptors, the
   controller scanned without the auto-configuration). It stays closed; the WARN names the cause.
 - App settings that break it, all closed: `spring.aop.proxy-target-class=false` with an aspect over controllers;
-  replaced exception resolvers; Gson as MVC's JSON converter (wrong status values in responses). A global
+  replaced exception resolvers; Gson as MVC's JSON converter (wrong status values, `key` and `payload` as number arrays
+  in responses). A global
   `ResponseBodyAdvice` wraps its answers: scope it. Spring
   Security's CSRF applies to these POSTs: exempt the path or use a token.
 
