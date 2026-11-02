@@ -96,11 +96,11 @@ s_pg_silent_drop() { # a firewall forgets the connections: open sockets are dead
   pc_finish
 }
 
-s_pg_silent_drop_no_timeout() { # the same with pgjdbc's default socketTimeout = 0: the relay heals by outbox.relay.networkTimeout
+s_pg_silent_drop_no_timeout() { # the same with pgjdbc's default socketTimeout = 0: the relay heals by outbox.networkTimeout
   pc_begin pg-silent-drop-no-timeout
   proxy_up 55440 55432
   PC_PG_URL=jdbc:postgresql://localhost:55440/outbox
-  local opts='-Ddb.dsProperties.socketTimeout=0 -Doutbox.relay.networkTimeout=10s'
+  local opts='-Ddb.dsProperties.socketTimeout=0 -Doutbox.networkTimeout=10s'
   trio "$MIX" $opts
   sleep 10
   proxy drop

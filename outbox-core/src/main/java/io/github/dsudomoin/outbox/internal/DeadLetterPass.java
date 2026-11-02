@@ -116,7 +116,7 @@ public final class DeadLetterPass {
             @Nullable OutboxDeadLetterHandler hook, OutboxTelemetry telemetry, InstantSource jvmClock) {
         OutboxSchema.validate(config);
         this.jvmClock = jvmClock;
-        this.socket = new SocketBound(config.relay().networkTimeout());
+        this.socket = new SocketBound(config.networkTimeout());
         this.db = db;
         this.hook = hook;
         this.active = hook != null && hook.active(); // read once: the relay's steps write by it

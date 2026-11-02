@@ -77,7 +77,7 @@ public final class Heartbeat {
         this.interval = config.partitions().maintenanceInterval();
         this.guard = schema.shardGuard();
         this.contracts = schema.contractGuard();
-        this.socket = new SocketBound(beatBound(config.relay().networkTimeout(), interval));
+        this.socket = new SocketBound(beatBound(config.networkTimeout(), interval));
         this.beat = "with gone as (delete from " + names.instance() + " where instance_id <> ? and coalesce(expires_at,"
                 + " last_seen) < now() - " + FORGET_AFTER.toSeconds() + " * interval '1 second') " + upsert(names);
     }

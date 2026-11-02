@@ -177,7 +177,7 @@ public final class Maintenance {
         this.db = db;
         this.names = names;
         this.detachLockTimeout = detachLockTimeout;
-        this.socket = new SocketBound(config.relay().networkTimeout());
+        this.socket = new SocketBound(config.networkTimeout());
         this.quiesceTimeout = quiesceTimeout(config);
         this.partitions = new XidPartitions(names, config.partitions());
         this.ticks = new Ticks(names, config.shards());

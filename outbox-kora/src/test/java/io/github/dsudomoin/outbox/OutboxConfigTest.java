@@ -35,7 +35,7 @@ class OutboxConfigTest {
             new $KoraOutboxConfig_KoraInboxConfig_ConfigValueExtractor(DURATION),
             new $KoraOutboxConfig_KoraDeadLettersConfig_ConfigValueExtractor(DURATION),
             new $KoraOutboxConfig_KoraRecoveryConfig_ConfigValueExtractor(DURATION),
-            new $KoraOutboxConfig_KoraSchemaConfig_ConfigValueExtractor());
+            new $KoraOutboxConfig_KoraSchemaConfig_ConfigValueExtractor(), DURATION);
 
     private static OutboxConfig parse(String hocon) {
         var config = HoconConfigFactory.fromHocon(
@@ -94,6 +94,13 @@ class OutboxConfigTest {
         assertThat(config.recovery().maxRows()).isEqualTo(5000);
         assertThat(config.recovery().clockMargin()).isEqualTo(Duration.ofHours(1));
         assertThat(config.recovery().timeout()).isEqualTo(Duration.ofMinutes(30));
+    }
+
+    @Test
+    void networkTimeoutIsReadFromTheTopLevel() {
+        assertThat(parse("outbox { networkTimeout = 10s }").networkTimeout()).isEqualTo(Duration.ofSeconds(10));
+        assertThatThrownBy(() -> OutboxSchema.validate(parse("outbox { networkTimeout = -1s }")))
+                .hasMessageContaining("outbox.networkTimeout");
     }
 
     @Test
@@ -226,6 +233,7 @@ class OutboxConfigTest {
     private static void assertDefaults(OutboxConfig config) {
         assertThat(config.table()).isEqualTo("outbox");
         assertThat(config.shards()).as("not set: an existing outbox keeps its count").isNull();
+        assertThat(config.networkTimeout()).isEqualTo(Duration.ofMinutes(5));
 
         var relay = config.relay();
         assertThat(relay.enabled()).isTrue();
@@ -236,7 +244,6 @@ class OutboxConfigTest {
         assertThat(relay.idlePollInterval()).isEqualTo(Duration.ofMillis(200));
         assertThat(relay.batchTimeout()).isEqualTo(Duration.ofSeconds(30));
         assertThat(relay.shutdownTimeout()).isEqualTo(Duration.ofSeconds(30));
-        assertThat(relay.networkTimeout()).isEqualTo(Duration.ofMinutes(5));
         assertThat(relay.headFailuresBeforeDivert()).isEqualTo(3);
         assertThat(relay.retry().initialDelay()).isEqualTo(Duration.ofSeconds(1));
         assertThat(relay.retry().maxDelay()).isEqualTo(Duration.ofMinutes(5));

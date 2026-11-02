@@ -84,7 +84,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
         this.db = db;
         this.notInTx = "Inbox.tryAccept and tryAcceptAll must be called inside " + db.transactionHint();
         this.config = config;
-        this.socket = new SocketBound(config.relay().networkTimeout());
+        this.socket = new SocketBound(config.networkTimeout());
         this.telemetry = telemetry;
         this.names = TableNames.of(config.inbox().table());
         this.partitions = new InboxPartitions(names.base(), config);

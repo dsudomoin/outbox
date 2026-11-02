@@ -10,7 +10,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * {@code outbox.relay.networkTimeout} on the library's own connections: without a bound, a connection the network
+ * {@code outbox.networkTimeout} on the library's own connections: without a bound, a connection the network
  * dropped silently holds its thread on the socket for good, and with pgjdbc's default {@code socketTimeout = 0} there
  * is none. From the client a silent socket and a long statement look alike, so the library tells them apart by what it
  * knows of the statement: most have no reason to last, and get this bound; one under a {@code statement_timeout} of the
@@ -51,7 +51,7 @@ public final class SocketBound {
             return new Held(c, true);
         } catch (SQLException | RuntimeException e) {
             if (WARNED.compareAndSet(false, true)) {
-                log.warn("outbox.relay.networkTimeout could not be set on a connection of the library ({}), so a"
+                log.warn("outbox.networkTimeout could not be set on a connection of the library ({}), so a"
                         + " connection the network drops silently holds its thread until the OS closes the socket; give"
                         + " the DataSource a socketTimeout. Logged once", e.toString());
             }
@@ -91,7 +91,7 @@ public final class SocketBound {
             if (c.getNetworkTimeout() == 0) {
                 log.warn("outbox {}: the application's connections have no socket timeout (pgjdbc socketTimeout = 0;"
                         + " in Kora, db.dsProperties.socketTimeout). The library bounds its own threads with"
-                        + " outbox.relay.networkTimeout, but not a business transaction: one on a connection the"
+                        + " outbox.networkTimeout, but not a business transaction: one on a connection the"
                         + " network dropped silently waits until the instance restarts. Set socketTimeout, in seconds,"
                         + " above the longest statement of the service", table);
             }

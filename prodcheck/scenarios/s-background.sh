@@ -101,11 +101,11 @@ hung_drain() { # hung_drain I LABEL BOUND: /drain must return within BOUND, or t
   check "$(passes is -n "$out")" "drain при молчащем сокете ($label) вернулся за $took с из $bound: $(echo "${out:-завис; стек в build/results/$SCN-$i-drain-$label.threads}" | cut -c1-170)"
 }
 
-s_drain_silent_drop() { # socketTimeout = 0: a drop under each part of drain. relay.networkTimeout bounds the shards' connection; and the rest?
+s_drain_silent_drop() { # socketTimeout = 0: a drop under each part of drain. outbox.networkTimeout bounds the shards' connection; and the rest?
   pc_begin drain-silent-drop
   pc_target
   silent_url
-  local opts='-Ddb.dsProperties.socketTimeout=0 -Doutbox.relay.networkTimeout=10s -Doutbox.relay.enabled=false -Dprodcheck.hook=policy -Doutbox.deadLetters.timeout=3s'
+  local opts='-Ddb.dsProperties.socketTimeout=0 -Doutbox.networkTimeout=10s -Doutbox.relay.enabled=false -Dprodcheck.hook=policy -Doutbox.deadLetters.timeout=3s'
   local bound=60 i=1001
   tfault 'delayMs=30'
   # 1. in a step, on the connection drain binds itself
@@ -152,7 +152,7 @@ s_silent_drop_background() { # socketTimeout = 0: maintenance, the dead-letter p
   pc_begin silent-drop-background
   pc_target
   silent_url
-  local opts='-Ddb.dsProperties.socketTimeout=0 -Doutbox.relay.networkTimeout=10s -Dprodcheck.hook=policy -Doutbox.deadLetters.timeout=30s -Doutbox.partitions.maintenanceInterval=2s -Doutbox.partitions.xidsPerPartition=1000 -Doutbox.partitions.premake=4'
+  local opts='-Ddb.dsProperties.socketTimeout=0 -Doutbox.networkTimeout=10s -Dprodcheck.hook=policy -Doutbox.deadLetters.timeout=30s -Doutbox.partitions.maintenanceInterval=2s -Doutbox.partitions.xidsPerPartition=1000 -Doutbox.partitions.premake=4'
   local i=1001
   pc_shop "$i" $opts
   sleep 3

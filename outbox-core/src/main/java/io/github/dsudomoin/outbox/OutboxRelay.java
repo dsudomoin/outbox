@@ -181,7 +181,7 @@ public final class OutboxRelay implements AutoCloseable {
         this.heartbeat = new Heartbeat(db, schema, config, relay.enabled() && deadLetters.active());
         this.idleNanos = relay.idlePollInterval().toNanos();
         this.minTickNanos = relay.minTickInterval().toNanos();
-        this.socket = new SocketBound(relay.networkTimeout());
+        this.socket = new SocketBound(config.networkTimeout());
         this.idleTickAge = Duration.ofNanos(Math.max(minTickNanos, idleNanos - idleNanos / 4));
         this.lastTickAttempt = System.nanoTime() - idleNanos; // the first pass ticks
         this.stepStarted = new AtomicLongArray(config.shards());

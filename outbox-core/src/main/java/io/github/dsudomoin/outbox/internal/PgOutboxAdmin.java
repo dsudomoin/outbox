@@ -120,7 +120,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         this.retries = new RetryStore(names, false); // its dead rows are kept: the abandoned ones
         this.parked = new ParkedStore(names, retries);
         this.recovery = new XidRecovery(names, config);
-        this.socket = new SocketBound(config.relay().networkTimeout());
+        this.socket = new SocketBound(config.networkTimeout());
         this.ticks = new Ticks(names, shards);
         this.cursors = new Cursors(names, shards);
         this.resender = new Resender(names, config);
