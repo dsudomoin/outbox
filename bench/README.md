@@ -42,6 +42,9 @@ Postgres нужны `max_locks_per_transaction=256` и `max_connections=300` (co
 
 Приватный порт 8085: `/metrics` (Prometheus), `/system/readiness`, `/system/liveness`.
 
+Админ-API подключён, но закрыт: каждый вызов получает 403. Так сборка этого приложения проверяет, что
+`OutboxAdminHttpModule` собирается на KSP.
+
 Режимы нагрузки:
 
 - `messagesPerTx = 1` (режим заказов). Каждая транзакция берёт следующий `seq` пользователя из счётчика `user_seq`

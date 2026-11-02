@@ -21,6 +21,7 @@ dependencies {
     ksp("ru.tinkoff.kora:symbol-processors")
 
     implementation(project(":outbox-kafka-kora"))
+    implementation(project(":outbox-admin-kora"))
     implementation("ru.tinkoff.kora:database-jdbc")
     implementation("ru.tinkoff.kora:config-hocon")
     implementation("ru.tinkoff.kora:logging-logback")

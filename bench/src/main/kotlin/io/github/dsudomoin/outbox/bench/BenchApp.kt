@@ -1,5 +1,7 @@
 package io.github.dsudomoin.outbox.bench
 
+import io.github.dsudomoin.outbox.admin.kora.OutboxAdminAuthorizer
+import io.github.dsudomoin.outbox.admin.kora.OutboxAdminHttpModule
 import io.github.dsudomoin.outbox.kora.InboxModule
 import io.github.dsudomoin.outbox.OutboxHandler
 import io.github.dsudomoin.outbox.kora.OutboxModule
@@ -59,7 +61,12 @@ interface BenchApp :
     OutboxModule,
     OutboxJsonModule,
     InboxModule,
-    KafkaOutboxModule {
+    KafkaOutboxModule,
+    OutboxAdminHttpModule {
+
+    /** The admin API stays shut here: this app is also what proves that the module builds on KSP. */
+    fun outboxAdminAuthorizer(): OutboxAdminAuthorizer =
+        OutboxAdminAuthorizer { OutboxAdminAuthorizer.forbidden("the bench app has no admin access") }
 
     /** Exactly `OutboxHandler`, so it replaces the module's default Kafka handler. */
     fun outboxHandler(kafka: KafkaOutboxSender, config: BenchConfig, metrics: BenchMetrics): OutboxHandler =
