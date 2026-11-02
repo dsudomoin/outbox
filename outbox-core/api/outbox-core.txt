@@ -115,6 +115,8 @@ package io.github.dsudomoin.outbox {
   }
 
   public interface OutboxAdmin {
+    method public io.github.dsudomoin.outbox.OutboxAdmin.Abandoned! abandonKey(String!, byte[]!, String!, boolean);
+    method public io.github.dsudomoin.outbox.OutboxAdmin.Abandoned! abandonRecord(String!, java.util.UUID!, String!, boolean);
     method public io.github.dsudomoin.outbox.OutboxAdmin.Abandoned! abandonWaiting(String!, byte[]?, String!, boolean);
     method public long countDeadLetters(io.github.dsudomoin.outbox.DeadLetterFilter!);
     method public long discardDeadLetters(io.github.dsudomoin.outbox.DeadLetterFilter!);

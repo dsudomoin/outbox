@@ -416,6 +416,71 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         }
     }
 
+    @Test
+    void abandonsAKeyOrAnUnkeyedRecord() throws Exception {
+        seedWaiting();
+
+        var dryRun = call("POST", "/keys/abandon", "{\"topic\":\"t\",\"key\":\"k\",\"reason\":\"stuck\",\"dryRun\":true}");
+        assertJson(dryRun, 200);
+        assertThat(dryRun.body()).isEqualTo("{\"keys\":1,\"records\":3}");
+        assertThat(deadIds()).isEmpty();
+
+        var key = call("POST", "/keys/abandon", "{\"topic\":\"t\",\"key\":\"k\",\"reason\":\"stuck\"}");
+        assertJson(key, 200);
+        assertThat(key.body()).as("head, follower and parked row").isEqualTo("{\"keys\":1,\"records\":3}");
+        assertThat(deadIds()).containsExactly(5L, 10L, 11L);
+
+        String unkeyed;
+        try (var c = TestDb.connect()) {
+            unkeyed = queryString(c, "select message_id::text from " + names().retry() + " where id = 20");
+        }
+        var record = call("POST", "/keys/abandon",
+                "{\"topic\":\"t\",\"messageId\":\"" + unkeyed + "\",\"reason\":\"poison\"}");
+        assertThat(record.body()).isEqualTo("{\"keys\":1,\"records\":1}");
+        assertThat(deadIds()).containsExactly(5L, 10L, 11L, 20L);
+
+        assertThat(call("POST", "/keys/abandon", "{\"topic\":\"t\",\"key\":\"k\",\"reason\":\"stuck\"}").body())
+                .as("a second call").isEqualTo("{\"keys\":0,\"records\":0}");
+    }
+
+    @Test
+    void abandonKeyRefusesBadInput() throws Exception {
+        seedWaiting();
+        for (var body : new String[] {
+            "{\"topic\":\"t\",\"reason\":\"r\"}",
+            "{\"topic\":\"t\",\"key\":\"k\",\"messageId\":\"" + UUID.randomUUID() + "\",\"reason\":\"r\"}",
+            "{\"topic\":\"t\",\"messageId\":\"not-a-uuid\",\"reason\":\"r\"}",
+            "{\"topic\":\"t\",\"kye\":\"k\",\"reason\":\"r\"}",
+            "{\"topic\":\"t\",\"key\":\"k\"}",
+            "{\"key\":\"k\",\"reason\":\"r\"}",
+            "{\"topic\":\"\",\"key\":\"k\",\"reason\":\"r\"}",
+            "{\"topic\":\"t\",\"key\":\"k\",\"reason\":\" \"}"
+        }) {
+            assertJson(call("POST", "/keys/abandon", body), 400);
+        }
+        assertThat(deadIds()).isEmpty();
+    }
+
+    @Test
+    void abandonKeyOnABusyShardIsAConflict() throws Exception {
+        seedWaiting();
+        try (var holder = TestDb.connect()) {
+            holder.setAutoCommit(false);
+            try (var ps = holder.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {
+                ps.setInt(1, names().internalNamespace());
+                ps.setInt(2, TableNames.LOCK_SHARD_BASE);
+                ps.execute();
+            }
+
+            var busy = call("POST", "/keys/abandon", "{\"topic\":\"t\",\"key\":\"k\",\"reason\":\"stuck\"}");
+
+            assertJson(busy, 409);
+            assertThat(busy.body()).contains("busy, retry");
+            holder.rollback();
+        }
+        assertThat(deadIds()).isEmpty();
+    }
+
     /** The one audit line names the caller and the reason, each value quoted and escaped, so none forges a part. */
     @Test
     void abandonAuditLineCarriesItsReason() throws Exception {

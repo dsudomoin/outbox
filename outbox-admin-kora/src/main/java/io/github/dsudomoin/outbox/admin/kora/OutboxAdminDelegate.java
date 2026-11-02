@@ -7,9 +7,13 @@ import io.github.dsudomoin.outbox.InternalApi;
 import io.github.dsudomoin.outbox.OutboxAdmin;
 import io.github.dsudomoin.outbox.OutboxStatus;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiDelegate;
+import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.AbandonKeyApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.AbandonWaitingApiResponse;
+import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.AbandonKeyApiResponse.AbandonKey200ApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.AbandonWaitingApiResponse.AbandonWaiting200ApiResponse;
+import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.AbandonKeyApiResponse.AbandonKey400ApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.AbandonWaitingApiResponse.AbandonWaiting400ApiResponse;
+import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.AbandonKeyApiResponse.AbandonKey409ApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.AbandonWaitingApiResponse.AbandonWaiting409ApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.CountDeadLettersApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.CountDeadLettersApiResponse.CountDeadLetters200ApiResponse;
@@ -43,6 +47,7 @@ import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.Restore
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.RestoreOrphanApiResponse.RestoreOrphan200ApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.RestoreOrphanApiResponse.RestoreOrphan400ApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.RestoreOrphanApiResponse.RestoreOrphan409ApiResponse;
+import io.github.dsudomoin.outbox.admin.kora.model.AbandonKey;
 import io.github.dsudomoin.outbox.admin.kora.model.AbandonWaiting;
 import io.github.dsudomoin.outbox.admin.kora.model.Abandoned;
 import io.github.dsudomoin.outbox.admin.kora.model.Count;
@@ -171,6 +176,27 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
                     body.reason(), dryRun);
             return new AbandonWaiting200ApiResponse(new Abandoned(abandoned.keys(), abandoned.records()));
         }, AbandonWaiting400ApiResponse::new, AbandonWaiting409ApiResponse::new);
+    }
+
+    @Override
+    public AbandonKeyApiResponse abandonKey(@Nullable AbandonKey body) {
+        return call(() -> {
+            if (body == null) {
+                throw new IllegalArgumentException("give the topic, the key or message id, and the reason");
+            }
+            boolean dryRun = Boolean.TRUE.equals(body.dryRun());
+            var detail = new LinkedHashMap<String, String>(); // the reason goes into the audit line
+            detail.put("topic", body.topic());
+            detail.put("key", body.key());
+            detail.put("messageId", body.messageId() == null ? null : body.messageId().toString());
+            detail.put("reason", body.reason());
+            detail.put("dryRun", String.valueOf(dryRun));
+            Context.current().set(OutboxAdminInterceptor.DETAIL, detail);
+            var abandoned = body.messageId() != null
+                    ? admin.abandonRecord(body.topic(), body.messageId(), body.reason(), dryRun)
+                    : admin.abandonKey(body.topic(), body.key().getBytes(UTF_8), body.reason(), dryRun);
+            return new AbandonKey200ApiResponse(new Abandoned(abandoned.keys(), abandoned.records()));
+        }, AbandonKey400ApiResponse::new, AbandonKey409ApiResponse::new);
     }
 
     /** {@code ok}, or the 400 or 409 for the refusals {@link OutboxAdmin} names; any other failure propagates. */

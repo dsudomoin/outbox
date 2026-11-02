@@ -46,8 +46,9 @@ import org.slf4j.LoggerFactory;
  * {@code recoverXidRegression} and {@code recoverStrandedShards} hold the maintenance lock for their whole run, so
  * maintenance's steps never run beside them. The reads, {@code status} and the dead-letter find and count, give up on
  * a statement after 60 s (57014).
- * {@code abandonWaiting} moves each chunk under its shard's lock, which every relay step holds while it writes the
- * retry and parked tables, so no step adds a record to a key it moves or makes a key it reads wait meanwhile.
+ * {@code abandonWaiting}, {@code abandonKey} and {@code abandonRecord} move each chunk under its shard's lock, which
+ * every relay step holds while it writes the retry and parked tables, so no step adds a record to a key it moves or
+ * makes a key it reads wait meanwhile.
  */
 public final class PgOutboxAdmin implements OutboxAdmin {
 
@@ -599,6 +600,139 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         var abandoned = new Abandoned(keys, records);
         log.info("outbox admin {} on {} returned {}", call, names.base(), abandoned);
         return abandoned;
+    }
+
+    @Override
+    public Abandoned abandonKey(String topic, byte[] key, String reason, boolean dryRun) {
+        if (key == null) {
+            throw new IllegalArgumentException("name the key whose records to abandon; an unkeyed record goes by its"
+                    + " message id");
+        }
+        return abandonRows(topic, " and key = ?", key, reason, dryRun, "abandonKey(" + topic + ", "
+                + HexFormat.of().formatHex(key));
+    }
+
+    @Override
+    public Abandoned abandonRecord(String topic, UUID messageId, String reason, boolean dryRun) {
+        if (messageId == null) {
+            throw new IllegalArgumentException("name the message id of the unkeyed record to abandon");
+        }
+        return abandonRows(topic, " and message_id = ?", messageId, reason, dryRun, "abandonRecord(" + topic + ", "
+                + messageId);
+    }
+
+    /**
+     * The rows of {@code topic} matching {@code condition} ({@code value} its parameter) in the retry and parked
+     * tables, shard by shard, chunk after chunk ({@link #abandonRowsChunk}); one INFO line, or a WARN on a failure.
+     */
+    private Abandoned abandonRows(String topic, String condition, Object value, String reason, boolean dryRun,
+            String named) {
+        requireOwnTransactions();
+        if (topic == null || topic.isBlank()) {
+            throw new IllegalArgumentException("name the topic of the records to abandon");
+        }
+        if (reason == null || reason.isBlank()) {
+            throw new IllegalArgumentException("give a reason to abandon records: it goes into the log line of the"
+                    + " call and their dead letters' error");
+        }
+        var call = printable(named + ", " + reason + ", " + (dryRun ? "dry run" : "for real") + ")");
+        var error = "abandoned: " + reason;
+        long records = 0;
+        try (var c = db.newConnection(); var bound = socket.on(c)) {
+            c.setAutoCommit(true);
+            for (int shard : read(c, tx -> shardsOf(tx, topic, condition, value))) {
+                if (dryRun) {
+                    records += read(c, tx -> countRows(tx, shard, topic, condition, value));
+                    continue;
+                }
+                int moved;
+                do {
+                    moved = inTx(c, tx -> abandonRowsChunk(tx, shard, topic, condition, value, error));
+                    records += moved;
+                } while (moved == CHUNK);
+            }
+        } catch (SQLException | RuntimeException e) {
+            log.warn("outbox admin {} on {} failed after {} records {}; calling again goes on: {}", call, names.base(),
+                    records, dryRun ? "counted" : "moved, which stay dead letters", printable(e.toString()));
+            throw e instanceof SQLException s ? db.translate(s) : (RuntimeException) e;
+        }
+        var abandoned = new Abandoned(records > 0 ? 1 : 0, records);
+        log.info("outbox admin {} on {} returned {}", call, names.base(), abandoned);
+        return abandoned;
+    }
+
+    /** The shards with such rows; refuses a record by message id that has a key. */
+    private List<Integer> shardsOf(Connection tx, String topic, String condition, Object value) throws SQLException {
+        var shards = new ArrayList<Integer>();
+        var selects = new ArrayList<String>();
+        for (var table : List.of(names.retry(), names.parked())) {
+            selects.add("select shard, key from " + table + " where topic = ?" + condition);
+        }
+        try (var ps = tx.prepareStatement(String.join(" union all ", selects))) {
+            ps.setString(1, topic);
+            ps.setObject(2, value);
+            ps.setString(3, topic);
+            ps.setObject(4, value);
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    if (value instanceof UUID && rs.getBytes(2) != null) {
+                        throw new IllegalArgumentException("message " + value + " has a key: it cannot go without the"
+                                + " rest of its key, abandon the key");
+                    }
+                    if (!shards.contains(rs.getInt(1))) {
+                        shards.add(rs.getInt(1));
+                    }
+                }
+            }
+        }
+        return shards;
+    }
+
+    private long countRows(Connection tx, int shard, String topic, String condition, Object value)
+            throws SQLException {
+        long rows = 0;
+        for (var table : List.of(names.retry(), names.parked())) {
+            try (var ps = tx.prepareStatement("select count(*) from " + table + " where shard = ? and topic = ?"
+                    + condition)) {
+                ps.setShort(1, (short) shard);
+                ps.setString(2, topic);
+                ps.setObject(3, value);
+                try (var rs = ps.executeQuery()) {
+                    rs.next();
+                    rows += rs.getLong(1);
+                }
+            }
+        }
+        return rows;
+    }
+
+    /**
+     * Up to {@link #CHUNK} such rows moved to the dead table with {@code error}, read after the shard's lock
+     * ({@link #lockShard}), so after any relay step that held it. The retry table first and its newest rows first: a
+     * call that stops between chunks leaves the key's retry rows with their head, and its parked rows, which block
+     * nothing.
+     */
+    private int abandonRowsChunk(Connection tx, int shard, String topic, String condition, Object value, String error)
+            throws SQLException {
+        lockShard(tx, shard);
+        int moved = 0;
+        for (var table : List.of(names.retry(), names.parked())) {
+            if (moved == CHUNK) {
+                break;
+            }
+            var delete = "delete from " + table + " where id in (select id from " + table + " where shard = ? and"
+                    + " topic = ?" + condition + " order by id desc limit ?) returning " + RetryStore.COLUMNS
+                    + ", attempts";
+            try (var ps = tx.prepareStatement(retries.toDead(delete, "attempts", "?"))) {
+                ps.setShort(1, (short) shard);
+                ps.setString(2, topic);
+                ps.setObject(3, value);
+                ps.setInt(4, CHUNK - moved);
+                ps.setString(5, RetryStore.errorText(error));
+                moved += ps.executeUpdate();
+            }
+        }
+        return moved;
     }
 
     private List<Integer> waitingShards(Connection c, String topic, @Nullable byte[] key) throws SQLException {

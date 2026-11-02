@@ -33,7 +33,7 @@ against the library's tables**; run only the README's SQL, on a staging copy fir
 | `outbox.partitions.orphaned` or `outbox.inbox.partitions.orphaned` > 0 | «Осиротевшие партиции» |
 | `outbox.partitions.overflow` = 1 past an extension, `premade` < 2 | «Переполнение хвоста (tail overflow)» |
 | ERROR «... has not run», «... over outbox.partitions.maxTailScan» | «Партиции» |
-| `outbox.parked.size` not back to its level | «Алерты» |
+| `outbox.parked.size` not back to its level, or a key failing for ever with `maxAttempts = 0` | «Алерты»; clear one key now with `keys/abandon` ([admin-api.md](admin-api.md)) |
 | `outbox.messages.route_unchecked` growing: a writer's heartbeat has not read the reports for over 3 × `maintenanceInterval` (WARN «outbox heartbeat of instance ... failed»), so the writer guard lets sends through by its last read. Nothing is lost (an unreadable record waits). The heartbeat's own pool (Kora default) does not depend on the app pool, so check the heartbeat source itself: WARN «outbox heartbeat connection source of ... failed, this beat uses the application's connections ...», ERROR «outbox heartbeat connection source reaches another database ...», the `hikaricp_*` meters with `pool="<db.poolName>-outbox-heartbeat"`, or `outbox.heartbeat.dedicatedConnection = false` (startup INFO «outbox heartbeat shares the application's connections ...»). A slow database or a transaction-mode pooler delays it even on its own pool | «Версии контрактов и откат» |
 
 Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dashboards/outbox.json`.
@@ -86,7 +86,7 @@ Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dash
 - **Rollback to 5fc60dd** («Обновление с предыдущего релиза»): set its `outbox.shards` to the cursors' count (256 if
   this release created it); then list the window's `kept` dead letters.
 - «Репликация, failover и PITR»: async failover may deliver events whose data is gone; PITR redelivers.
-- `relay.retry.maxAttempts = 0` (default): a key stuck on a broken target shows as lag only.
+- `relay.retry.maxAttempts = 0` (default): a key stuck on a broken target shows as lag only; `keys/abandon` clears it without a rollout.
 - Kafka records slower for up to 10 min after a call expired or was cut, often with a `RecordTooLargeException` dead
   letter («Требования к Kafka»): on kafka-clients ≤ 4.1 an oversized record shared a producer batch, and the sender
   resends its batch-mates unbatched. Nothing is lost; fix the cause with `batch.size` ≤ the topic's

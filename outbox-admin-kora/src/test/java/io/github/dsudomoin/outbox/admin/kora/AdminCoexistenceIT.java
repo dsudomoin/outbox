@@ -62,6 +62,7 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
             new Route("restoreOrphan", "POST", API + "/orphans/{orphan}/restore?fromXid=0", null),
             new Route("recoverStrandedShards", "POST", API + "/recovery/stranded-shards", null),
             new Route("recoverXidRegression", "POST", API + "/recovery/xid-regression", null),
+            new Route("abandonKey", "POST", API + "/keys/abandon", "{\"topic\":\"t\",\"key\":\"k\",\"reason\":\"test\"}"),
             new Route("abandonWaiting", "POST", API + "/waiting/abandon", "{\"topic\":\"t\",\"reason\":\"test\"}"));
 
     @TestComponent
@@ -217,8 +218,11 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
         var expected = new ArrayList<String>();
         for (var route : ROUTES) {
             var call = "outbox admin " + route.method() + " \"" + path(route) + "\"";
-            var allowed = call + " by \"tester\"" + (route.operation().equals("abandonWaiting")
-                    ? " with topic \"t\", key null, reason \"test\", dryRun \"false\"" : "") + ": 200";
+            var allowed = call + " by \"tester\"" + switch (route.operation()) {
+                case "abandonWaiting" -> " with topic \"t\", key null, reason \"test\", dryRun \"false\"";
+                case "abandonKey" -> " with topic \"t\", key \"k\", messageId null, reason \"test\", dryRun \"false\"";
+                default -> "";
+            } + ": 200";
             expected.addAll(List.of(call + " denied: 401", call + " denied: 403", allowed));
         }
         assertThat(audit(log)).as("one INFO line per call").containsExactlyElementsOf(expected);
@@ -282,6 +286,8 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
                 + " values (1, 0, gen_random_uuid(), 't', now(), 3)");
         execute("insert into " + table + "_retry (id, shard, message_id, topic, created_at, next_attempt_at,"
                 + " waiting_since) values (2, 0, gen_random_uuid(), 't', now(), now(), now())");
+        execute("insert into " + table + "_retry (id, shard, message_id, topic, key, created_at, next_attempt_at)"
+                + " values (3, 0, gen_random_uuid(), 't', 'k', now(), now())");
         execute("create table " + orphan() + " (like " + table + " including defaults)");
         execute("insert into " + orphan() + " (id, shard, xid, message_id, topic)"
                 + " values (1, 0, '10', gen_random_uuid(), 't')");

@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox.admin.kora;
 import com.fasterxml.jackson.core.JsonParseException;
 import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonToken;
+import io.github.dsudomoin.outbox.admin.kora.model.AbandonKey;
 import io.github.dsudomoin.outbox.admin.kora.model.AbandonWaiting;
 import io.github.dsudomoin.outbox.admin.kora.model.DeadLetterStatus;
 import io.github.dsudomoin.outbox.admin.kora.model.Filter;
@@ -11,6 +12,7 @@ import jakarta.annotation.Nullable;
 import java.io.IOException;
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.UUID;
 import ru.tinkoff.kora.json.common.JsonReader;
 
 /**
@@ -66,6 +68,47 @@ final class RequestReaders {
             }
             return new Filter(topic, key, error, failedFrom, failedTo, status);
         };
+    }
+
+    static JsonReader<AbandonKey> abandonKey() {
+        return parser -> {
+            if (!startObject(parser)) {
+                return null;
+            }
+            String topic = null;
+            String key = null;
+            UUID messageId = null;
+            String reason = null;
+            Boolean dryRun = null;
+            for (var field = parser.nextFieldName(); field != null; field = parser.nextFieldName()) {
+                parser.nextToken();
+                switch (field) {
+                    case "topic" -> topic = string(parser, field);
+                    case "key" -> key = string(parser, field);
+                    case "messageId" -> messageId = uuid(parser, field);
+                    case "reason" -> reason = string(parser, field);
+                    case "dryRun" -> dryRun = bool(parser, field);
+                    default -> throw unknown(parser, field, "AbandonKey", "topic, key, messageId, reason, dryRun");
+                }
+            }
+            if (topic == null || reason == null) {
+                throw new JsonParseException(parser, "missing field '" + (topic == null ? "topic" : "reason")
+                        + "' in AbandonKey");
+            }
+            if ((key == null) == (messageId == null)) {
+                throw new JsonParseException(parser, "AbandonKey needs exactly one of 'key' and 'messageId'");
+            }
+            return new AbandonKey(topic, key, messageId, reason, dryRun);
+        };
+    }
+
+    private static UUID uuid(JsonParser parser, String field) throws IOException {
+        var text = string(parser, field);
+        try {
+            return text == null ? null : UUID.fromString(text);
+        } catch (IllegalArgumentException e) {
+            throw new JsonParseException(parser, "field '" + field + "' is not a UUID: " + text);
+        }
     }
 
     static JsonReader<AbandonWaiting> abandonWaiting() {

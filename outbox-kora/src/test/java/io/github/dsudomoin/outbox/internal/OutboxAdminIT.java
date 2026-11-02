@@ -41,6 +41,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -48,6 +49,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.IntStream;
 import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -697,6 +699,173 @@ class OutboxAdminIT {
         assertThat(deadIds()).isEmpty();
     }
 
+    @Test
+    void abandonKeyMovesAFailingKeyWholeAndLeavesTheOthers() throws Exception {
+        seedWaiting();
+
+        assertThat(admin.abandonKey("t", bytes("j"), "fails for ever", true)).as("a dry run")
+                .isEqualTo(new Abandoned(1, 3));
+        assertThat(count(names.dead())).as("a dry run moves nothing").isZero();
+
+        assertThat(admin.abandonKey("t", bytes("j"), "fails for ever", false)).as("head, follower and parked row")
+                .isEqualTo(new Abandoned(1, 3));
+
+        assertThat(ids(names.retry())).as("beside it").containsExactly(10L, 11L, 12L, 20L, 40L);
+        assertThat(ids(names.parked())).containsExactly(5L, 13L, 33L);
+        assertThat(ids(names.dead())).containsExactly(30L, 31L, 32L);
+        try (var c = TestDb.connect()) {
+            assertThat(queryString(c, "select string_agg(distinct status || ' ' || error, ', ') from " + names.dead()))
+                    .isEqualTo("kept abandoned: fails for ever");
+            assertThat(queryLong(c, "select attempts from " + names.dead() + " where id = 30")).as("attempts kept")
+                    .isOne();
+        }
+        assertThat(admin.abandonKey("t", bytes("j"), "fails for ever", false)).as("a second call")
+                .isEqualTo(new Abandoned(0, 0));
+    }
+
+    @Test
+    void abandonKeyTakesAWaitingKeyAndAKeyOnlyParked() throws Exception {
+        seedWaiting();
+        execute("insert into " + names.parked() + " (id, shard, message_id, topic, key, created_at, attempts, due_at)"
+                + " values (50, 0, gen_random_uuid(), 't', 'p', now(), 0, now())");
+
+        assertThat(admin.abandonKey("t", bytes("k"), "gone", false)).isEqualTo(new Abandoned(1, 5));
+        assertThat(admin.abandonKey("t", bytes("p"), "requeues for ever", false)).isEqualTo(new Abandoned(1, 1));
+        assertThat(admin.abandonKey("t", bytes("nobody"), "gone", false)).isEqualTo(new Abandoned(0, 0));
+
+        assertThat(ids(names.dead())).containsExactly(5L, 10L, 11L, 12L, 13L, 50L);
+        assertThat(ids(names.retry())).as("topic u keeps its key k").contains(40L);
+    }
+
+    @Test
+    void abandonRecordTakesAnUnkeyedRecordByItsMessageIdAndRefusesAKeyedOne() throws Exception {
+        seedWaiting();
+        var inRetry = UUID.fromString(queryText("select message_id::text from " + names.retry() + " where id = 20"));
+        var parkedRow = UUID.fromString(queryText("select message_id::text from " + names.parked() + " where id = 33"));
+        var keyed = UUID.fromString(queryText("select message_id::text from " + names.retry() + " where id = 30"));
+
+        assertThat(admin.abandonRecord("t", inRetry, "poison", true)).isEqualTo(new Abandoned(1, 1));
+        assertThat(count(names.dead())).isZero();
+        assertThat(admin.abandonRecord("t", inRetry, "poison", false)).isEqualTo(new Abandoned(1, 1));
+        assertThat(admin.abandonRecord("t", parkedRow, "poison", false)).isEqualTo(new Abandoned(1, 1));
+        assertThat(ids(names.dead())).containsExactly(20L, 33L);
+        assertThat(admin.abandonRecord("t", inRetry, "poison", false)).as("a second call")
+                .isEqualTo(new Abandoned(0, 0));
+        assertThat(admin.abandonRecord("u", keyed, "poison", false)).as("another topic").isEqualTo(new Abandoned(0, 0));
+
+        assertThatThrownBy(() -> admin.abandonRecord("t", keyed, "poison", false))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("has a key");
+        assertThat(ids(names.retry())).contains(30L);
+    }
+
+    @Test
+    void abandonKeyNeedsATopicAKeyAndAReason() throws Exception {
+        for (var blank : new String[] {null, "", " "}) {
+            assertThatThrownBy(() -> admin.abandonKey(blank, bytes("k"), "gone", false))
+                    .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("topic");
+            assertThatThrownBy(() -> admin.abandonKey("t", bytes("k"), blank, false))
+                    .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("reason");
+        }
+        assertThatThrownBy(() -> admin.abandonKey("t", null, "gone", false))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("message id");
+        assertThatThrownBy(() -> admin.abandonRecord("t", null, "gone", false))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("message id");
+    }
+
+    /** Chunks, the newest first: a call cut between them leaves the head with the rest, and calling again goes on. */
+    @Test
+    void abandonKeyCutBetweenChunksLeavesTheKeyWithItsHead() throws Exception {
+        execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, created_at, attempts,"
+                + " next_attempt_at) select i, 0, gen_random_uuid(), 't', 'k', now(), 0, case when i = 1 then now() end"
+                + " from generate_series(1, 2500) i");
+        var refuse = names.dead().replace('.', '_') + "_refuse";
+        execute("create function " + refuse + "() returns trigger language plpgsql as"
+                + " $$ begin if new.id = 1400 then raise exception 'cut'; end if; return new; end $$");
+        execute("create trigger cut before insert on " + names.dead() + " for each row execute function " + refuse
+                + "()");
+
+        assertThatThrownBy(() -> admin.abandonKey("t", bytes("k"), "gone", false)).hasMessageContaining("cut");
+
+        assertThat(count(names.dead())).as("the first chunk stays done").isEqualTo(1000);
+        assertThat(count(names.retry())).isEqualTo(1500);
+        assertThat(queryText("select string_agg(id::text, ',') from " + names.retry()
+                + " where next_attempt_at is not null")).as("its head").isEqualTo("1");
+
+        execute("drop trigger cut on " + names.dead());
+        assertThat(admin.abandonKey("t", bytes("k"), "gone", false)).isEqualTo(new Abandoned(1, 1500));
+        assertThat(count(names.retry())).isZero();
+    }
+
+    /** The letters redrive as any: new messages of the key, and a record sent after the abandon needs no call of it. */
+    @Test
+    void anAbandonedKeyFlowsAgainAndItsLettersRedrive() throws Exception {
+        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
+        var ticks = new Ticks(names, config.shards());
+        int shard = Hashing.shard(Hashing.keyHash("t", bytes("k")), config.shards());
+        var handed = new CopyOnWriteArrayList<String>();
+        var processor = new ShardProcessor(names, config, record -> handed.add(new String(record.payload(), UTF_8)),
+                TestTelemetry.kora(), false);
+        try {
+            execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, payload, created_at,"
+                    + " attempts, next_attempt_at) values (1, " + shard + ", gen_random_uuid(), 't', 'k', 'stuck',"
+                    + " now(), 7, now() + interval '1 hour')");
+            db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("t", "k", bytes("later"))));
+            assertThat(admin.abandonKey("t", bytes("k"), "gone", false)).isEqualTo(new Abandoned(1, 1));
+
+            step(processor, ticks, shard, Instant.now());
+
+            assertThat(handed).as("sent later, delivered").containsExactly("later");
+            assertThat(admin.redriveDeadLetters(List.of(1L))).isOne();
+            step(processor, ticks, shard, Instant.now().plusSeconds(1));
+            assertThat(handed).containsExactly("later", "stuck");
+            assertThat(count(names.dead())).isZero();
+        } finally {
+            processor.close();
+        }
+    }
+
+    /** A relay step on the shard: waited for, and what it adds to the key goes too; past the wait, "retry". */
+    @Test
+    void abandonKeyWaitsForARelayStepOnItsShard() throws Exception {
+        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
+        var ticks = new Ticks(names, config.shards());
+        int shard = Hashing.shard(Hashing.keyHash("t", bytes("w")), config.shards());
+        var inHandler = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var processor = new ShardProcessor(names, config, record -> {
+            inHandler.countDown();
+            release.await();
+        }, TestTelemetry.kora(), false);
+        try {
+            execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, payload, created_at,"
+                    + " attempts, next_attempt_at) values (1, " + shard + ", gen_random_uuid(), 't', 'w', 'w#1', now(),"
+                    + " 3, now() + interval '1 hour')");
+            var neighbour = IntStream.range(0, 10_000).mapToObj(i -> "other" + i)
+                    .filter(k -> Hashing.shard(Hashing.keyHash("t", bytes(k)), config.shards()) == shard).findFirst()
+                    .orElseThrow();
+            db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("t", neighbour, bytes("o#1"))));
+            var step = pool.submit(() -> step(processor, ticks, shard, Instant.now()));
+            assertThat(inHandler.await(10, SECONDS)).isTrue();
+
+            admin.shardWait = Duration.ofMillis(200);
+            assertThatThrownBy(() -> admin.abandonKey("t", bytes("w"), "gone", false))
+                    .isInstanceOf(IllegalStateException.class).hasMessageContaining("is busy, retry");
+            assertThat(ids(names.retry())).containsExactly(1L);
+
+            admin.shardWait = Duration.ofSeconds(10);
+            var abandon = pool.submit(() -> admin.abandonKey("t", bytes("w"), "gone", false));
+            awaitShardLockWaiter(shard);
+            assertThat(abandon.isDone()).as("waits for the step").isFalse();
+            release.countDown();
+            step.get(10, SECONDS);
+
+            assertThat(abandon.get(10, SECONDS)).isEqualTo(new Abandoned(1, 1));
+        } finally {
+            release.countDown();
+            processor.close();
+        }
+    }
+
     /**
      * A relay step holds the shard's lock while its handler runs and adds a follower to the waiting key after it: the
      * abandon waits for the step's commit, then moves the follower too, or gives up with "retry" after its wait.
@@ -766,6 +935,12 @@ class OutboxAdminIT {
                 + " (13, 0, gen_random_uuid(), 't', 'k', now(), 0, now()),"
                 + " (32, 0, gen_random_uuid(), 't', 'j', now(), 0, now()),"
                 + " (33, 1, gen_random_uuid(), 't', null, now(), 0, now())");
+    }
+
+    private String queryText(String sql) throws SQLException {
+        try (var c = TestDb.connect()) {
+            return queryString(c, sql);
+        }
     }
 
     /** One relay step of {@code shard} at {@code now} after a new tick, committed. */

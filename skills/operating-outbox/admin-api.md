@@ -17,6 +17,8 @@ A component of `OutboxModule`. Each call runs its own transactions; inside `inTx
 | `recoverXidRegression()` | The xid regression recovery now, in any mode and for any `maxRows`. |
 | `recoverStrandedShards()` | Repairs shards whose starting tick, or their batch's target tick, no longer exists, on running instances; returns the rows re-sent. Refused while an xid regression halt is recorded. |
 | `abandonWaiting(topic, key, reason, dryRun)` | Records of `topic` (of `key` only unless null) waiting for an instance able to handle them, the whole key each (waiting head, its followers, its parked records; an unkeyed head alone), to the dead table as `kept` (the hook is not asked) with error `abandoned: <reason>`. Returns `Abandoned(keys, records)`; `dryRun` counts only. Shard by shard, chunks of 1 000 keys, each under the shard's lock, waited up to `batchTimeout` + 5 s, then `IllegalStateException` «... busy, retry» (done chunks stay done; call again). Later records of the key are delivered ahead of the abandoned ones. |
+| `abandonKey(topic, key, reason, dryRun)` | Every row of `key` in the retry and parked tables, whether or not its head waits, to the dead table as `kept` (the hook is not asked) with error `abandoned: <reason>`. For a record that requeues for ever or fails for ever with `maxAttempts = 0`. Returns `Abandoned(keys, records)`, with `dryRun` what it would move. Records not read yet, or sent later, are delivered. Chunks of 1 000 rows, newest first, under the shard's lock: «busy, retry» past `batchTimeout` + 5 s, calling again goes on. |
+| `abandonRecord(topic, messageId, reason, dryRun)` | The same for an unkeyed record, by message id; a record with a key is refused. |
 
 - Bulk calls take letters dead when the call starts, in chunks of 1 000 by id, one transaction per chunk. Letters
   held by a running hook call, and (redrive) letters whose key an open transaction sends, are skipped without
@@ -48,11 +50,13 @@ curl -s -X POST -H "$KEY" $API/recovery/stranded-shards                         
 curl -s -X POST -H "$KEY" $API/recovery/xid-regression
 curl -s -H "$KEY" -H "$JSON" -d '{"topic":"orders","reason":"v2 rolled back for good","dryRun":true}' \
     $API/waiting/abandon                                                       # {"keys":3,"records":5}
+curl -s -H "$KEY" -H "$JSON" -d '{"topic":"orders","key":"order-42","reason":"handler bug, TASK-1","dryRun":true}' \
+    $API/keys/abandon                                                          # {"keys":1,"records":7}
 ```
 
-- 200 with JSON (changing calls: `{"count": N}`; `waiting/abandon`: `{"keys": N, "records": M}`); 400 rejected input
+- 200 with JSON (changing calls: `{"count": N}`; `waiting/abandon`, `keys/abandon`: `{"keys": N, "records": M}`); 400 rejected input
   (unknown field, so a mistyped `key` never widens an abandon; over 1 000 `ids`, empty filter, not an orphan, blank
-  `topic` or `reason`); 401 / 403 from the authorizer; 409 not now (maintenance running, or a relay step holding the
+  `topic` or `reason`; in `keys/abandon` not exactly one of `key` and `messageId`, or the `messageId` of a keyed record); 401 / 403 from the authorizer; 409 not now (maintenance running, or a relay step holding the
   shard past `batchTimeout` + 5 s: retry; no xid regression); 500 otherwise. Every error body is `{"message": "..."}`.
 - Reads (`/status`, find, count) wait at most 5 s for a lock and 60 s per statement: during an xid regression
   recovery, which holds its tables, `/status` answers 500 (55P03) after 5 s; retry once it is done.
@@ -82,6 +86,11 @@ curl -s -H "$KEY" -H "$JSON" -d '{"topic":"orders","reason":"v2 rolled back for 
   `waiting/abandon` with `dryRun: true`, then without; body `{"topic", "key"?, "reason", "dryRun"?}`, `key` as UTF-8.
   The audit line carries topic, key, reason and dryRun. Later: redrive with `{"filter":{"topic":"orders",
   "error":"abandoned"}}` once a reading release runs, or discard. A reshard needs them gone first.
+- **A key that never gets through** («Ключ, который не проходит никогда»): a record that requeues for ever (`parkedSize`
+  stays up) or fails for ever with `maxAttempts = 0` (shard lag, its error in the WARN). No rollout: `keys/abandon`
+  with `dryRun: true`, then without; body `{"topic", "key" | "messageId", "reason", "dryRun"?}`, `key` as UTF-8, `messageId`
+  for an unkeyed record (`select message_id from <table>_retry where key is null`). Fix the handler, then redrive the
+  letters with `{"filter":{"topic":"orders","error":"abandoned"}}`, or discard them.
 - **After a rollback window** («Rolling-деплои», «Обновление с предыдущего релиза (5fc60dd), смешанный парк и
   откат»): the previous release writes dead letters `kept` and the hook never sees them:
   `curl -s -H "$KEY" "$API/dead-letters?status=kept&failedFrom=<start>&failedTo=<end>"`.

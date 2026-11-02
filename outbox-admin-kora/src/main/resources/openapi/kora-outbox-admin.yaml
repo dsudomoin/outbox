@@ -259,6 +259,42 @@ paths:
           $ref: '#/components/responses/Conflict'
         '500':
           $ref: '#/components/responses/ServerError'
+  /kora-outbox/admin/v1/keys/abandon:
+    post:
+      operationId: abandonKey
+      tags: [OutboxAdmin]
+      summary: Moves a key's records in the retry and parked tables to dead letters, whether or not its head waits
+      description: >-
+        For a record that fails or requeues for ever. Names exactly one of key or messageId; an unkeyed record has no
+        key, so it goes by its message id, and a record with a key is refused there. Its rows in the retry and parked
+        tables become kept dead letters with the error "abandoned: <reason>", without asking the hook. Records of the
+        key not read yet, and those sent later, are delivered. Works in chunks of 1 000 rows, each under the shard's
+        lock, the newest first, so what a failed call leaves still has its head: waits up to
+        outbox.relay.batchTimeout + 5 s for a relay step, then answers 409, the chunks before it staying done; calling
+        again goes on.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AbandonKey'
+      responses:
+        '200':
+          description: What was moved, or with dryRun would be
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Abandoned'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/ServerError'
   /kora-outbox/admin/v1/waiting/abandon:
     post:
       operationId: abandonWaiting
@@ -633,6 +669,28 @@ components:
           type: boolean
           default: false
           description: Count what would be moved, moving nothing
+    AbandonKey:
+      type: object
+      description: A field not named here is refused; exactly one of key and messageId
+      additionalProperties: false
+      required: [topic, reason]
+      properties:
+        topic:
+          type: string
+        key:
+          type: string
+          description: The key, as its UTF-8 bytes
+        messageId:
+          type: string
+          format: uuid
+          description: An unkeyed record, in place of a key
+        reason:
+          type: string
+          description: Why, logged with the call and put into the dead letters' error
+        dryRun:
+          type: boolean
+          default: false
+          description: Count what would be moved, moving nothing
     Abandoned:
       type: object
       required: [keys, records]
@@ -640,11 +698,11 @@ components:
         keys:
           type: integer
           format: int64
-          description: Waiting keys, an unkeyed head counting as one
+          description: Keys, an unkeyed record counting as one
         records:
           type: integer
           format: int64
-          description: Their records, the waiting heads included
+          description: Their records, heads included
     Count:
       type: object
       required: [count]

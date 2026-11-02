@@ -1643,7 +1643,29 @@ flowchart TD
   N попыток, переносится в dead-таблицу. При значении по умолчанию 0 временные сбои никогда не приводят в dead letters.
 - **Зависшая запись** (её вызов обработчика не завершается до `batchTimeout`) при `maxAttempts = 0` заставляет свой ключ
   повторяться вечно, пока другие ключи идут. Каждый раз, когда подходит её срок (не чаще раза в `maxDelay`), она
-  обходится шагу своего шарда примерно в 2 × `batchTimeout`. Задайте `maxAttempts` или исправьте обработчик.
+  обходится шагу своего шарда примерно в 2 × `batchTimeout`. Задайте `maxAttempts` или исправьте обработчик; снять такой ключ
+  сейчас, без выкатки, можно через `keys/abandon` ([ниже](#ключ-который-не-проходит-никогда)).
+
+### Ключ, который не проходит никогда
+
+Запись, которую обработчик откладывает без конца, и ключ, который вечно падает при `maxAttempts = 0`, сами не уйдут. Новый
+`maxAttempts` или `maxRequeues` потребовал бы выкатки посреди ночи, поэтому такой ключ снимают вызовом:
+`OutboxAdmin.abandonKey(topic, key, reason, dryRun)` или `POST /kora-outbox/admin/v1/keys/abandon` с телом
+`{"topic": "...", "key": "...", "reason": "...", "dryRun": true}` ([Админ-API и HTTP](#админ-api-и-http)).
+
+- `topic`, `key` (строка в UTF-8) и `reason` обязательны; поле, которого нет в контракте, — 400. Сначала вызовите с `dryRun`.
+- Все строки ключа в retry-таблице и среди отложенных, ждёт его голова или нет, становятся письмами `kept` с ошибкой
+  `abandoned: <reason>`, с прежними `attempts`. Хук dead letters их не получает. Дальше письма можно переотправить или удалить,
+  как любые ([Dead letters](#dead-letters)).
+- Записи ключа, которые relay ещё не прочитал, и те, что отправят позже, будут доставлены, раньше снятых. Если они упадут снова,
+  ключ вернётся в retry-таблицу: вызов повторяют.
+- Работает чанками по 1 000 строк, по транзакции на чанк, под блокировкой шарда, той, что держит шаг relay. Шаг он ждёт до
+  `relay.batchTimeout` + 5 с, потом 409. Чанки до этого остаются сделанными, новые строки уходят первыми, поэтому у оставшегося
+  ключа голова на месте; повторный вызов продолжает, а на снятом ключе вернёт нули.
+- Запись без ключа назвать нечем, поэтому вместо `key` передают `messageId`:
+  `select message_id from <base>_retry where key is null union all select message_id from <base>_parked where key is null`.
+  Запись с ключом этим способом не снять (400): без остального ключа нарушился бы его порядок.
+- Ключ, который нельзя записать в UTF-8, по HTTP не назвать: для него есть `OutboxAdmin.abandonKey` с байтами.
 
 ### Часы
 
@@ -2266,7 +2288,7 @@ Gauge показывает, сколько xid осталось, а обслуж
 | `outbox.partitions.overflow` = 1 дольше одного цикла расширения | Строки ушли в хвост, а своп не прошёл: держатель блокировки на outbox (WARN «deferred» и часовой ERROR «has not run on N due runs» называют его) или хвост больше `maxTailScan` вне окна (часовой ERROR «over outbox.partitions.maxTailScan»: его превратит окно `tailConversion`). Запись идёт, ничего не теряется ([Переполнение хвоста](#переполнение-хвоста-tail-overflow)). Одна выборка `overflow` = 1 — информация, а не авария. |
 | `outbox.partitions.premade` < 2 | Расширение отстаёт, строки скоро пойдут в хвост. |
 | `outbox.messages.route_unchecked` растёт | Heartbeat инстанса не читает отчёты других инстансов дольше 3 × `maintenanceInterval` (WARN «outbox heartbeat of instance ... failed»), и проверка при записи пропускает сообщения по последнему чтению (WARN «... through unchecked ...»). Ничего не теряется: запись, которую инстанс прочитать не сможет, ждёт. Чините heartbeat. Собственный пул heartbeat (в Kora по умолчанию) от исчерпанного пула приложения не зависит, поэтому смотрите сам источник heartbeat: WARN «outbox heartbeat connection source of ... failed, this beat uses the application's connections ...» (тогда beat ушёл в пул приложения), ERROR «outbox heartbeat connection source reaches another database ...», метры `hikaricp_*` с `pool="<db.poolName>-outbox-heartbeat"`, не выключен ли `outbox.heartbeat.dedicatedConnection` (тогда при старте INFO «outbox heartbeat shares the application's connections ...»). Медленная база и пулер в режиме transaction задерживают heartbeat и со своим пулом ([Версии контрактов и откат](#версии-контрактов-и-откат)). |
-| `outbox.parked.size` не возвращается к обычному уровню или растёт | Записи откладываются снова и снова: блокирующий их процесс не заканчивается. `outbox.shard.lag` отложенных записей не видит. Предел задаёт обработчик или `relay.requeue.maxRequeues` ([Свой обработчик](#свой-обработчик)). |
+| `outbox.parked.size` не возвращается к обычному уровню или растёт | Записи откладываются снова и снова: блокирующий их процесс не заканчивается. `outbox.shard.lag` отложенных записей не видит. Предел задаёт обработчик или `relay.requeue.maxRequeues` ([Свой обработчик](#свой-обработчик)); снять одну запись сейчас — `keys/abandon` ([Ключ, который не проходит никогда](#ключ-который-не-проходит-никогда)). |
 | WARN «outbox tick made without its shard set» | Проба шардов при записи тика не прошла, чаще всего потому, что партицию держит ACCESS EXCLUSIVE (ALTER TABLE, VACUUM FULL, TRUNCATE, LOCK вручную). Тики идут дальше без набора шардов, и relay шагает по всем шардам; пока партиция заблокирована, шаги ждут её, и растёт `outbox.shard.lag`. Не чаще раза в минуту. |
 
 ### Админ-API и HTTP
@@ -2287,6 +2309,8 @@ Gauge показывает, сколько xid осталось, а обслуж
 | `recoverXidRegression()` | Восстановление после регрессии xid сейчас ([Восстановление после регрессии xid](#восстановление-после-регрессии-xid-xid-regression-recovery)). |
 | `recoverStrandedShards()` | Починка шардов, чей тик потерян, на работающих инстансах; возвращает число переотправленных строк ([Застрявшие шарды](#застрявшие-шарды)). |
 | `abandonWaiting(topic, key, reason, dryRun)` | Отказаться от записей топика, которые ждут инстанс, способный их обработать (для окончательного отката): ключ целиком в dead-таблицу как `kept`, с ошибкой `abandoned: <reason>`. Возвращает `Abandoned(keys, records)`; с `dryRun` — сколько перенёс бы, ничего не перенося ([Версии контрактов и откат](#версии-контрактов-и-откат)). |
+| `abandonKey(topic, key, reason, dryRun)` | Отказаться от ключа, запись которого не пройдёт никогда (`requeue` без конца или вечный сбой при `maxAttempts = 0`): все строки ключа в retry-таблице и среди отложенных, ждёт его голова или нет, в dead-таблицу как `kept`, с ошибкой `abandoned: <reason>`. Возвращает `Abandoned(keys, records)`; с `dryRun` — сколько перенёс бы ([Ключ, который не проходит никогда](#ключ-который-не-проходит-никогда)). |
+| `abandonRecord(topic, messageId, reason, dryRun)` | То же для записи без ключа: называть больше нечего, поэтому она идёт по `message_id`. Запись с ключом отвергается: без остального ключа её не забрать. |
 
 - Массовые вызовы работают с письмами, мёртвыми на момент начала вызова, чанками по 1 000 в порядке id, по
   транзакции на чанк: не держат больше 1 000 блокировок ключей. Упавший чанк откатывается один; повторный вызов
@@ -2348,6 +2372,7 @@ public final class ApiKeyAuthorizer implements OutboxAdminAuthorizer {
 - Каждый вызов оставляет строку INFO: `outbox admin POST "/kora-outbox/admin/v1/..." by "admin-key": 200` или
   `... denied: 401`. У `waiting/abandon` перед статусом стоят его аргументы, каждое значение в кавычках:
   `... by "admin-key" with topic "orders", key null, reason "v2 rolled back for good", dryRun "false": 200`.
+  То же у `keys/abandon`, с `messageId` после `key`.
 - Открывайте админ-API только во внутренней сети или за TLS: ключ в заголовке без TLS читается по дороге, а
   ответы несут dead letters с payload.
 - Решайте по тому, что клиент отправляет намеренно (заголовок с ключом или токеном), а не по тому, что браузер
@@ -2411,11 +2436,15 @@ curl -s -X POST -H "$KEY" $API/recovery/xid-regression
 curl -s -X POST -H "$KEY" $API/recovery/stranded-shards
 curl -s -H "$KEY" -H "$JSON" -d '{"topic":"orders","reason":"v2 rolled back for good","dryRun":true}' \
     $API/waiting/abandon                                                       # {"keys":3,"records":5}
+curl -s -H "$KEY" -H "$JSON" -d '{"topic":"orders","key":"order-42","reason":"handler bug, TASK-1","dryRun":true}' \
+    $API/keys/abandon                                                          # {"keys":1,"records":7}
+curl -s -H "$KEY" -H "$JSON" -d '{"topic":"orders","messageId":"01a19dd9-e555-74b8-963e-0c53f485fb87","reason":"poison"}' \
+    $API/keys/abandon                                                          # запись без ключа
 ```
 
-- Ответы: 200 с JSON (изменяющие вызовы — `{"count": N}`, `waiting/abandon` — `{"keys": N, "records": M}`); 400 —
+- Ответы: 200 с JSON (изменяющие вызовы — `{"count": N}`, `waiting/abandon` и `keys/abandon` — `{"keys": N, "records": M}`); 400 —
   отвергнутый ввод (в том числе поле, которого нет в контракте, больше 1 000 `ids`, пустой фильтр, не сирота, пустые
-  `topic` или `reason`); 401 и 403 — от `OutboxAdminAuthorizer` (403 — ещё и изменяющий вызов с другого сайта); 409 —
+  `topic` или `reason`, в `keys/abandon` не ровно одно из `key` и `messageId`, `messageId` записи с ключом); 401 и 403 — от `OutboxAdminAuthorizer` (403 — ещё и изменяющий вызов с другого сайта); 409 —
   нельзя в текущем состоянии (идёт обслуживание или шаг relay держит шард дольше `batchTimeout` + 5 с: повторите; нет
   регрессии xid или застрявших шардов); 500 — прочее. Тело любой ошибки, 500
   тоже, — `{"message": "..."}`. У 500 в `message` текст исключения, в том числе текст ошибки SQL, а у 4xx, который

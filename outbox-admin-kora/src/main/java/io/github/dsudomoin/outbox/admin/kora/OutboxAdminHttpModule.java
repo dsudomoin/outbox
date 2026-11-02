@@ -5,6 +5,7 @@ import io.github.dsudomoin.outbox.OutboxAdmin;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiController;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiControllerModule;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiDelegate;
+import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiServerResponseMappers.AbandonKeyApiResponseMapper;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiServerResponseMappers.AbandonWaitingApiResponseMapper;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiServerResponseMappers.CountDeadLettersApiResponseMapper;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiServerResponseMappers.DiscardDeadLettersApiResponseMapper;
@@ -15,6 +16,7 @@ import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiServerResponseMap
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiServerResponseMappers.RedriveDeadLettersApiResponseMapper;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiServerResponseMappers.RestoreOrphanApiResponseMapper;
 import io.github.dsudomoin.outbox.admin.kora.model.Abandoned;
+import io.github.dsudomoin.outbox.admin.kora.model.AbandonKey;
 import io.github.dsudomoin.outbox.admin.kora.model.AbandonWaiting;
 import io.github.dsudomoin.outbox.admin.kora.model.Count;
 import io.github.dsudomoin.outbox.admin.kora.model.DeadLetterPage;
@@ -115,6 +117,12 @@ public interface OutboxAdminHttpModule extends OutboxAdminApiControllerModule {
         return RequestReaders.abandonWaiting();
     }
 
+    /** Internal type, unstable: for the adapters of this repository. Refuses unnamed fields, as the one above. */
+    @InternalApi
+    default JsonReader<AbandonKey> outboxAdminAbandonKeyJsonReader() {
+        return RequestReaders.abandonKey();
+    }
+
     // The generated controller and response mappers: the Java processor creates them from their constructors, KSP
     // creates no Java class of a library jar that way, and a Kotlin app would not build without these.
 
@@ -122,6 +130,13 @@ public interface OutboxAdminHttpModule extends OutboxAdminApiControllerModule {
     @InternalApi
     default OutboxAdminApiController outboxAdminApiController(OutboxAdminApiDelegate delegate) {
         return new OutboxAdminApiController(delegate);
+    }
+
+    /** Internal type, unstable: for the adapters of this repository. */
+    @InternalApi
+    default AbandonKeyApiResponseMapper outboxAdminAbandonKeyApiResponseMapper(
+            @Json HttpServerResponseMapper<Abandoned> abandoned, @Json HttpServerResponseMapper<ModelError> error) {
+        return new AbandonKeyApiResponseMapper(abandoned, error, error, error, error, error);
     }
 
     /** Internal type, unstable: for the adapters of this repository. */

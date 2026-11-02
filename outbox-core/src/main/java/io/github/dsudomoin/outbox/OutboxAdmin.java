@@ -2,6 +2,7 @@ package io.github.dsudomoin.outbox;
 
 import jakarta.annotation.Nullable;
 import java.util.Collection;
+import java.util.UUID;
 
 /**
  * The morning tool, for any code of the service (an endpoint, a job, a test): the outbox's status, dead letters, kept
@@ -127,6 +128,31 @@ public interface OutboxAdmin {
      */
     Abandoned abandonWaiting(String topic, @Nullable byte[] key, String reason, boolean dryRun);
 
-    /** What {@link #abandonWaiting} moved, or would move: the waiting keys and all their records. */
+    /**
+     * Gives up on the records of {@code key} that a handler will never take: one that requeues for ever, or fails for
+     * ever with {@code maxAttempts = 0}. Every row of the key in the retry and parked tables, whether or not its head
+     * waits, becomes a dead letter, kept (the dead-letter hook is not asked), with the error {@code "abandoned: "} +
+     * {@code reason}. Records of the key not read yet, and those sent later, are delivered, ahead of the abandoned ones.
+     * Returns one key and its records moved, or nothing when it has none; with {@code dryRun}, those it would move,
+     * moving nothing.
+     *
+     * <p>In chunks of 1 000 rows, the newest first, one transaction each under the shard's lock, the one a relay step
+     * holds while it runs: what a failed call leaves still has its head. It waits up to
+     * {@code outbox.relay.batchTimeout} + 5 s for it, then fails with {@link IllegalStateException} "... busy, retry",
+     * the chunks before it staying done; calling again goes on. A dry run takes no lock.
+     *
+     * @throws IllegalArgumentException for a blank {@code topic} or {@code reason}, or a null {@code key}
+     */
+    Abandoned abandonKey(String topic, byte[] key, String reason, boolean dryRun);
+
+    /**
+     * {@link #abandonKey} for an unkeyed record, which has no key to name: its row in the retry or parked table.
+     *
+     * @throws IllegalArgumentException as {@link #abandonKey}, or when the record has a key: it cannot go without the
+     *     rest of its key, so name that
+     */
+    Abandoned abandonRecord(String topic, UUID messageId, String reason, boolean dryRun);
+
+    /** What an abandon moved, or would move: the keys, an unkeyed record counting as one, and all their records. */
     record Abandoned(long keys, long records) {}
 }
