@@ -104,7 +104,8 @@ public interface OutboxAdmin {
      * for last. Whatever keeps a lock too long fails the call with {@link IllegalStateException} "... busy, retry": the
      * rows moved stay moved, each once, and calling again goes on. Wakes the relay; returns the rows re-sent.
      *
-     * @throws IllegalStateException "no stranded shards" when no shard is stranded
+     * @throws IllegalStateException "no stranded shards" when no shard is stranded; "recover the xid regression first"
+     *     while an xid regression halt is recorded: that recovery rebuilds every cursor
      */
     long recoverStrandedShards();
 

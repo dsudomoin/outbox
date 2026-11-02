@@ -370,6 +370,12 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         try (var c = ddl.newConnection()) {
             c.setAutoCommit(true);
             underMaintenanceLock(c, call, () -> {
+                if (queryBoolean(c, "select exists (select 1 from " + names.halt() + ")")) {
+                    // its re-send goes by xids, which moved rows would not keep, and it rebuilds the cursors anyway
+                    throw new IllegalStateException("an xid regression halt is recorded in " + names.halt()
+                            + ": recover the xid regression first (OutboxAdmin.recoverXidRegression()); it rebuilds"
+                            + " every cursor, so no shard stays stranded");
+                }
                 stranded.addAll(maintenance.strandedShards(c).keySet());
                 if (stranded.isEmpty()) {
                     throw new IllegalStateException("no stranded shards in " + names.base() + ": every shard's"
@@ -382,7 +388,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                 return null;
             });
         } catch (SQLException | RuntimeException e) {
-            // refused, nothing changed: maintenance running, no shard stranded, or a transaction-pooled connection
+            // refused, nothing changed: maintenance running, a halt, no shard stranded or a transaction-pooled connection
             if (recovering.get()) {
                 log.warn("outbox admin {} on {} failed after {} rows re-sent, which stay re-sent; calling again goes"
                         + " on: {}", call, names.base(), moved.get(), printable(e.toString()));

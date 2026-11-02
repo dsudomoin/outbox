@@ -323,6 +323,25 @@ class StrandedShardsIT {
     }
 
     @Test
+    void refusesDuringAnXidRegressionHalt() throws Exception {
+        leaveTheOtherShardsOnANewerTick();
+        var rows = sendMany(1, 2);
+        makeATick();
+        deleteTheirTick();
+        startRelay();
+        long id = idOf(rows.get(0));
+        try (var c = direct.getConnection(); var ps = c.prepareStatement(XidRecovery.haltInsert(names))) {
+            ps.setLong(1, 1);
+            ps.executeUpdate();
+        }
+
+        assertThatThrownBy(() -> admin().recoverStrandedShards()).isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("recover the xid regression first");
+
+        assertThat(idOf(rows.get(0))).as("nothing moved").isEqualTo(id);
+    }
+
+    @Test
     void logsItsResultInOneLine() throws Exception {
         leaveTheOtherShardsOnANewerTick();
         sendMany(1, 2);
