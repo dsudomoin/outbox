@@ -7,11 +7,13 @@ import io.github.dsudomoin.outbox.OutboxTransactions;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.internal.Cursors.Position;
 import io.github.dsudomoin.outbox.internal.Sql.SqlFunction0;
+import io.github.dsudomoin.outbox.internal.Sql.SqlFunction1;
 import io.github.dsudomoin.outbox.internal.Ticks.Tick;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -566,7 +568,9 @@ public final class Maintenance {
         // The checkpoint is written with stranded shards too: it moves the others on, and keeps them busy at their own
         // ticks (the lowest of which is busy_tick_id), as they were
         var slowest = read == null ? null : step("checkpoint", () -> {
-            cursors.checkpoint(c, read.latest().id(), read.positions());
+            if (anchorBelowAGoneTick(c, read)) {
+                cursors.checkpoint(c, read.latest().id(), read.positions());
+            }
             return read.slowest();
         });
         step("cursor anchors", () -> anchor(c));
@@ -674,12 +678,48 @@ public final class Maintenance {
                 .map(Cursor::shard).toList();
         int appended = 0;
         for (int from = 0; from < wanted.size(); from += ANCHOR_CHUNK) {
-            appended += anchor(c, wanted.subList(from, Math.min(wanted.size(), from + ANCHOR_CHUNK)));
+            appended += anchor(c, wanted.subList(from, Math.min(wanted.size(), from + ANCHOR_CHUNK)),
+                    locked -> cursors.anchors(c, locked, anchorInterval));
         }
         return appended;
     }
 
-    private int anchor(Connection c, List<Integer> shards) throws SQLException {
+    /**
+     * Whether the checkpoint of {@code read} may be written. Its {@code busy_tick_id} is the lowest effective tick of the
+     * busy shards, which a stranded shard's gone tick may be, and it has to stay so: a higher one would give that shard
+     * an existing tick, past rows of its that were never read. But a healthy busy shard whose cursor row lies below it
+     * would get that gone tick as its effective one, and be stranded too. So each such shard first gets a cursor row at
+     * its own effective tick (as its next step would: no row of it lies between, a batch in progress goes on from
+     * there), as {@link #anchor} writes them, a shard a step holds being left. Then false, no checkpoint this run, unless
+     * none is left below the tick.
+     */
+    private boolean anchorBelowAGoneTick(Connection c, Read read) throws SQLException {
+        long lowest = Cursors.busyTick(read.positions(), read.latest().id());
+        if (!read.stranded().containsValue(lowest)) {
+            return true;
+        }
+        var below = read.positions().stream()
+                .filter(p -> Cursors.busy(p) && !read.stranded().containsKey(p.cursor().shard())
+                        && p.cursor().tickId() < lowest)
+                .map(p -> p.cursor().shard()).toList();
+        for (int from = 0; from < below.size(); from += ANCHOR_CHUNK) {
+            anchor(c, below.subList(from, Math.min(below.size(), from + ANCHOR_CHUNK)), locked -> {
+                var rows = new ArrayList<Cursor>();
+                for (var current : cursors.latest(c, locked).values()) {
+                    if (current.effectiveTickId() > current.cursor().tickId()) {
+                        rows.add(current.cursor().withProgress(current.effectiveTickId(),
+                                current.cursor().targetTickId(), current.cursor().lastId()));
+                    }
+                }
+                return rows;
+            });
+        }
+        return cursors.latest(c, below).values().stream().allMatch(current -> current.cursor().tickId() >= lowest);
+    }
+
+    /** One transaction of {@link #anchor}: {@code rows}, given the shards it locked, read after the lock. */
+    private int anchor(Connection c, List<Integer> shards, SqlFunction1<List<Integer>, List<Cursor>> rowsOf)
+            throws SQLException {
         c.setAutoCommit(false);
         try {
             execute(c, "set transaction isolation level read committed");
@@ -695,7 +735,7 @@ public final class Maintenance {
                 }
             }
             anchorLocked.run();
-            var rows = cursors.anchors(c, locked, anchorInterval); // a statement after the lock
+            var rows = rowsOf.apply(locked); // a statement after the lock
             cursors.appendAll(c, rows);
             c.commit();
             return rows.size();

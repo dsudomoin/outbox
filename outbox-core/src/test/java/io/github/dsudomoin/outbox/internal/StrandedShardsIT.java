@@ -275,6 +275,43 @@ class StrandedShardsIT {
     }
 
     @Test
+    void aHealthyShardIdleBehindAGoneTickKeepsFlowing() throws Exception {
+        // the stranded shard on tick X, with a row behind it, so busy at a checkpoint at K; the healthy one idle, its
+        // cursor row on the bootstrap tick, below X, and its effective tick the checkpoint's
+        int stranded = 1;
+        int healthy = 3;
+        var cursors = new Cursors(names, SHARDS);
+        var ticks = new Ticks(names, SHARDS);
+        var maintenance = writer.maintenance();
+        long gone;
+        try (var c = direct.getConnection()) {
+            sendMany(stranded, 1);
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            gone = ticks.latest(c).id();
+            cursors.append(c, new Cursor(stranded, gone, null, 0, null, 0, null, null));
+            sendMany(stranded, 1);
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+        }
+        assertThat(maintenance.runOnce()).isTrue();
+        try (var c = direct.getConnection()) {
+            execute(c, "delete from " + names.tick() + " where id = " + gone);
+        }
+        var row = sendMany(healthy, 1); // busy at the next read
+        makeATick();
+
+        assertThat(maintenance.runOnce()).isTrue();
+
+        try (var c = direct.getConnection()) {
+            assertThat(maintenance.strandedShards(c)).as("the checkpoint strands no other shard")
+                    .containsOnlyKeys(stranded);
+        }
+        startRelay();
+        await(() -> delivered.containsAll(row));
+        Thread.sleep(300);
+        assertThat(times.get(row.get(0))).as("once: the relay's, no repair's").isEqualTo(1);
+    }
+
+    @Test
     void refusesWhenNoShardIsStranded() throws Exception {
         startRelay();
 
