@@ -22,7 +22,8 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 public final class LoadGenerator {
 
     public record Settings(int rate, int writers, int keys, List<String> topics, double rollbackPercent,
-            Map<String, Integer> tags, int txMessages, long holdMs, boolean bulk, String outbox) {
+            Map<String, Integer> tags, int txMessages, long holdMs, boolean bulk, String outbox,
+            @Nullable String bulkKey) {
         Map<String, Object> asMap() {
             var map = new LinkedHashMap<String, Object>();
             map.put("rate", rate);
@@ -35,6 +36,7 @@ public final class LoadGenerator {
             map.put("holdMs", holdMs);
             map.put("bulk", bulk);
             map.put("outbox", outbox);
+            map.put("bulkKey", bulkKey);
             return map;
         }
     }
@@ -196,20 +198,25 @@ public final class LoadGenerator {
 
     private void bulkTx(Settings s, Sender sender, Counts counts) {
         var drafts = new ArrayList<Draft>(s.txMessages());
-        var messages = new ArrayList<OutboxMessage>(s.txMessages());
         for (var i = 0; i < s.txMessages(); i++) {
             var tag = tag(s, counts);
-            var d = new Draft(topic(s, sender, counts, tag), UUID.randomUUID().toString(), tag);
-            drafts.add(d);
-            messages.add(sender.message(d.topic(), d.key(), 0, d.tag()));
+            var key = s.bulkKey() != null ? s.bulkKey() : UUID.randomUUID().toString();
+            drafts.add(new Draft(topic(s, sender, counts, tag), key, tag));
         }
         var rollback = ThreadLocalRandom.current().nextDouble() * 100 < s.rollbackPercent();
         var rows = new ArrayList<Ledger.Sent>(drafts.size());
         try {
             db.inTx(c -> {
+                // one fixed key: the whole batch takes consecutive seqs under the key's row lock, so its order is checked
+                var last = s.bulkKey() == null ? 0 : Ledger.nextSeqs(c, drafts.get(0).topic(), s.bulkKey(), drafts.size());
+                var messages = new ArrayList<OutboxMessage>(drafts.size());
+                for (var i = 0; i < drafts.size(); i++) {
+                    var d = drafts.get(i);
+                    messages.add(sender.message(d.topic(), d.key(), s.bulkKey() == null ? 0 : last - drafts.size() + 1 + i, d.tag()));
+                }
                 var ids = sender.outbox().sendAll(messages);
                 for (var i = 0; i < ids.size(); i++) {
-                    rows.add(row(sender, ids.get(i), drafts.get(i), 0));
+                    rows.add(row(sender, ids.get(i), drafts.get(i), s.bulkKey() == null ? 0 : last - drafts.size() + 1 + i));
                 }
                 Ledger.sent(c, rows);
                 finish(s, rollback);

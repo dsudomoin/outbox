@@ -14,3 +14,5 @@ create table if not exists pc_effect (no bigserial primary key, sink text not nu
   unique (sink, message_id));
 -- own dedupe of the DB route (route `ledger`, see below)
 create table if not exists pc_dedupe (message_id uuid primary key);
+-- a target that counts: the inbox accepted a message whose effect exists
+create table if not exists pc_double_effect (no bigserial primary key, sink text not null, message_id uuid not null, at timestamptz not null default clock_timestamp());

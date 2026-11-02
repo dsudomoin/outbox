@@ -13,7 +13,7 @@ s_db_clock() { # the database's clock jumps forward and back under load, with a 
   docker exec -i "$PG" psql -U outbox -d outbox -q < "$PC/scenarios/ledger.sql"
   docker stop -t 5 "$PG" > /dev/null
   docker rm "$PG" > /dev/null
-  docker run -d --name "$PG" --cpus 2 --memory 2g --shm-size 512m -p 127.0.0.1:55434:5432 -v "$volume:/var/lib/postgresql/data" --entrypoint sh kora-outbox-prodcheck-pg \
+  docker run -d --name "$PG" --cpus 2 --memory 2g --shm-size 512m -p 127.0.0.1:55434:5432 -v "$volume:/var/lib/postgresql/data" --entrypoint sh "$PG_IMAGE" \
     -c "echo '+0' > /tmp/faketime.rc; chmod 644 /tmp/faketime.rc; exec gosu postgres env LD_PRELOAD=$FAKE FAKETIME_TIMESTAMP_FILE=/tmp/faketime.rc FAKETIME_CACHE_DURATION=1 FAKETIME_DONT_FAKE_MONOTONIC=1 postgres -c max_connections=300 -c shared_buffers=512MB -c max_locks_per_transaction=256" > /dev/null
   ready() { docker exec "$PG" pg_isready -U outbox -d outbox -q; }
   wait_for 60 ready

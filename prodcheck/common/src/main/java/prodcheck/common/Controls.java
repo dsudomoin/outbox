@@ -1,6 +1,7 @@
 package prodcheck.common;
 
 import io.github.dsudomoin.outbox.OutboxMessage;
+import io.github.dsudomoin.outbox.OutboxRelay;
 import jakarta.annotation.Nullable;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
@@ -54,7 +55,8 @@ public final class Controls {
                     positive("txMessages", param(r, "txMessages", "1")),
                     Long.parseLong(param(r, "holdMs", "0")),
                     Boolean.parseBoolean(param(r, "bulk", "false")),
-                    outbox);
+                    outbox,
+                    param(r, "bulkKey"));
             var load = loads.get(outbox);
             if (load == null) {
                 throw new IllegalArgumentException("unknown outbox " + outbox + ", this app has " + loads.keySet());
@@ -161,11 +163,29 @@ public final class Controls {
     public HttpServerResponse putHandler(HttpServerRequest r) {
         try {
             handlers.update(param(r, "route"), param(r, "mode"), param(r, "delayMs"), param(r, "failKeys"),
-                    param(r, "poisonFixed"), param(r, "waiting"));
+                    param(r, "poisonFixed"), param(r, "waiting"), param(r, "oneRound"));
             return json(200, handlers.asMap());
         } catch (IllegalArgumentException e) {
             return json(400, Map.of("message", String.valueOf(e.getMessage())));
         }
+    }
+
+    /** {@code OutboxRelay.drain()} on this request's thread: what it returned, or what it threw, and how long it took. */
+    public static HttpServerResponse drain(OutboxRelay relay) {
+        var started = System.nanoTime();
+        var body = new LinkedHashMap<String, Object>();
+        int status = 200;
+        try {
+            body.put("delivered", relay.drain());
+        } catch (Exception e) {
+            status = 409;
+            var root = LoadGenerator.rootCause(e);
+            body.put("exception", e.getClass().getName());
+            body.put("rootCause", root.getClass().getName());
+            body.put("message", e.getMessage());
+        }
+        body.put("ms", (System.nanoTime() - started) / 1_000_000);
+        return json(status, body);
     }
 
     public HttpServerResponse getHandler() {

@@ -59,13 +59,13 @@ class TargetHttp(
     }
 
     /** The statuses of the records, in order; sink = topic. */
-    fun postBatch(records: List<OutboxRecord>): List<Int> {
+    fun postBatch(records: List<OutboxRecord>, oneTx: Boolean = false): List<Int> {
         val items = records.map {
             val e = Event.of(it, it.topic(), instance)
             BatchItem(e.id, e.sink, e.topic, e.key, e.seq, e.tag, e.contract, e.instance)
         }
         val response = http.send(
-            request("/events/batch")
+            request(if (oneTx) "/events/batch-tx" else "/events/batch")
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofByteArray(batchWriter.toByteArray(items)))
                 .build(),

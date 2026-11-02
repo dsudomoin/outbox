@@ -15,7 +15,14 @@ import java.time.ZoneOffset
 enum class AccountEventResult {
     ACKNOWLEDGE,
     REQUEUE,
+    WAIT,
 }
+
+/** {@code accounts.corruptPermanent}: the envelope will never parse. */
+class CorruptEnvelope(cause: Exception) : RuntimeException(cause)
+
+/** The proto3 number of the source field in the envelope, an unknown field of {@code BytesValue} here. */
+const val SOURCE_FIELD = 2
 
 @Component
 class AccountOperation(
@@ -24,16 +31,28 @@ class AccountOperation(
     prodcheck: ProdcheckConfig,
 ) {
     private val instance = prodcheck.instance()
+    private val knownSources = config.knownSources().split(",").map { it.trim().toLong() }.toSet()
 
     /** A parse failure or a null payload throws: the handler answers Retry. */
     fun execute(record: OutboxRecord): AccountEventResult {
-        val body = BytesValue.parseFrom(record.payload()).value.toByteArray()
+        val envelope = try {
+            BytesValue.parseFrom(record.payload())
+        } catch (e: Exception) {
+            if (config.corruptPermanent()) throw CorruptEnvelope(e)
+            throw e
+        }
+        val body = envelope.value.toByteArray()
         val event = Event(
             ROUTE, record.messageId(), record.topic(), record.keyAsString(),
             Payload.seq(body), Payload.tag(body), instance, 1,
         )
         db.inTx<Unit> { c: Connection -> Ledger.arrival(c, event) }
         db.inTx<Unit> { c: Connection -> checkSeen(c, record) }
+        val source = envelope.unknownFields.getField(SOURCE_FIELD).varintList.firstOrNull() ?: 0L
+        if (source !in knownSources) {
+            // the service acknowledges a source it does not know: the event is gone, nothing applied
+            return if (config.unknownSource() == "wait") AccountEventResult.WAIT else AccountEventResult.ACKNOWLEDGE
+        }
         return db.inTx<AccountEventResult> { c: Connection -> business(c, event) }
     }
 

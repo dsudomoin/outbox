@@ -2,6 +2,17 @@
 # (bench/scenarios/chaos-lib.sh and lib.sh, stand-lock.sh among them): the same PID discipline and the same stand lock.
 # Instance I listens on 8079+I and 8084+I, so 1001..1005 are 9080..9084 and 9085..9089; the target is 1011.
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../../bench/scenarios/chaos-lib.sh"
+# Ends with a scenario's own containers removed, after its instances stopped and before the stand lock goes.
+pc_exit() {
+  local rc=$? i
+  if [ -n "${AFTER:-}" ]; then
+    for i in "${!APP_PIDS[@]}"; do inst_stop "$i" || true; done
+    eval "$AFTER" > /dev/null 2>&1 || true
+  fi
+  cleanup
+  exit "$rc"
+}
+trap pc_exit EXIT
 PC=$ROOT/prodcheck
 PG=kora-outbox-prodcheck-source # the helpers' psql_q and cleanup act on this container
 KAFKA=kora-outbox-prodcheck-no-kafka # no Kafka yet: cleanup must not start the stand's
@@ -17,6 +28,11 @@ SHOP_N2=$PC/shop/build/install/shop-n2/bin/shop
 COURIER=$PC/courier/build/install/courier/bin/courier
 TARGET=$PC/target/build/install/target/bin/target
 ACCOUNTS=$PC/accounts/build/install/accounts/bin/accounts
+ACCOUNTS_FULL=$PC/accounts/build/install/accounts-full/bin/accounts
+COMPOSE=(docker compose -f "$PC/docker-compose.yml")
+export PG_VERSION=${PG_VERSION:-16} # also the compose file's
+PG_IMAGE=kora-outbox-prodcheck-pg:$PG_VERSION
+FAKETIME_LIB=/usr/lib/aarch64-linux-gnu/faketime
 T=1011 # the target's instance number
 PC_PG_URL=jdbc:postgresql://localhost:55432/outbox
 PC_TARGET_URL=http://localhost:9090
@@ -32,9 +48,15 @@ pub() { echo "http://localhost:$((8079 + $1))"; }
 pc_begin() {
   SCN=$1 NAME=$1 T0=$(now) CHECKS="" CHECK_FAILED="" FAULTS="" LOADS=()
   log "=== $SCN"
-  docker rm -f "$SOURCE_B" > /dev/null 2>&1 || true
+  docker rm -f -v "$SOURCE_B" > /dev/null 2>&1 || true
   docker volume rm kora-outbox-prodcheck-backup > /dev/null 2>&1 || true
-  docker compose -f "$PC/docker-compose.yml" up -d --wait > /dev/null 2>&1
+  # a replica's or a pooler's leftovers (synchronous_standby_names, say) or another server version: the stand from scratch
+  local image
+  image=$(docker inspect -f '{{.Config.Image}}' "$PG" 2> /dev/null || echo "$PG_IMAGE")
+  if [ "$image" != "$PG_IMAGE" ] || docker inspect kora-outbox-prodcheck-replica > /dev/null 2>&1 || docker inspect kora-outbox-prodcheck-pooler > /dev/null 2>&1; then
+    "${COMPOSE[@]}" --profile failover --profile pooler down -v > /dev/null 2>&1 || true
+  fi
+  "${COMPOSE[@]}" up -d --wait > /dev/null 2>&1
   local c
   for c in "$PG" "$TGT"; do
     docker exec "$c" psql -U outbox -d postgres -Atq -c "drop database if exists outbox with (force)" -c "create database outbox"
@@ -50,7 +72,7 @@ source_replace() {
   PG=$SOURCE_B
   # shellcheck disable=SC2086
   docker run -d --name "$PG" -e POSTGRES_DB=outbox -e POSTGRES_USER=outbox -e POSTGRES_PASSWORD=outbox --cpus 2 --memory 2g \
-    --shm-size 512m -p "127.0.0.1:${2:-55432}:5432" $1 "${3:-kora-outbox-prodcheck-pg}" \
+    --shm-size 512m -p "127.0.0.1:${2:-55432}:5432" $1 "${3:-$PG_IMAGE}" \
     postgres -c max_connections=300 -c shared_buffers=512MB -c max_locks_per_transaction=256 -c synchronous_commit=on > /dev/null
   ready() { docker exec "$PG" pg_isready -U outbox -d outbox -q; }
   wait_for 60 ready
@@ -71,6 +93,18 @@ pc_app() {
 }
 pc_shop() { pc_app "$SHOP" "$@"; }
 pc_courier() { pc_app "$COURIER" "$@"; }
+
+# thread_dump I LABEL: the instance's stacks into build/results, and the outbox threads' top frames to the log.
+thread_dump() {
+  local f=$RESULT_DIR/$SCN-$1-$2.threads
+  "$JAVA_HOME/bin/jstack" "${APP_PIDS[$1]}" > "$f" 2>&1 || true
+  log "threads of $1 ($2): $f"
+  grep -A6 -E '^"outbox-(maintenance|heartbeat|dead-letters|dead-letter-hook|inbox-maintenance)' "$f" | grep -E '^"|^\s+at ' | cut -c1-110 >&2 || true
+}
+
+drain_call() { # drain_call I MAX_SECONDS: the JSON /drain answers, empty when the call did not return in time
+  curl -s --max-time "$2" -XPOST "$(pub "$1")/drain" || true
+}
 
 pc_load() { LOADS[$1]=$2; curl -sf --max-time 10 -XPOST "$(pub "$1")/load?$2" > /dev/null; }
 pc_unload() { LOADS[$1]=""; curl -sf --max-time 60 -XDELETE "$(pub "$1")/load" > /dev/null || true; }

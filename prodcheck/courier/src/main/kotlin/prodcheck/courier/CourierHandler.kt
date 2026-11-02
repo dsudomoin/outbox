@@ -60,6 +60,10 @@ class CourierHandler(private val target: TargetHttp, private val control: Handle
                         else -> {
                             round.add(next)
                             roundKeys.add(key)
+                            if (control.state(ROUTE).oneRound) { // the target is known healthy: the key's rest in this POST
+                                queues.getValue(key).forEach { round.add(it); roundKeys.add(key) }
+                                queues.getValue(key).clear()
+                            }
                         }
                     }
                 }
@@ -70,7 +74,7 @@ class CourierHandler(private val target: TargetHttp, private val control: Handle
             }
             if (round.isEmpty()) continue
             val statuses = try {
-                target.postBatch(round.map { records[it] })
+                target.postBatch(round.map { records[it] }, control.state(ROUTE).oneRound)
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
                 round.forEach { outcomes[it] = Outcome.retry(e) }
@@ -103,6 +107,10 @@ class CourierHandler(private val target: TargetHttp, private val control: Handle
             when {
                 tag == "requeue" && record.requeues() < 3 -> {
                     outcomes[i] = Outcome.requeue() // later messages of the key go on
+                    queue.removeFirst()
+                }
+                tag == "hold" && state.waiting -> {
+                    outcomes[i] = Outcome.requeue()
                     queue.removeFirst()
                 }
                 tag == "wait" && state.waiting -> {

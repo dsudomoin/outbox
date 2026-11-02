@@ -73,8 +73,17 @@ class AccountEventsHandler(
                                 }
                                 Outcome.requeue()
                             }
+
+                            AccountEventResult.WAIT -> {
+                                if (key != null) {
+                                    failedKeys.add(key) // the rule of a waiting head: its key's later records stay behind it
+                                }
+                                Outcome.waitFor("a source this release does not read")
+                            }
                         }
                     }
+                } catch (failure: CorruptEnvelope) {
+                    Outcome.permanent(failure)
                 } catch (failure: Exception) {
                     if (
                         failure is InterruptedException

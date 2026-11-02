@@ -27,17 +27,53 @@ x-postgres: &postgres
 services:
   source:
     <<: *postgres
-    build: ./docker
-    image: kora-outbox-prodcheck-pg
+    build:
+      context: ./docker
+      args:
+        PG_VERSION: ${PG_VERSION:-16}
+    image: kora-outbox-prodcheck-pg:${PG_VERSION:-16}
     container_name: kora-outbox-prodcheck-source
     ports:
       - "127.0.0.1:55432:5432"
   target:
     <<: *postgres
-    image: postgres:16
+    image: postgres:${PG_VERSION:-16}
     container_name: kora-outbox-prodcheck-target
     ports:
       - "127.0.0.1:55433:5432"
+  # A physical streaming replica of the source, for the failover scenarios; the source lets it in first (s-failover.sh).
+  replica:
+    <<: *postgres
+    profiles: [failover]
+    image: kora-outbox-prodcheck-pg:${PG_VERSION:-16}
+    container_name: kora-outbox-prodcheck-replica
+    entrypoint: ["bash", "/replica.sh"]
+    volumes:
+      - ./docker/replica.sh:/replica.sh:ro
+    ports:
+      - "127.0.0.1:55436:5432"
+  # pgbouncer in front of the source's published port, in the mode and as the user the scenario says.
+  pooler:
+    profiles: [pooler]
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.pgbouncer
+    image: kora-outbox-prodcheck-pgbouncer
+    container_name: kora-outbox-prodcheck-pooler
+    environment:
+      POOL_MODE: ${POOL_MODE:-transaction}
+      POOL_USER: ${POOL_USER:-outbox}
+      POOL_SIZE: ${POOL_SIZE:-20}
+    entrypoint: ["bash", "/pgbouncer.sh"]
+    volumes:
+      - ./docker/pgbouncer.sh:/pgbouncer.sh:ro
+    ports:
+      - "127.0.0.1:55437:6432"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6432"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
   # Not a service: the image of an instance whose clock is off (scenario app-clock). `--profile tools build` builds it.
   skewed-app:
     profiles: [tools]

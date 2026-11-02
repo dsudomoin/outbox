@@ -27,6 +27,21 @@ public final class Ledger {
         }
     }
 
+    /** Takes {@code n} seqs of the key at once; the last one. */
+    public static long nextSeqs(Connection c, String topic, String key, int n) throws SQLException {
+        try (var ps = c.prepareStatement("""
+                insert into pc_key_seq (topic, key, seq) values (?, ?, ?)
+                on conflict (topic, key) do update set seq = pc_key_seq.seq + excluded.seq returning seq""")) {
+            ps.setString(1, topic);
+            ps.setString(2, key);
+            ps.setLong(3, n);
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getLong(1);
+            }
+        }
+    }
+
     public static void sent(Connection c, List<Sent> rows) throws SQLException {
         try (var ps = c.prepareStatement("""
                 insert into pc_sent (message_id, app, instance, outbox, topic, key, seq, tag, contract)

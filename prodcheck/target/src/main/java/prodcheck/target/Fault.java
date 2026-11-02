@@ -18,10 +18,12 @@ public final class Fault {
     volatile double failPercent;
     volatile double dropPercent;
     volatile boolean poisonFixed;
+    volatile boolean countDoubles;
 
     /** Omitted parameters keep their value; {@code failKeys=} clears. */
     void update(@Nullable String mode, @Nullable String delayMs, @Nullable String failKeys,
-            @Nullable String failPercent, @Nullable String dropPercent, @Nullable String poisonFixed) {
+            @Nullable String failPercent, @Nullable String dropPercent, @Nullable String poisonFixed,
+            @Nullable String countDoubles) {
         if (mode != null && !Set.of("ok", "error", "hang").contains(mode)) {
             throw new IllegalArgumentException("mode must be ok, error or hang, got " + mode);
         }
@@ -44,6 +46,9 @@ public final class Fault {
         if (poisonFixed != null) {
             this.poisonFixed = Boolean.parseBoolean(poisonFixed);
         }
+        if (countDoubles != null) {
+            this.countDoubles = Boolean.parseBoolean(countDoubles);
+        }
         if (mode != null) {
             this.mode = mode;
         }
@@ -57,6 +62,7 @@ public final class Fault {
         map.put("failPercent", failPercent);
         map.put("dropPercent", dropPercent);
         map.put("poisonFixed", poisonFixed);
+        map.put("countDoubles", countDoubles);
         return map;
     }
 }

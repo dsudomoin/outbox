@@ -1,5 +1,6 @@
 package prodcheck.courier
 
+import io.github.dsudomoin.outbox.OutboxRelay
 import prodcheck.common.Controls
 import ru.tinkoff.kora.common.Component
 import ru.tinkoff.kora.http.common.HttpMethod
@@ -10,7 +11,10 @@ import ru.tinkoff.kora.http.server.common.annotation.HttpController
 
 @Component
 @HttpController
-class CourierController(private val controls: Controls, private val second: SecondOutbox) {
+class CourierController(private val controls: Controls, private val second: SecondOutbox, private val relay: OutboxRelay) {
+
+    @HttpRoute(method = HttpMethod.POST, path = "/drain")
+    fun drain(): HttpServerResponse = Controls.drain(relay)
 
     @HttpRoute(method = HttpMethod.POST, path = "/load")
     fun startLoad(r: HttpServerRequest): HttpServerResponse = controls.startLoad(r)

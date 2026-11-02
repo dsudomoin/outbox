@@ -19,6 +19,7 @@ public final class HandlerControl {
         public volatile Set<String> failKeys = Set.of();
         public volatile boolean poisonFixed;
         public volatile boolean waiting;
+        public volatile boolean oneRound;
     }
 
     private static final long ONE_HOUR_NANOS = 3_600_000_000_000L;
@@ -82,7 +83,7 @@ public final class HandlerControl {
 
     /** Omitted parameters keep their value; {@code failKeys=} clears. */
     void update(@Nullable String route, @Nullable String mode, @Nullable String delayMs, @Nullable String failKeys,
-            @Nullable String poisonFixed, @Nullable String waiting) {
+            @Nullable String poisonFixed, @Nullable String waiting, @Nullable String oneRound) {
         if (route != null && !routes.containsKey(route)) {
             throw new IllegalArgumentException("unknown route " + route + ", this app has " + routes.keySet());
         }
@@ -105,6 +106,9 @@ public final class HandlerControl {
                 }
                 if (waiting != null) {
                     state.waiting = Boolean.parseBoolean(waiting);
+                }
+                if (oneRound != null) {
+                    state.oneRound = Boolean.parseBoolean(oneRound);
                 }
                 if (mode != null) {
                     state.mode = mode;

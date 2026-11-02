@@ -1,5 +1,6 @@
 package prodcheck.shop;
 
+import io.github.dsudomoin.outbox.OutboxRelay;
 import java.util.Map;
 import java.util.Set;
 import prodcheck.common.Controls;
@@ -16,10 +17,17 @@ public final class ShopController {
 
     private final Controls controls;
     private final DeadLetterPolicy hook;
+    private final OutboxRelay relay;
 
-    public ShopController(Controls controls, DeadLetterPolicy hook) {
+    public ShopController(Controls controls, DeadLetterPolicy hook, OutboxRelay relay) {
         this.controls = controls;
         this.hook = hook;
+        this.relay = relay;
+    }
+
+    @HttpRoute(method = HttpMethod.POST, path = "/drain")
+    public HttpServerResponse drain() {
+        return Controls.drain(relay);
     }
 
     @HttpRoute(method = HttpMethod.POST, path = "/load")
