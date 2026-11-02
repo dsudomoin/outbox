@@ -369,7 +369,7 @@ public final class ShardProcessor implements AutoCloseable {
             // null means no parked rows, and a step looks up parked rows only then or on its full check
             s.parkedDue = s.full ? parked.minDue(inTx, shard) : cursor.parkedDueAt();
             var dueParked = !deferred && s.parkedDue != null && !s.parkedDue.isAfter(now)
-                    ? parked.due(inTx, shard, now, relay.batchSize() - heads.size())
+                    ? parked.dueWithOlder(inTx, shard, now, relay.batchSize() - heads.size())
                     : List.<OutboxRecord>of();
             if (s.target == null && heads.isEmpty() && dueParked.isEmpty()) {
                 var checked = cursor.withRetryDueAt(s.full ? retries.minDue(inTx, shard) : s.retryDue)
@@ -942,7 +942,8 @@ public final class ShardProcessor implements AutoCloseable {
 
     /**
      * Each due head with its followers, in id order, in one handler call together with the other due heads and, in the
-     * first round, the due parked rows ({@code dueParked}, a group per key), at most {@code batchSize} rows in all; the
+     * first round, the due parked rows with the older ones of their keys ({@code dueParked}, a group per key;
+     * {@link ParkedStore#dueWithOlder}, {@link ParkedStore#postponeNewer}), at most {@code batchSize} rows in all; the
      * followers of keyed heads that do not wait share what the heads and parked rows leave of it, and a waiting head
      * is handed alone. Per key the delivered rows are deleted, a permanent failure goes to dead and a requeued row is
      * parked (past {@code maxRequeues}: dead, attempts kept); the first row that fails transiently (an attempt,
@@ -959,6 +960,7 @@ public final class ShardProcessor implements AutoCloseable {
     private Pass retryPass(Connection c, int shard, List<RetryStore.DueHead> heads, List<OutboxRecord> dueParked,
             Instant now) throws SQLException, InterruptedException {
         int budget = relay.batchSize() - dueParked.size();
+        boolean parkedCut = heads.size() + dueParked.size() >= relay.batchSize(); // due parked rows may be left
         var pass = new Pass(System.nanoTime() + relay.batchTimeout().toNanos());
         boolean probe = probing.get(shard) == 1; // the first round only: later rounds hand promoted rows
         var parkedGroups = parkedGroups(dueParked);
@@ -1004,6 +1006,9 @@ public final class ShardProcessor implements AutoCloseable {
         var parkedIds = new HashSet<Long>();
         dueParked.forEach(row -> parkedIds.add(row.id()));
         parked.apply(c, shard, pass.parkedWrites, parkedIds, now);
+        if (parkedCut) {
+            parked.postponeNewer(c, shard, pass.parkedWrites, dueParked, now, now.plus(requeue.delay()));
+        }
         return pass;
     }
 

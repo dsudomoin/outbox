@@ -2464,6 +2464,143 @@ class ShardProcessorIT {
     }
 
     @Test
+    void anOlderParkedRowOfAKeyComesBackBeforeADueNewerOne() throws Exception {
+        bootstrap();
+        parkAll("k#1", "k#2");
+        now = now.plus(REQUEUE_DELAY);
+        setParkedDue("k#1", now.plusSeconds(60));
+        setParkedDue("k#2", now);
+        script = answering(Map.of("k#1", Outcome.requeue())); // k#2 is delivered: legal, row by row
+        calls.clear();
+
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+
+        assertThat(calls).singleElement().satisfies(call -> {
+            assertThat(payloads(call)).as("oldest first, not yet due as it is").containsExactly("k#1", "k#2");
+            assertThat(call.get(0).requeues()).isEqualTo(1);
+        });
+        assertThat(delivered()).containsExactly("k#2");
+        assertThat(parkedRows()).as("the early offer counts").containsExactly("k#1:2:" + now.plus(REQUEUE_DELAY));
+        assertThat(cursor().parkedDueAt()).isEqualTo(now.plus(REQUEUE_DELAY));
+    }
+
+    @Test
+    void aKeysParkedRowsKeepTheirOrderAcrossCallsWithMoreOfThemThanBatchSize() throws Exception {
+        config.batchSize(3);
+        bootstrap();
+        var all = IntStream.rangeClosed(1, 8).mapToObj(i -> "k#" + i).toArray(String[]::new);
+        parkAll(all);
+        now = now.plusSeconds(1);
+        for (int i = 0; i < all.length; i++) { // the newest due, the older the later
+            setParkedDue(all[i], now.plusSeconds(all.length - 1 - i));
+        }
+        script = answering(Map.of());
+        calls.clear();
+
+        processUntilNoWork();
+
+        assertThat(calls).extracting(ShardProcessorIT::payloads)
+                .containsExactly(List.of("k#1", "k#2", "k#3"), List.of("k#4", "k#5", "k#6"), List.of("k#7", "k#8"));
+        assertThat(delivered()).containsExactly(all);
+        assertThat(parkedRows()).isEmpty();
+    }
+
+    @Test
+    void aBlockedKeyWithMoreParkedRowsThanBatchSizeWaitsItsDelayAndKeepsItsOrder() throws Exception {
+        config.batchSize(3);
+        bootstrap();
+        var all = IntStream.rangeClosed(1, 8).mapToObj(i -> "k#" + i).toArray(String[]::new);
+        parkAll(all);
+        now = now.plusSeconds(1);
+        for (int i = 0; i < all.length; i++) {
+            setParkedDue(all[i], now.minusMillis(i));
+        }
+        script = records -> records.stream().map(r -> Outcome.requeue()).toList();
+        calls.clear();
+        var behind = rows("select requeues from " + names.parked() + " order by id offset 3", rs -> rs.getString(1));
+
+        process();
+        var first = List.of("k#1", "k#2", "k#3");
+        assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(first);
+        assertThat(process()).as("the newer rows wait with the older: no call again at once")
+                .isEqualTo(new ShardResult(NO_WORK, 0, true));
+        assertThat(calls).hasSize(1);
+        assertThat(cursor().parkedDueAt()).isEqualTo(now.plus(REQUEUE_DELAY));
+
+        now = now.plus(REQUEUE_DELAY);
+        process();
+        assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(first, first);
+        assertThat(rows("select requeues from " + names.parked() + " order by id offset 3", rs -> rs.getString(1)))
+                .as("a row behind the older ones spends no requeue").isEqualTo(behind);
+
+        script = answering(Map.of()); // the block ends
+        now = now.plus(REQUEUE_DELAY);
+        processUntilNoWork();
+        assertThat(delivered()).containsExactly(all);
+    }
+
+    @Test
+    void aDueParkedRowWhoseKeyWaitsInRetryComesAloneAndItsOlderRowsStayAsTheyAre() throws Exception {
+        bootstrap();
+        parkAll("k#1", "k#2");
+        script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.requeue(),
+                "k#3", Outcome.retry(new RuntimeException("k#3 down"))));
+        send(msg("t", "k", "k#3"), msg("t", "j", "j#1"));
+        tick();
+        process();
+        now = now.plus(REQUEUE_DELAY);
+        var later = now.plusSeconds(60);
+        setParkedDue("k#1", later);
+        setParkedDue("k#2", now);
+        try (var c = TestDb.connect()) {
+            execute(c, "update " + names.retry() + " set next_attempt_at = now() + interval '1 hour'");
+        }
+        script = answering(Map.of());
+        calls.clear();
+
+        process();
+
+        assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("k#2"));
+        assertThat(parkedRows()).containsExactly("k#1:2:" + later);
+    }
+
+    @Test
+    void anEarlyOfferCountsAgainstMaxRequeues() throws Exception {
+        config.maxRequeues(1);
+        bootstrap();
+        parkAll("k#1", "k#2");
+        now = now.plus(REQUEUE_DELAY);
+        setParkedDue("k#1", now.plusSeconds(60));
+        setParkedDue("k#2", now);
+        script = answering(Map.of("k#1", Outcome.requeue()));
+
+        process();
+
+        assertThat(deadRows()).containsExactly("k#1:0");
+        assertThat(delivered()).containsExactly("k#2");
+    }
+
+    /** Sends them with one key {@code k}, in order, and has every one parked. */
+    private void parkAll(String... payloads) throws Exception {
+        var script = this.script;
+        this.script = records -> records.stream().map(r -> Outcome.requeue()).toList();
+        send(Arrays.stream(payloads).map(p -> msg("t", "k", p)).toArray(OutboxMessage[]::new));
+        tick();
+        processUntilNoWork();
+        assertThat(parkedRows()).hasSize(payloads.length);
+        this.script = script;
+    }
+
+    private void setParkedDue(String payload, Instant due) throws Exception {
+        try (var c = TestDb.connect(); var ps = c.prepareStatement("update " + names.parked()
+                + " set due_at = ? where payload = ?")) {
+            ps.setObject(1, due.atOffset(ZoneOffset.UTC));
+            ps.setBytes(2, payload.getBytes(UTF_8));
+            assertThat(ps.executeUpdate()).isEqualTo(1);
+        }
+    }
+
+    @Test
     void requeueIsNoFailure() throws Exception {
         config.batchSize(5);
         bootstrap();

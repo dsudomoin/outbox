@@ -21,13 +21,15 @@ import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Set;
+import java.util.TreeMap;
 
 /**
  * Requeued records in {@code <base>_parked}: unlike retry rows they block nothing; each comes back right before the
- * next record of its (topic, key) or at its {@code due_at}. Every method runs on the caller's connection, so inside the
- * shard step's transaction a rolled-back step leaves each record where it was.
+ * next record of its (topic, key) or at its {@code due_at}, or that of a newer parked row of its key. Every method runs
+ * on the caller's connection, so inside the shard step's transaction a rolled-back step leaves each record where it was.
  */
 public final class ParkedStore {
 
@@ -40,6 +42,8 @@ public final class ParkedStore {
     private final String fromRetry;
     private final String selectDue;
     private final String selectOfKeys;
+    private final String selectOlder;
+    private final String postponeNewer;
     private final String minDue;
     private final String size;
 
@@ -72,6 +76,14 @@ public final class ParkedStore {
         selectOfKeys = "select " + RECORD_COLUMNS + " from (select distinct t, b from unnest(?::text[], ?::bytea[])"
                 + " u(t, b)) k cross join lateral (select " + RECORD_COLUMNS + " from " + parked
                 + " where shard = ? and topic = k.t and key = k.b order by id limit ?) p order by id limit ?";
+        selectOlder = "select " + RECORD_COLUMNS + " from unnest(?::text[], ?::bytea[], ?::int8[]) k(t, b, below)"
+                + " cross join lateral (select " + RECORD_COLUMNS + " from " + parked
+                + " where shard = ? and topic = k.t and key = k.b and id < k.below order by id limit ?) p"
+                + " where not exists (select 1 from " + retry + " r where r.shard = ? and r.topic = k.t"
+                + " and r.key = k.b) order by id limit ?";
+        postponeNewer = "update " + parked + " p set due_at = ? from unnest(?::text[], ?::bytea[], ?::int8[])"
+                + " k(t, b, above) where p.shard = ? and p.topic = k.t and p.key = k.b and p.id > k.above"
+                + " and p.due_at <= ?";
         minDue = "select min(due_at) from " + parked + " where shard = ?";
         size = "select count(*) from " + parked;
     }
@@ -218,6 +230,79 @@ public final class ParkedStore {
             ps.setInt(3, limit);
             return records(ps.executeQuery());
         }
+    }
+
+    /**
+     * What a due pass hands: the rows of {@code shard} due at {@code now} and, for each keyed one, the older parked
+     * rows of its (topic, key), due or not, so a key's rows come back in their order whatever their due times; the
+     * oldest {@code limit} of all these, in id order, which keeps each key's a prefix of its rows. A row whose key waits
+     * in the retry table brings none: its key is blocked, and its rows stay as they are until they are due. An unkeyed
+     * row comes alone.
+     */
+    public List<OutboxRecord> dueWithOlder(Connection c, int shard, Instant now, int limit) throws SQLException {
+        var due = due(c, shard, now, limit);
+        var newest = new LinkedHashMap<Object, OutboxRecord>();
+        for (var row : due) { // in id order: the last of a key stays
+            if (row.key() != null) {
+                newest.put(BatchClassifier.orderingKey(row), row);
+            }
+        }
+        if (newest.isEmpty()) {
+            return due;
+        }
+        var rows = new TreeMap<Long, OutboxRecord>();
+        due.forEach(row -> rows.put(row.id(), row));
+        try (var ps = c.prepareStatement(selectOlder)) {
+            bindKeys(c, ps, 1, newest.values());
+            ps.setShort(4, (short) shard);
+            ps.setInt(5, limit);
+            ps.setShort(6, (short) shard);
+            ps.setInt(7, limit);
+            records(ps.executeQuery()).forEach(row -> rows.put(row.id(), row));
+        }
+        return rows.values().stream().limit(limit).toList();
+    }
+
+    /**
+     * After a due pass that may have left due rows of a key unhanded, {@code handed} being as many as it could take:
+     * for each key one of whose handed rows stays parked ({@code writes}: its {@link Park} or {@link Keep}), its due
+     * rows above the highest handed one are due at {@code until}. They could not go before that row anyway, and each
+     * would bring the older rows along again ({@link #dueWithOlder}) right after they were put off, in a loop of calls
+     * that spends their requeues without waiting. A key whose handed rows all left goes on with its next step.
+     */
+    public void postponeNewer(Connection c, int shard, List<Action> writes, List<OutboxRecord> handed, Instant now,
+            Instant until) throws SQLException {
+        var highest = new LinkedHashMap<Object, OutboxRecord>();
+        for (var row : handed) {
+            if (row.key() != null) {
+                highest.put(BatchClassifier.orderingKey(row), row);
+            }
+        }
+        var stay = new LinkedHashMap<Object, OutboxRecord>();
+        for (var write : writes) {
+            var row = highest.get(BatchClassifier.orderingKey(write.r()));
+            if (row != null && (write instanceof Park || write instanceof Keep)) {
+                stay.put(BatchClassifier.orderingKey(row), row);
+            }
+        }
+        if (stay.isEmpty()) {
+            return;
+        }
+        try (var ps = c.prepareStatement(postponeNewer)) {
+            ps.setObject(1, timestamp(until));
+            bindKeys(c, ps, 2, stay.values());
+            ps.setShort(5, (short) shard);
+            ps.setObject(6, timestamp(now));
+            ps.executeUpdate();
+        }
+    }
+
+    /** Parameters {@code first..first+2} of a statement per (topic, key) and an id: each of {@code rows}'. */
+    private static void bindKeys(Connection c, PreparedStatement ps, int first, Collection<OutboxRecord> rows)
+            throws SQLException {
+        ps.setArray(first, c.createArrayOf("text", rows.stream().map(OutboxRecord::topic).toArray()));
+        ps.setArray(first + 1, c.createArrayOf("bytea", rows.stream().map(OutboxRecord::key).toArray(byte[][]::new)));
+        ps.setArray(first + 2, c.createArrayOf("int8", rows.stream().map(OutboxRecord::id).toArray()));
     }
 
     /**

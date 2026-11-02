@@ -303,6 +303,56 @@ class ParkedStoreIT {
     }
 
     @Test
+    void dueWithOlderBringsTheOlderRowsOfEachDueKeyOldestFirst() throws SQLException {
+        var older = record("t", "a");
+        var keyB = record("t", "b");
+        var unkeyedLater = record("t", null);
+        var dueRow = record("t", "a");
+        var newer = record("t", "a");
+        var unkeyedDue = record("t", null);
+        store.apply(c, 0, List.of(new Park(older, 1, LATER), new Park(keyB, 1, LATER),
+                new Park(unkeyedLater, 1, LATER), new Park(dueRow, 1, NOW), new Park(newer, 1, LATER),
+                new Park(unkeyedDue, 1, NOW)), Set.of(), NOW);
+
+        assertThat(store.dueWithOlder(c, 0, NOW, 10)).extracting(OutboxRecord::id)
+                .as("not the row above the due one, another key's or an unkeyed one's")
+                .containsExactly(older.id(), dueRow.id(), unkeyedDue.id());
+        assertThat(store.dueWithOlder(c, 0, NOW, 1)).extracting(OutboxRecord::id).as("cut to the limit, oldest first")
+                .containsExactly(older.id());
+    }
+
+    @Test
+    void dueWithOlderLeavesTheRowsOfAKeyInRetryAsTheyAre() throws SQLException {
+        var older = record("t", "a");
+        var dueRow = record("t", "a");
+        store.apply(c, 0, List.of(new Park(older, 1, LATER), new Park(dueRow, 1, NOW)), Set.of(), NOW);
+        retries.apply(c, 0, List.of(new Head(record("t", "a"), 1, LATER, "down")), NOW);
+
+        assertThat(store.dueWithOlder(c, 0, NOW, 10)).extracting(OutboxRecord::id).containsExactly(dueRow.id());
+    }
+
+    @Test
+    void postponeNewerPutsOffTheDueRowsAboveAKeysHandedRowThatStays() throws SQLException {
+        var handed = record("t", "a");
+        var newerDue = record("t", "a");
+        var newerLater = record("t", "a");
+        var goneHanded = record("t", "b");
+        var goneNewerDue = record("t", "b");
+        store.apply(c, 0, List.of(new Park(handed, 1, NOW), new Park(newerDue, 1, NOW), new Park(newerLater, 1, LATER),
+                new Park(goneHanded, 1, NOW), new Park(goneNewerDue, 1, NOW)), Set.of(), NOW);
+        var until = NOW.plusSeconds(5);
+
+        store.postponeNewer(c, 0, List.of(new Park(handed, 2, until), new Unpark(goneHanded)),
+                List.of(handed, goneHanded), NOW, until);
+
+        assertThat(store.due(c, 0, NOW, 10)).extracting(OutboxRecord::id)
+                .as("a key whose handed row left goes on").containsExactly(handed.id(), goneHanded.id(),
+                        goneNewerDue.id());
+        assertThat(store.due(c, 0, until, 10)).extracting(OutboxRecord::id).contains(newerDue.id())
+                .doesNotContain(newerLater.id());
+    }
+
+    @Test
     void ofKeysMatchesTopicAndKeyExactlyOldestFirst() throws SQLException {
         var k1 = record("t", "k");
         var j1 = record("t", "j");
