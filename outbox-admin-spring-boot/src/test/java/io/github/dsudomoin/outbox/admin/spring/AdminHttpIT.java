@@ -19,6 +19,8 @@ import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestSql;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.sql.Connection;
@@ -47,6 +49,8 @@ import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.test.context.runner.WebApplicationContextRunner;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.ResponseEntity;
 import org.springframework.test.web.servlet.MockMvc;
@@ -62,6 +66,9 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.context.WebApplicationContext;
+import org.springframework.web.servlet.HandlerInterceptor;
+import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
+import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter;
 
 /**
@@ -412,6 +419,49 @@ class AdminHttpIT {
         });
     }
 
+    /** Read as absent, a misspelt status would widen the call to every letter of the topic. */
+    @Test
+    void misspeltStatusIsRefusedWhenTheMapperReadsUnknownEnumsAsNull() {
+        var unknownAsNull = "4.1".equals(System.getProperty("outbox.test.boot"))
+            ? "spring.jackson.datatype.enum.read-unknown-enum-values-as-null=true"
+            : "spring.jackson.deserialization.read-unknown-enum-values-as-null=true";
+        app(() -> {
+            long id = letter(1, "t", "k", "boom", T0, KEPT);
+
+            for (var operation : List.of("redrive", "discard")) {
+                var response = call("POST", "/dead-letters/" + operation,
+                    "{\"filter\":{\"topic\":\"t\",\"status\":\"kpet\"}}");
+
+                assertJson(response, 400);
+                assertThat(response.body).startsWith("{\"message\":\"");
+            }
+            assertThat(deadIds()).containsExactly(id);
+            assertThat(outboxMessageIds()).isEmpty();
+        }, unknownAsNull);
+    }
+
+    /** One MiB gets through, a byte more does not: 1000 ids take about 21 kB. */
+    @Test
+    void aBodyOverTheLimitIsRefused() {
+        app(() -> {
+            long id = letter(1, "t", "k", "boom", T0, KEPT);
+            var start = "{\"ids\":[" + id + "]";
+            var atTheLimit = start + " ".repeat(1024 * 1024 - start.length() - 1) + "}";
+
+            var over = call("POST", "/dead-letters/discard", " " + atTheLimit);
+
+            assertJson(over, 400);
+            assertThat(over.body)
+                .isEqualTo("{\"message\":\"a request body of at most 1048576 bytes, not more\"}");
+            assertThat(deadIds()).containsExactly(id);
+
+            var at = call("POST", "/dead-letters/discard", atTheLimit);
+
+            assertJson(at, 200);
+            assertThat(at.body).isEqualTo("{\"count\":1}");
+        });
+    }
+
     @Test
     void idsAreCappedAt1000() {
         app(() -> {
@@ -735,6 +785,77 @@ class AdminHttpIT {
                 assertJson(call("GET", "/dead-letters/count", null), 500);
             }, "spring.mvc.problemdetails.enabled=" + problemDetails);
         }
+    }
+
+    /** What many apps have: first in order, answering every exception in the app's own way. */
+    @RestControllerAdvice
+    @Order(Ordered.HIGHEST_PRECEDENCE)
+    static class FirstAppAdvice {
+
+        @ExceptionHandler(Exception.class)
+        ResponseEntity<String> any(Exception e) {
+            return ResponseEntity.status(418).body("the app's first handler: " + e.getClass().getSimpleName());
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class FirstApp {
+
+        @Bean
+        AppController appController() {
+            return new AppController();
+        }
+
+        @Bean
+        FirstAppAdvice firstAppAdvice() {
+            return new FirstAppAdvice();
+        }
+    }
+
+    @Test
+    void anAppsFirstInOrderAdviceDoesNotAnswerForTheAdmin() {
+        app(new Class<?>[] {FirstApp.class}, () -> {
+            assertThat(perform("GET", "/app/fail", null, null).getResponse().getStatus()).isEqualTo(418);
+
+            var refused = call("POST", "/dead-letters/discard", "{\"idz\":[1]}");
+            assertJson(refused, 400);
+            assertThat(refused.body).startsWith("{\"message\":\"unknown field 'idz'");
+            var conflict = call("POST", "/recovery/xid-regression", null);
+            assertJson(conflict, 409);
+            assertThat(conflict.body).startsWith("{\"message\":\"no xid regression to recover");
+            execute("drop table " + names.dead() + " cascade");
+            var failed = call("GET", "/dead-letters/count", null);
+            assertJson(failed, 500);
+            assertThat(failed.body).contains(names.dead() + "\\\" does not exist");
+        });
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class RefusingInterceptor implements WebMvcConfigurer {
+
+        @Override
+        public void addInterceptors(InterceptorRegistry registry) {
+            registry.addInterceptor(new HandlerInterceptor() {
+                @Override
+                public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
+                    throw new IllegalArgumentException("refused before the method");
+                }
+            }).addPathPatterns(API + "/**");
+        }
+    }
+
+    /** As a guard's failure: the route's method has not run, the controller's own handlers still answer. */
+    @Test
+    void anExceptionBeforeTheMethodRunsGetsAnError() {
+        app(new Class<?>[] {FirstApp.class, RefusingInterceptor.class}, () -> {
+            long id = letter(1, "t", "k", "boom", T0, KEPT);
+
+            var refused = call("POST", "/dead-letters/discard", "{\"ids\":[" + id + "]}");
+
+            assertJson(refused, 400);
+            assertThat(refused.body).isEqualTo("{\"message\":\"refused before the method\"}");
+            assertThat(deadIds()).containsExactly(id);
+        });
     }
 
     @Aspect

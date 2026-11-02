@@ -22,6 +22,7 @@ import io.github.dsudomoin.outbox.admin.spring.model.OrphanKind;
 import io.github.dsudomoin.outbox.admin.spring.model.Selection;
 import io.github.dsudomoin.outbox.admin.spring.model.Status;
 import jakarta.annotation.Nullable;
+import jakarta.servlet.http.HttpServletRequest;
 import java.beans.PropertyEditorSupport;
 import java.time.Instant;
 import java.time.OffsetDateTime;
@@ -32,28 +33,42 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Objects;
 import java.util.TreeMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.core.NestedRuntimeException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.ErrorResponse;
 import org.springframework.web.bind.WebDataBinder;
+import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.InitBinder;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.context.request.RequestAttributes;
 import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 /**
- * The admin API over {@link OutboxAdmin}, each route a method of the contract's {@link OutboxAdminApi}. An
- * {@link IllegalArgumentException} of a call answers 400, an {@link IllegalStateException} 409, anything else 500
- * ({@link OutboxAdminErrors}). Enums are mapped by exhaustive {@code switch}, so a constant added on either side fails
- * the build instead of a request. Every route is a method of this class, so a {@code HandlerInterceptor} that takes
- * the handlers of this bean type sees them all, before any body is read. Not final: an app's aspect over every
- * controller proxies this one too.
+ * The admin API over {@link OutboxAdmin}, each route a method of the contract's {@link OutboxAdminApi}. Failures become
+ * JSON {@code Error} bodies by this class's own exception handlers, which Spring tries before any advice, so an app's
+ * global advice, whatever its order, or Boot's problem details, do not answer for this controller, nor these handlers
+ * for any other; they also answer what is thrown before a route's method runs (by an argument, or by a
+ * {@code HandlerInterceptor} of its handler). A call's {@link IllegalArgumentException} answers 400, its
+ * {@link IllegalStateException} 409, a request MVC could not read 400, any other exception MVC gives a status (a missing
+ * parameter) that status, and anything else 500 with the failure's message, for the authenticated operator; a 5xx after
+ * one WARN with the exception. Enums are mapped by exhaustive {@code switch}, so a constant added on either side fails
+ * the build instead of a request. Every route is a method of this class, so a {@code HandlerInterceptor} that takes the
+ * handlers of this bean type sees them all, before any body is read. Not final: an app's aspect over every controller
+ * proxies this one too.
  */
 @RestController
 class OutboxAdminController implements OutboxAdminApi {
+
+    private static final Logger log = LoggerFactory.getLogger(OutboxAdminController.class);
 
     /**
      * Request attribute: an operation's arguments for its audit line, a {@code Map<String, String>} by name in order,
@@ -155,6 +170,48 @@ class OutboxAdminController implements OutboxAdminApi {
             ? ResponseEntity.badRequest().body(new Error("a JSON body is required, with Content-Type application/json"))
             : ResponseEntity.status(HttpStatus.UNSUPPORTED_MEDIA_TYPE)
                 .body(new Error("Content-Type " + contentType + " is not supported: application/json only"));
+    }
+
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<Error> refused(IllegalArgumentException e) {
+        return error(HttpStatus.BAD_REQUEST.value(), message(e));
+    }
+
+    @ExceptionHandler(IllegalStateException.class)
+    public ResponseEntity<Error> conflict(IllegalStateException e) {
+        return error(HttpStatus.CONFLICT.value(), message(e));
+    }
+
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    public ResponseEntity<Error> badParameter(MethodArgumentTypeMismatchException e) {
+        return error(HttpStatus.BAD_REQUEST.value(),
+            "Query parameter '" + e.getName() + "' has invalid value: " + e.getValue());
+    }
+
+    /** The parser's own words; Spring's for a missing body would name this controller's method. */
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<Error> unreadable(HttpMessageNotReadableException e) {
+        return error(HttpStatus.BAD_REQUEST.value(),
+            e.getCause() == null ? "a request body is required" : message(e.getMostSpecificCause()));
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<Error> failed(Exception e, HttpServletRequest request) {
+        int status = e instanceof ErrorResponse response ? response.getStatusCode().value() : 500;
+        if (status >= 500) {
+            log.warn("outbox admin {} \"{}\" failed, answered {}", request.getMethod(), request.getRequestURI(), status,
+                e);
+        }
+        // a DataAccessException says "bad SQL grammar []"; the database's own words are the failure
+        return error(status, message(e instanceof NestedRuntimeException nested ? nested.getMostSpecificCause() : e));
+    }
+
+    private static ResponseEntity<Error> error(int status, String message) {
+        return ResponseEntity.status(status).contentType(MediaType.APPLICATION_JSON).body(new Error(message));
+    }
+
+    private static String message(Throwable e) {
+        return Objects.requireNonNullElse(e.getMessage(), e.getClass().getName());
     }
 
     /** The ids, or null for the filter: exactly one of them. */

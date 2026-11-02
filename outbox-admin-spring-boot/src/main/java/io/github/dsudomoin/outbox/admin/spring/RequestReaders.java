@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.admin.spring;
 
+import io.github.dsudomoin.outbox.admin.spring.model.DeadLetterStatus;
 import io.github.dsudomoin.outbox.admin.spring.model.Selection;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -21,12 +22,16 @@ import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandl
  * Checks {@link OutboxAdminController}'s request bodies against the contract before they are bound, as the app's
  * lenient mapper would not: an unknown field it skips, so a typo such as {@code eror} would widen a discard to every
  * letter the rest of the filter matches, and values it coerces ({@code "dryRun":""} to false, {@code [1.5]} to letter
- * 1). Reads the body as a plain tree with the converter about to bind it, so with the app's own JSON library, whichever
- * Jackson that is, without naming one; what this passes has only the contract's fields, each of the contract's JSON
- * type, which every mapper binds the same way.
+ * 1, with {@code read-unknown-enum-values-as-null} a misspelt status to none). Reads the body as a plain tree with the
+ * converter about to bind it, so with the app's own JSON library, whichever Jackson that is, without naming one; what
+ * this passes has only the contract's fields, each of the contract's JSON type and enum values, which leaves a mapper's
+ * settings nothing to coerce. Bodies stop at {@link #MAX_BODY}, as each is held in memory and parsed twice.
  */
 @ControllerAdvice(assignableTypes = OutboxAdminController.class)
 class RequestReaders extends RequestBodyAdviceAdapter {
+
+    /** Far above the largest body the contract needs: 1000 ids take about 21 kB. */
+    private static final int MAX_BODY = 1024 * 1024;
 
     private static final Set<String> SELECTION = Set.of("ids", "filter");
     private static final Set<String> FILTER = Set.of("topic", "key", "error", "failedFrom", "failedTo", "status");
@@ -47,7 +52,10 @@ class RequestReaders extends RequestBodyAdviceAdapter {
     @Override
     public HttpInputMessage beforeBodyRead(HttpInputMessage input, MethodParameter parameter, Type targetType,
             Class<? extends HttpMessageConverter<?>> converterType) throws IOException {
-        var body = input.getBody().readAllBytes();
+        var body = input.getBody().readNBytes(MAX_BODY + 1);
+        if (body.length > MAX_BODY) {
+            throw new IllegalArgumentException("a request body of at most " + MAX_BODY + " bytes, not more");
+        }
         var message = new HttpInputMessage() {
             @Override
             public InputStream getBody() {
@@ -97,6 +105,9 @@ class RequestReaders extends RequestBodyAdviceAdapter {
             }
             known(map, "Filter", FILTER, "topic, key, error, failedFrom, failedTo, status");
             FILTER.forEach(field -> string(map, field));
+            if (map.get("status") instanceof String status) {
+                DeadLetterStatus.fromValue(status); // refuses what a mapper may read as absent
+            }
         }
     }
 

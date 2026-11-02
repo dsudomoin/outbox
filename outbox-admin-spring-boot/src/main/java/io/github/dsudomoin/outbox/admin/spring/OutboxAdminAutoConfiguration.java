@@ -27,11 +27,6 @@ public final class OutboxAdminAutoConfiguration {
     }
 
     @Bean
-    OutboxAdminErrors outboxAdminErrors() {
-        return new OutboxAdminErrors();
-    }
-
-    @Bean
     RequestReaders outboxAdminRequestReaders(ObjectProvider<RequestMappingHandlerAdapter> adapters) {
         return new RequestReaders(adapters);
     }
