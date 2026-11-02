@@ -367,6 +367,29 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
     }
 
     @Test
+    void repairsStrandedShardsOnlyWhenThereAreAny() throws Exception {
+        var none = call("POST", "/recovery/stranded-shards", null);
+
+        assertJson(none, 409);
+        assertThat(none.body()).startsWith("{\"message\":\"no stranded shards");
+
+        var outbox = new PgOutbox(new KoraOutboxTransactions(db), schema, 2, () -> {}, TestTelemetry.kora());
+        var sent = db.inTx((SqlFunction0<List<UUID>>) () -> outbox.sendAll(List.of(
+                OutboxMessage.of("t", "a", bytes("1")), OutboxMessage.of("t", "b", bytes("2")),
+                OutboxMessage.of("t", "c", bytes("3")))));
+        execute("insert into " + names().tick() + " (snapshot) values (pg_current_snapshot())");
+        execute("delete from " + names().tick() + " where id = (select min(tick_id) from " + names().cursor() + ")");
+        execute("delete from " + names().checkpoint());
+
+        var repaired = call("POST", "/recovery/stranded-shards", null);
+
+        assertJson(repaired, 200);
+        assertThat(repaired.body()).isEqualTo("{\"count\":3}");
+        assertThat(outboxMessageIds()).as("re-sent with the same message ids").containsAll(sent);
+        assertJson(call("POST", "/recovery/stranded-shards", null), 409);
+    }
+
+    @Test
     void abandonsWaitingKeysWhole() throws Exception {
         seedWaiting();
 

@@ -10,6 +10,7 @@ import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiServerResponseMap
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiServerResponseMappers.DiscardDeadLettersApiResponseMapper;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiServerResponseMappers.FindDeadLettersApiResponseMapper;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiServerResponseMappers.GetStatusApiResponseMapper;
+import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiServerResponseMappers.RecoverStrandedShardsApiResponseMapper;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiServerResponseMappers.RecoverXidRegressionApiResponseMapper;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiServerResponseMappers.RedriveDeadLettersApiResponseMapper;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiServerResponseMappers.RestoreOrphanApiResponseMapper;
@@ -156,6 +157,13 @@ public interface OutboxAdminHttpModule extends OutboxAdminApiControllerModule {
     default GetStatusApiResponseMapper outboxAdminGetStatusApiResponseMapper(
             @Json HttpServerResponseMapper<Status> status, @Json HttpServerResponseMapper<ModelError> error) {
         return new GetStatusApiResponseMapper(status, error, error, error, error, error);
+    }
+
+    /** Internal type, unstable: for the adapters of this repository. */
+    @InternalApi
+    default RecoverStrandedShardsApiResponseMapper outboxAdminRecoverStrandedShardsApiResponseMapper(
+            @Json HttpServerResponseMapper<Count> count, @Json HttpServerResponseMapper<ModelError> error) {
+        return new RecoverStrandedShardsApiResponseMapper(count, error, error, error, error, error);
     }
 
     /** Internal type, unstable: for the adapters of this repository. */

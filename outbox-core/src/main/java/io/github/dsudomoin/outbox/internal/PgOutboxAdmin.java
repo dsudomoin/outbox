@@ -23,9 +23,12 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HexFormat;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
@@ -39,9 +42,10 @@ import org.slf4j.LoggerFactory;
  * {@code for update skip locked}, in a read-committed transaction of its own. A redrive chunk then tries their key
  * locks without waiting ({@link DeadLetters#tryKeyLocks}) and redrives the ready ones as the dead-letter pass does
  * ({@link DeadLetters#redrive}), so no writer waits for one of its key locks. Filters are bound parameters, never
- * interpolated; user text is logged with control characters escaped ({@link #printable}). {@code restoreOrphan} and
- * {@code recoverXidRegression} hold the maintenance lock for their whole run, so maintenance's steps never run beside
- * them. The reads, {@code status} and the dead-letter find and count, give up on a statement after 60 s (57014).
+ * interpolated; user text is logged with control characters escaped ({@link #printable}). {@code restoreOrphan},
+ * {@code recoverXidRegression} and {@code recoverStrandedShards} hold the maintenance lock for their whole run, so
+ * maintenance's steps never run beside them. The reads, {@code status} and the dead-letter find and count, give up on
+ * a statement after 60 s (57014).
  * {@code abandonWaiting} moves each chunk under its shard's lock, which every relay step holds while it writes the
  * retry and parked tables, so no step adds a record to a key it moves or makes a key it reads wait meanwhile.
  */
@@ -54,8 +58,9 @@ public final class PgOutboxAdmin implements OutboxAdmin {
 
     private final OutboxTransactions db;
     /**
-     * Where {@link #status}, {@link #restoreOrphan} and {@link #recoverXidRegression} run: {@link #db}, or the owner's
-     * connections ({@link OwnerTransactions}): they read partitions directly or run DDL.
+     * Where {@link #status}, {@link #restoreOrphan}, {@link #recoverXidRegression} and {@link #recoverStrandedShards}
+     * run: {@link #db}, or the owner's connections ({@link OwnerTransactions}): they read partitions directly, run DDL
+     * or hold the maintenance lock.
      */
     private final OutboxTransactions ddl;
     private final TableNames names;
@@ -67,6 +72,11 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     private final RetryStore retries;
     private final ParkedStore parked;
     private final XidRecovery recovery;
+    private final Ticks ticks;
+    private final Cursors cursors;
+    private final Resender resender;
+    /** How long a {@link #recoverStranded} chunk may wait for a lock while it holds key locks. */
+    private final Duration keyLockWait;
     final OrphanRestore orphanRestore; // for a test's seam
     private final String dead;
     /** Moves, then counts, the rows of a chunk's waiting heads: of the retry table, then of the parked one. */
@@ -109,8 +119,11 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         this.retries = new RetryStore(names, false); // its dead rows are kept: the abandoned ones
         this.parked = new ParkedStore(names, retries);
         this.recovery = new XidRecovery(names, config);
-        this.orphanRestore = new OrphanRestore(
-                names, new Resender(names, config), XidPartitions.lockWait(config.partitions()));
+        this.ticks = new Ticks(names, shards);
+        this.cursors = new Cursors(names, shards);
+        this.resender = new Resender(names, config);
+        this.keyLockWait = XidPartitions.lockWait(config.partitions());
+        this.orphanRestore = new OrphanRestore(names, resender, keyLockWait);
         this.dead = names.dead();
         this.shardWait = Maintenance.quiesceTimeout(config);
         // the rows of a chunk's waiting heads: each head by id (in the retry table), and every row of its key
@@ -341,6 +354,191 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             wakeRelay.run();
         }
         return sent.get();
+    }
+
+    /**
+     * Under the maintenance lock ({@link #underMaintenanceLock}), so no recovery or other such call goes on beside it,
+     * shard by shard ({@link #recoverStranded}) as {@link Maintenance#strandedShards} finds them.
+     */
+    @Override
+    public long recoverStrandedShards() {
+        requireOwnTransactions();
+        var call = "recoverStrandedShards()";
+        var recovering = new AtomicBoolean();
+        var moved = new AtomicLong();
+        var stranded = new ArrayList<Integer>();
+        try (var c = ddl.newConnection()) {
+            c.setAutoCommit(true);
+            underMaintenanceLock(c, call, () -> {
+                stranded.addAll(maintenance.strandedShards(c).keySet());
+                if (stranded.isEmpty()) {
+                    throw new IllegalStateException("no stranded shards in " + names.base() + ": every shard's"
+                            + " effective tick exists");
+                }
+                recovering.set(true);
+                for (var shard : stranded) {
+                    recoverStranded(c, shard, moved);
+                }
+                return null;
+            });
+        } catch (SQLException | RuntimeException e) {
+            // refused, nothing changed: maintenance running, no shard stranded, or a transaction-pooled connection
+            if (recovering.get()) {
+                log.warn("outbox admin {} on {} failed after {} rows re-sent, which stay re-sent; calling again goes"
+                        + " on: {}", call, names.base(), moved.get(), printable(e.toString()));
+                wakeRelay.run(); // for the shards it repaired before it failed
+            }
+            throw e instanceof SQLException s ? db.translate(s) : (RuntimeException) e;
+        }
+        log.info("outbox admin {} on {} returned {}, the rows re-sent, for shards {}", call, names.base(), moved.get(),
+                stranded);
+        wakeRelay.run();
+        return moved.get();
+    }
+
+    /**
+     * Repairs one stranded shard: its rows the latest tick L covers are moved back into the outbox, then its cursor
+     * goes to L, due as its retry and parked tables say. L is read first, so what its snapshot covers had committed
+     * before the read of the rows, which so finds all of it. What it does not cover is the relay's from the new cursor
+     * on and is not touched: a transaction committing at any point of this, the re-sent rows included, whose xids L
+     * cannot cover, as they were taken after it. The rows move rather than copy, the insert and the delete in one
+     * transaction, so a call that fails midway repeats none of them: until the cursor moves, no step delivers any.
+     * Those of a key another transaction holds stay, in this pass's later chunks too, so that each key's rows go in id
+     * order; each pass after the first waits for one such key, so a key held almost all the time gets through too,
+     * and for at most {@link XidPartitions#lockWait}, only that key's writers waiting meanwhile. After
+     * {@link OrphanRestore#HELD_KEYS_WAITED} waits, or a wait that ran out, the call gives up.
+     *
+     * <p>ponytail: the ids and xids of a shard's rows sit in memory for the call, about 40 bytes a row, 40 MB per
+     * million; the outbox has no index on id, so reading them in id order per chunk would scan the shard each time.
+     */
+    private void recoverStranded(Connection c, int shard, AtomicLong moved) throws SQLException {
+        var latest = ticks.latest(c);
+        var pending = coveredRows(c, shard, latest);
+        try {
+            Integer waitFor = null;
+            for (int waits = 0; !pending.isEmpty(); waits++) {
+                var left = new ArrayList<CoveredRow>();
+                var held = new LinkedHashSet<Integer>();
+                for (int from = 0; from < pending.size(); from += CHUNK) {
+                    var chunk = pending.subList(from, Math.min(from + CHUNK, pending.size()));
+                    var firstWait = from == 0 ? waitFor : null;
+                    moved.addAndGet(inTx(c, tx -> moveChunk(tx, shard, chunk, firstWait, held, left)));
+                    if (afterChunk != null) {
+                        afterChunk.accept(c);
+                    }
+                }
+                if (!left.isEmpty() && waits == OrphanRestore.HELD_KEYS_WAITED) {
+                    throw new IllegalStateException("shard " + shard + " of " + names.base() + " is busy, retry: "
+                            + left.size() + " of its rows are of keys open transactions held all along");
+                }
+                pending = left;
+                waitFor = held.isEmpty() ? null : held.iterator().next();
+            }
+            inTx(c, tx -> {
+                lockShard(tx, shard);
+                cursors.append(tx, new Cursors.Cursor(shard, latest.id(), null, 0, null, 0, retries.minDue(tx, shard),
+                        parked.minDue(tx, shard)));
+                return null;
+            });
+        } catch (Throwable e) { // an inTx rolled back, and left the connection out of autocommit
+            try {
+                c.setAutoCommit(true);
+            } catch (SQLException cleanup) { // a terminated session
+                e.addSuppressed(cleanup);
+            }
+            if (e instanceof SQLException x && LOCK_NOT_AVAILABLE.equals(x.getSQLState())) {
+                throw new IllegalStateException("shard " + shard + " of " + names.base() + " is busy, retry: a key of"
+                        + " its rows or a table they go to stayed locked for longer than "
+                        + keyLockWait.toMillis() / 1e3 + " s", e);
+            }
+            throw e;
+        }
+    }
+
+    /** A row of a stranded shard, as much of it as finds it again: the outbox has an index on (shard, xid) alone. */
+    private record CoveredRow(long id, long xid) {}
+
+    /** The rows of {@code shard} that {@code tick}'s snapshot covers, in id order. */
+    private List<CoveredRow> coveredRows(Connection c, int shard, Ticks.Tick tick) throws SQLException {
+        try (var ps = c.prepareStatement("select id, xid::text from " + names.base() + " where shard = ?"
+                + " and pg_visible_in_snapshot(xid, ?::pg_snapshot) order by id")) {
+            ps.setShort(1, (short) shard);
+            ps.setString(2, tick.snapshot().text());
+            var rows = new ArrayList<CoveredRow>();
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    rows.add(new CoveredRow(rs.getLong(1), Long.parseLong(rs.getString(2))));
+                }
+            }
+            return rows;
+        }
+    }
+
+    /**
+     * One transaction under the shard's lock: first, with {@code waitFor}, that key's lock, waited for; then the rows
+     * of {@code chunk} not in the retry, parked or dead tables, each of which keeps the id and message id of its outbox
+     * row, moved ({@link Resender}), but those of a key another transaction holds, tried without waiting, which go to
+     * {@code left}, their keys to {@code held}. Returns the rows moved.
+     */
+    private long moveChunk(Connection tx, int shard, List<CoveredRow> chunk, @Nullable Integer waitFor,
+            Set<Integer> held, List<CoveredRow> left) throws SQLException {
+        lockShard(tx, shard);
+        // from here on, writers may queue behind this chunk's key locks: wait no longer than the swap may
+        execute(tx, "set local lock_timeout = " + keyLockWait.toMillis());
+        if (waitFor != null) {
+            try (var ps = tx.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {
+                ps.setInt(1, names.keyNamespace());
+                ps.setInt(2, waitFor);
+                ps.execute();
+            }
+        }
+        var xids = tx.createArrayOf("text", chunk.stream().map(r -> Long.toString(r.xid())).distinct().toArray());
+        var rows = new ArrayList<Resender.Row>(chunk.size());
+        var ids = new ArrayList<Long>(chunk.size());
+        var xidsOf = new ArrayList<Long>(chunk.size());
+        try (var ps = tx.prepareStatement("select o.id, o.xid::text, o.message_id, o.topic, o.key, o.payload, o.headers"
+                + " from " + names.base() + " o where o.shard = ? and o.xid = any(?::text[]::xid8[]) and o.id = any(?)"
+                + " and not exists (select 1 from " + names.retry() + " r where r.id = o.id"
+                + " and r.message_id = o.message_id)"
+                + " and not exists (select 1 from " + names.parked() + " p where p.id = o.id"
+                + " and p.message_id = o.message_id)"
+                + " and not exists (select 1 from " + dead + " d where d.id = o.id and d.message_id = o.message_id)"
+                + " order by o.id")) {
+            ps.setShort(1, (short) shard);
+            ps.setArray(2, xids);
+            ps.setArray(3, tx.createArrayOf("int8", chunk.stream().map(CoveredRow::id).toArray()));
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    ids.add(rs.getLong(1));
+                    xidsOf.add(Long.parseLong(rs.getString(2)));
+                    rows.add(new Resender.Row(rs.getObject(3, UUID.class), rs.getString(4), rs.getBytes(5),
+                            rs.getBytes(6), rs.getBytes(7)));
+                }
+            }
+        }
+        var hashes = rows.stream().map(r -> r.key() == null ? null : Hashing.keyHash(r.topic(), r.key())).toList();
+        held.addAll(resender.tryKeyLocks(tx, hashes.stream().filter(h -> h != null && !held.contains(h)).toList()));
+        var ready = new ArrayList<Resender.Row>(rows.size());
+        var readyIds = new ArrayList<Long>(rows.size());
+        var readyXids = new ArrayList<String>(rows.size());
+        for (int i = 0; i < rows.size(); i++) {
+            if (hashes.get(i) != null && held.contains(hashes.get(i))) {
+                left.add(new CoveredRow(ids.get(i), xidsOf.get(i)));
+            } else {
+                ready.add(rows.get(i));
+                readyIds.add(ids.get(i));
+                readyXids.add(Long.toString(xidsOf.get(i)));
+            }
+        }
+        resender.insertAll(tx, ready);
+        try (var ps = tx.prepareStatement("delete from " + names.base() + " where shard = ?"
+                + " and xid = any(?::text[]::xid8[]) and id = any(?)")) {
+            ps.setShort(1, (short) shard);
+            ps.setArray(2, tx.createArrayOf("text", readyXids.stream().distinct().toArray()));
+            ps.setArray(3, tx.createArrayOf("int8", readyIds.toArray()));
+            ps.executeUpdate();
+        }
+        return ready.size();
     }
 
     /**

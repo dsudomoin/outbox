@@ -52,7 +52,7 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
         }
     }
 
-    /** All eight, in the contract's order, each acting on what {@link #seed} made when allowed. */
+    /** All nine, in the contract's order, each acting on what {@link #seed} made when allowed. */
     static final List<Route> ROUTES = List.of(
             new Route("getStatus", "GET", API + "/status", null),
             new Route("findDeadLetters", "GET", API + "/dead-letters?topic=t", null),
@@ -60,6 +60,7 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
             new Route("redriveDeadLetters", "POST", API + "/dead-letters/redrive", "{\"ids\":[1]}"),
             new Route("discardDeadLetters", "POST", API + "/dead-letters/discard", "{\"ids\":[1]}"),
             new Route("restoreOrphan", "POST", API + "/orphans/{orphan}/restore?fromXid=0", null),
+            new Route("recoverStrandedShards", "POST", API + "/recovery/stranded-shards", null),
             new Route("recoverXidRegression", "POST", API + "/recovery/xid-regression", null),
             new Route("abandonWaiting", "POST", API + "/waiting/abandon", "{\"topic\":\"t\",\"reason\":\"test\"}"));
 
@@ -288,9 +289,11 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
         execute("insert into " + table + "_tick (snapshot, created_at) select (x || ':' || x || ':')::pg_snapshot,"
                 + " now() - interval '1 minute' from (select pg_snapshot_xmax(pg_current_snapshot())::text::bigint"
                 + " + 1000000000 x) s");
+        // the cursors' tick gone, so the shards stranded; the forged tick above is the latest
+        execute("delete from " + table + "_tick where id = (select min(tick_id) from " + table + "_cursor)");
     }
 
-    /** What the mutating routes change: dead letter ids, outbox message ids, the orphan's rows, the ticks. */
+    /** What the mutating routes change: dead letter ids, outbox message ids, the orphan's rows, ticks and cursors. */
     private String state() throws SQLException {
         try (var c = TestDb.connect()) {
             var orphanRows = queryString(c, "select to_regclass(?)::text", orphan()) == null ? "dropped"
@@ -299,7 +302,8 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
                     queryString(c, "select string_agg(id::text, ',' order by id) from " + table + "_dead"),
                     queryString(c, "select string_agg(message_id::text, ',' order by id) from " + table),
                     orphanRows,
-                    queryString(c, "select string_agg(id::text, ',' order by id) from " + table + "_tick"));
+                    queryString(c, "select string_agg(id::text, ',' order by id) from " + table + "_tick"),
+                    queryString(c, "select string_agg(seq::text, ',' order by seq) from " + table + "_cursor"));
         }
     }
 

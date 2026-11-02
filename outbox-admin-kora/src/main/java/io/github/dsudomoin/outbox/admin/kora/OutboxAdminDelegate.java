@@ -27,6 +27,10 @@ import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.GetStat
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.GetStatusApiResponse.GetStatus200ApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.GetStatusApiResponse.GetStatus400ApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.GetStatusApiResponse.GetStatus409ApiResponse;
+import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.RecoverStrandedShardsApiResponse;
+import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.RecoverStrandedShardsApiResponse.RecoverStrandedShards200ApiResponse;
+import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.RecoverStrandedShardsApiResponse.RecoverStrandedShards400ApiResponse;
+import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.RecoverStrandedShardsApiResponse.RecoverStrandedShards409ApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.RecoverXidRegressionApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.RecoverXidRegressionApiResponse.RecoverXidRegression200ApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.RecoverXidRegressionApiResponse.RecoverXidRegression400ApiResponse;
@@ -142,6 +146,12 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
     public RecoverXidRegressionApiResponse recoverXidRegression() {
         return call(() -> new RecoverXidRegression200ApiResponse(new Count(admin.recoverXidRegression())),
                 RecoverXidRegression400ApiResponse::new, RecoverXidRegression409ApiResponse::new);
+    }
+
+    @Override
+    public RecoverStrandedShardsApiResponse recoverStrandedShards() {
+        return call(() -> new RecoverStrandedShards200ApiResponse(new Count(admin.recoverStrandedShards())),
+                RecoverStrandedShards400ApiResponse::new, RecoverStrandedShards409ApiResponse::new);
     }
 
     @Override

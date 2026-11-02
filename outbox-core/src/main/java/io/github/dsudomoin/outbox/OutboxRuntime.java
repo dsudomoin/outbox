@@ -250,8 +250,8 @@ public final class OutboxRuntime implements AutoCloseable {
         /**
          * Connections of the role that owns the tables, for everything that runs DDL or holds the session locks: the
          * startup, maintenance (partitions, orphans, the xid-regression recovery), {@link OutboxAdmin#status()},
-         * {@link OutboxAdmin#restoreOrphan} and {@link OutboxAdmin#recoverXidRegression()}; {@code transactions} then
-         * needs DML only. Requires {@code outbox.schema.bootstrap = false}: the migrations own the base tables.
+         * {@link OutboxAdmin#restoreOrphan}, {@link OutboxAdmin#recoverXidRegression()} and
+         * {@link OutboxAdmin#recoverStrandedShards()}; {@code transactions} then needs DML only. Requires {@code outbox.schema.bootstrap = false}: the migrations own the base tables.
          */
         public Builder ownerConnections(ConnectionSource owner) {
             this.owner = Objects.requireNonNull(owner, "owner");

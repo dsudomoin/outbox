@@ -401,6 +401,11 @@ public final class Maintenance {
         }
     }
 
+    /** The shards a step of which fails as their effective tick has no row, by shard, with that tick; read now. */
+    Map<Integer, Long> strandedShards(Connection c) throws SQLException {
+        return read(c).stranded();
+    }
+
     /** {@code outbox.shard.lag} read now, for {@link PgOutboxAdmin#status()}. */
     double lagSeconds(Connection c) throws SQLException {
         return read(c).lagSeconds();
@@ -451,15 +456,17 @@ public final class Maintenance {
      * The ERROR for shards whose effective tick has no row: their batches cannot be read from it, so every step of
      * theirs fails and the relay is stopped for them, and maintenance drops no partitions and deletes no ticks while
      * any is, as the horizon they need is unknown. Their rows stay in the outbox. Nothing moves them on by itself:
-     * which rows their lost tick had seen is gone with it.
+     * which rows their lost tick had seen is gone with it, so the repair re-sends them, a call of the admin's
+     * ({@link PgOutboxAdmin#recoverStrandedShards()}).
      */
     private void logStranded(Read read) {
         log.error("outbox shards {} of {} start from ticks {} that no longer exist: deleted by hand, or lost with"
                 + " a restore of {} without {} and {} (cleanup keeps every tick a latest cursor row is on). Their"
                 + " batches cannot be read, so the relay is stopped for them (each step fails with «its effective tick"
                 + " was deleted»), and maintenance drops no partitions and deletes no ticks until they move; their rows"
-                + " stay in the outbox, and outbox.shard.lag counts from the oldest tick left. To recover, see the"
-                + " README, «Застрявшие шарды» under «Таблицы»; this ERROR repeats at most once a minute",
+                + " stay in the outbox, and outbox.shard.lag counts from the oldest tick left."
+                + " OutboxAdmin.recoverStrandedShards() or POST /kora-outbox/admin/v1/recovery/stranded-shards repairs"
+                + " them on running instances, re-sending their rows; this ERROR repeats at most once a minute",
                 read.stranded().keySet(), names.base(), read.stranded().values().stream().distinct().sorted().toList(),
                 names.tick(), names.cursor(), names.checkpoint());
     }

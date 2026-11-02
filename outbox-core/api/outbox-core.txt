@@ -120,6 +120,7 @@ package io.github.dsudomoin.outbox {
     method public long discardDeadLetters(io.github.dsudomoin.outbox.DeadLetterFilter!);
     method public long discardDeadLetters(java.util.Collection<java.lang.Long!>!);
     method public io.github.dsudomoin.outbox.DeadLetterPage! findDeadLetters(io.github.dsudomoin.outbox.DeadLetterFilter!, Long?, int);
+    method public long recoverStrandedShards();
     method public long recoverXidRegression();
     method public long redriveDeadLetters(io.github.dsudomoin.outbox.DeadLetterFilter!);
     method public long redriveDeadLetters(java.util.Collection<java.lang.Long!>!);

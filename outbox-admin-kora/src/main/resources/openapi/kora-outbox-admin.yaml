@@ -3,12 +3,12 @@ info:
   title: kora-outbox admin
   version: v1
   description: >-
-    The kora-outbox admin API: status, dead letters, orphans, the xid-regression recovery and waiting records, each call
-    acting on the shared database, so any instance answers the same. No security scheme is declared: access is decided
+    The kora-outbox admin API: status, dead letters, orphans, the xid-regression recovery, stranded shards and waiting
+    records, each call acting on the shared database, so any instance answers the same. No security scheme is declared: access is decided
     by the service's OutboxAdminAuthorizer, which runs before every operation and answers 401 or 403 with an Error (500,
     "authorization failed", when it fails). A call refused for its input answers 400, a request body with a field this
     contract does not name included; one that cannot run in the outbox's current state (maintenance or a relay step
-    running, no xid regression to recover) answers 409; any other failure of an allowed call answers 500 with the
+    running, no xid regression to recover, no stranded shard) answers 409; any other failure of an allowed call answers 500 with the
     failure's message, or the HTTP server's own status for one it raised itself (a 503, say). Every one of them carries
     an Error.
 paths:
@@ -191,6 +191,34 @@ paths:
       responses:
         '200':
           description: How many rows were moved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Count'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/ServerError'
+  /kora-outbox/admin/v1/recovery/stranded-shards:
+    post:
+      operationId: recoverStrandedShards
+      tags: [OutboxAdmin]
+      summary: Repairs the shards that start from a tick that no longer exists, on running instances
+      description: >-
+        Re-sends the stranded shards' rows still in the outbox but those in the retry, parked and dead tables, as new
+        messages with the same message ids, delivered before or not, then moves each shard's cursor to the latest tick.
+        The other shards keep flowing. Answers 409 when no shard is stranded, or, the rows moved so far staying moved
+        and calling again going on, when a maintenance run held its lock for 60 s or a lock on a shard or key was held
+        for too long.
+      responses:
+        '200':
+          description: How many rows were re-sent
           content:
             application/json:
               schema:

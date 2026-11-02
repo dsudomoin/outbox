@@ -5,9 +5,9 @@ import java.util.Collection;
 
 /**
  * The morning tool, for any code of the service (an endpoint, a job, a test): the outbox's status, dead letters, kept
- * orphans, the xid-regression recovery and waiting records. Every call manages its own transactions, so it fails with
- * {@link IllegalStateException} inside the application's transaction; any instance gives the same answers, as all act
- * on the shared database.
+ * orphans, the xid-regression recovery, stranded shards and waiting records. Every call manages its own transactions,
+ * so it fails with {@link IllegalStateException} inside the application's transaction; any instance gives the same
+ * answers, as all act on the shared database.
  *
  * <p>Bulk calls act on the letters dead when they began, none that die meanwhile (a redriven letter dying again
  * included), in chunks of 1 000 letters in id order, one transaction each, so a large redrive never holds more than
@@ -86,6 +86,26 @@ public interface OutboxAdmin {
      *     retries, finishing it first
      */
     long recoverXidRegression();
+
+    /**
+     * Repairs the stranded shards, those starting from a tick that no longer exists (the ERROR "outbox shards ... start
+     * from ticks ... that no longer exist"), on a running fleet: the other shards keep flowing and nothing has to stop.
+     * Which of a stranded shard's rows went through the relay is gone with its tick, so each of its rows still in the
+     * outbox goes back as a new message, with a new id and xid and the same message id, delivered after later messages
+     * of its key: consumers get as duplicates the ones delivered before, and only those inside their inbox window are
+     * dropped for them. Rows in the retry, parked and dead tables stay there. Then the shard's cursor moves to the
+     * latest tick. A transaction committing meanwhile loses nothing: what the tick does not cover the relay delivers.
+     *
+     * <p>Under the maintenance lock: waits up to 60 s for a maintenance run in progress, then fails with
+     * {@link IllegalStateException} "maintenance is running, retry". Shard by shard, in chunks of 1 000 rows, one
+     * transaction each under the shard's lock, the one a relay step holds, waited for up to
+     * {@code outbox.relay.batchTimeout} + 5 s. A key another transaction holds (an open {@code send} of it) is waited
+     * for last. Whatever keeps a lock too long fails the call with {@link IllegalStateException} "... busy, retry": the
+     * rows moved stay moved, each once, and calling again goes on. Wakes the relay; returns the rows re-sent.
+     *
+     * @throws IllegalStateException "no stranded shards" when no shard is stranded
+     */
+    long recoverStrandedShards();
 
     /**
      * Gives up on the records of {@code topic} that wait for an instance able to handle them ({@link Outcome.Waiting}),
