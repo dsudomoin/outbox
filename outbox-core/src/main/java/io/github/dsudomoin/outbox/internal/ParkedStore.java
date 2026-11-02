@@ -83,9 +83,10 @@ public final class ParkedStore {
                 + " where shard = ? and topic = k.t and key = k.b order by id limit ?) p order by id limit ?";
         // of a key waiting in retry, its lowest row not due; of any other, its rows below the due one, the oldest
         // first, after those, so that those never cut the others to fewer than the limit
-        selectOlder = "select " + RECORD_COLUMNS + ", due_at, in_retry from unnest(?::text[], ?::bytea[], ?::int8[])"
-                + " u(t, b, below) cross join lateral (select exists (select 1 from " + retry
-                + " r where r.shard = ? and r.topic = u.t and r.key = u.b) in_retry) k"
+        selectOlder = "select " + RECORD_COLUMNS + ", due_at, in_retry, head_due"
+                + " from unnest(?::text[], ?::bytea[], ?::int8[]) u(t, b, below)"
+                + " cross join lateral (select count(*) > 0 in_retry, min(r.next_attempt_at) head_due from " + retry
+                + " r where r.shard = ? and r.topic = u.t and r.key = u.b) k"
                 + " cross join lateral (select " + RECORD_COLUMNS + ", due_at from " + parked
                 + " where shard = ? and topic = u.t and key = u.b and id < u.below and (not k.in_retry or due_at > ?)"
                 + " order by id limit case when k.in_retry then 1 else ? end) p order by in_retry desc, id limit ?";
@@ -252,8 +253,10 @@ public final class ParkedStore {
      * rows of its (topic, key), due or not, so a key's rows come back in their order whatever their due times; the
      * oldest {@code limit} of all these, in id order, which keeps each key's a prefix of its rows. A key waiting in the
      * retry table is blocked, so its rows are not offered ahead of time: its due rows come only up to its lowest row
-     * not due, and those above that stay parked, due with it and at least {@code requeueDelay} from now, no requeue
-     * spent, so the shard is not stepped for them in the meantime. An unkeyed row comes alone.
+     * not due, and those above that stay parked, no requeue spent, due with it or when the key's retry head comes up,
+     * whichever is sooner, as the key may leave the retry table then, and at least {@code requeueDelay} from now, so
+     * the shard is not stepped for them in the meantime: at most one more step per retry attempt. An unkeyed row comes
+     * alone.
      */
     public DueRows dueWithOlder(Connection c, int shard, Instant now, int limit, Duration requeueDelay)
             throws SQLException {
@@ -270,7 +273,7 @@ public final class ParkedStore {
         var rows = new TreeMap<Long, OutboxRecord>();
         due.forEach(row -> rows.put(row.id(), row));
         var notDue = new HashMap<Object, OutboxRecord>(); // of a key waiting in retry
-        var notDueAt = new HashMap<Object, OffsetDateTime>();
+        var lookAgainAt = new HashMap<Object, OffsetDateTime>();
         try (var ps = c.prepareStatement(selectOlder)) {
             bindKeys(c, ps, 1, newest.values());
             ps.setShort(4, (short) shard);
@@ -283,7 +286,10 @@ public final class ParkedStore {
                     var row = RetryStore.record(rs, 1);
                     if (rs.getBoolean("in_retry")) {
                         notDue.put(BatchClassifier.orderingKey(row), row);
-                        notDueAt.put(BatchClassifier.orderingKey(row), rs.getObject("due_at", OffsetDateTime.class));
+                        var at = rs.getObject("due_at", OffsetDateTime.class);
+                        var head = rs.getObject("head_due", OffsetDateTime.class);
+                        lookAgainAt.put(BatchClassifier.orderingKey(row),
+                                head != null && head.isBefore(at) ? head : at);
                     } else {
                         rows.put(row.id(), row);
                     }
@@ -300,7 +306,7 @@ public final class ParkedStore {
                     ids.add(row.id());
                 }
             }
-            var at = notDueAt.get(older.getKey());
+            var at = lookAgainAt.get(older.getKey());
             try (var ps = c.prepareStatement(putOff)) {
                 ps.setObject(1, at.isAfter(earliest) ? at : earliest);
                 ps.setArray(2, c.createArrayOf("int8", ids.toArray()));

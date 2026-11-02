@@ -2597,6 +2597,48 @@ class ShardProcessorIT {
     }
 
     @Test
+    void aPutOffParkedRowIsLookedAtAgainWhenItsRetryHeadComesUp() throws Exception {
+        bootstrap();
+        parkAll("k#1", "k#2");
+        script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.requeue(),
+                "k#3", Outcome.retry(new RuntimeException("k#3 down"))));
+        send(msg("t", "k", "k#3"), msg("t", "j", "j#1"));
+        tick();
+        process();
+        now = now.plus(REQUEUE_DELAY);
+        var farOff = now.plus(Duration.ofHours(24));
+        var headDue = now.plusSeconds(2);
+        setParkedDue("k#1", farOff);
+        setParkedDue("k#2", now);
+        try (var c = TestDb.connect(); var ps = c.prepareStatement("update " + names.retry()
+                + " set next_attempt_at = ?")) {
+            ps.setObject(1, headDue.atOffset(ZoneOffset.UTC));
+            ps.executeUpdate();
+        }
+        script = answering(Map.of());
+        calls.clear();
+
+        process();
+
+        assertThat(calls).isEmpty();
+        assertThat(parkedRows()).as("until its head comes up, not k#1's 24 h")
+                .containsExactly("k#1:2:" + farOff, "k#2:2:" + headDue);
+
+        now = headDue; // the head goes first and leaves; k is in retry when the step reads the parked rows
+        process();
+        assertThat(delivered()).contains("k#3");
+        assertThat(parkedRows()).containsExactly("k#1:2:" + farOff, "k#2:2:" + headDue.plus(REQUEUE_DELAY));
+
+        now = headDue.plus(REQUEUE_DELAY);
+        calls.clear();
+        process();
+
+        assertThat(calls).as("out of retry: its own time, bringing the older one along")
+                .singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("k#1", "k#2"));
+        assertThat(parkedRows()).isEmpty();
+    }
+
+    @Test
     void anEarlyOfferCountsAgainstMaxRequeues() throws Exception {
         config.maxRequeues(1);
         bootstrap();
