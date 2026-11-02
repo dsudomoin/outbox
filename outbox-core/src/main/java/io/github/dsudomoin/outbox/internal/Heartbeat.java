@@ -193,33 +193,37 @@ public final class Heartbeat {
     void beat() { // package-private for a test
         boolean refreshed = false;
         try (var c = connections.newConnection()) {
-            c.setAutoCommit(false);
-            lockTimeout(c);
-            contracts.refresh(c, names); // before the statement below, which may give up on its lock
-            try (var ps = c.prepareStatement(beat)) {
-                ps.setString(1, id); // the cleanup's; the upsert's parameters follow
-                bind(ps, 1, id, shards, hookActive, relay, contracts.contracts(), contracts.routes(), interval);
-                ps.executeUpdate();
+            try {
+                c.setAutoCommit(false);
+                lockTimeout(c);
+                contracts.refresh(c, names); // before the statement below, which may give up on its lock
+                try (var ps = c.prepareStatement(beat)) {
+                    ps.setString(1, id); // the cleanup's; the upsert's parameters follow
+                    bind(ps, 1, id, shards, hookActive, relay, contracts.contracts(), contracts.routes(), interval);
+                    ps.executeUpdate();
+                }
+                if (stopped) {
+                    c.rollback(); // stop() deleted the row, or is about to
+                    return;
+                }
+                c.commit(); // before the shard count, whose lock a recovery may hold for its run
+                refreshed = true;
+                if (relay) {
+                    contracts.renewed(id);
+                }
+                if (stopped) { // stop() deleted it before this commit; on c, as its source may hold no second connection
+                    delete(c, names, id, STOP_BUDGET);
+                    return;
+                }
+                lockTimeout(c);
+                try (var st = c.createStatement(); var rs = st.executeQuery(Cursors.shardCount(names))) {
+                    rs.next();
+                    guard.observed(rs.getInt(1));
+                }
+                c.commit();
+            } finally {
+                giveBack(c);
             }
-            if (stopped) {
-                c.rollback(); // stop() deleted the row, or is about to
-                return;
-            }
-            c.commit(); // before the shard count, whose lock a recovery may hold for its run
-            refreshed = true;
-            if (relay) {
-                contracts.renewed(id);
-            }
-            if (stopped) { // stop() deleted it before this commit; on c, as its source may hold no second connection
-                delete(c, names, id, STOP_BUDGET);
-                return;
-            }
-            lockTimeout(c);
-            try (var st = c.createStatement(); var rs = st.executeQuery(Cursors.shardCount(names))) {
-                rs.next();
-                guard.observed(rs.getInt(1));
-            }
-            c.commit();
         } catch (Throwable t) { // logged, never thrown: a throw would cancel every later beat without a word
             if (refreshed && t instanceof SQLException e && "55P03".equals(e.getSQLState())) {
                 log.warn("outbox heartbeat of instance {} into {} waited {} ms for a lock (a recovery holds {} for its"
@@ -229,6 +233,21 @@ public final class Heartbeat {
             }
             log.warn("outbox heartbeat of instance {} into {} failed; retrying in {}", id, names.instance(), interval,
                     t);
+        }
+    }
+
+    /**
+     * Nothing of a beat left on {@code c}, whichever way it ended: a source that rolls nothing back and hands it out
+     * again would fail each later beat on the aborted transaction. A dead connection, which refuses, goes anyway.
+     */
+    private static void giveBack(Connection c) {
+        try {
+            if (!c.getAutoCommit()) {
+                c.rollback();
+                c.setAutoCommit(true);
+            }
+        } catch (SQLException | RuntimeException e) {
+            log.debug("outbox heartbeat could not reset its connection", e);
         }
     }
 

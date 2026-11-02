@@ -4,13 +4,17 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.dsudomoin.outbox.ConnectionSource;
+import io.github.dsudomoin.outbox.JdbcTransactions;
+import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
+import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -42,6 +46,51 @@ class HeartbeatConnectionsIT {
         try (var c = MAIN.getConnection()) {
             TestSql.execute(c, "drop table " + TABLE);
             TestSql.execute(c, "drop database " + OTHER + " with (force)");
+        }
+    }
+
+    @Test
+    void aFailedBeatLeavesNoTransactionOnASourceThatKeepsItsConnection() throws Exception {
+        var config = new TestOutboxConfig().relayEnabled(false).maintenanceInterval(Duration.ofMillis(50));
+        try (var kept = MAIN.getConnection()) {
+            ConnectionSource keeping = () -> (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
+                    new Class<?>[] {Connection.class}, (c, method, args) -> {
+                        if (method.getName().equals("close")) {
+                            return null; // a source that rolls nothing back and keeps the connection
+                        }
+                        try {
+                            return method.invoke(kept, args);
+                        } catch (InvocationTargetException e) {
+                            throw e.getCause();
+                        }
+                    });
+            var runtime = OutboxRuntime.builder(config, new JdbcTransactions(MAIN), record -> {})
+                    .heartbeatConnections(keeping).build();
+            runtime.start();
+            try (var holder = MAIN.getConnection()) {
+                var instances = runtime.schema().names().instance();
+                holder.setAutoCommit(false);
+                TestSql.execute(holder, "lock table " + instances + " in access exclusive mode");
+                Thread.sleep(300); // beats give up on their lock wait
+                holder.rollback();
+                var lastSeen = "select (extract(epoch from last_seen) * 1000000)::bigint from " + instances
+                        + " where instance_id = '" + runtime.schema().instanceId() + "'";
+                long seen = TestSql.queryLong(holder, lastSeen);
+                holder.commit();
+
+                long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+                while (true) {
+                    boolean moved = TestSql.queryLong(holder, lastSeen) > seen;
+                    holder.commit();
+                    if (moved) {
+                        break;
+                    }
+                    assertThat(System.nanoTime()).as("a beat gets through once the lock is gone").isLessThan(deadline);
+                    Thread.sleep(20);
+                }
+            } finally {
+                runtime.close();
+            }
         }
     }
 
