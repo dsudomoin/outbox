@@ -26,6 +26,7 @@ public final class PartitionDdl {
 
     public static final Duration CREATE_LOCK_TIMEOUT = Duration.ofSeconds(2);
     public static final Duration DETACH_LOCK_TIMEOUT = Duration.ofSeconds(30);
+    private static final Pattern NEEDLESS_QUOTES = Pattern.compile("\"([a-z_][a-z0-9_]*)\"");
     /** A DDL statement's {@code statement_timeout} past its {@code lock_timeout}: room for its own work. */
     static final Duration DDL_MARGIN = Duration.ofSeconds(60);
     /** The two timeouts as this session set them, null where it did not (the role, database or server default). */
@@ -124,14 +125,15 @@ public final class PartitionDdl {
             ps.setString(1, parent);
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    if (dropped(rs.getString(1)) || rs.getString(2) == null) { // pg_get_expr: null once dropped
+                    var name = unquoted(rs.getString(1));
+                    if (dropped(name) || rs.getString(2) == null) { // pg_get_expr: null once dropped
                         continue;
                     }
                     var m = BOUNDS.matcher(rs.getString(2));
                     if (!m.matches()) {
-                        throw new IllegalStateException("not a range partition: " + rs.getString(1));
+                        throw new IllegalStateException("not a range partition: " + name);
                     }
-                    bounds.add(new Bound(rs.getString(1), value(m.group(1)), value(m.group(2))));
+                    bounds.add(new Bound(name, value(m.group(1)), value(m.group(2))));
                 }
             }
         }
@@ -145,7 +147,7 @@ public final class PartitionDdl {
                 + " where inhparent = to_regclass(?) and inhdetachpending")) {
             ps.setString(1, parent);
             try (var rs = ps.executeQuery()) {
-                return rs.next() && !dropped(rs.getString(1)) ? rs.getString(1) : null;
+                return rs.next() && !dropped(rs.getString(1)) ? unquoted(rs.getString(1)) : null;
             }
         }
     }
@@ -240,12 +242,20 @@ public final class PartitionDdl {
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
                     if (!dropped(rs.getString(1))) {
-                        tables.add(rs.getString(1));
+                        tables.add(unquoted(rs.getString(1)));
                     }
                 }
             }
         }
         return tables;
+    }
+
+    /**
+     * {@code regclass}, an {@code oid::regclass::text}, as a session prints it without {@code quote_all_identifiers}:
+     * with it, the library's own names read {@code "schema"."table_x0"}, which they are never written as.
+     */
+    static String unquoted(String regclass) {
+        return NEEDLESS_QUOTES.matcher(regclass).replaceAll("$1");
     }
 
     /**

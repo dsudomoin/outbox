@@ -425,7 +425,7 @@ public final class XidRecovery {
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
                     if (!PartitionDdl.dropped(rs.getString(1))) {
-                        tables.add(rs.getString(1));
+                        tables.add(PartitionDdl.unquoted(rs.getString(1)));
                     }
                 }
             }

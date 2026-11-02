@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.dsudomoin.outbox.internal.SchemaObjects;
 import io.github.dsudomoin.outbox.internal.TableNames;
+import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -78,6 +79,62 @@ class SchemaValidationIT {
         }
         assertThat(runtime.maintenance().runOnce()).isTrue();
         assertThat(runtime.admin().status().premade()).isGreaterThanOrEqualTo(config.partitions().premake());
+    }
+
+    @Test
+    void aSessionQuotingAllIdentifiersBootstrapsDeliversAndMaintains() throws Exception {
+        deliversAndMaintains(new TestOutboxConfig().table(schema + ".quoted").schemaBootstrap(true)
+                .xidsPerPartition(1000));
+    }
+
+    @Test
+    void aSessionQuotingAllIdentifiersValidatesTheSchema() throws Exception {
+        var bootstrap = new TestOutboxConfig().table(schema + ".quoted").schemaBootstrap(true).xidsPerPartition(1000);
+        var plain = runtime(bootstrap, TestDataSources.newDataSource());
+        plain.start();
+        plain.close();
+
+        deliversAndMaintains(new TestOutboxConfig().table(schema + ".quoted").schemaBootstrap(false)
+                .xidsPerPartition(1000));
+    }
+
+    private void deliversAndMaintains(TestOutboxConfig quoted) throws Exception {
+        var quoting = new PGSimpleDataSource();
+        quoting.setUrl(TestDataSources.jdbcUrl());
+        quoting.setUser(TestDataSources.user());
+        quoting.setPassword(TestDataSources.password());
+        quoting.setOptions("-c quote_all_identifiers=on");
+        var handler = new RecordingHandler();
+        var transactions = new JdbcTransactions(quoting);
+        var runtime = OutboxRuntime.builder(quoted, transactions, handler).build();
+        runtimes.add(runtime);
+        runtime.start();
+
+        var id = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", "k", "p".getBytes(UTF_8))));
+
+        long deadline = System.nanoTime() + Duration.ofSeconds(15).toNanos();
+        while (handler.delivered().stream().noneMatch(r -> r.messageId().equals(id))) {
+            assertThat(System.nanoTime()).as("delivered").isLessThan(deadline);
+            Thread.sleep(20);
+        }
+        // past a few ranges, so a run extends and drops them; every step of its reads and DDL under the setting
+        try (var c = quoting.getConnection(); var err = new CapturedStderr()) {
+            for (int i = 0; i < 5000; i++) {
+                TestSql.execute(c, "select pg_current_xact_id()");
+            }
+            var seen = transactions.inTx(c2 -> runtime.outbox().send(OutboxMessage.of("t", "k2", "p".getBytes(UTF_8))));
+            while (handler.delivered().stream().noneMatch(r -> r.messageId().equals(seen))) {
+                assertThat(System.nanoTime()).as("delivered past the ranges").isLessThan(deadline);
+                Thread.sleep(20);
+            }
+            assertThat(runtime.maintenance().runOnce()).isTrue();
+            assertThat(runtime.maintenance().runOnce()).isTrue();
+            assertThat(err.text()).doesNotContain("maintenance step");
+        }
+        var status = runtime.admin().status();
+        assertThat(status.halted()).isFalse();
+        assertThat(status.orphans()).isEmpty();
+        assertThat(status.maintenanceSinceSuccessSeconds()).isLessThan(10.0);
     }
 
     @Test

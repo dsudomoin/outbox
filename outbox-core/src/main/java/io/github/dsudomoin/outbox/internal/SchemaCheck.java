@@ -7,6 +7,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -34,6 +35,15 @@ final class SchemaCheck {
 
     /** {@code table}: the configured name, for the message; {@code render}: the method whose SQL fixes it. */
     static void run(Connection app, Connection ddl, SchemaObjects required, String table, String render)
+            throws SQLException {
+        // what it compares is catalog text, which a session with quote_all_identifiers prints otherwise
+        SessionSettings.with(app, Map.of("quote_all_identifiers", "off"), () -> {
+            check(app, ddl, required, table, render);
+            return null;
+        });
+    }
+
+    private static void check(Connection app, Connection ddl, SchemaObjects required, String table, String render)
             throws SQLException {
         var problems = new ArrayList<String>();
         for (var t : required.tables()) {
