@@ -15,6 +15,7 @@ p.add_argument("--discarded-file", help="message ids discarded through the admin
 p.add_argument("--exempt-tags", default="", help="tags the order checks skip: a dead letter, requeue, redrive")
 p.add_argument("--exempt-topics", default="", help="topics the order checks skip: redrive by filter, restored rows")
 p.add_argument("--order-within-tag", action="append", default=[], help="exempt from the key order, but in order among themselves")
+p.add_argument("--report-order-within-tag", action="append", default=[], help="the same, counted and reported, no violation")
 p.add_argument("--search-path", help="schema of the ledger tables, when not public")
 p.add_argument("--max-dups", type=int, help="arrivals beyond the first of a message, at most")
 p.add_argument("--min-dups", type=int, default=0, help="at least: the fault really hit a batch in flight")
@@ -150,6 +151,7 @@ if not args.no_time_checks:
             if done is not None and b["at"] < done:
                 overtakes.append({"key": list(k), "seq": [a["seq"], b["seq"]], "early_by": round(done - b["at"], 3)})
 
+result["order_within_tag"] = {tag: len(inversions(by_key(effects, tag))) for tag in args.report_order_within_tag}
 dups = len(arrivals) - len({(a["sink"], a["id"]) for a in arrivals})
 latency = []
 slow_keys, slow_tags = split(args.slow_keys), split(args.slow_tags)

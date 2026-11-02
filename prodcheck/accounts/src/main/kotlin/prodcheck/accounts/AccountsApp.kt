@@ -76,6 +76,8 @@ interface ProdcheckConfig {
 @ConfigSource("accounts")
 interface AccountsConfig {
     fun lockTimeoutMs(): Long
+
+    fun holdSameType(): Boolean
 }
 
 fun main() {

@@ -1,10 +1,12 @@
 package prodcheck.accounts
 
+import com.google.protobuf.BytesValue
 import io.github.dsudomoin.outbox.OutboxHandler
 import io.github.dsudomoin.outbox.OutboxRecord
 import io.github.dsudomoin.outbox.OutboxTopicHandler
 import io.github.dsudomoin.outbox.Outcome
 import prodcheck.common.HandlerControl
+import prodcheck.common.Payload
 import ru.tinkoff.kora.common.Component
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory
 import java.nio.ByteBuffer
@@ -15,6 +17,7 @@ class AccountEventsHandler(
     private val operation: AccountOperation,
     private val control: HandlerControl,
     private val db: JdbcConnectionFactory,
+    private val config: AccountsConfig,
 ) : OutboxTopicHandler {
     override fun topics(): Set<String> =
         setOf(ROUTE)
@@ -36,6 +39,9 @@ class AccountEventsHandler(
     ): List<Outcome> {
         val failedKeys =
             mutableSetOf<Pair<String, ByteBuffer>>()
+        // accounts.holdSameType: the library README's rule for a blocking process that ends in the middle of a call
+        val heldTypes =
+            mutableSetOf<Pair<ByteBuffer, String>>()
 
         return records.map { record ->
             val key = record.key()?.let {
@@ -47,6 +53,10 @@ class AccountEventsHandler(
                 key in failedKeys
             ) {
                 Outcome.notAttempted()
+            } else if (
+                config.holdSameType() && key != null && (key.second to tagOf(record)) in heldTypes
+            ) {
+                Outcome.requeue()
             } else {
                 try {
                     OutboxHandler.inRecordScope(record) {
@@ -57,8 +67,12 @@ class AccountEventsHandler(
                             AccountEventResult.ACKNOWLEDGE ->
                                 Outcome.delivered()
 
-                            AccountEventResult.REQUEUE ->
+                            AccountEventResult.REQUEUE -> {
+                                if (key != null) {
+                                    heldTypes.add(key.second to tagOf(record))
+                                }
                                 Outcome.requeue()
+                            }
                         }
                     }
                 } catch (failure: Exception) {
@@ -77,4 +91,7 @@ class AccountEventsHandler(
             }
         }
     }
+
+    private fun tagOf(record: OutboxRecord): String =
+        runCatching { Payload.tag(BytesValue.parseFrom(record.payload()).value.toByteArray()) }.getOrDefault("")
 }

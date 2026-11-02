@@ -4,7 +4,8 @@
 # block, a row lock on the account inside the handler, no metrics, no admin API, no hook.
 ACC=account-events
 ACC_LOAD='rate=80&writers=4&keys=30&tags=block:97,unblock:101,wait:7&rollbackPercent=3'
-ACC_FINISH=(--exempt-tags wait --order-within-tag wait --timeout 120)
+# the handler as the service has it: a later record of a key may pass a parked one when the block ends inside a call
+ACC_FINISH=(--exempt-tags wait --report-order-within-tag wait --timeout 120)
 acc_q() { psql_q "set search_path = accounts; $1"; }
 
 acc_begin() { # acc_begin NAME: Postgres 17, the roles, the migration as the owner, the ledger in the app's schema
@@ -198,7 +199,7 @@ s_accounts_requeue_storm() { # thousands of records parked with maxRequeues = 0 
   local to=$(now)
   pc_unload 1002
   log "max requeues so far: $(acc_q 'select max(max_requeues) from seen')"
-  ACC_FINISH=(--exempt-tags wait --order-within-tag wait --timeout 200 --slow-tags wait --slow-from "$from" --slow-to "$to")
+  ACC_FINISH=(--exempt-tags wait --report-order-within-tag wait --timeout 200 --slow-tags wait --slow-from "$from" --slow-to "$to")
   acc_end
 }
 
@@ -267,4 +268,20 @@ s_accounts_pg_restart() { # Postgres 17 restarts and goes away for a minute: wit
   check "$(passes wait_for 120 sh -c "[ \"\$(docker exec $PG psql -U outbox -d outbox -Atq -c 'select count(*) from accounts.pc_effect')\" -gt $before ]")" "доставка вернулась сама через $(($(now) - t)) с после возврата базы"
   sleep 5
   acc_end
+}
+
+s_accounts_same_type_held() { # with the README's rule in the handler (hold a key's later records of the same type): parked rows of a key stay in order
+  acc_begin accounts-same-type-held
+  ACC_FINISH=(--exempt-tags wait --order-within-tag wait --timeout 120)
+  local n i
+  for i in 1001 1002 1003; do acc "$i" -Daccounts.holdSameType=true; acc_load "$i"; done
+  for n in 1 2 3 4; do
+    sleep 8
+    i=$((1001 + n % 3))
+    pc_kill "$i"
+    sleep 4
+    acc "$i" -Daccounts.holdSameType=true
+  done
+  sleep 5
+  acc_end --min-dups 1
 }
