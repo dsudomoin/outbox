@@ -4,6 +4,7 @@ import io.github.dsudomoin.outbox.ConnectionSource;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.time.Duration;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
@@ -38,22 +39,28 @@ final class HeartbeatConnections implements ConnectionSource {
 
     private final ConnectionSource application;
     private final ConnectionSource heartbeat;
+    private final SocketBound socket;
     /** When the fallback WARN last logged ({@link System#nanoTime()}). */
     private final AtomicLong warned = new AtomicLong(System.nanoTime() - WARN_INTERVAL);
     private volatile State state = State.UNCHECKED;
     private volatile String table;
 
     HeartbeatConnections(ConnectionSource application, ConnectionSource heartbeat) {
+        this(application, heartbeat, new SocketBound(Duration.ZERO));
+    }
+
+    HeartbeatConnections(ConnectionSource application, ConnectionSource heartbeat, SocketBound socket) {
         this.application = application;
         this.heartbeat = heartbeat;
+        this.socket = socket;
     }
 
     /**
      * Checks the heartbeat source against {@code reference}, a connection to the application's database, on
      * {@code table}, the base table name the beats use. Only another database fails it, and a failure of
      * {@code reference} is thrown. A heartbeat source that fails to connect, or whose check query fails, only logs a
-     * WARN. One that does not answer at all holds the start: without a connection, statement or network timeout of its
-     * own, this waits until it answers or gives up (a pooler may connect at once and wait on the first query).
+     * WARN, as does one going silent on its check past the beat's socket bound. One that does not answer its login holds
+     * the start until its own connection timeout: a pool has one, a bare DataSource needs {@code loginTimeout}.
      */
     void start(Connection reference, String table) throws SQLException {
         this.table = table;
@@ -141,8 +148,10 @@ final class HeartbeatConnections implements ConnectionSource {
      * two measures, while another database stays another.
      */
     private Measure measure(Connection app, Connection own) throws SQLException {
-        var first = once(app, own);
-        return first.failure() != null || first.same() ? first : once(app, own);
+        try (var appBound = socket.on(app); var ownBound = socket.on(own)) {
+            var first = once(app, own);
+            return first.failure() != null || first.same() ? first : once(app, own);
+        }
     }
 
     /**

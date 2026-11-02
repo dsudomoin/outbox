@@ -747,6 +747,112 @@ class NetworkBlackholeIT {
         }
     }
 
+    /** The first statement on a connection, which {@code start} then waits on, cut off. */
+    private DataSource forgottenAtItsFirstStatement(DataSource source) {
+        return intercepting(source, (c, call, args) -> {
+            if (call.getName().equals("createStatement") || call.getName().equals("prepareStatement")) {
+                hole.forget();
+            }
+        });
+    }
+
+    private static void startFails(Runnable start) throws Exception {
+        var started = CompletableFuture.runAsync(start);
+        assertThatThrownBy(() -> started.get(20, TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class);
+    }
+
+    @Test
+    void aStartOnASilentSocketFails() throws Exception {
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(1));
+        var relay = OutboxRuntime.builder(config, new JdbcTransactions(forgottenAtItsFirstStatement(
+                throughTheHole(3, 0))), record -> {}).build();
+        closing.add(relay);
+
+        startFails(relay::start);
+    }
+
+    @Test
+    void aStartOnASilentApplicationConnectionFails() throws Exception {
+        var table = new TestOutboxConfig();
+        var bootstrap = OutboxRuntime.builder(table, new JdbcTransactions(DIRECT), record -> {}).build();
+        closing.add(bootstrap);
+        bootstrap.start();
+        var config = new TestOutboxConfig().table(table.table()).schemaBootstrap(false)
+                .networkTimeout(Duration.ofSeconds(1));
+        var relay = OutboxRuntime.builder(config, new JdbcTransactions(forgottenAtItsFirstStatement(
+                throughTheHole(3, 0))), record -> {}).ownerConnections(DIRECT::getConnection).build();
+        closing.add(relay);
+
+        startFails(relay::start);
+    }
+
+    @Test
+    void anInboxStartOnASilentSocketFails() throws Exception {
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(1));
+        var inbox = InboxRuntime.builder(config, new JdbcTransactions(forgottenAtItsFirstStatement(
+                throughTheHole(3, 0)))).build();
+        closing.add(inbox);
+
+        startFails(inbox::start);
+    }
+
+    /** A lock wait the start's own lock_timeout ends is no silence, however short the bound. */
+    @Test
+    void aStartWaitingOnALockOutlastsTheNetworkTimeout() throws Exception {
+        var table = new TestOutboxConfig();
+        var first = OutboxRuntime.builder(table, new JdbcTransactions(DIRECT), record -> {}).build();
+        closing.add(first);
+        first.start();
+        var maintenance = first.schema().names().maintenance();
+        var config = new TestOutboxConfig().table(table.table()).networkTimeout(Duration.ofSeconds(1));
+        var second = OutboxRuntime.builder(config, new JdbcTransactions(throughTheHole(3, 0)), record -> {}).build();
+        closing.add(second);
+        try (var locker = DIRECT.getConnection()) {
+            locker.setAutoCommit(false);
+            TestSql.execute(locker, "lock table " + maintenance + " in access exclusive mode");
+            var started = CompletableFuture.runAsync(second::start);
+            Thread.sleep(3000);
+            locker.rollback();
+            started.get(30, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void aHeartbeatSourceSilentAtStartLeavesTheStartGoing() throws Exception {
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(1));
+        var own = forgottenAtItsFirstStatement(throughTheHole(3, 0));
+        var relay = OutboxRuntime.builder(config, new JdbcTransactions(DIRECT), record -> {})
+                .heartbeatConnections(own::getConnection).build();
+        closing.add(relay);
+
+        CompletableFuture.runAsync(relay::start).get(20, TimeUnit.SECONDS);
+    }
+
+    /** Its first connection after a start that could not reach it: the check of it goes silent, and the beats go on. */
+    @Test
+    void aHeartbeatSourceSilentAtItsFirstCheckFallsBack() throws Exception {
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(1))
+                .maintenanceInterval(Duration.ofMillis(100));
+        var reachable = new AtomicBoolean();
+        var own = forgottenAtItsFirstStatement(throughTheHole(3, 0));
+        var relay = OutboxRuntime.builder(config, new JdbcTransactions(DIRECT), record -> {})
+                .heartbeatConnections(() -> {
+                    if (!reachable.get()) {
+                        throw new SQLException("unreachable");
+                    }
+                    return own.getConnection();
+                }).build();
+        closing.add(relay);
+        relay.start();
+        var instances = relay.schema().names().instance();
+
+        reachable.set(true);
+
+        Thread.sleep(500); // on the beat that takes it
+        long seen = lastSeen(instances, relay);
+        await(() -> lastSeen(instances, relay) > seen);
+    }
+
     @Test
     void aConnectionGoesBackWithTheTimeoutItCameWith() throws Exception {
         var atClose = new ConcurrentLinkedQueue<Integer>();

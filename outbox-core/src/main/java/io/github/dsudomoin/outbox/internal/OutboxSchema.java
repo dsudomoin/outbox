@@ -98,6 +98,7 @@ public final class OutboxSchema implements AutoCloseable {
     /** The heartbeat's own connections, which fall back on {@link #db}; null without a source of its own. */
     @Nullable
     private final HeartbeatConnections heartbeat;
+    private final SocketBound socket;
     /** The tick guard's lower bound, whatever the intervals say; shorter in tests. */
     Duration tickFloor = Duration.ofMinutes(1);
     /** How long the reshard waits for the tick guard alone to pass before it refuses; shorter in tests. */
@@ -153,7 +154,9 @@ public final class OutboxSchema implements AutoCloseable {
         this.spelled = TableNames.of(config.table());
         this.schemaLockAttempts = schemaLockAttempts;
         this.contracts = new ContractGuard(contracts, routes, config.partitions().maintenanceInterval());
-        this.heartbeat = heartbeat == null ? null : new HeartbeatConnections(db, heartbeat);
+        this.heartbeat = heartbeat == null ? null
+                : new HeartbeatConnections(db, heartbeat, Heartbeat.socketBound(config));
+        this.socket = new SocketBound(config.networkTimeout());
     }
 
     /**
@@ -361,9 +364,9 @@ public final class OutboxSchema implements AutoCloseable {
     }
 
     public void start() throws SQLException {
-        try (var c = ddl.newConnection()) {
+        try (var c = ddl.newConnection(); var bound = socket.on(c)) {
             if (ddl != db) { // before any DDL
-                try (var app = db.newConnection()) {
+                try (var app = db.newConnection(); var appBound = socket.on(app)) {
                     SchemaCheck.requireSameDatabase(app, c, spelled.base());
                     SchemaCheck.warnIfAppCanCreateWhereOwnerResolves(app, c, spelled.base());
                 }
@@ -373,7 +376,8 @@ public final class OutboxSchema implements AutoCloseable {
             try {
                 // first: behind a transaction-pooling proxy even the settings below would leak
                 PartitionDdl.requireSessionStable(c, "outbox bootstrap of " + spelled.base());
-                SessionSettings.with(c, BOOTSTRAP_SETTINGS, () -> {
+                // a statement runs for as long as its timeout: silence only past that says the network dropped it
+                SocketBound.atLeast(c, STATEMENT_TIMEOUT, () -> SessionSettings.with(c, BOOTSTRAP_SETTINGS, () -> {
                     // where the table is or will be created, so every spelling of it takes the same schema lock
                     var resolved = spelled.resolve(c);
                     if (heartbeat != null) { // before any DDL, and before the bootstrap writes the row
@@ -387,7 +391,7 @@ public final class OutboxSchema implements AutoCloseable {
                         advisory(c, "pg_advisory_unlock", resolved, TableNames.LOCK_SCHEMA);
                     }
                     return null;
-                });
+                }));
             } catch (Throwable e) {
                 try {
                     c.setAutoCommit(autoCommit);
@@ -417,7 +421,7 @@ public final class OutboxSchema implements AutoCloseable {
             if (config.schema().bootstrap()) {
                 createBaseObjects(c, n);
             } else { // the application's migrations own them: only checked, and nothing created when one is missing
-                try (var app = db.newConnection()) {
+                try (var app = db.newConnection(); var appBound = socket.on(app)) {
                     SchemaCheck.run(app, c, SchemaObjects.outbox(n), spelled.base(), "OutboxSql.outbox");
                 }
             }

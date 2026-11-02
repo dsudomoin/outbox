@@ -190,9 +190,9 @@ public final class PgInbox implements Inbox, AutoCloseable {
     }
 
     public void start() throws SQLException {
-        try (var c = ddl.newConnection()) {
+        try (var c = ddl.newConnection(); var bound = socket.on(c)) {
             if (ddl != db) { // before any DDL
-                try (var app = db.newConnection()) {
+                try (var app = db.newConnection(); var appBound = socket.on(app)) {
                     SchemaCheck.requireSameDatabase(app, c, names.base());
                     SchemaCheck.warnIfAppCanCreateWhereOwnerResolves(app, c, names.base());
                 }
@@ -200,12 +200,13 @@ public final class PgInbox implements Inbox, AutoCloseable {
             c.setAutoCommit(true);
             PartitionDdl.requireSessionStable(c, "outbox inbox bootstrap of " + names.base());
             // statement_timeout: a shorter role or database default would end the lock waits with 57014, not 55P03
+            var budget = LOCK_TIMEOUT.plus(PartitionDdl.DDL_MARGIN);
             var settings = Map.of("lock_timeout", String.valueOf(LOCK_TIMEOUT.toMillis()),
-                    "statement_timeout", String.valueOf(LOCK_TIMEOUT.plus(PartitionDdl.DDL_MARGIN).toMillis()));
-            SessionSettings.with(c, settings, () -> {
+                    "statement_timeout", String.valueOf(budget.toMillis()));
+            SocketBound.atLeast(c, budget, () -> SessionSettings.with(c, settings, () -> {
                 bootstrap(c);
                 return null;
-            });
+            }));
             if (!OutboxSchema.columnExists(c, names.base(), "consumer")) {
                 throw new IllegalStateException("outbox inbox table " + names.base() + " has no consumer column: an"
                         + " earlier version made it, and its dedup spans every consumer of a message; drop the table"
@@ -281,7 +282,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
                             + " consumer text not null default '', received_at timestamptz not null default now(),"
                             + " primary key (message_id, consumer)) partition by range (message_id)");
                 } else { // the application's migrations own it
-                    try (var app = db.newConnection()) {
+                    try (var app = db.newConnection(); var appBound = socket.on(app)) {
                         SchemaCheck.run(app, c, SchemaObjects.inbox(names), names.base(), "OutboxSql.inbox");
                     }
                 }

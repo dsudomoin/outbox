@@ -77,7 +77,7 @@ public final class Heartbeat {
         this.interval = config.partitions().maintenanceInterval();
         this.guard = schema.shardGuard();
         this.contracts = schema.contractGuard();
-        this.socket = new SocketBound(beatBound(config.networkTimeout(), interval));
+        this.socket = socketBound(config);
         this.beat = "with gone as (delete from " + names.instance() + " where instance_id <> ? and coalesce(expires_at,"
                 + " last_seen) < now() - " + FORGET_AFTER.toSeconds() + " * interval '1 second') " + upsert(names);
     }
@@ -86,9 +86,11 @@ public final class Heartbeat {
      * A beat's statements wait at most {@link Maintenance#SHARDS_LOCK_TIMEOUT} for a lock, so one still silent after an
      * interval is lost, and waiting {@code networkTimeout} for it would let the row expire and the guards go stale.
      */
-    private static Duration beatBound(Duration networkTimeout, Duration interval) {
+    static SocketBound socketBound(OutboxConfig config) {
+        var interval = config.partitions().maintenanceInterval();
         var bound = interval.compareTo(BEAT_BOUND_FLOOR) < 0 ? BEAT_BOUND_FLOOR : interval;
-        return networkTimeout.compareTo(bound) < 0 ? networkTimeout : bound;
+        var networkTimeout = config.networkTimeout();
+        return new SocketBound(networkTimeout.compareTo(bound) < 0 ? networkTimeout : bound);
     }
 
     /** {@code <host>/<pid>/<8 hex>}, new on every call. */
