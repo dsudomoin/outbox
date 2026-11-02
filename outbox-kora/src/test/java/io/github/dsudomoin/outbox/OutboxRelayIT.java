@@ -1227,7 +1227,8 @@ class OutboxRelayIT {
             assertThat(handler.delivered().subList(before, before + 3)).extracting(OutboxRelayIT::payload)
                     .containsExactlyInAnyOrder("b1", "b2", "b3");
             await(Duration.ofSeconds(5), () -> err.text().contains("outbox shard 0 step failed"));
-            assertThat(err.text()).contains("no tick " + stuckAt + " for shard 0");
+            long tick = stuckAt; // the stack trace comes after the line, in a write of its own
+            await(Duration.ofSeconds(5), () -> err.text().contains("no tick " + tick + " for shard 0"));
             // keeps failing, alone: one shared step at most found it out
             send(outbox, IntStream.range(1, 4).mapToObj(shard -> msg("t", keyOnShard(shard, "c"), "c" + shard))
                     .toArray(OutboxMessage[]::new));
