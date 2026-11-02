@@ -67,6 +67,8 @@ class TransactionPoolingTest {
                 return stub(Connection.class, (name, args) -> switch (name) {
                     case "getAutoCommit" -> true;
                     case "setAutoCommit", "close" -> null;
+                    case "getNetworkTimeout" -> 0; // a socket bound goes nowhere: neither is a statement
+                    case "setNetworkTimeout" -> null;
                     case "createStatement" -> statement(pid);
                     default -> throw new AssertionError("Connection." + name);
                 });

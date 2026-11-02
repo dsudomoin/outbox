@@ -200,7 +200,6 @@ public final class PgInbox implements Inbox, AutoCloseable {
 
     public void start() throws SQLException {
         try (var c = ddl.newConnection(); var bound = socket.on(c)) {
-            clock.read(c);
             if (ddl != db) { // before any DDL
                 try (var app = db.newConnection(); var appBound = socket.on(app)) {
                     SchemaCheck.requireSameDatabase(app, c, names.base());
@@ -209,6 +208,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
             }
             c.setAutoCommit(true);
             PartitionDdl.requireSessionStable(c, "outbox inbox bootstrap of " + names.base());
+            clock.read(c);
             // statement_timeout: a shorter role or database default would end the lock waits with 57014, not 55P03
             var budget = LOCK_TIMEOUT.plus(PartitionDdl.DDL_MARGIN);
             var settings = Map.of("lock_timeout", String.valueOf(LOCK_TIMEOUT.toMillis()),
