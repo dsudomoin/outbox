@@ -39,6 +39,7 @@ class ParkedStoreIT {
     private static final Instant NOW = Instant.now().truncatedTo(ChronoUnit.MICROS);
     /** After every due time the tests write. */
     private static final Instant LATER = NOW.plus(Duration.ofMinutes(10));
+    private static final Duration DELAY = Duration.ofSeconds(1);
 
     private final TestDatabase db = TestDb.newDatabase(2);
     private TableNames names;
@@ -314,21 +315,44 @@ class ParkedStoreIT {
                 new Park(unkeyedLater, 1, LATER), new Park(dueRow, 1, NOW), new Park(newer, 1, LATER),
                 new Park(unkeyedDue, 1, NOW)), Set.of(), NOW);
 
-        assertThat(store.dueWithOlder(c, 0, NOW, 10)).extracting(OutboxRecord::id)
+        assertThat(store.dueWithOlder(c, 0, NOW, 10, DELAY).rows()).extracting(OutboxRecord::id)
                 .as("not the row above the due one, another key's or an unkeyed one's")
                 .containsExactly(older.id(), dueRow.id(), unkeyedDue.id());
-        assertThat(store.dueWithOlder(c, 0, NOW, 1)).extracting(OutboxRecord::id).as("cut to the limit, oldest first")
-                .containsExactly(older.id());
+        assertThat(store.dueWithOlder(c, 0, NOW, 1, DELAY).rows()).extracting(OutboxRecord::id)
+                .as("cut to the limit, oldest first").containsExactly(older.id());
     }
 
     @Test
-    void dueWithOlderLeavesTheRowsOfAKeyInRetryAsTheyAre() throws SQLException {
+    void dueWithOlderOfAKeyInRetryHandsItsDueRowsUpToItsLowestRowNotDue() throws SQLException {
+        var due1 = record("t", "a");
+        var older = record("t", "a");
+        var due2 = record("t", "a");
+        var alone = record("t", "b");
+        store.apply(c, 0, List.of(new Park(due1, 1, NOW), new Park(older, 1, LATER), new Park(due2, 1, NOW),
+                new Park(alone, 1, NOW)), Set.of(), NOW);
+        retries.apply(c, 0, List.of(new Head(record("t", "a"), 1, LATER, "down"),
+                new Head(record("t", "b"), 1, LATER, "down")), NOW);
+
+        var due = store.dueWithOlder(c, 0, NOW, 10, DELAY);
+
+        assertThat(due.rows()).extracting(OutboxRecord::id).containsExactly(due1.id(), alone.id());
+        assertThat(due.putOff()).isTrue();
+        assertThat(store.due(c, 0, LATER.minusNanos(1000), 10)).extracting(OutboxRecord::id)
+                .as("due2 waits with older").containsExactly(due1.id(), alone.id());
+        assertThat(store.due(c, 0, LATER, 10)).extracting(OutboxRecord::id).contains(older.id(), due2.id());
+    }
+
+    @Test
+    void dueWithOlderOfAKeyInRetryWithoutARowNotDueMovesNothing() throws SQLException {
         var older = record("t", "a");
         var dueRow = record("t", "a");
-        store.apply(c, 0, List.of(new Park(older, 1, LATER), new Park(dueRow, 1, NOW)), Set.of(), NOW);
+        store.apply(c, 0, List.of(new Park(older, 1, NOW), new Park(dueRow, 1, NOW)), Set.of(), NOW);
         retries.apply(c, 0, List.of(new Head(record("t", "a"), 1, LATER, "down")), NOW);
 
-        assertThat(store.dueWithOlder(c, 0, NOW, 10)).extracting(OutboxRecord::id).containsExactly(dueRow.id());
+        var due = store.dueWithOlder(c, 0, NOW, 10, DELAY);
+
+        assertThat(due.rows()).extracting(OutboxRecord::id).containsExactly(older.id(), dueRow.id());
+        assertThat(due.putOff()).isFalse();
     }
 
     @Test

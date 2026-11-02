@@ -368,9 +368,13 @@ public final class ShardProcessor implements AutoCloseable {
             // parked_due_at works as retry_due_at: every step that writes to the parked table stores min(due_at), so
             // null means no parked rows, and a step looks up parked rows only then or on its full check
             s.parkedDue = s.full ? parked.minDue(inTx, shard) : cursor.parkedDueAt();
-            var dueParked = !deferred && s.parkedDue != null && !s.parkedDue.isAfter(now)
-                    ? parked.dueWithOlder(inTx, shard, now, relay.batchSize() - heads.size())
-                    : List.<OutboxRecord>of();
+            var dueRows = !deferred && s.parkedDue != null && !s.parkedDue.isAfter(now)
+                    ? parked.dueWithOlder(inTx, shard, now, relay.batchSize() - heads.size(), requeue.delay())
+                    : ParkedStore.DueRows.NONE;
+            var dueParked = dueRows.rows();
+            if (dueRows.putOff()) {
+                s.parkedDue = parked.minDue(inTx, shard); // not due any more, or the shard would be stepped again
+            }
             if (s.target == null && heads.isEmpty() && dueParked.isEmpty()) {
                 var checked = cursor.withRetryDueAt(s.full ? retries.minDue(inTx, shard) : s.retryDue)
                         .withParkedDueAt(s.parkedDue);
@@ -391,7 +395,7 @@ public final class ShardProcessor implements AutoCloseable {
             s.deadLettered = pass.deadLettered;
             // the retry pass writes to the table of the rows it hands, and moves rows between the two
             s.wroteRetry = !heads.isEmpty() || pass.toRetry;
-            s.wroteParked = !dueParked.isEmpty() || pass.fromRetry;
+            s.wroteParked = !dueParked.isEmpty() || pass.fromRetry || dueRows.putOff();
             s.busy = pass.busy; // no handler thread free: the main pass would find none either
             s.called = pass.called; // a handler thread was free
             s.next = cursor;

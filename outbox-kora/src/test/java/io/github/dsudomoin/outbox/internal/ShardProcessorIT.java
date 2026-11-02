@@ -2540,7 +2540,7 @@ class ShardProcessorIT {
     }
 
     @Test
-    void aDueParkedRowWhoseKeyWaitsInRetryComesAloneAndItsOlderRowsStayAsTheyAre() throws Exception {
+    void aDueParkedRowWhoseKeyWaitsInRetryWaitsForItsOlderRowThatIsNotDue() throws Exception {
         bootstrap();
         parkAll("k#1", "k#2");
         script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.requeue(),
@@ -2560,8 +2560,40 @@ class ShardProcessorIT {
 
         process();
 
-        assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("k#2"));
-        assertThat(parkedRows()).containsExactly("k#1:2:" + later);
+        assertThat(calls).as("neither handed").isEmpty();
+        assertThat(parkedRows()).as("k#2 waits for k#1, no requeue spent")
+                .containsExactly("k#1:2:" + later, "k#2:2:" + later);
+        assertThat(cursor().parkedDueAt()).as("not due, or the shard would be stepped again at once").isEqualTo(later);
+
+        now = later;
+        calls.clear();
+        process();
+
+        assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("k#1", "k#2"));
+        assertThat(parkedRows()).isEmpty();
+    }
+
+    @Test
+    void aDueParkedRowWhoseKeyWaitsInRetryIsNotHeldBackByAnOlderRowDueSoon() throws Exception {
+        bootstrap();
+        parkAll("k#1", "k#2");
+        script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.requeue(),
+                "k#3", Outcome.retry(new RuntimeException("k#3 down"))));
+        send(msg("t", "k", "k#3"), msg("t", "j", "j#1"));
+        tick();
+        process();
+        now = now.plus(REQUEUE_DELAY);
+        setParkedDue("k#1", now.plus(Duration.ofMillis(1)));
+        setParkedDue("k#2", now);
+        try (var c = TestDb.connect()) {
+            execute(c, "update " + names.retry() + " set next_attempt_at = now() + interval '1 hour'");
+        }
+        script = answering(Map.of());
+
+        process();
+
+        assertThat(parkedRows()).as("put off at least the requeue delay, so a shard is not stepped for a moment's wait")
+                .containsExactly("k#1:2:" + now.plus(Duration.ofMillis(1)), "k#2:2:" + now.plus(REQUEUE_DELAY));
     }
 
     @Test

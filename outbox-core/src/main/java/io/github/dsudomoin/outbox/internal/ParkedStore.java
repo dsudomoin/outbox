@@ -18,9 +18,12 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Set;
@@ -29,7 +32,8 @@ import java.util.TreeMap;
 /**
  * Requeued records in {@code <base>_parked}: unlike retry rows they block nothing; each comes back right before the
  * next record of its (topic, key) or at its {@code due_at}, or that of a newer parked row of its key. Every method runs
- * on the caller's connection, so inside the shard step's transaction a rolled-back step leaves each record where it was.
+ * on the caller's connection, so inside the shard step's transaction a rolled-back step leaves each record where it
+ * was.
  */
 public final class ParkedStore {
 
@@ -43,6 +47,7 @@ public final class ParkedStore {
     private final String selectDue;
     private final String selectOfKeys;
     private final String selectOlder;
+    private final String putOff;
     private final String postponeNewer;
     private final String minDue;
     private final String size;
@@ -76,11 +81,15 @@ public final class ParkedStore {
         selectOfKeys = "select " + RECORD_COLUMNS + " from (select distinct t, b from unnest(?::text[], ?::bytea[])"
                 + " u(t, b)) k cross join lateral (select " + RECORD_COLUMNS + " from " + parked
                 + " where shard = ? and topic = k.t and key = k.b order by id limit ?) p order by id limit ?";
-        selectOlder = "select " + RECORD_COLUMNS + " from unnest(?::text[], ?::bytea[], ?::int8[]) k(t, b, below)"
-                + " cross join lateral (select " + RECORD_COLUMNS + " from " + parked
-                + " where shard = ? and topic = k.t and key = k.b and id < k.below order by id limit ?) p"
-                + " where not exists (select 1 from " + retry + " r where r.shard = ? and r.topic = k.t"
-                + " and r.key = k.b) order by id limit ?";
+        // of a key waiting in retry, its lowest row not due; of any other, its rows below the due one, the oldest
+        // first, after those, so that those never cut the others to fewer than the limit
+        selectOlder = "select " + RECORD_COLUMNS + ", due_at, in_retry from unnest(?::text[], ?::bytea[], ?::int8[])"
+                + " u(t, b, below) cross join lateral (select exists (select 1 from " + retry
+                + " r where r.shard = ? and r.topic = u.t and r.key = u.b) in_retry) k"
+                + " cross join lateral (select " + RECORD_COLUMNS + ", due_at from " + parked
+                + " where shard = ? and topic = u.t and key = u.b and id < u.below and (not k.in_retry or due_at > ?)"
+                + " order by id limit case when k.in_retry then 1 else ? end) p order by in_retry desc, id limit ?";
+        putOff = "update " + parked + " set due_at = ? where id = any(?)";
         postponeNewer = "update " + parked + " p set due_at = ? from unnest(?::text[], ?::bytea[], ?::int8[])"
                 + " k(t, b, above) where p.shard = ? and p.topic = k.t and p.key = k.b and p.id > k.above"
                 + " and p.due_at <= ?";
@@ -232,14 +241,22 @@ public final class ParkedStore {
         }
     }
 
+    /** What a due pass hands, and whether it moved the due time of rows it did not hand: {@link #minDue} changed. */
+    public record DueRows(List<OutboxRecord> rows, boolean putOff) {
+
+        public static final DueRows NONE = new DueRows(List.of(), false);
+    }
+
     /**
      * What a due pass hands: the rows of {@code shard} due at {@code now} and, for each keyed one, the older parked
      * rows of its (topic, key), due or not, so a key's rows come back in their order whatever their due times; the
-     * oldest {@code limit} of all these, in id order, which keeps each key's a prefix of its rows. A row whose key waits
-     * in the retry table brings none: its key is blocked, and its rows stay as they are until they are due. An unkeyed
-     * row comes alone.
+     * oldest {@code limit} of all these, in id order, which keeps each key's a prefix of its rows. A key waiting in the
+     * retry table is blocked, so its rows are not offered ahead of time: its due rows come only up to its lowest row
+     * not due, and those above that stay parked, due with it and at least {@code requeueDelay} from now, no requeue
+     * spent, so the shard is not stepped for them in the meantime. An unkeyed row comes alone.
      */
-    public List<OutboxRecord> dueWithOlder(Connection c, int shard, Instant now, int limit) throws SQLException {
+    public DueRows dueWithOlder(Connection c, int shard, Instant now, int limit, Duration requeueDelay)
+            throws SQLException {
         var due = due(c, shard, now, limit);
         var newest = new LinkedHashMap<Object, OutboxRecord>();
         for (var row : due) { // in id order: the last of a key stays
@@ -248,19 +265,50 @@ public final class ParkedStore {
             }
         }
         if (newest.isEmpty()) {
-            return due;
+            return new DueRows(due, false);
         }
         var rows = new TreeMap<Long, OutboxRecord>();
         due.forEach(row -> rows.put(row.id(), row));
+        var notDue = new HashMap<Object, OutboxRecord>(); // of a key waiting in retry
+        var notDueAt = new HashMap<Object, OffsetDateTime>();
         try (var ps = c.prepareStatement(selectOlder)) {
             bindKeys(c, ps, 1, newest.values());
             ps.setShort(4, (short) shard);
-            ps.setInt(5, limit);
-            ps.setShort(6, (short) shard);
+            ps.setShort(5, (short) shard);
+            ps.setObject(6, timestamp(now));
             ps.setInt(7, limit);
-            records(ps.executeQuery()).forEach(row -> rows.put(row.id(), row));
+            ps.setInt(8, limit + newest.size());
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    var row = RetryStore.record(rs, 1);
+                    if (rs.getBoolean("in_retry")) {
+                        notDue.put(BatchClassifier.orderingKey(row), row);
+                        notDueAt.put(BatchClassifier.orderingKey(row), rs.getObject("due_at", OffsetDateTime.class));
+                    } else {
+                        rows.put(row.id(), row);
+                    }
+                }
+            }
         }
-        return rows.values().stream().limit(limit).toList();
+        boolean putBack = false;
+        var earliest = timestamp(now.plus(requeueDelay));
+        for (var older : notDue.entrySet()) {
+            var ids = new ArrayList<Long>();
+            for (var row : due) {
+                if (row.id() > older.getValue().id() && older.getKey().equals(BatchClassifier.orderingKey(row))) {
+                    rows.remove(row.id());
+                    ids.add(row.id());
+                }
+            }
+            var at = notDueAt.get(older.getKey());
+            try (var ps = c.prepareStatement(putOff)) {
+                ps.setObject(1, at.isAfter(earliest) ? at : earliest);
+                ps.setArray(2, c.createArrayOf("int8", ids.toArray()));
+                ps.executeUpdate();
+            }
+            putBack = true;
+        }
+        return new DueRows(rows.values().stream().limit(limit).toList(), putBack);
     }
 
     /**
