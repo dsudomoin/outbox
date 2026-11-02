@@ -375,7 +375,8 @@ class OperationsUnderLoadIT {
             }
             c.rollback();
         }
-        assertThat(gauge("outbox.inbox.partitions.orphaned")).isZero();
+        // a read during a maintenance run in progress is NaN, unknown until its orphan step completes
+        await(BOUND, "the inbox orphan gauge at 0", () -> gauge("outbox.inbox.partitions.orphaned") == 0);
     }
 
     @Test
