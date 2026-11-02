@@ -1,0 +1,47 @@
+name: kora-outbox-prodcheck
+
+x-postgres: &postgres
+  environment:
+    POSTGRES_DB: outbox
+    POSTGRES_USER: outbox
+    POSTGRES_PASSWORD: outbox
+  command:
+    - postgres
+    - -c
+    - max_connections=300
+    - -c
+    - shared_buffers=512MB
+    - -c
+    - max_locks_per_transaction=256
+    - -c
+    - synchronous_commit=on
+  cpus: 2
+  mem_limit: 2g
+  shm_size: 512m
+  healthcheck:
+    test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "outbox", "-d", "outbox"]
+    interval: 1s
+    timeout: 3s
+    retries: 60
+
+services:
+  source:
+    <<: *postgres
+    build: ./docker
+    image: kora-outbox-prodcheck-pg
+    container_name: kora-outbox-prodcheck-source
+    ports:
+      - "127.0.0.1:55432:5432"
+  target:
+    <<: *postgres
+    image: postgres:16
+    container_name: kora-outbox-prodcheck-target
+    ports:
+      - "127.0.0.1:55433:5432"
+  # Not a service: the image of an instance whose clock is off (scenario app-clock). `--profile tools build` builds it.
+  skewed-app:
+    profiles: [tools]
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.app
+    image: kora-outbox-prodcheck-app
