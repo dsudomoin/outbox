@@ -1330,7 +1330,8 @@ relay](#как-работает-relay), [Обработка сбоев](#обр�
 Импорты в примерах опущены. Типы лежат в `io.github.dsudomoin.outbox` (`Outbox`, `TypedOutbox`, `Inbox`, обработчики),
 `io.github.dsudomoin.outbox.spring` (`OutboxOwner`, `OutboxHeartbeat`), `io.github.dsudomoin.outbox.admin.spring`
 (`OutboxAdminAuthorizer`) и `io.github.dsudomoin.outbox.kafka` (`KafkaOutboxHeaders`). `ReadmeExamplesTest` компилирует
-каждый пример этого раздела на обеих линиях и запускает приложение из этого подраздела.
+каждый пример этого раздела на обеих линиях и запускает приложение этого подраздела с тестовой базой и выключенным
+relay.
 
 ### Подключение и первая отправка
 
@@ -1340,11 +1341,13 @@ relay](#как-работает-relay), [Обработка сбоев](#обр�
 ```kotlin
 dependencies {
     implementation("org.springframework.boot:spring-boot-starter-jdbc") // или spring-boot-starter-data-jpa
+    // для админ-API; на Boot 4.1 spring-boot-starter-webmvc
+    implementation("org.springframework.boot:spring-boot-starter-web")
     runtimeOnly("org.postgresql:postgresql")
 
     implementation("io.github.dsudomoin:outbox-spring-boot:0.1.0-SNAPSHOT")
     implementation("io.github.dsudomoin:outbox-kafka-spring-boot:0.1.0-SNAPSHOT") // обработчик Kafka; без Kafka не нужен
-    implementation("io.github.dsudomoin:outbox-admin-spring-boot:0.1.0-SNAPSHOT") // админ-API по HTTP; нужен Spring MVC
+    implementation("io.github.dsudomoin:outbox-admin-spring-boot:0.1.0-SNAPSHOT") // админ-API по HTTP
 }
 ```
 
@@ -1363,7 +1366,7 @@ spring:
     bootstrap-servers: kafka-1:9092,kafka-2:9092
 
 outbox:
-  table: app.outbox             # таблицы в своей схеме сервиса; схема должна существовать
+  table: app.outbox             # таблицы outbox в своей схеме, она должна существовать; inbox задаётся отдельно
   kafka:
     driver-properties:
       bootstrap.servers: ${spring.kafka.bootstrap-servers}
@@ -1430,8 +1433,8 @@ class ApiKeyAuthorizer implements OutboxAdminAuthorizer {
 }
 ```
 
-Этого достаточно: на старте библиотека создаёт недостающие таблицы (права роли — в [Роли в базе и
-привилегиях](#роль-в-базе-и-привилегии)), затем запускает relay. После коммита relay доставляет сообщение в Kafka в
+Этого достаточно, если таблица `orders` уже есть в ваших миграциях: на старте библиотека создаёт недостающие таблицы
+outbox (права роли — в [Роли в базе и привилегиях](#роль-в-базе-и-привилегии)), затем запускает relay. После коммита relay доставляет сообщение в Kafka в
 топик `orders`; топики создайте заранее ([Требования к Kafka](#требования-к-kafka)). Строка INFO при старте показывает,
 куда пойдёт каждый топик: `outbox routes: none; other topics -> outboxKafkaFallbackHandler`.
 
@@ -1516,6 +1519,10 @@ class OrderImport {
   `TransactionAwareDataSourceProxy` разворачивается до своего `DataSource`. Пул с
   `spring.datasource.hikari.auto-commit=false` поддержан: соединения для собственной работы outbox адаптер сам
   переводит в autocommit, а соединения транзакций не трогает.
+- **`afterCommit` и `@TransactionalEventListener(AFTER_COMMIT)`.** Транзакция уже зафиксирована, но её соединение ещё
+  привязано к потоку, поэтому проверка отправку пропускает, а строка окажется вне бизнес-транзакции. На пуле с
+  `auto-commit=false` она теряется молча, хотя `send` вернул id. Как и для остального доступа к данным Spring, такой
+  колбэк должен открыть `REQUIRES_NEW`.
 - **Отправка до старта и после остановки.** До первого старта `Outbox` отказывает; из `@PostConstruct` отправлять нельзя
   ([Запуск и остановка](#запуск-и-остановка)). После остановки контекста отправка в транзакции всё равно пишет строку, и
   её доставит следующий старт или другой инстанс.
@@ -1698,10 +1705,12 @@ class BatchProjection implements OutboxTopicHandler {
 
     private final TransactionTemplate transaction;
     private final JdbcTemplate jdbc;
+    private final Inbox inbox;
 
-    BatchProjection(PlatformTransactionManager transactions, JdbcTemplate jdbc) {
+    BatchProjection(PlatformTransactionManager transactions, JdbcTemplate jdbc, Inbox inbox) {
         this.transaction = new TransactionTemplate(transactions);
         this.jdbc = jdbc;
+        this.inbox = inbox;
     }
 
     @Override
@@ -1711,7 +1720,9 @@ class BatchProjection implements OutboxTopicHandler {
 
     @Override
     public void handle(OutboxRecord record) {
-        jdbc.update("insert into projection (message_id) values (?)", record.messageId());
+        if (inbox.tryAccept(record.messageId())) { // отметка в той же транзакции: повторная передача пакета безопасна
+            jdbc.update("insert into projection (message_id) values (?)", record.messageId());
+        }
     }
 
     @Override
@@ -1839,6 +1850,11 @@ class OutboxMigrations {
 }
 ```
 
+На Boot 4.1 нужны `spring-boot-starter-flyway` или `spring-boot-starter-liquibase`, на 3.5 `flyway-core` или
+`liquibase-core`; для Flyway ещё `flyway-database-postgresql`. Без них миграции молча не выполнятся, и старт откажет
+из-за отсутствующей таблицы. `OutboxSql.inbox` берёт таблицу из `config.inbox().table()`: если вы задали
+`outbox.inbox.table`, переопределите в конфиге и `inbox()`.
+
 Для Flyway положите файл в `db/migration` как есть, для Liquibase подключите его через `sqlFile`:
 
 ```yaml
@@ -1919,6 +1935,7 @@ class OutboxHeartbeatConfig {
                 .url(directUrl).username(username).password(password).build();
         pool.setPoolName("outbox-heartbeat-direct");
         pool.setMaximumPoolSize(1); // иначе Hikari держит 10 открытых соединений
+        pool.setConnectionTimeout(5_000); // заметно меньше интервала heartbeat
         return pool;
     }
 }
@@ -1938,7 +1955,7 @@ class OutboxHeartbeatConfig {
 - **`@PostConstruct`.** До старта `Outbox` и `OutboxAdmin` отказывают:
   `the outbox starts with the application context's lifecycle; send from an ApplicationRunner or later, not from @PostConstruct`.
   То же в `SmartInitializingSingleton` и в `SmartLifecycle` с фазой ниже. Отправляйте из `ApplicationRunner` или позже.
-- **Рестарт контекста** (`context.stop()`, затем `start()`, checkpoint/restore) создаёт новый runtime. Бины `Outbox` и
+- **Рестарт контекста** (`context.stop()`, затем `start()`) создаёт новый runtime. Бины `Outbox` и
   `OutboxAdmin` следуют за ним сами.
 - **`OutboxRelay`** — прототип: каждый поиск даёт relay последнего старта. Поле, внедрённое до рестарта, держит закрытый
   relay. Внедрение до первого старта падает с тем же текстом про `ApplicationRunner`, как и
@@ -1948,10 +1965,11 @@ class OutboxHeartbeatConfig {
 - **Глобальный lazy-init** на старт outbox не влияет: бин жизненного цикла создаётся сразу.
 
 **Kubernetes.** Выделите pod столько времени, сколько длится остановка:
-`terminationGracePeriodSeconds` > задержка `preStop` + graceful-остановка веб-сервера (до
-`spring.lifecycle.timeout-per-shutdown-phase`, 30 с по умолчанию) + `outbox.relay.shutdown-timeout` (30 с по умолчанию).
-Стандартных 30 с Kubernetes на это не хватает. Таймаут фазы Spring остановку outbox не обрывает: она синхронная, и
-её предел — собственный `shutdown-timeout`. SIGKILL посреди вызова ничего не теряет: записи без зафиксированного исхода
+`terminationGracePeriodSeconds` > задержка `preStop` + graceful-остановка веб-сервера и контейнеров listener (до
+`spring.lifecycle.timeout-per-shutdown-phase` на фазу, 30 с по умолчанию) + `outbox.relay.shutdown-timeout` (30 с по
+умолчанию) и ещё пара секунд. Стандартных 30 с Kubernetes на это не хватает. Таймаут фазы Spring остановку outbox не
+обрывает: она синхронная, и её предел — `shutdown-timeout` и ещё около секунды на прерывание воркеров и удаление строки
+инстанса. SIGKILL посреди вызова ничего не теряет: записи без зафиксированного исхода
 будут доставлены повторно ([Гарантии](#гарантии)), а строка инстанса останется до истечения.
 
 ### Переход с Jackson 2 на Jackson 3
@@ -2032,9 +2050,8 @@ letters, написанные одним мажором, читает друго
 **Отличия от Kora:**
 
 - JSON-тело без `Content-Type` получает 400 (с другим `Content-Type` — 415).
-- Пустой `key` в фильтре массового вызова и в `waiting/abandon` получает 400 (Kora работает с пустым ключом; берите
-  `ids`).
 - Тело больше 1 МиБ получает 400.
+- Пустые `?limit=` и `?afterId=` читаются как отсутствующие (Kora на пустой `limit` отвечает 400).
 - Несовпавшие 404, 405, 406 и `OPTIONS` идут в обработку приложения по умолчанию: без проверки, но и без запуска
   маршрута.
 - Multipart-запрос разбирает `DispatcherServlet` ещё до поиска обработчика на любом пути приложения, поэтому «тело не
@@ -2042,13 +2059,16 @@ letters, написанные одним мажором, читает друго
 - `MappedInterceptor` приложения может выполниться раньше проверки. Если он бросит исключение, вызывающий получит
   фиксированный 500 «authorization failed» без текста.
 
+Тело запроса админ-API читается собственным маппером библиотеки, поэтому настройки и десериализаторы приложения не меняют
+смысл вызова: пропавшее или обрезанное значение не расширит массовую операцию. Конвертер приложения всё равно
+вызывается, его результат отбрасывается, а его исключение даёт 400. Нужен `jackson-databind` 2 или 3 на classpath, без
+него приложение не стартует.
+
 **Настройки приложения, которые ломают админ-API.** Все они оставляют его закрытым, ни одна не открывает маршрут:
 
 - `spring.aop.proxy-target-class=false` вместе с аспектом над контроллерами: 500 на каждый вызов.
 - Заменённые резолверы исключений MVC: отказ становится 500 контейнера.
-- Gson как JSON-конвертер MVC не поддержан: неверные значения статуса и отказ `ids`.
-- `spring.jackson.deserialization.use-java-array-for-json-array` и `use-big-integer-for-ints`: корректные вызовы с `ids`
-  получают отказ.
+- Gson как JSON-конвертер MVC не поддержан: неверные значения статуса в ответах.
 - Глобальный `ResponseBodyAdvice` приложения оборачивает и ответы админ-API: ограничьте его своими контроллерами.
 - CSRF в Spring Security действует и на эти POST: исключите путь или шлите токен.
 
@@ -2116,6 +2136,7 @@ class OrdersTest {
 | `outbox handler bean <бин>: handleBatch(List) runs in one transaction around the batch` | `@Transactional` на `handle` и `handleBatch` по умолчанию, или `TransactionTemplate` внутри `handleBatch` ([формы](#transactional-на-обработчике)). |
 | `outbox handler bean <бин>: <метод> has propagation MANDATORY` | На потоке обработчика транзакции нет: `REQUIRED` или `REQUIRES_NEW`. |
 | `outbox handler bean <бин>: advisor <советник> matches <метод> but no method the relay calls on its proxy, so the advice would never run` | Конец сообщения называет причину ([таблица вызовов](#обработчики-за-прокси)): `override handleBatch or advise handle`; `advise handleBatch, or use a TransactionTemplate inside the override`; `set spring.aop.proxy-target-class=true`; `advise the hook handle(T, OutboxRecord) or handleTombstone instead`; `advise the method where the class declares it`. |
+| `outbox handler bean <бин>: ... an interface-based (JDK) proxy dispatches a method that several of its interfaces have as the first listed one has it` | Типизированный обработчик под JDK-прокси, совет на интерфейсе, который в `implements` стоит позже другого с тем же методом. Поставьте этот интерфейс первым: сообщение называет оба. |
 | `outbox handler bean <бин>: <метод> is final, and the relay calls it on a class-based proxy` | Уберите `final`; для типизированного: только class-based или только JDK-прокси. |
 | `outbox handler bean <бин> is a proxy without a singleton target` | Сделайте бин обычным singleton. |
 | `Cannot subclass final class <класс>` | Аспект задел финальный бин: сузьте pointcut ([широкий аспект](#обработчики-за-прокси)). |

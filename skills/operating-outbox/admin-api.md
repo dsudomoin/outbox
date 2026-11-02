@@ -105,14 +105,16 @@ class ApiKeyAuthorizer implements OutboxAdminAuthorizer {
   address.
 - Audit: logger `io.github.dsudomoin.outbox.admin.spring.OutboxAdminGuard` at INFO; keep it on. An allowed call's line
   comes just after its response is flushed.
-- Differs from Kora: a JSON body with no `Content-Type` gets 400; a blank `key` in a bulk filter or abandon gets 400
-  (use `ids`); a body over 1 MiB gets 400; unmatched 404/405/406 and OPTIONS go to the app's default handling, no route
-  run. A multipart request is parsed ahead of authorization on every path.
+- Differs from Kora: a JSON body with no `Content-Type` gets 400; a body over 1 MiB gets 400; blank `?limit=` and
+  `?afterId=` read as absent; unmatched 404/405/406 and OPTIONS go to the app's default handling, no route run. A
+  multipart request is parsed ahead of authorization on every path.
+- Request bodies are read with the library's own mapper, so the app's Jackson settings and deserializers cannot change
+  what a call means. Jackson 2 or 3 must be on the classpath, or the start fails.
 - A 500 «authorization did not run»: something lost the guard (an app's `HandlerMapping` dropping interceptors, the
   controller scanned without the auto-configuration). It stays closed; the WARN names the cause.
 - App settings that break it, all closed: `spring.aop.proxy-target-class=false` with an aspect over controllers;
-  replaced exception resolvers; Gson as MVC's JSON converter; `use-java-array-for-json-array` or
-  `use-big-integer-for-ints` (valid `ids` refused). A global `ResponseBodyAdvice` wraps its answers: scope it. Spring
+  replaced exception resolvers; Gson as MVC's JSON converter (wrong status values in responses). A global
+  `ResponseBodyAdvice` wraps its answers: scope it. Spring
   Security's CSRF applies to these POSTs: exempt the path or use a token.
 
 ## Procedures

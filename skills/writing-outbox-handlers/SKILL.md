@@ -116,7 +116,8 @@ Everything above holds; what differs is wiring, proxies and transactions (README
   `handle(OutboxRecord)` (typed, JDK proxy: the payload decodes twice, and an aspect there never sees records that fail
   to decode or wait on a newer contract); only `handleBatch` when overridden. Advice that could never run fails the
   start with the fix. A scoped or `@RefreshScope` bean fails too. Broad pointcuts: add
-  `!within(io.github.dsudomoin..*)`, the library's beans are final.
+  `!within(io.github.dsudomoin..*)`, the library's beans are final; `execution(* *(..))` still fails on Boot's own final
+  classes, so narrow it.
 
 **The guarantee**: if the handler ends with an error, Retry/Permanent/Waiting, its transaction rolls back; if the
 handler committed but the relay did not record Delivered, the re-hand is safe thanks to Inbox dedup. So the marker

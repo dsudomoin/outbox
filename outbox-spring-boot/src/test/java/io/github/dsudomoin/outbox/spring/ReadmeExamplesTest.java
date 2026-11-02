@@ -39,6 +39,7 @@ class ReadmeExamplesTest {
     private static final Pattern NEXT_SECTION = Pattern.compile("^## ", Pattern.MULTILINE);
     private static final Pattern JAVA_BLOCK = Pattern.compile("^ *```java\n(.*?)^ *```$",
         Pattern.MULTILINE | Pattern.DOTALL);
+    private static final Pattern FENCE = Pattern.compile("^[ \\t>]*(```|~~~)(.*)$", Pattern.MULTILINE);
     private static final Pattern YAML_BLOCK = Pattern.compile("^```yaml\n(.*?)^```$",
         Pattern.MULTILINE | Pattern.DOTALL);
     private static final String IMPORTS = """
@@ -96,6 +97,18 @@ import java.io.IOException;
             return Files.readString(document).contains("\n" + HEADING);
         } catch (IOException e) {
             throw new IllegalStateException(e);
+        }
+    }
+
+    /** A block tagged in any other way would quietly stay out of {@link #JAVA_BLOCK}, so unchecked. */
+    @Test
+    void everyFenceInTheSectionsHasAKnownTag() throws IOException {
+        for (var document : documents()) {
+            var fences = FENCE.matcher(section(document)).results().toList();
+            for (int opening = 0; opening < fences.size(); opening += 2) {
+                assertThat(fences.get(opening).group(1) + fences.get(opening).group(2)).as(document)
+                    .isIn("```java", "```kotlin", "```yaml");
+            }
         }
     }
 

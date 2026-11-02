@@ -167,8 +167,9 @@ no route check.
 
 ## Spring Boot
 
-README «Spring Boot» is the reference; its refusal table quotes every start failure. Spring and Boot are the app's own:
-it needs `spring-boot-starter-jdbc` or `-data-jpa` and the Postgres driver.
+README «Spring Boot» is the reference; its refusal table quotes the adapter's start failures. Spring and Boot are the
+app's own: it needs `spring-boot-starter-jdbc` or `-data-jpa`, the Postgres driver, and for the admin API
+`spring-boot-starter-web` (Boot 4.1: `spring-boot-starter-webmvc`).
 
 ```kotlin
 implementation("io.github.dsudomoin:outbox-spring-boot:0.1.0-SNAPSHOT")
@@ -275,7 +276,8 @@ class OutboxDataSources {
   for a pooler bypass, another role or other timeouts. Set `spring.datasource.hikari.pool-name` so dashboards see a
   stable `<pool>-outbox-heartbeat`.
 - **Before deploy, Kubernetes**: `terminationGracePeriodSeconds` > `preStop` +
-  `spring.lifecycle.timeout-per-shutdown-phase` + `outbox.relay.shutdown-timeout`; the default 30 s is too little.
+  `spring.lifecycle.timeout-per-shutdown-phase` per phase + `outbox.relay.shutdown-timeout` + a couple of seconds; the
+  default 30 s is too little.
 
 ## Before deploy
 
