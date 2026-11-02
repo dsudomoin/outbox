@@ -7,11 +7,14 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
 import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRelay;
+import io.github.dsudomoin.outbox.OutboxTransactions;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Park;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
@@ -39,6 +42,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -1801,6 +1805,83 @@ class MaintenanceIT {
             released.countDown();
         }
         awaitBuildEnd(maintenance);
+    }
+
+    @Test
+    void aCancelThatComesLateMissesWhatThePoolRunsNext() throws Exception {
+        bootstrap();
+        deadTableWithoutIndex(1);
+        var foreign = "foreign_" + Long.toHexString(System.nanoTime());
+        var released = new CountDownLatch(1);
+        var cancel = new AtomicReference<Thread>();
+        var hikari = new HikariConfig();
+        hikari.setJdbcUrl(TestDb.jdbcUrl());
+        hikari.setUsername(TestDb.user());
+        hikari.setPassword(TestDb.password());
+        hikari.setMaximumPoolSize(1); // the next user gets the build's backend, for as long as that backend lives
+        try (var pool = new HikariDataSource(hikari); var c = TestDb.connect(); var holder = TestDb.connect()) {
+            var builder = new DeadIndexBuilder(new OutboxTransactions() {
+                @Override
+                public Connection newConnection() throws SQLException {
+                    if (!Thread.currentThread().getName().equals(DeadIndexBuilder.THREAD_NAME + "-cancel")) {
+                        return pool.getConnection();
+                    }
+                    cancel.set(Thread.currentThread());
+                    while (released.getCount() > 0) { // deaf to the interrupt, as a read from a socket is
+                        try {
+                            released.await();
+                        } catch (InterruptedException e) {
+                            // waits on
+                        }
+                    }
+                    return TestDb.connect();
+                }
+
+                @Override
+                public Connection currentConnection() {
+                    return null;
+                }
+
+                @Override
+                public void afterCommit(Runnable action) {
+                    throw new UnsupportedOperationException();
+                }
+
+                @Override
+                public String transactionHint() {
+                    return "";
+                }
+            }, names, Duration.ofMinutes(1), Duration.ofMinutes(1));
+            execute(c, "create table " + foreign + " (id int)");
+            holder.setAutoCommit(false);
+            insertDead(holder, 2);
+            builder.startIfDue(c);
+            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
+
+            builder.close(Duration.ofMillis(100)); // gives up on the cancel, stuck in the source above
+            holder.rollback();
+            await(Duration.ofSeconds(30), () -> !builder.running());
+            assertThat(indexState()).as("the build ended by itself").endsWith(":true");
+
+            execute(holder, "insert into " + foreign + " values (1)"); // holds the pool's next user in its statement
+            var next = CompletableFuture.runAsync(() -> {
+                try (var own = pool.getConnection()) {
+                    execute(own, "create index concurrently " + foreign + "_id on " + foreign + " (id)");
+                } catch (SQLException e) {
+                    throw new IllegalStateException(e);
+                }
+            });
+            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
+
+            released.countDown();
+            cancel.get().join(TimeUnit.SECONDS.toMillis(10));
+            assertThat(cancel.get().isAlive()).isFalse();
+            holder.rollback();
+
+            next.get(30, TimeUnit.SECONDS);
+        } finally {
+            released.countDown();
+        }
     }
 
     @Test

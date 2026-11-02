@@ -20,9 +20,10 @@ import org.slf4j.LoggerFactory;
  * concurrently: SHARE UPDATE EXCLUSIVE, which dead inserts pass; no {@code statement_timeout}, each lock wait (the wait
  * for older transactions included) under {@code lockTimeout}, the session's own values given back. Any failure is a
  * WARN and backs the next try off by 1, 2, 4… maintenance intervals, at most {@link #MAX_BACKOFF}; a success resets
- * it. The backoff is in memory: a restart tries at its first run. {@link #close} cancels a statement in flight; the
- * thread then aborts its connection, which the pool evicts rather than reuse with the build's timeouts, and the next
- * build drops the INVALID leftover. An {@link Error} is logged at ERROR and ends the thread.
+ * it. The backoff is in memory: a restart tries at its first run. {@link #close} cancels a statement in flight; a
+ * thread still running then aborts its connection however its build ended, which the pool evicts rather than reuse with
+ * the build's timeouts or on a backend a late cancel may reach, and the next build drops an INVALID leftover. An
+ * {@link Error} is logged at ERROR and ends the thread.
  */
 final class DeadIndexBuilder {
 
@@ -92,9 +93,8 @@ final class DeadIndexBuilder {
         synchronized (monitor) {
             closed = true;
             t = thread;
-            // under the monitor, so the thread cannot begin another DDL statement meanwhile
-            // ponytail: a cancel landing just after its DDL ends hits PartitionDdl's restore instead; the thread then
-            // aborts the connection (the pool evicts it), so a cancelled build may cost one pooled connection
+            // under the monitor, so the thread cannot begin another DDL statement meanwhile, and past its DDL finds
+            // closed set and aborts the connection: however late this cancel comes, no other user of the pool is there
             if (inDdl != 0) {
                 int pid = inDdl;
                 if (!Bounded.run(THREAD_NAME + "-cancel", CANCEL_WAIT, () -> cancel(pid))) { // no free connection, say
@@ -118,7 +118,7 @@ final class DeadIndexBuilder {
     }
 
     private void cancel(int pid) {
-        // only while the backend runs the build: a cancel given up on may get here later, when it runs anything else
+        // only while the backend runs the build: a cancel given up on may get here after it ended, its pid free again
         try (var c = db.newConnection(); var ps = c.prepareStatement("select pg_cancel_backend(pid) from"
                 + " pg_stat_activity where pid = ? and (query like 'create index concurrently%' or query like"
                 + " 'drop index concurrently%')")) {
@@ -137,7 +137,6 @@ final class DeadIndexBuilder {
             if (!advisory(c, "pg_try_advisory_lock")) {
                 return; // another instance builds it
             }
-            boolean aborted = false;
             Exception failure = null;
             try {
                 var valid = state(c);
@@ -157,12 +156,11 @@ final class DeadIndexBuilder {
                 }
             } catch (SQLException | RuntimeException e) {
                 failure = e;
-                if (isClosed()) { // its timeouts may still be set: the pool evicts it instead of reusing it
-                    aborted = abort(c, e);
-                }
                 throw e;
             } finally {
-                if (!aborted) { // an aborted session took its lock with it
+                // past a close, its timeouts may still be set and a cancel may still come for its pid: the pool evicts
+                // it instead of reusing it
+                if (!(isClosed() && abort(c, failure))) { // an aborted session took its lock with it
                     try {
                         advisory(c, "pg_advisory_unlock");
                     } catch (SQLException e) { // the session died, and its lock with it: keep the cause on top
@@ -180,7 +178,7 @@ final class DeadIndexBuilder {
             throw e;
         } catch (SQLException | RuntimeException e) {
             if (isClosed()) {
-                log.info("outbox build of {} cancelled at shutdown; the next one drops what it left", index);
+                log.info("outbox build of {} ended at shutdown; the next one drops anything it left", index);
                 return;
             }
             int failed = ++failures;
@@ -204,13 +202,18 @@ final class DeadIndexBuilder {
         }
     }
 
-    /** Closes {@code c}'s session at once; false, with the failure added to {@code cause}, when that failed. */
-    private static boolean abort(Connection c, Exception cause) {
+    /** Closes {@code c}'s session at once; false when that failed, added to {@code cause} if any, else logged. */
+    private boolean abort(Connection c, @Nullable Exception cause) {
         try {
             c.abort(Runnable::run);
             return true;
         } catch (SQLException e) {
-            cause.addSuppressed(e);
+            if (cause != null) {
+                cause.addSuppressed(e);
+            } else {
+                log.warn("outbox could not abort the connection of the build of {} at shutdown: {}", index,
+                        e.toString());
+            }
             return false;
         }
     }
