@@ -7,7 +7,9 @@ import static org.awaitility.Awaitility.await;
 
 import io.github.dsudomoin.outbox.DeadLetter;
 import io.github.dsudomoin.outbox.DeadLetterDecision;
+import io.github.dsudomoin.outbox.DeadLetterFilter;
 import io.github.dsudomoin.outbox.Outbox;
+import io.github.dsudomoin.outbox.OutboxAdmin;
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxDeadLetterHandler;
 import io.github.dsudomoin.outbox.OutboxHandler;
@@ -211,13 +213,54 @@ class KafkaOutboxAutoConfigurationIT {
         }
     }
 
-    @Test
-    void appOutboxHandlerWithFallbackFails() {
-        runner().withUserConfiguration(WithAppHandler.class).run(context -> assertThat(failure(context))
+    private static void assertNamesTheConflict(String failure) {
+        assertThat(failure)
             .contains("several OutboxHandler beans: ").contains("outboxKafkaFallbackHandler")
             .contains("appHandler (" + AppHandler.class.getName() + ")")
             .endsWith("; outbox-kafka-spring-boot provides outboxKafkaFallbackHandler while"
-                + " outbox.kafka.fallback=true: set outbox.kafka.fallback=false to let your own handler take them"));
+                + " outbox.kafka.fallback=true: set outbox.kafka.fallback=false to let your own handler take them");
+    }
+
+    @Test
+    void appOutboxHandlerWithFallbackFails() {
+        runner().withUserConfiguration(WithAppHandler.class)
+            .run(context -> assertNamesTheConflict(failure(context)));
+    }
+
+    /** The conflict comes first: a sender that cannot be built must not hide it behind advice to configure Kafka. */
+    @Test
+    void appOutboxHandlerWithFallbackFailsWhateverTheSender() {
+        withoutKafka().withUserConfiguration(WithAppHandler.class)
+            .run(context -> assertNamesTheConflict(failure(context)));
+        runner("outbox.kafka.driver-properties.acks=1").withUserConfiguration(WithAppHandler.class)
+            .run(context -> assertNamesTheConflict(failure(context)));
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class WithSubHandlers {
+
+        @Bean(defaultCandidate = false)
+        OutboxHandler notByDefault() {
+            return new AppHandler();
+        }
+
+        @Bean(autowireCandidate = false)
+        OutboxHandler neverInjected() {
+            return new AppHandler();
+        }
+    }
+
+    /** Sub-handlers the outbox's lookup does not see are no second OutboxHandler. */
+    @Test
+    void nonCandidateHandlersBesideFallbackStart() {
+        var topic = TestKafka.createTopic(1);
+        runner().withUserConfiguration(WithSubHandlers.class).run(context -> {
+            assertThat(context).hasNotFailed();
+            var id = send(context, topic);
+
+            var record = TestKafka.consumeUntil(topic, WAIT, r -> !r.isEmpty()).get(0);
+            assertThat(KafkaOutboxHeaders.messageId(record)).isEqualTo(id);
+        });
     }
 
     @Test
@@ -240,8 +283,12 @@ class KafkaOutboxAutoConfigurationIT {
         withoutKafka("outbox.kafka.fallback=false").withUserConfiguration(WithRoute.class).run(context -> {
             assertThat(context).doesNotHaveBean(OutboxHandler.class);
 
-            assertThatThrownBy(() -> send(context, "unrouted")).isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("unrouted");
+            // caught inside, so that the transaction commits: a row written before the refusal would stay
+            var outbox = context.getBean(Outbox.class);
+            new TransactionTemplate(context.getBean(PlatformTransactionManager.class))
+                .executeWithoutResult(status -> assertThatThrownBy(() ->
+                    outbox.send(OutboxMessage.of("unrouted", "k", "v".getBytes(UTF_8))))
+                    .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("unrouted"));
             try (var c = TestDataSources.newDataSource().getConnection()) {
                 assertThat(TestSql.queryLong(c, "select count(*) from " + context.getBean(OutboxConfig.class).table()))
                     .isZero();
@@ -264,6 +311,26 @@ class KafkaOutboxAutoConfigurationIT {
             assertThat(KafkaOutboxHeaders.messageId(record)).isEqualTo(id);
             assertThat(record.headers().lastHeader(KafkaDeadLetterHandler.DEAD_TOPIC).value())
                 .isEqualTo(topic.getBytes(UTF_8));
+        });
+    }
+
+    @Test
+    void camelCaseDeadLetterTopicActivatesTheHook() {
+        runner("outbox.kafka.deadLetterTopic={topic}.dlq")
+            .run(context -> assertThat(context.getBean(KafkaDeadLetterHandler.class).active()).isTrue());
+    }
+
+    /** No hook bean to leave in the slot of a later one: the core's default keeps the letter, with no call. */
+    @Test
+    void withoutDeadLetterTopicThereIsNoHookAndLettersAreKept() {
+        var topic = refusingTopic();
+        runner().run(context -> {
+            assertThat(context).doesNotHaveBean(OutboxDeadLetterHandler.class);
+
+            send(context, tooLarge(topic));
+
+            var admin = context.getBean(OutboxAdmin.class);
+            await().atMost(WAIT).until(() -> admin.countDeadLetters(DeadLetterFilter.any()) == 1);
         });
     }
 
@@ -312,6 +379,12 @@ class KafkaOutboxAutoConfigurationIT {
                 assertThat(properties.deadLetterTopic()).isNull();
                 assertThat(properties.fallback()).isTrue();
             });
+    }
+
+    @Test
+    void toStringLeavesOutDriverValues() {
+        assertThat(new KafkaOutboxProperties(Map.of("sasl.jaas.config", "secret"), "{topic}.dlq", true).toString())
+            .doesNotContain("secret").contains("sasl.jaas.config", "{topic}.dlq", "fallback=true");
     }
 
     @Test

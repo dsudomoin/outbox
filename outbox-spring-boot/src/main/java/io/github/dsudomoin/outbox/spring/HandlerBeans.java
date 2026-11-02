@@ -28,7 +28,10 @@ import org.springframework.aop.interceptor.ExposeInvocationInterceptor;
 import org.springframework.aop.support.AopUtils;
 import org.springframework.beans.factory.BeanFactoryUtils;
 import org.springframework.beans.factory.ListableBeanFactory;
+import org.springframework.beans.factory.NoSuchBeanDefinitionException;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.config.ConfigurableBeanFactory;
+import org.springframework.beans.factory.support.AbstractBeanDefinition;
 import org.springframework.util.ClassUtils;
 
 /**
@@ -97,6 +100,7 @@ final class HandlerBeans {
      */
     static HandlerBeans collect(ListableBeanFactory beans, ObjectProvider<OutboxHandler> handlerBeans,
             ObjectProvider<OutboxTopicHandler> routeBeans) {
+        refuseBesideKafka(beans);
         var fallbacks = handlerBeans.orderedStream().toList();
         var routeList = routeBeans.orderedStream().toList();
         var names = new IdentityHashMap<Object, String>(); // singletons only: never a scoped target
@@ -114,11 +118,7 @@ final class HandlerBeans {
         }
         if (fallbacks.size() > 1) {
             var all = fallbacks.stream().map(bean -> describe(names, bean)).collect(Collectors.joining(", "));
-            boolean kafka = fallbacks.stream().anyMatch(bean -> KAFKA_FALLBACK.equals(names.get(bean)));
-            throw new IllegalArgumentException("several OutboxHandler beans: " + all + "; the outbox takes one, for"
-                + " the topics no OutboxTopicHandler claims" + (kafka ? "; outbox-kafka-spring-boot provides "
-                + KAFKA_FALLBACK + " while outbox.kafka.fallback=true: set outbox.kafka.fallback=false to let your own"
-                + " handler take them" : ": keep one"));
+            throw several(all, fallbacks.stream().anyMatch(bean -> KAFKA_FALLBACK.equals(names.get(bean))));
         }
 
         var handlers = new ArrayList<Handler>();
@@ -153,6 +153,44 @@ final class HandlerBeans {
             .map(e -> e.getKey() + " -> " + e.getValue().name()).collect(Collectors.joining(", "));
         return new HandlerBeans(fallback, List.copyOf(routes), List.copyOf(handlers),
             "outbox routes: " + line + "; other topics -> " + fallbackName);
+    }
+
+    /**
+     * Refuses the Kafka fallback beside another {@code OutboxHandler} by bean names, which instantiates no lazy bean:
+     * building the fallback builds its sender, whose own failure ({@code bootstrap.servers} unset, {@code acks=1})
+     * would hide the conflict behind advice to configure Kafka when the fix may be {@code outbox.kafka.fallback=false}.
+     * Counts what the handler lookup sees, and leaves a bean of both kinds to its own message.
+     */
+    private static void refuseBesideKafka(ListableBeanFactory beans) {
+        var names = Arrays.stream(BeanFactoryUtils.beanNamesForTypeIncludingAncestors(beans, OutboxHandler.class, true,
+                true))
+            .filter(name -> autowireCandidate(beans, name) && !beans.isTypeMatch(name, OutboxTopicHandler.class))
+            .toList();
+        if (names.size() > 1 && names.contains(KAFKA_FALLBACK)) {
+            throw several(names.stream().map(name -> describeByName(beans, name)).collect(Collectors.joining(", ")),
+                true);
+        }
+    }
+
+    /** Whether an unqualified lookup takes it; a singleton registered without a definition has nothing against it. */
+    private static boolean autowireCandidate(ListableBeanFactory beans, String name) {
+        if (!(beans instanceof ConfigurableBeanFactory factory)) {
+            return true;
+        }
+        try {
+            var definition = factory.getMergedBeanDefinition(name);
+            return definition.isAutowireCandidate()
+                && !(definition instanceof AbstractBeanDefinition d && !d.isDefaultCandidate());
+        } catch (NoSuchBeanDefinitionException e) {
+            return true;
+        }
+    }
+
+    private static IllegalArgumentException several(String handlers, boolean kafka) {
+        return new IllegalArgumentException("several OutboxHandler beans: " + handlers + "; the outbox takes one, for"
+            + " the topics no OutboxTopicHandler claims" + (kafka ? "; outbox-kafka-spring-boot provides "
+            + KAFKA_FALLBACK + " while outbox.kafka.fallback=true: set outbox.kafka.fallback=false to let your own"
+            + " handler take them" : ": keep one"));
     }
 
     /** The {@code OutboxHandler} for the topics no route claims, as the runtime takes it; null without one. */
@@ -375,6 +413,12 @@ final class HandlerBeans {
 
     private static String describe(Map<Object, String> names, Object bean) {
         return name(names, bean) + " (" + AopProxyUtils.ultimateTargetClass(bean).getName() + ")";
+    }
+
+    /** The bean's declared type when not built yet: nothing is instantiated to name it. */
+    private static String describeByName(ListableBeanFactory beans, String name) {
+        var type = beans.getType(name);
+        return type != null ? name + " (" + ClassUtils.getUserClass(type).getName() + ")" : name;
     }
 
     private static Method method(Class<?> type, String name, Class<?>... parameters) {

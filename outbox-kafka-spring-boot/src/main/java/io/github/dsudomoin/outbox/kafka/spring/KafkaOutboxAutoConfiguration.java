@@ -19,15 +19,15 @@ import org.springframework.context.annotation.Lazy;
 
 /**
  * Relays the outbox to Kafka, settings under {@code outbox.kafka.*}: a {@link KafkaOutboxSender}, a
- * {@link KafkaOutboxHandler} for every topic no {@link OutboxTopicHandler} bean claims, and a
- * {@link KafkaDeadLetterHandler}, which publishes dead letters once {@code outbox.kafka.dead-letter-topic} is set. An
- * app's own {@link KafkaOutboxSender} or {@link OutboxDeadLetterHandler} bean replaces that one. An app's own
- * {@link OutboxHandler} bean fails the start, so that it cannot take Kafka's topics by accident, unless
- * {@code outbox.kafka.fallback=false} lets it.
+ * {@link KafkaOutboxHandler} for every topic no {@link OutboxTopicHandler} bean claims, and, with
+ * {@code outbox.kafka.dead-letter-topic} set, a {@link KafkaDeadLetterHandler} that publishes dead letters; without it
+ * they stay in the dead table. An app's own {@link KafkaOutboxSender} or {@link OutboxDeadLetterHandler} bean replaces
+ * that one. An app's own {@link OutboxHandler} bean fails the start, so that it cannot take Kafka's topics by
+ * accident, unless {@code outbox.kafka.fallback=false} lets it.
  * <p>
  * The beans are lazy, as Kora builds only what the graph's roots reach: {@code bootstrap.servers} is required once
- * something uses the sender (the outbox's fallback or active dead-letter hook, or an app's bean), and fails the start
- * then, and not with {@code outbox.enabled=false} or a routes-only outbox.
+ * something uses the sender (the outbox's fallback or dead-letter hook, or an app's bean), and fails the start then,
+ * and not with {@code outbox.enabled=false} or a routes-only outbox.
  */
 @AutoConfiguration
 @EnableConfigurationProperties(KafkaOutboxProperties.class)
@@ -55,19 +55,15 @@ public final class KafkaOutboxAutoConfiguration {
         return sender.handler();
     }
 
-    /** Without a dead-letter topic it is inactive and never calls a sender, so none is built for it. */
+    /** The condition's kebab-case name also matches camelCase and environment variables, as the binder does. */
     @Bean
     @Lazy
+    @ConditionalOnProperty(prefix = "outbox.kafka", name = "dead-letter-topic")
     @ConditionalOnMissingBean(OutboxDeadLetterHandler.class)
-    KafkaDeadLetterHandler kafkaDeadLetterHandler(KafkaOutboxProperties properties,
-            ObjectProvider<KafkaOutboxSender> sender, ObjectProvider<OutboxConfig> outbox) {
-        var topic = properties.deadLetterTopic();
-        if (topic == null) {
-            return new KafkaDeadLetterHandler(null, null);
-        }
-        var active = sender.getObject();
-        var hook = new KafkaDeadLetterHandler(active, topic);
-        outbox.ifAvailable(o -> active.warnIfLongerThan("outbox.deadLetters.timeout", o.deadLetters().timeout(),
+    KafkaDeadLetterHandler kafkaDeadLetterHandler(KafkaOutboxProperties properties, KafkaOutboxSender sender,
+            ObjectProvider<OutboxConfig> outbox) {
+        var hook = new KafkaDeadLetterHandler(sender, properties.deadLetterTopic());
+        outbox.ifAvailable(o -> sender.warnIfLongerThan("outbox.deadLetters.timeout", o.deadLetters().timeout(),
             "The dead-letter pass abandons a hook call at its timeout and hands its letters again after a backoff, so"
                 + " slow dead-letter sends end as retries and letters acked meanwhile repeat on their dead-letter"
                 + " topic"));

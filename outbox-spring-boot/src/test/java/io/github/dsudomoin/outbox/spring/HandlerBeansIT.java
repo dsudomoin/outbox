@@ -160,6 +160,13 @@ class HandlerBeansIT {
             .contains("both (" + Both.class.getName() + ")").contains("implement OutboxTopicHandler only"));
     }
 
+    @Test
+    void bothRolesBesideKafkaKeepTheirOwnMessage() {
+        runner().withUserConfiguration(BothRoles.class, KafkaInParent.class).run(context -> assertThat(failure(context))
+            .contains("both (" + Both.class.getName() + ")").contains("implement OutboxTopicHandler only")
+            .doesNotContain("several OutboxHandler beans"));
+    }
+
     @Configuration(proxyBeanMethods = false)
     static class TwoAuditRoutes {
 

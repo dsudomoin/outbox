@@ -29,4 +29,11 @@ public record KafkaOutboxProperties(
     public KafkaOutboxProperties {
         driverProperties = driverProperties != null ? driverProperties : Map.of();
     }
+
+    /** The driver properties' keys only: their values can hold secrets, such as {@code sasl.jaas.config}. */
+    @Override
+    public String toString() {
+        return "KafkaOutboxProperties[driverProperties=" + driverProperties.keySet() + ", deadLetterTopic="
+            + deadLetterTopic + ", fallback=" + fallback + "]";
+    }
 }
