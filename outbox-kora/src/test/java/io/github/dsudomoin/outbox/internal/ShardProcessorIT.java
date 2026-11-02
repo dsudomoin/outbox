@@ -2630,6 +2630,27 @@ class ShardProcessorIT {
                 .satisfies(call -> assertThat(payloads(call)).containsExactly("j#1"));
     }
 
+    /** An unkeyed head has no older rows to bring, on a shard with parked rows too. */
+    @Test
+    void anUnkeyedRetryHeadOnAShardWithParkedRowsComesAlone() throws Exception {
+        bootstrap();
+        parkAll("k#1");
+        setParkedDue("k#1", now.plus(Duration.ofHours(24)));
+        script = answering(Map.of("u#1", Outcome.retry(new RuntimeException("u#1 down"))));
+        send(msg("t", null, "u#1"), msg("t", "j", "j#1"));
+        tick();
+        process();
+        assertThat(retryRows()).singleElement().satisfies(row -> assertThat(row).startsWith("u#1:"));
+        now = now.plus(Duration.ofMinutes(1));
+        calls.clear();
+        script = answering(Map.of());
+
+        process();
+
+        assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("u#1"));
+        assertThat(parkedRows()).singleElement().satisfies(row -> assertThat(row).startsWith("k#1:"));
+    }
+
     /** Parked k#1, retry head k#2 with its follower k#3, the head due and k#1 not. */
     private void keyInRetryAboveAParkedRow() throws Exception {
         bootstrap();
