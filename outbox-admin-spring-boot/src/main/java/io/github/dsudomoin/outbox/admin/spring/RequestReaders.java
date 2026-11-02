@@ -14,6 +14,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.core.MethodParameter;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpInputMessage;
@@ -45,6 +47,7 @@ class RequestReaders extends RequestBodyAdviceAdapter {
     private static final Set<String> FILTER = Set.of("topic", "key", "error", "failedFrom", "failedTo", "status");
     private static final Set<String> ABANDON = Set.of("topic", "key", "reason", "dryRun");
 
+    private static final Logger log = LoggerFactory.getLogger(RequestReaders.class);
     private static final String BOUND = RequestReaders.class.getName() + ".bound";
     private static final String JACKSON3 = "tools.jackson.databind.json.JsonMapper";
     private static final String JACKSON2 = "com.fasterxml.jackson.databind.ObjectMapper";
@@ -99,11 +102,19 @@ class RequestReaders extends RequestBodyAdviceAdapter {
         return message;
     }
 
-    /** What {@link #beforeBodyRead} made of the body, never what the app's converter did. */
-    @Override
-    public Object afterBodyRead(Object body, HttpInputMessage input, MethodParameter parameter, Type targetType,
-            Class<? extends HttpMessageConverter<?>> converterType) {
-        return RequestContextHolder.currentRequestAttributes().getAttribute(BOUND, RequestAttributes.SCOPE_REQUEST);
+    /**
+     * What {@link #beforeBodyRead} made of this request's body, which is what a route acts on, never its parameter: the
+     * app's converter bound that, and an app's advice or resolver may have changed it. A resolver that skips this reader
+     * leaves nothing here, so the call is refused rather than acting on a body nobody checked.
+     */
+    static <T> T read(Class<T> type) {
+        var read = RequestContextHolder.currentRequestAttributes().getAttribute(BOUND, RequestAttributes.SCOPE_REQUEST);
+        if (!type.isInstance(read)) {
+            log.warn("outbox admin: answered 500, the request body did not go through its reader: an app's argument"
+                + " resolver ahead of MVC's took it");
+            throw new OutboxAdminGuard.Refused(500, "the request body was not checked");
+        }
+        return type.cast(read);
     }
 
     private static Selection selection(Map<?, ?> body) {

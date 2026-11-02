@@ -143,14 +143,16 @@ class OutboxAdminController implements OutboxAdminApi {
     }
 
     @Override
-    public ResponseEntity<Count> redriveDeadLetters(Selection selection) {
+    public ResponseEntity<Count> redriveDeadLetters(Selection parameter) {
+        var selection = RequestReaders.read(Selection.class);
         var ids = ids(selection);
         return ResponseEntity.ok(new Count(ids != null ? admin().redriveDeadLetters(ids)
             : admin().redriveDeadLetters(filter(selection.getFilter()))));
     }
 
     @Override
-    public ResponseEntity<Count> discardDeadLetters(Selection selection) {
+    public ResponseEntity<Count> discardDeadLetters(Selection parameter) {
+        var selection = RequestReaders.read(Selection.class);
         var ids = ids(selection);
         return ResponseEntity.ok(new Count(ids != null ? admin().discardDeadLetters(ids)
             : admin().discardDeadLetters(filter(selection.getFilter()))));
@@ -167,7 +169,8 @@ class OutboxAdminController implements OutboxAdminApi {
     }
 
     @Override
-    public ResponseEntity<Abandoned> abandonWaiting(AbandonWaiting body) {
+    public ResponseEntity<Abandoned> abandonWaiting(AbandonWaiting parameter) {
+        var body = RequestReaders.read(AbandonWaiting.class);
         boolean dryRun = Boolean.TRUE.equals(body.getDryRun());
         var detail = new LinkedHashMap<String, String>(); // the reason goes into the audit line
         detail.put("topic", body.getTopic());

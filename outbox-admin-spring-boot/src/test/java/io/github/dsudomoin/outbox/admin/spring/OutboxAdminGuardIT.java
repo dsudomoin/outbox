@@ -24,6 +24,7 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.lang.reflect.Proxy;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -40,6 +41,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.config.BeanPostProcessor;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.AutoConfigurationExcludeFilter;
 import org.springframework.boot.test.context.runner.WebApplicationContextRunner;
@@ -59,6 +61,7 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.filter.OncePerRequestFilter;
 import org.springframework.web.method.HandlerMethod;
 import org.springframework.web.method.HandlerTypePredicate;
+import org.springframework.web.method.support.HandlerMethodArgumentResolver;
 import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.servlet.HandlerExceptionResolver;
 import org.springframework.web.servlet.HandlerExecutionChain;
@@ -69,7 +72,9 @@ import org.springframework.web.servlet.config.annotation.WebMvcConfigurationSupp
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 import org.springframework.web.servlet.handler.HandlerMappingIntrospector;
 import org.springframework.web.servlet.handler.MappedInterceptor;
+import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
+import org.springframework.web.servlet.mvc.method.annotation.RequestResponseBodyMethodProcessor;
 
 /**
  * Who gets to the admin routes, on a real Tomcat. The {@link Spy} sees which handler each call was mapped to, ahead of
@@ -650,6 +655,38 @@ class OutboxAdminGuardIT {
             letter(server);
 
             assertError(server.post(DISCARD, "{\"ids\":[1]}"), 500, "authorization did not run");
+
+            assertThat(letters(server)).as("the letter stays").isEqualTo(1);
+        }
+    }
+
+    /** A body resolver of the app's own, ahead of MVC's, without its advice chain: the reader never sees the body. */
+    @Configuration(proxyBeanMethods = false)
+    static class SkipsTheReader {
+
+        @Bean
+        static BeanPostProcessor bodyResolverAhead() {
+            return new BeanPostProcessor() {
+                @Override
+                public Object postProcessAfterInitialization(Object bean, String name) {
+                    if (bean instanceof RequestMappingHandlerAdapter adapter) {
+                        var resolvers = new ArrayList<HandlerMethodArgumentResolver>();
+                        resolvers.add(new RequestResponseBodyMethodProcessor(adapter.getMessageConverters()));
+                        resolvers.addAll(adapter.getArgumentResolvers());
+                        adapter.setArgumentResolvers(resolvers);
+                    }
+                    return bean;
+                }
+            };
+        }
+    }
+
+    @Test
+    void aBodyTheReaderDidNotSeeActsOnNothing() throws Exception {
+        try (var server = AdminServer.start(WithKeys.class, SkipsTheReader.class)) {
+            letter(server);
+
+            assertError(server.post(DISCARD, "{\"ids\":[1]}", KEY, "secret"), 500, "the request body was not checked");
 
             assertThat(letters(server)).as("the letter stays").isEqualTo(1);
         }
