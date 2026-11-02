@@ -735,8 +735,9 @@ class NetworkBlackholeIT {
             await(() -> delivered.contains(sent));
             Thread.sleep(200); // more passes
 
-            assertThat(err.text().lines().filter(line -> line.contains("outbox.relay.networkTimeout")))
-                    .as("once, however many passes").hasSize(1);
+            assertThat(err.text().lines().filter(line -> line.contains("could not be set")).count())
+                    .as("once per JVM, however many passes and components; a test before it may have had it")
+                    .isLessThanOrEqualTo(1);
         }
     }
 
