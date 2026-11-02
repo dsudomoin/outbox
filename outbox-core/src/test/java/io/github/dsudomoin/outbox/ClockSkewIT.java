@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.github.dsudomoin.outbox.internal.UuidV7;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
@@ -18,6 +19,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -38,10 +40,12 @@ class ClockSkewIT {
     private final JdbcTransactions transactions = new JdbcTransactions(direct);
     private final TestOutboxConfig config = new TestOutboxConfig();
     private final List<OutboxRuntime> runtimes = new ArrayList<>();
+    private final List<InboxRuntime> inboxes = new ArrayList<>();
 
     @AfterEach
     void release() {
         runtimes.forEach(OutboxRuntime::close);
+        inboxes.forEach(InboxRuntime::close);
     }
 
     @ParameterizedTest
@@ -213,6 +217,71 @@ class ClockSkewIT {
                 .isBetween(LONG_LOW, LONG_HIGH);
         assertThat(count(remaining("due_at", dead) + " where key = 'forever'::bytea")).as("capped at 7 days")
                 .isBetween(7 * 86400L - 60, 7 * 86400L);
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {3 * 86400, -3 * 86400})
+    void aMessageIdFollowsTheDatabasesClock(long skew) throws Exception {
+        var runtime = runtime(skew, record -> {});
+
+        var id = send(runtime, "k");
+
+        assertThat(Math.abs(UuidV7.timestampMillis(id) - databaseMillis())).isLessThan(60_000);
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {3 * 86400, -3 * 86400})
+    void aMessageIdOfAWriterWithoutARelayFollowsTheDatabasesClock(long skew) throws Exception {
+        var writer = OutboxRuntime.builder(new TestOutboxConfig().table(config.table()).relayEnabled(false),
+                transactions, record -> {}).jvmClock(clock(skew)).build();
+        runtimes.add(writer);
+        writer.start();
+
+        var id = transactions.inTx(c -> writer.outbox().send(OutboxMessage.of(TOPIC, "k", "p".getBytes(UTF_8))));
+
+        assertThat(Math.abs(UuidV7.timestampMillis(id) - databaseMillis())).isLessThan(60_000);
+    }
+
+    /** Past retention either way: with the JVM's clock the ids would fall outside the window, and go without dedup. */
+    @ParameterizedTest
+    @ValueSource(longs = {3 * 86400, -3 * 86400})
+    void anInboxDeduplicatesWhateverItsJvmClockSays(long skew) throws Exception {
+        var inbox = InboxRuntime.builder(config, transactions).jvmClock(clock(skew)).build();
+        inboxes.add(inbox);
+        inbox.start();
+        var id = UuidV7.next(databaseMillis());
+
+        assertThat(accepted(inbox, id)).isTrue();
+        assertThat(accepted(inbox, id)).as("the second one").isFalse();
+    }
+
+    /** A wrong clock must not drop live ranges either. */
+    @Test
+    void aJvmClockFarAheadDropsNoLiveInboxRange() throws Exception {
+        var first = InboxRuntime.builder(config, transactions).build();
+        inboxes.add(first);
+        first.start();
+        var id = UuidV7.next(databaseMillis());
+        assertThat(accepted(first, id)).isTrue();
+
+        var ahead = InboxRuntime.builder(new TestOutboxConfig().table(config.table()).inboxTable(config.inbox().table())
+                .maintenanceInterval(Duration.ofMillis(100)), transactions).jvmClock(clock(3 * 86400)).build();
+        inboxes.add(ahead);
+        ahead.start();
+        Thread.sleep(1000); // several maintenance runs
+
+        assertThat(accepted(first, id)).as("still recorded").isFalse();
+    }
+
+    private boolean accepted(InboxRuntime inbox, UUID id) {
+        Boolean accepted = transactions.inTx(c -> inbox.inbox().tryAccept(id));
+        return accepted;
+    }
+
+    private static long databaseMillis() throws Exception {
+        try (var c = TestDataSources.newDataSource().getConnection()) {
+            return TestSql.queryLong(c, "select (extract(epoch from now()) * 1000)::bigint");
+        }
     }
 
     private OutboxRuntime runtime(long skew, OutboxHandler handler) {

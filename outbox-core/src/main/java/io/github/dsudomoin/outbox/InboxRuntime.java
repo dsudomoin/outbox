@@ -5,6 +5,7 @@ import io.github.dsudomoin.outbox.internal.OwnerTransactions;
 import io.github.dsudomoin.outbox.internal.PgInbox;
 import jakarta.annotation.Nullable;
 import java.sql.SQLException;
+import java.time.InstantSource;
 import java.util.Objects;
 
 /**
@@ -62,6 +63,7 @@ public final class InboxRuntime implements AutoCloseable {
         private OutboxTelemetry telemetry = OutboxTelemetry.NONE;
         @Nullable
         private ConnectionSource owner;
+        private InstantSource jvmClock = InstantSource.system();
 
         private Builder(OutboxConfig config, OutboxTransactions transactions) {
             this.config = Objects.requireNonNull(config, "config");
@@ -82,13 +84,19 @@ public final class InboxRuntime implements AutoCloseable {
             return this;
         }
 
+        /** The JVM's clock, another one only in tests. */
+        Builder jvmClock(InstantSource jvmClock) {
+            this.jvmClock = jvmClock;
+            return this;
+        }
+
         /** Validates the inbox keys of the config; touches no database. */
         public InboxRuntime build() {
             if (owner != null && config.schema().bootstrap()) {
                 throw new IllegalArgumentException(OutboxRuntime.OWNER_NEEDS_MIGRATIONS);
             }
             return new InboxRuntime(transactions, new PgInbox(transactions, OwnerTransactions.of(transactions, owner),
-                    config, GuardedTelemetry.of(telemetry)));
+                    config, GuardedTelemetry.of(telemetry), jvmClock));
         }
     }
 }

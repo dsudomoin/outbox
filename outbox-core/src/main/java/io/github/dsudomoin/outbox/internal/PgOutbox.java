@@ -8,6 +8,7 @@ import io.github.dsudomoin.outbox.OutboxTransactions;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.time.InstantSource;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -49,6 +50,7 @@ public final class PgOutbox implements Outbox {
     /** The topics the routes claim; null: a handler takes every other topic, so every topic goes in. */
     @Nullable
     private final Set<String> claimedTopics;
+    private final DatabaseClock clock;
 
     /** Takes every topic. */
     public PgOutbox(OutboxTransactions db, OutboxSchema schema, int shards, Runnable wakeUpRelay,
@@ -59,7 +61,14 @@ public final class PgOutbox implements Outbox {
     /** {@code claimedTopics}: the only topics it takes, or null for every topic. */
     public PgOutbox(OutboxTransactions db, OutboxSchema schema, int shards, Runnable wakeUpRelay,
             OutboxTelemetry telemetry, @Nullable Set<String> claimedTopics) {
+        this(db, schema, shards, wakeUpRelay, telemetry, claimedTopics, new DatabaseClock(InstantSource.system()));
+    }
+
+    /** {@code clock}: the time of its message ids. */
+    public PgOutbox(OutboxTransactions db, OutboxSchema schema, int shards, Runnable wakeUpRelay,
+            OutboxTelemetry telemetry, @Nullable Set<String> claimedTopics, DatabaseClock clock) {
         OutboxSchema.validateShards(shards);
+        this.clock = clock;
         this.db = db;
         this.notInTx = "Outbox.send must be called inside " + db.transactionHint();
         this.keyNamespace = schema.names().keyNamespace();
@@ -126,7 +135,7 @@ public final class PgOutbox implements Outbox {
             var rows = new ArrayList<Resender.Row>(n);
             for (int i = 0; i < n; i++) {
                 var m = messages.get(i);
-                ids[i] = UuidV7.next();
+                ids[i] = UuidV7.next(clock.millis());
                 var headers = marked(local[i], enqueue.headers(m.headers()));
                 rows.add(new Resender.Row(ids[i], m.topic(), m.key(), m.payload(), HeaderCodec.encode(headers)));
             }
@@ -154,7 +163,7 @@ public final class PgOutbox implements Outbox {
         boolean local = contracts.routes().contains(m.topic());
         contracts.require(names, m, type, local, telemetry);
         var enqueue = telemetry.enqueueStarted();
-        var id = UuidV7.next();
+        var id = UuidV7.next(clock.millis());
         boolean keyed = m.key() != null;
         int hash = keyed ? Hashing.keyHash(m.topic(), m.key()) : 0;
         try (var ps = c.prepareStatement(keyed ? insertKeyed : insertUnkeyed)) {

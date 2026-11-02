@@ -12,7 +12,12 @@ public final class UuidV7 {
     private UuidV7() {}
 
     public static UUID next() {
-        long msb = (System.currentTimeMillis() << 16) | 0x7000L | (RANDOM.nextLong() & 0x0FFFL);
+        return next(System.currentTimeMillis());
+    }
+
+    /** An id of {@code epochMillis}. */
+    public static UUID next(long epochMillis) {
+        long msb = (epochMillis << 16) | 0x7000L | (RANDOM.nextLong() & 0x0FFFL);
         long lsb = (RANDOM.nextLong() & 0x3FFF_FFFF_FFFF_FFFFL) | 0x8000_0000_0000_0000L;
         return new UUID(msb, lsb);
     }

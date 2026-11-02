@@ -165,7 +165,8 @@ public final class OutboxRuntime implements AutoCloseable {
                     jvmClock);
             var relay = new OutboxRelay(transactions, resolved, schema, handler, telemetry, maintenance, deadLetters,
                     jvmClock);
-            var outbox = new PgOutbox(transactions, schema, resolved.shards(), relay::wake, telemetry, claimedTopics);
+            var outbox = new PgOutbox(transactions, schema, resolved.shards(), relay::wake, telemetry, claimedTopics,
+                    relay.clock());
             var admin = new PgOutboxAdmin(transactions, ddl, names, resolved, maintenance, relay::wake);
             relay.start();
             parts = new Parts(schema, maintenance, deadLetters, relay, outbox, admin);

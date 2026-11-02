@@ -1,9 +1,12 @@
 package io.github.dsudomoin.outbox.internal;
 
 import jakarta.annotation.Nullable;
+import java.sql.Connection;
+import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.InstantSource;
+import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
 
 /**
@@ -12,7 +15,9 @@ import java.time.temporal.ChronoUnit;
  * clock off by any amount neither stalls another instance nor shortens a backoff. A statement the relay runs anyway
  * brings a reading ({@link Ticks#latest(java.sql.Connection, DatabaseClock)}: no round trip of its own), and
  * {@code nanoTime} counts on from it until the next, so a JVM clock stepped between two readings changes nothing.
- * Thread-safe; a later reading of another worker simply replaces the last.
+ * Thread-safe; a later reading of another worker simply replaces the last. Message ids and the inbox's window follow it
+ * too ({@link #millis}), as ids a clock off by more than the inbox's retention lie outside the window of dedup; there
+ * the readings come from the heartbeat, the relay's ticks and the inbox's maintenance, never from a send or an accept.
  */
 public final class DatabaseClock {
 
@@ -32,6 +37,20 @@ public final class DatabaseClock {
 
     void read(Instant databaseNow) {
         reading = new Reading(databaseNow, System.nanoTime());
+    }
+
+    /** A reading by a statement of its own: for a caller with no statement that can bring one. */
+    public void read(Connection c) throws SQLException {
+        try (var ps = c.prepareStatement("select clock_timestamp()"); var rs = ps.executeQuery()) {
+            rs.next();
+            read(rs.getObject(1, OffsetDateTime.class).toInstant());
+        }
+    }
+
+    /** {@link #now()} in epoch milliseconds, with no allocation to speak of: on the path of every send and accept. */
+    public long millis() {
+        var r = reading;
+        return r == null ? jvm.millis() : r.at().toEpochMilli() + (System.nanoTime() - r.nanoTime()) / 1_000_000;
     }
 
     /** Now by the last reading, in microseconds as Postgres stores it; by the JVM clock before the first reading. */

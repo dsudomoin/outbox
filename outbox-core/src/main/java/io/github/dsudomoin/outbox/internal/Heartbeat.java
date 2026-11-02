@@ -8,6 +8,8 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.time.InstantSource;
+import java.time.OffsetDateTime;
 import java.util.Collection;
 import java.util.Map;
 import java.util.concurrent.Executors;
@@ -61,12 +63,20 @@ public final class Heartbeat {
     private final ShardGuard guard;
     private final ContractGuard contracts;
     private final SocketBound socket;
+    private final DatabaseClock clock;
     private final String beat;
     private ScheduledExecutorService scheduler;
     private volatile boolean stopped;
 
     /** {@code config}: the instance's, as {@link OutboxSchema#config()} resolved it. */
     public Heartbeat(OutboxTransactions db, OutboxSchema schema, OutboxConfig config, boolean hookActive) {
+        this(db, schema, config, hookActive, new DatabaseClock(InstantSource.system()));
+    }
+
+    /** {@code clock}: gets a reading from each beat, which is all a writer without a relay has. */
+    public Heartbeat(OutboxTransactions db, OutboxSchema schema, OutboxConfig config, boolean hookActive,
+            DatabaseClock clock) {
+        this.clock = clock;
         var own = schema.heartbeatConnections();
         this.connections = own != null ? own : db;
         this.names = schema.names();
@@ -79,7 +89,8 @@ public final class Heartbeat {
         this.contracts = schema.contractGuard();
         this.socket = socketBound(config);
         this.beat = "with gone as (delete from " + names.instance() + " where instance_id <> ? and coalesce(expires_at,"
-                + " last_seen) < now() - " + FORGET_AFTER.toSeconds() + " * interval '1 second') " + upsert(names);
+                + " last_seen) < now() - " + FORGET_AFTER.toSeconds() + " * interval '1 second') " + upsert(names)
+                + " returning clock_timestamp()";
     }
 
     /**
@@ -216,7 +227,10 @@ public final class Heartbeat {
                 try (var ps = c.prepareStatement(beat)) {
                     ps.setString(1, id); // the cleanup's; the upsert's parameters follow
                     bind(ps, 1, id, shards, hookActive, relay, contracts.contracts(), contracts.routes(), interval);
-                    ps.executeUpdate();
+                    try (var rs = ps.executeQuery()) {
+                        rs.next();
+                        clock.read(rs.getObject(1, OffsetDateTime.class).toInstant());
+                    }
                 }
                 if (stopped) {
                     c.rollback(); // stop() deleted the row, or is about to

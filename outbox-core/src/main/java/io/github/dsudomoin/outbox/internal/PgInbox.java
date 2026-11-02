@@ -12,6 +12,7 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.InstantSource;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
@@ -71,6 +72,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
     private volatile double transactionPooling = Double.NaN;
     private volatile double orphaned = Double.NaN;
     private volatile Window window = Window.EMPTY;
+    private final DatabaseClock clock;
     @Nullable
     private volatile ScheduledExecutorService scheduler;
 
@@ -80,6 +82,13 @@ public final class PgInbox implements Inbox, AutoCloseable {
 
     /** {@code ddl}: the transactions whose new connections run the startup and maintenance. */
     public PgInbox(OutboxTransactions db, OutboxTransactions ddl, OutboxConfig config, OutboxTelemetry telemetry) {
+        this(db, ddl, config, telemetry, InstantSource.system());
+    }
+
+    /** {@code jvmClock}: until the clock's first reading, and only that; another one only in tests. */
+    public PgInbox(OutboxTransactions db, OutboxTransactions ddl, OutboxConfig config, OutboxTelemetry telemetry,
+            InstantSource jvmClock) {
+        this.clock = new DatabaseClock(jvmClock);
         this.ddl = ddl;
         this.db = db;
         this.notInTx = "Inbox.tryAccept and tryAcceptAll must be called inside " + db.transactionHint();
@@ -191,6 +200,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
 
     public void start() throws SQLException {
         try (var c = ddl.newConnection(); var bound = socket.on(c)) {
+            clock.read(c);
             if (ddl != db) { // before any DDL
                 try (var app = db.newConnection(); var appBound = socket.on(app)) {
                     SchemaCheck.requireSameDatabase(app, c, names.base());
@@ -263,6 +273,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
     public void runMaintenance() {
         try (var c = ddl.newConnection(); var bound = socket.on(c)) {
             c.setAutoCommit(true);
+            clock.read(c);
             if (sessionStable(c)) {
                 maintain(c);
             }
@@ -286,14 +297,14 @@ public final class PgInbox implements Inbox, AutoCloseable {
                         SchemaCheck.run(app, c, SchemaObjects.inbox(names), names.base(), "OutboxSql.inbox");
                     }
                 }
-                partitions.ensurePremade(c, System.currentTimeMillis());
+                partitions.ensurePremade(c, clock.millis());
             } finally {
                 advisory(c, "pg_advisory_unlock", ns);
             }
         } catch (SQLException e) {
             // a maintenance run elsewhere holds the lock (a detach waiting for consumer transactions) and extends too
             if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())
-                    || !partitions.window(c).contains(System.currentTimeMillis())) {
+                    || !partitions.window(c).contains(clock.millis())) {
                 throw e;
             }
             log.warn("outbox inbox {} partitions not extended at startup (lock timeout); maintenance does it: {}",
@@ -310,7 +321,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
         try {
             locked = advisory(c, "pg_try_advisory_lock", ns);
             if (locked) {
-                long now = System.currentTimeMillis();
+                long now = clock.millis();
                 var timeout = PartitionDdl.DETACH_LOCK_TIMEOUT;
                 step("finish pending detach", () -> partitions.finishPendingDetach(c, now, timeout));
                 step("partition drop", () -> partitions.dropExpired(c, now, timeout));
@@ -443,7 +454,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
 
     /** The window's lower bound, raised to what is safe now: the cached window may predate a drop elsewhere. */
     private long dedupFrom(Window w) {
-        return Math.max(w.from(), partitions.safeFrom(System.currentTimeMillis()));
+        return Math.max(w.from(), partitions.safeFrom(clock.millis()));
     }
 
     private void acceptedOutside(UUID id) {

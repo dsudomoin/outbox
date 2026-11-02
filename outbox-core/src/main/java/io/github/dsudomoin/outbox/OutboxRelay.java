@@ -178,7 +178,7 @@ public final class OutboxRelay implements AutoCloseable {
         this.processor = new ShardProcessor(schema.names(), config, handler, telemetry, deadLetters.active(), clock);
         this.telemetry = telemetry;
         // the pass runs only where the relay does
-        this.heartbeat = new Heartbeat(db, schema, config, relay.enabled() && deadLetters.active());
+        this.heartbeat = new Heartbeat(db, schema, config, relay.enabled() && deadLetters.active(), clock);
         this.idleNanos = relay.idlePollInterval().toNanos();
         this.minTickNanos = relay.minTickInterval().toNanos();
         this.socket = new SocketBound(config.networkTimeout());
@@ -197,8 +197,19 @@ public final class OutboxRelay implements AutoCloseable {
         }
     }
 
+    /** The clock of its readings, which an instance's message ids follow too. */
+    @InternalApi
+    public DatabaseClock clock() {
+        return clock;
+    }
+
     /** Starts the workers, the dead-letter thread and maintenance, unless {@code relay.enabled} is false. */
     public void start() {
+        try (var c = db.newConnection(); var bound = socket.on(c)) { // a send right after start has its time too
+            clock.read(c);
+        } catch (SQLException | RuntimeException e) {
+            log.debug("outbox could not read the database's clock at start: the JVM's until the first beat", e);
+        }
         heartbeat.start(); // with the relay disabled too: the reshard guard counts writers
         if (!relay.enabled()) {
             log.info("outbox relay disabled (outbox.relay.enabled = false); messages are delivered only by drain()");
