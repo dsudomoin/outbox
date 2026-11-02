@@ -88,6 +88,9 @@ public final class AccountJobsHandler implements OutboxTopicHandler {
 - Once a record of a key is requeued in a call, requeue that key's later records of the same type in the call too, or
   FEE_RELEASE#2 overtakes a requeued FEE_RELEASE#1 when the blocking process ends mid-call; other types still go
   through (a requeued SYNCHRONIZE#2 does not hold back FEE_RELEASE).
+  This is safe only where no later record of that type carries what the older one waits for. Otherwise the handler
+  holds the very record that would end the wait, and the key stands for ever (with `maxRequeues = 0` nothing stops it):
+  make the type tell «waits for a result» from «carries a result».
 - Use `requeue(notBefore)` when the handler knows when the blocking process ends. `notBefore` is by the JVM's clock
   (`Instant.now().plusSeconds(3)` means 3 s on the database's clock, however far off this instance's is), and it is no
   lower bound: a newer record of the key, or its due time, can bring the record back sooner.
