@@ -143,6 +143,10 @@ public final class XidRecovery {
      * between this count and the recovery's lock are re-sent too, so {@code maxRows} is approximate.
      */
     public long rowsToSave(Connection autocommit) throws SQLException {
+        return SocketBound.atLeast(autocommit, timeout, () -> countRowsToSave(autocommit));
+    }
+
+    private long countRowsToSave(Connection autocommit) throws SQLException {
         var c = autocommit;
         c.setAutoCommit(false);
         try (var st = c.createStatement()) {
@@ -277,6 +281,10 @@ public final class XidRecovery {
      *     finishes it first
      */
     public long recover(Connection autocommit) throws SQLException {
+        return SocketBound.atLeast(autocommit, timeout, () -> recoverBounded(autocommit));
+    }
+
+    private long recoverBounded(Connection autocommit) throws SQLException {
         var c = autocommit;
         outboxLocked = false;
         partitions.finishPendingDetach(c, LOCK_TIMEOUT);

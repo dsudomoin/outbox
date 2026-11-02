@@ -35,6 +35,7 @@ final class DeadIndexBuilder {
     private static final String STATE = "select indisvalid from pg_index where indexrelid = to_regclass(?)";
 
     private final OutboxTransactions db;
+    private final SocketBound socket;
     private final TableNames names;
     private final String index;
     private final Duration interval;
@@ -48,11 +49,18 @@ final class DeadIndexBuilder {
     private Thread thread;
     /** The builder's backend pid while a drop or build runs on it, 0 otherwise: what {@link #close} cancels. */
     private int inDdl;
+    /** The connection it runs on, null otherwise. */
+    @Nullable
+    private Connection ddlConnection;
+    /** Runs of maintenance in a row that found {@link #inDdl}'s backend not running it; on maintenance's thread. */
+    private int silentRuns;
     private volatile int failures;
     private volatile long retryAt = System.nanoTime();
 
-    DeadIndexBuilder(OutboxTransactions db, TableNames names, Duration interval, Duration lockTimeout) {
+    DeadIndexBuilder(OutboxTransactions db, TableNames names, Duration interval, Duration lockTimeout,
+            SocketBound socket) {
         this.db = db;
+        this.socket = socket;
         this.names = names;
         this.index = names.dead() + "_due";
         this.interval = interval;
@@ -61,10 +69,26 @@ final class DeadIndexBuilder {
 
     /** From the maintenance step, on its connection {@code c}: starts the thread when the index needs it and may. */
     void startIfDue(Connection c) throws SQLException {
+        int building = 0;
+        Connection on = null;
         synchronized (monitor) {
-            if (closed || (thread != null && thread.isAlive()) || System.nanoTime() - retryAt < 0) {
+            if (closed) {
                 return;
             }
+            if (thread != null && thread.isAlive()) {
+                building = inDdl;
+                on = ddlConnection;
+                if (building == 0) {
+                    silentRuns = 0;
+                    return;
+                }
+            } else if (System.nanoTime() - retryAt < 0) {
+                return;
+            }
+        }
+        if (on != null) {
+            letGoIfStopped(c, building, on);
+            return;
         }
         if (Boolean.TRUE.equals(state(c))) {
             return;
@@ -77,6 +101,32 @@ final class DeadIndexBuilder {
             t.setDaemon(true);
             thread = t;
             t.start();
+        }
+    }
+
+    /**
+     * The build has no bound on its socket, as it may run for hours, so a connection the network dropped silently would
+     * hold its thread for good. From the client that looks the same as a long build; the database can tell: a backend
+     * that no longer runs its statement, at two runs of maintenance in a row (between the build's own statements it
+     * idles a moment), has answered into the void. {@code on} is aborted, which ends the thread as any failed build.
+     */
+    private void letGoIfStopped(Connection c, int pid, Connection on) throws SQLException {
+        try (var ps = c.prepareStatement("select exists (select 1 from pg_stat_activity where pid = ? and state ="
+                + " 'active')")) {
+            ps.setInt(1, pid);
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                if (rs.getBoolean(1)) {
+                    silentRuns = 0;
+                    return;
+                }
+            }
+        }
+        if (++silentRuns >= 2) {
+            silentRuns = 0;
+            log.warn("outbox build of {}: its backend {} no longer runs it, so its answer was lost: aborting its"
+                    + " connection, and the next run looks at the index again", index, pid);
+            abort(on, null);
         }
     }
 
@@ -131,7 +181,7 @@ final class DeadIndexBuilder {
 
     private void build() {
         long start = System.nanoTime();
-        try (var c = db.newConnection()) {
+        try (var c = db.newConnection(); var bound = socket.on(c)) {
             c.setAutoCommit(true);
             int pid = pid(c);
             if (!advisory(c, "pg_try_advisory_lock")) {
@@ -225,12 +275,14 @@ final class DeadIndexBuilder {
                 return false;
             }
             inDdl = pid;
+            ddlConnection = c;
         }
         try {
             PartitionDdl.execute(c, lockTimeout, statementTimeout, sql);
         } finally {
             synchronized (monitor) {
                 inDdl = 0;
+                ddlConnection = null;
             }
         }
         return true;

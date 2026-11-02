@@ -199,6 +199,13 @@ public final class PartitionDdl {
     static boolean dropIfEmptyElseAttach(
             Connection c, String parent, String table, String from, @Nullable String to, Duration lockTimeout)
             throws SQLException {
+        return SocketBound.atLeast(c, lockTimeout.plus(DDL_MARGIN),
+                () -> dropIfEmptyElseAttachBounded(c, parent, table, from, to, lockTimeout));
+    }
+
+    private static boolean dropIfEmptyElseAttachBounded(
+            Connection c, String parent, String table, String from, @Nullable String to, Duration lockTimeout)
+            throws SQLException {
         boolean empty;
         c.setAutoCommit(false);
         try (var st = c.createStatement()) {
@@ -278,6 +285,13 @@ public final class PartitionDdl {
      * maintenance step is retried next run. Returns true when dropped.
      */
     static boolean dropUnlessFound(
+            Connection c, String table, String find, @Nullable String bound, Duration lockTimeout)
+            throws SQLException {
+        return SocketBound.atLeast(c, lockTimeout.plus(DDL_MARGIN),
+                () -> dropUnlessFoundBounded(c, table, find, bound, lockTimeout));
+    }
+
+    private static boolean dropUnlessFoundBounded(
             Connection c, String table, String find, @Nullable String bound, Duration lockTimeout)
             throws SQLException {
         boolean found;
@@ -402,6 +416,11 @@ public final class PartitionDdl {
      * {@code transaction_timeout} off) for each of its statements, the session's own given back afterwards.
      */
     static <T> T withTimeouts(Connection c, Duration lockTimeout, Duration statementTimeout,
+            Sql.SqlFunction0<T> body) throws SQLException {
+        return SocketBound.atLeast(c, statementTimeout, () -> withSetTimeouts(c, lockTimeout, statementTimeout, body));
+    }
+
+    private static <T> T withSetTimeouts(Connection c, Duration lockTimeout, Duration statementTimeout,
             Sql.SqlFunction0<T> body) throws SQLException {
         String lock;
         String statement;

@@ -75,6 +75,12 @@ public final class OrphanRestore {
      *     schema that is no partition
      */
     public long restore(Connection autocommit, String table, long fromXid, Duration lockTimeout) throws SQLException {
+        return SocketBound.atLeast(autocommit, lockTimeout.plus(PartitionDdl.DDL_MARGIN),
+                () -> restoreBounded(autocommit, table, fromXid, lockTimeout));
+    }
+
+    private long restoreBounded(Connection autocommit, String table, long fromXid, Duration lockTimeout)
+            throws SQLException {
         if (!range.matcher(table).matches() || !standalone(autocommit, table)) {
             throw new IllegalArgumentException(table + " is not a standalone range of the outbox " + names.base()
                     + ": a table " + names.partitionPrefix() + "<digits> or " + names.setAsidePrefix() + "<digits> in"

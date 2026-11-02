@@ -70,6 +70,7 @@ public final class DeadLetterPass {
     private final boolean active;
     private final OutboxTelemetry telemetry;
     private final InstantSource jvmClock;
+    private final SocketBound socket;
     private final DeadLetters rows;
     private final String dead;
     private final int batchSize;
@@ -115,6 +116,7 @@ public final class DeadLetterPass {
             @Nullable OutboxDeadLetterHandler hook, OutboxTelemetry telemetry, InstantSource jvmClock) {
         OutboxSchema.validate(config);
         this.jvmClock = jvmClock;
+        this.socket = new SocketBound(config.relay().networkTimeout());
         this.db = db;
         this.hook = hook;
         this.active = hook != null && hook.active(); // read once: the relay's steps write by it
@@ -186,7 +188,7 @@ public final class DeadLetterPass {
 
     /** One run under {@link #running}. */
     private int run() {
-        try (var c = db.newConnection()) {
+        try (var c = db.newConnection(); var bound = socket.on(c)) {
             var redriven = new Redriven(0, false);
             if (active()) {
                 // a redrive batch after each full one, as pending letters may keep coming: due redrives, those just
@@ -218,7 +220,7 @@ public final class DeadLetterPass {
      */
     @Nullable
     public Duration untilNextDue() {
-        try (var c = db.newConnection()) {
+        try (var c = db.newConnection(); var bound = socket.on(c)) {
             c.setAutoCommit(true);
             try (var st = c.createStatement(); var rs = st.executeQuery(untilNextDue)) {
                 rs.next();

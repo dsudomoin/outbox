@@ -19,6 +19,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URI;
 import java.sql.Connection;
+import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -33,7 +34,9 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -199,7 +202,7 @@ class NetworkBlackholeIT {
     }
 
     @Test
-    void onlyRelayWorkersGetTheNetworkTimeout() throws Exception {
+    void everyThreadOfTheLibraryGetsTheNetworkTimeout() throws Exception {
         var calls = new ConcurrentLinkedQueue<String>();
         var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(9))
                 .maintenanceInterval(Duration.ofMillis(100));
@@ -211,9 +214,11 @@ class NetworkBlackholeIT {
 
         var sent = send(relay, transactions, "k");
         await(() -> delivered.contains(sent));
-        Thread.sleep(500); // some maintenance runs and beats
+        Thread.sleep(500); // some maintenance runs, dead-letter passes and beats
 
-        assertThat(calls).isNotEmpty().allMatch(call -> call.startsWith("outbox-relay-") && call.endsWith(":9000"));
+        assertThat(calls).allMatch(call -> call.endsWith(":9000"));
+        assertThat(calls.stream().map(call -> call.replaceAll("-[0-9]+:.*", "").replaceAll(":.*", "")).toList())
+                .contains("outbox-relay", "outbox-maintenance", "outbox-dead-letters", "outbox-heartbeat");
     }
 
     @Test
@@ -243,12 +248,346 @@ class NetworkBlackholeIT {
         var relay = OutboxRuntime.builder(config, transactions, record -> {}).build();
         closing.add(relay);
         relay.start();
+
+        assertThatThrownBy(() -> draining(relay).get(20, TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class);
+    }
+
+    @Test
+    void maintenanceSurvivesASilentDrop() throws Exception {
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(1))
+                .maintenanceInterval(Duration.ofMillis(100));
+        var relay = OutboxRuntime.builder(config, new JdbcTransactions(pool(throughTheHole(3, 0))), record -> {}).build();
+        closing.add(relay);
+        relay.start();
+        var names = relay.schema().names();
+        await(() -> lastSuccess(names.maintenance()) > 0);
+
+        hole.forget();
+
+        long seen = lastSuccess(names.maintenance());
+        await(() -> lastSuccess(names.maintenance()) > seen);
+    }
+
+    @Test
+    void maintenanceOnOwnerConnectionsSurvivesASilentDrop() throws Exception {
+        var table = new TestOutboxConfig();
+        var bootstrap = OutboxRuntime.builder(table, new JdbcTransactions(DIRECT), record -> {}).build();
+        bootstrap.start();
+        bootstrap.close();
+        var config = new TestOutboxConfig().table(table.table()).schemaBootstrap(false)
+                .networkTimeout(Duration.ofSeconds(1)).maintenanceInterval(Duration.ofMillis(100));
+        var owner = pool(throughTheHole(3, 0));
+        var relay = OutboxRuntime.builder(config, new JdbcTransactions(DIRECT), record -> {})
+                .ownerConnections(owner::getConnection).build();
+        closing.add(relay);
+        relay.start();
+        var names = relay.schema().names();
+        await(() -> lastSuccess(names.maintenance()) > 0);
+
+        hole.forget();
+
+        long seen = lastSuccess(names.maintenance());
+        await(() -> lastSuccess(names.maintenance()) > seen);
+    }
+
+    @Test
+    void inboxMaintenanceSurvivesASilentDrop() throws Exception {
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(1))
+                .maintenanceInterval(Duration.ofMillis(100));
+        var inbox = InboxRuntime.builder(config, new JdbcTransactions(pool(throughTheHole(3, 0)))).build();
+        closing.add(inbox);
+        inbox.start();
+        Thread.sleep(150); // past a run, so it waits on its next statement
+
+        hole.forget();
+
+        var past = config.inbox().table() + "_t2020010100"; // a run drops it, far past retention and empty
+        try (var c = DIRECT.getConnection()) {
+            TestSql.execute(c, "create table " + past + " (like " + config.inbox().table() + " including defaults)");
+        }
+        await(() -> {
+            try (var c = DIRECT.getConnection()) {
+                return TestSql.queryString(c, "select to_regclass(?)::text", past) == null;
+            }
+        });
+    }
+
+    @Test
+    void aStatementTheLibraryBoundsItselfOutlastsTheNetworkTimeout() throws Exception {
+        // a recovery's wait for a lock, under its own timeouts, longer than the bound of the connection it runs on
+        var config = new TestOutboxConfig().relayEnabled(false).networkTimeout(Duration.ofSeconds(1));
+        var transactions = new JdbcTransactions(DIRECT);
+        var runtime = OutboxRuntime.builder(config, transactions, record -> {}).build();
+        closing.add(runtime);
+        runtime.start();
+        var names = runtime.schema().names();
+        send(runtime, transactions, "k");
+        try (var holder = DIRECT.getConnection()) {
+            long xmax = TestSql.queryLong(holder, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint")
+                    + 1_000_000_000L;
+            TestSql.execute(holder, "insert into " + names.tick() + " (snapshot, created_at) values ('" + xmax + ":"
+                    + xmax + ":'::pg_snapshot, now() - interval '1 minute')");
+            holder.setAutoCommit(false);
+            TestSql.execute(holder, "lock table " + names.cursor() + " in access exclusive mode");
+            var release = CompletableFuture.runAsync(() -> {
+                try {
+                    Thread.sleep(2500);
+                    holder.rollback();
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+            });
+
+            assertThat(runtime.admin().recoverXidRegression()).as("re-sent, not cut at 1 s").isEqualTo(1);
+
+            release.get(10, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void anOrphanRestoreOutlastsTheNetworkTimeout() throws Exception {
+        var config = new TestOutboxConfig().relayEnabled(false).networkTimeout(Duration.ofSeconds(1));
+        var runtime = OutboxRuntime.builder(config, new JdbcTransactions(DIRECT), record -> {}).build();
+        closing.add(runtime);
+        runtime.start();
+        var names = runtime.schema().names();
+        var orphan = names.base() + "_x1000";
+        try (var c = DIRECT.getConnection()) {
+            TestSql.execute(c, "create table " + orphan + " (like " + names.base() + " including defaults)");
+            TestSql.execute(c, "insert into " + orphan + " (id, shard, xid, message_id, topic)"
+                    + " values (1, 0, '1000', gen_random_uuid(), 't')");
+        }
+        try (var holder = DIRECT.getConnection()) {
+            holder.setAutoCommit(false);
+            TestSql.execute(holder, "lock table " + orphan + " in access exclusive mode");
+            var release = CompletableFuture.runAsync(() -> {
+                try {
+                    Thread.sleep(2500);
+                    holder.rollback();
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+            });
+
+            assertThat(runtime.admin().restoreOrphan(orphan, 0)).as("moved, not cut at 1 s").isEqualTo(1);
+
+            release.get(10, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void theDeadLetterPassSurvivesASilentDrop() throws Exception {
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(1))
+                .maintenanceInterval(Duration.ofMillis(100));
+        Set<UUID> handed = ConcurrentHashMap.newKeySet();
+        var transactions = new JdbcTransactions(pool(throughTheHole(3, 0)));
+        var relay = OutboxRuntime.builder(config, transactions, new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {}
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                return records.stream().map(r -> Outcome.permanent(new IOException("never"))).toList();
+            }
+        }).deadLetterHandler(letters -> {
+            letters.forEach(letter -> handed.add(letter.messageId()));
+            return letters.stream().map(letter -> DeadLetterDecision.keep()).toList();
+        }).build();
+        closing.add(relay);
+        relay.start();
+        var writerTransactions = new JdbcTransactions(DIRECT);
+        var writer = OutboxRuntime.builder(new TestOutboxConfig().table(config.table()).relayEnabled(false),
+                writerTransactions, record -> {}).build();
+        closing.add(writer);
+        writer.start();
+        var before = send(writer, writerTransactions, "before");
+        await(() -> handed.contains(before));
+
+        Thread.sleep(150); // past its run, so it waits on its next statement
+        hole.forget();
+        var after = send(writer, writerTransactions, "after");
+
+        await(() -> handed.contains(after));
+    }
+
+    @Test
+    void theHeartbeatOnItsOwnPoolSurvivesASilentDrop() throws Exception {
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(1))
+                .maintenanceInterval(Duration.ofMillis(100));
+        var own = pool(throughTheHole(3, 0));
+        var relay = OutboxRuntime.builder(config, new JdbcTransactions(DIRECT), record -> {})
+                .heartbeatConnections(own::getConnection).build();
+        closing.add(relay);
+        relay.start();
+        var names = relay.schema().names();
+
+        hole.forget();
+
+        long seen = lastSeen(names.instance(), relay);
+        await(() -> lastSeen(names.instance(), relay) > seen);
+    }
+
+    @Test
+    void theHeartbeatOnTheApplicationsPoolAsItsFallbackSurvivesASilentDrop() throws Exception {
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(1))
+                .maintenanceInterval(Duration.ofMillis(100));
+        var relay = OutboxRuntime.builder(config, new JdbcTransactions(pool(throughTheHole(3, 0))), record -> {})
+                .heartbeatConnections(() -> {
+                    throw new SQLException("its own pool is down");
+                }).build();
+        closing.add(relay);
+        relay.start();
+        var names = relay.schema().names();
+
+        hole.forget();
+
+        long seen = lastSeen(names.instance(), relay);
+        await(() -> lastSeen(names.instance(), relay) > seen);
+    }
+
+    @Test
+    void anAdminCallOnASilentSocketFails() throws Exception {
+        var config = new TestOutboxConfig().relayEnabled(false).networkTimeout(Duration.ofSeconds(1));
+        var transactions = new JdbcTransactions(intercepting(throughTheHole(3, 0), (c, call, args) -> {
+            if (Thread.currentThread().getName().equals("test-admin")) {
+                hole.forget();
+            }
+        }));
+        var runtime = OutboxRuntime.builder(config, transactions, record -> {}).build();
+        closing.add(runtime);
+        runtime.start();
+        // no read of its own 60 s statement timeout, which a status would be given
+        var call = new FutureTask<>(() -> runtime.admin().abandonWaiting("t", null, "no such", false));
+        var thread = new Thread(call, "test-admin");
+        thread.setDaemon(true);
+        thread.start();
+
+        assertThatThrownBy(() -> call.get(20, TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class);
+    }
+
+    @Test
+    void anIndexBuildLeftBehindByASilentDropIsLetGoOnceItsBackendStopped() throws Exception {
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(1))
+                .maintenanceInterval(Duration.ofMillis(100));
+        var bootstrap = OutboxRuntime.builder(config, new JdbcTransactions(DIRECT), record -> {}).build();
+        bootstrap.start();
+        bootstrap.close();
+        var names = bootstrap.schema().names();
+        var index = names.dead() + "_due";
+        try (var c = DIRECT.getConnection(); var holder = DIRECT.getConnection()) {
+            TestSql.execute(c, "drop index " + index);
+            TestSql.execute(c, "insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts)"
+                    + " values (1, 0, gen_random_uuid(), 't', now(), 1)"); // so maintenance builds it, not the start
+            // a snapshot the concurrent build waits for, so it runs longer than any bound
+            holder.setAutoCommit(false);
+            holder.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
+            TestSql.queryLong(holder, "select 1");
+            var relay = OutboxRuntime.builder(new TestOutboxConfig().table(config.table())
+                    .networkTimeout(Duration.ofSeconds(1)).maintenanceInterval(Duration.ofMillis(100)),
+                    new JdbcTransactions(pool(throughTheHole(3, 0))), record -> {}).build();
+            closing.add(relay);
+            relay.start();
+            await(() -> TestSql.queryLong(c, "select count(*) from pg_stat_activity where query like"
+                    + " 'create index concurrently%" + index.substring(index.lastIndexOf('.') + 1) + "%'"
+                    + " and state = 'active'") == 1);
+            Thread.sleep(1500); // past the bound: a long statement, which it must not cut
+
+            assertThat(TestSql.queryLong(c, "select count(*) from pg_stat_activity where query like"
+                    + " 'create index concurrently%' and state = 'active'")).as("still building").isEqualTo(1);
+
+            hole.forget();
+            holder.rollback(); // the backend ends the build and its answer goes nowhere
+        }
+
+        await(() -> Thread.getAllStackTraces().keySet().stream()
+                .noneMatch(thread -> thread.getName().equals("outbox-dead-index")));
+        try (var c = DIRECT.getConnection()) {
+            assertThat(TestSql.queryString(c, "select indisvalid::text from pg_index where indexrelid = to_regclass(?)",
+                    index)).isEqualTo("true");
+        }
+    }
+
+    @Test
+    void aSocketTimeoutOfTheDataSourceDoesNotCutTheIndexBuild() throws Exception {
+        var config = new TestOutboxConfig().maintenanceInterval(Duration.ofMillis(100));
+        var bootstrap = OutboxRuntime.builder(config, new JdbcTransactions(DIRECT), record -> {}).build();
+        bootstrap.start();
+        bootstrap.close();
+        var names = bootstrap.schema().names();
+        var index = names.dead() + "_due";
+        try (var c = DIRECT.getConnection(); var holder = DIRECT.getConnection(); var err = new CapturedStderr()) {
+            TestSql.execute(c, "drop index " + index);
+            TestSql.execute(c, "insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts)"
+                    + " values (1, 0, gen_random_uuid(), 't', now(), 1)");
+            holder.setAutoCommit(false);
+            holder.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
+            TestSql.queryLong(holder, "select 1");
+            var relay = OutboxRuntime.builder(new TestOutboxConfig().table(config.table())
+                    .maintenanceInterval(Duration.ofMillis(100)), new JdbcTransactions(throughTheHole(3, 1)),
+                    record -> {}).build();
+            closing.add(relay);
+            relay.start();
+            await(() -> TestSql.queryLong(c, "select count(*) from pg_stat_activity where query like"
+                    + " 'create index concurrently%' and state = 'active'") == 1);
+            Thread.sleep(2000); // past the DataSource's 1 s
+
+            holder.rollback();
+
+            await(() -> "true".equals(TestSql.queryString(c, "select indisvalid::text from pg_index"
+                    + " where indexrelid = to_regclass(?)", index)));
+            assertThat(err.text()).doesNotContain("could not build");
+        }
+    }
+
+    @Test
+    void aDrainOnASilentSocketFailsInItsHaltCheck() throws Exception {
+        var config = new TestOutboxConfig().relayEnabled(false).networkTimeout(Duration.ofSeconds(1));
+        var transactions = new JdbcTransactions(intercepting(throughTheHole(3, 0), (c, call, args) -> {
+            if (call.getName().equals("setAutoCommit") && Thread.currentThread().getName().equals("test-drain")) {
+                hole.forget(); // the first call on the check's connection
+            }
+        }));
+        var relay = OutboxRuntime.builder(config, transactions, record -> {}).build();
+        closing.add(relay);
+        relay.start();
+
+        assertThatThrownBy(() -> draining(relay).get(20, TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class);
+    }
+
+    @Test
+    void aDrainOnASilentSocketFailsInItsDeadLetterPass() throws Exception {
+        var config = new TestOutboxConfig().relayEnabled(false).networkTimeout(Duration.ofSeconds(1));
+        var deadTable = new AtomicReference<String>();
+        var transactions = new JdbcTransactions(intercepting(throughTheHole(3, 0), (c, call, args) -> {
+            if (call.getName().equals("prepareStatement") && Thread.currentThread().getName().equals("test-drain")
+                    && deadTable.get() != null && args[0].toString().contains(deadTable.get())) {
+                hole.forget(); // the pass's claim
+            }
+        }));
+        var relay = OutboxRuntime.builder(config, transactions, record -> {})
+                .deadLetterHandler(letters -> letters.stream().map(letter -> DeadLetterDecision.keep()).toList())
+                .build();
+        closing.add(relay);
+        relay.start();
+        deadTable.set(relay.schema().names().dead());
+
+        assertThatThrownBy(() -> draining(relay).get(20, TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class);
+    }
+
+    private static FutureTask<Integer> draining(OutboxRuntime relay) {
         var drain = new FutureTask<>(relay.relay()::drain);
         var thread = new Thread(drain, "test-drain");
         thread.setDaemon(true);
         thread.start();
+        return drain;
+    }
 
-        assertThatThrownBy(() -> drain.get(20, TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class);
+    /** When a maintenance run last completed, microseconds. */
+    private static long lastSuccess(String maintenance) throws Exception {
+        try (var c = DIRECT.getConnection()) {
+            return TestSql.queryLong(c, "select (extract(epoch from succeeded_at) * 1000000)::bigint from "
+                    + maintenance);
+        }
     }
 
     @Test
@@ -330,6 +669,8 @@ class NetworkBlackholeIT {
         config.setDataSource(source);
         config.setMaximumPoolSize(8);
         config.setValidationTimeout(250); // sheds the idle connections it finds dead fast: 5 s each by default
+        // also its login timeout: its one adder thread on a login the hole forgot holds every new connection that long
+        config.setConnectionTimeout(2000);
         var pool = new HikariDataSource(config);
         closing.add(pool);
         return pool;

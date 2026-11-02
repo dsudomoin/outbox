@@ -127,6 +127,7 @@ public final class Maintenance {
     private final AtomicLong checkpointLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong strandedLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong mismatchLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
+    private final SocketBound socket;
     private final AtomicLong premadeLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     /** One each, so the first ERROR past {@code alertAfter} is not held back by a WARN just before it. */
     private final AtomicLong waitingWarned = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
@@ -168,6 +169,7 @@ public final class Maintenance {
         this.db = db;
         this.names = names;
         this.detachLockTimeout = detachLockTimeout;
+        this.socket = new SocketBound(config.relay().networkTimeout());
         this.quiesceTimeout = quiesceTimeout(config);
         this.partitions = new XidPartitions(names, config.partitions());
         this.ticks = new Ticks(names, config.shards());
@@ -188,7 +190,8 @@ public final class Maintenance {
                 + " on conflict (id) do update set succeeded_at = excluded.succeeded_at";
         this.staleAfter = config.partitions().maintenanceInterval().multipliedBy(STALE_INTERVALS);
         this.cursorShards = Cursors.shardCount(names);
-        this.deadIndex = new DeadIndexBuilder(db, names, config.partitions().maintenanceInterval(), detachLockTimeout);
+        this.deadIndex = new DeadIndexBuilder(db, names, config.partitions().maintenanceInterval(), detachLockTimeout,
+                socket);
         this.buildsDeadIndex = config.schema().bootstrap();
         this.deadRetention = config.deadLetters().retention();
         this.redriveHistory = config.deadLetters().redriveHistory();
@@ -266,7 +269,7 @@ public final class Maintenance {
      * recovery is replacing.
      */
     public boolean checkHalt() {
-        try (var c = db.newConnection()) {
+        try (var c = db.newConnection(); var bound = socket.on(c)) {
             c.setAutoCommit(false);
             try (var st = c.createStatement()) {
                 st.execute("set local lock_timeout = " + SHARDS_LOCK_TIMEOUT.toMillis()); // a transaction's: no leak
@@ -345,7 +348,7 @@ public final class Maintenance {
      * taken).
      */
     public boolean runOnce() {
-        try (var c = db.newConnection()) {
+        try (var c = db.newConnection(); var bound = socket.on(c)) {
             c.setAutoCommit(true);
             var check = checkXidCounter(c); // first: nothing may keep it from running
             readLastSuccess(c, check != null);

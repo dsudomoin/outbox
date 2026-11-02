@@ -12,6 +12,7 @@ import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.ShardProcessor.ShardResult;
 import io.github.dsudomoin.outbox.internal.ShardProcessor.ShardStatus;
 import io.github.dsudomoin.outbox.internal.ShardProcessor;
+import io.github.dsudomoin.outbox.internal.SocketBound;
 import io.github.dsudomoin.outbox.internal.Ticks;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
@@ -30,7 +31,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.atomic.AtomicLong;
@@ -85,9 +85,7 @@ public final class OutboxRelay implements AutoCloseable {
     private final DatabaseClock clock;
     private final long idleNanos;
     private final long minTickNanos;
-    /** {@code relay.networkTimeout}; 0: none. */
-    private final int networkTimeoutMillis;
-    private final AtomicBoolean unboundWarned = new AtomicBoolean();
+    private final SocketBound socket;
     /**
      * An idle tick attempt inserts only when the newest tick, any instance's, is older than this: so a cluster makes
      * about one idle tick per {@code idlePollInterval} (at most 4 per 3 intervals with many instances), not one per
@@ -183,7 +181,7 @@ public final class OutboxRelay implements AutoCloseable {
         this.heartbeat = new Heartbeat(db, schema, config, relay.enabled() && deadLetters.active());
         this.idleNanos = relay.idlePollInterval().toNanos();
         this.minTickNanos = relay.minTickInterval().toNanos();
-        this.networkTimeoutMillis = (int) relay.networkTimeout().toMillis();
+        this.socket = new SocketBound(relay.networkTimeout());
         this.idleTickAge = Duration.ofNanos(Math.max(minTickNanos, idleNanos - idleNanos / 4));
         this.lastTickAttempt = System.nanoTime() - idleNanos; // the first pass ticks
         this.stepStarted = new AtomicLongArray(config.shards());
@@ -342,13 +340,8 @@ public final class OutboxRelay implements AutoCloseable {
         requireNotHalted();
         // a swap keeps every step out while it waits for those in flight: no progress for that long is no stall
         var stallAfter = Maintenance.quiesceTimeout(config).multipliedBy(2);
-        try (var c = db.newConnection()) {
-            boolean bound = boundSilentSocket(c);
-            try {
-                return drainOn(c, stallAfter);
-            } finally {
-                unbindSocket(c, bound);
-            }
+        try (var c = db.newConnection(); var bound = socket.on(c)) {
+            return drainOn(c, stallAfter);
         } catch (SQLException e) {
             throw db.translate(e);
         } catch (InterruptedException e) {
@@ -409,46 +402,6 @@ public final class OutboxRelay implements AutoCloseable {
             }
             if (!worked) {
                 TimeUnit.NANOSECONDS.sleep(idleNanos); // locked by workers, or paused
-            }
-        }
-    }
-
-    /**
-     * {@code relay.networkTimeout} on a connection with no such bound of its own (pgjdbc's default
-     * {@code socketTimeout}): without one, a connection the network dropped silently holds its thread on the socket for
-     * good. Returns whether it set one, which {@link #unbindSocket} takes back. Neither call goes to the database. A
-     * connection that does not take it still delivers: a WARN, once.
-     */
-    private boolean boundSilentSocket(Connection c) {
-        if (networkTimeoutMillis == 0) {
-            return false;
-        }
-        try {
-            if (c.getNetworkTimeout() != 0) {
-                return false;
-            }
-            c.setNetworkTimeout(Runnable::run, networkTimeoutMillis);
-            return true;
-        } catch (SQLException | RuntimeException e) {
-            if (unboundWarned.compareAndSet(false, true)) {
-                log.warn("outbox.relay.networkTimeout could not be set on a connection of this relay ({}), so a"
-                        + " connection the network drops silently holds its worker until the OS closes the socket; give"
-                        + " the DataSource a socketTimeout. Logged once", e.toString());
-            }
-            return false;
-        }
-    }
-
-    /**
-     * Gives {@code c} back as it came, whichever pool it goes back to, when {@link #boundSilentSocket} set its timeout:
-     * another user of the pool may run a longer statement. A dead connection, which does not take it, goes anyway.
-     */
-    private static void unbindSocket(Connection c, boolean bound) {
-        if (bound) {
-            try {
-                c.setNetworkTimeout(Runnable::run, 0);
-            } catch (SQLException | RuntimeException e) {
-                log.debug("outbox relay could not take back the network timeout of a connection", e);
             }
         }
     }
@@ -840,13 +793,8 @@ public final class OutboxRelay implements AutoCloseable {
          * {@link #readRound}); returns whether a step did work (progress or a pause).
          */
         private boolean pass(long seen) throws Exception {
-            try (var c = db.newConnection()) {
-                boolean bound = boundSilentSocket(c);
-                try {
-                    return passOn(c, seen);
-                } finally {
-                    unbindSocket(c, bound);
-                }
+            try (var c = db.newConnection(); var bound = socket.on(c)) {
+                return passOn(c, seen);
             }
         }
 

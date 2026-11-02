@@ -60,6 +60,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
     private final OutboxTransactions ddl;
     private final String notInTx;
     private final OutboxConfig config;
+    private final SocketBound socket;
     private final OutboxTelemetry telemetry;
     private final TableNames names;
     private final InboxPartitions partitions;
@@ -83,6 +84,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
         this.db = db;
         this.notInTx = "Inbox.tryAccept and tryAcceptAll must be called inside " + db.transactionHint();
         this.config = config;
+        this.socket = new SocketBound(config.relay().networkTimeout());
         this.telemetry = telemetry;
         this.names = TableNames.of(config.inbox().table());
         this.partitions = new InboxPartitions(names.base(), config);
@@ -258,7 +260,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
      * refresh.
      */
     public void runMaintenance() {
-        try (var c = ddl.newConnection()) {
+        try (var c = ddl.newConnection(); var bound = socket.on(c)) {
             c.setAutoCommit(true);
             if (sessionStable(c)) {
                 maintain(c);

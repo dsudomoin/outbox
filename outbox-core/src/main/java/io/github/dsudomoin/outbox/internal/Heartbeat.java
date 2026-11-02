@@ -47,6 +47,8 @@ public final class Heartbeat {
     static final Duration STOP_BUDGET = Duration.ofSeconds(5);
     /** How long a delete gets past its own SQL timeouts for their cancel to come back, before it counts as stuck. */
     private static final Duration CANCEL_GRACE = Duration.ofMillis(500);
+    /** The least a beat's statement gets on a silent socket, however short the interval: a slow network is no drop. */
+    private static final Duration BEAT_BOUND_FLOOR = Duration.ofSeconds(10);
 
     /** The schema's heartbeat connections, else {@code db}. */
     private final ConnectionSource connections;
@@ -58,6 +60,7 @@ public final class Heartbeat {
     private final Duration interval;
     private final ShardGuard guard;
     private final ContractGuard contracts;
+    private final SocketBound socket;
     private final String beat;
     private ScheduledExecutorService scheduler;
     private volatile boolean stopped;
@@ -74,8 +77,18 @@ public final class Heartbeat {
         this.interval = config.partitions().maintenanceInterval();
         this.guard = schema.shardGuard();
         this.contracts = schema.contractGuard();
+        this.socket = new SocketBound(beatBound(config.relay().networkTimeout(), interval));
         this.beat = "with gone as (delete from " + names.instance() + " where instance_id <> ? and coalesce(expires_at,"
                 + " last_seen) < now() - " + FORGET_AFTER.toSeconds() + " * interval '1 second') " + upsert(names);
+    }
+
+    /**
+     * A beat's statements wait at most {@link Maintenance#SHARDS_LOCK_TIMEOUT} for a lock, so one still silent after an
+     * interval is lost, and waiting {@code networkTimeout} for it would let the row expire and the guards go stale.
+     */
+    private static Duration beatBound(Duration networkTimeout, Duration interval) {
+        var bound = interval.compareTo(BEAT_BOUND_FLOOR) < 0 ? BEAT_BOUND_FLOOR : interval;
+        return networkTimeout.compareTo(bound) < 0 ? networkTimeout : bound;
     }
 
     /** {@code <host>/<pid>/<8 hex>}, new on every call. */
@@ -192,7 +205,7 @@ public final class Heartbeat {
 
     void beat() { // package-private for a test
         boolean refreshed = false;
-        try (var c = connections.newConnection()) {
+        try (var c = connections.newConnection(); var bound = socket.on(c)) {
             try {
                 c.setAutoCommit(false);
                 lockTimeout(c);

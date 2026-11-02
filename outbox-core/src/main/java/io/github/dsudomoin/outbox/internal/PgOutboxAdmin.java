@@ -72,6 +72,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     private final RetryStore retries;
     private final ParkedStore parked;
     private final XidRecovery recovery;
+    private final SocketBound socket;
     private final Ticks ticks;
     private final Cursors cursors;
     private final Resender resender;
@@ -119,6 +120,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         this.retries = new RetryStore(names, false); // its dead rows are kept: the abandoned ones
         this.parked = new ParkedStore(names, retries);
         this.recovery = new XidRecovery(names, config);
+        this.socket = new SocketBound(config.relay().networkTimeout());
         this.ticks = new Ticks(names, shards);
         this.cursors = new Cursors(names, shards);
         this.resender = new Resender(names, config);
@@ -140,7 +142,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     @Override
     public OutboxStatus status() {
         requireOwnTransactions();
-        try (var conn = ddl.newConnection()) { // the tail check reads the tail itself
+        try (var conn = ddl.newConnection(); var bound = socket.on(conn)) {
             // in a transaction of its own: its lock on the tail lasts until the commit, and a swap's hold waits 10 ms at
             // most for it, so the reads after it would make a swap running meanwhile miss
             boolean tailOverflow = read(conn, c -> PartitionDdl.attachment(c, names.base(), names.tail())
@@ -188,7 +190,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             throw new IllegalArgumentException("limit must be within 1.." + CHUNK + ": " + limit);
         }
         var where = Where.of(filter);
-        try (var conn = db.newConnection()) {
+        try (var conn = db.newConnection(); var bound = socket.on(conn)) {
             var letters = read(conn, c -> {
                 try (var ps = c.prepareStatement("select " + DeadLetters.COLUMNS + " from " + dead + " where "
                         + where.sql() + " and id > ? order by id limit ?")) {
@@ -214,7 +216,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     public long countDeadLetters(DeadLetterFilter filter) {
         requireOwnTransactions();
         var where = Where.of(filter);
-        try (var conn = db.newConnection()) {
+        try (var conn = db.newConnection(); var bound = socket.on(conn)) {
             return read(conn, c -> {
                 try (var ps = c.prepareStatement("select count(*) from " + dead + " where " + where.sql())) {
                     where.bind(ps);
@@ -264,7 +266,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         var call = printable("restoreOrphan(" + table + ", " + fromXid + ")");
         long moved;
         var restoring = new AtomicBoolean();
-        try (var c = ddl.newConnection()) {
+        try (var c = ddl.newConnection(); var bound = socket.on(c)) {
             c.setAutoCommit(true);
             moved = underMaintenanceLock(c, call, () -> {
                 var name = names.unqualified(table);
@@ -311,7 +313,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         var recovering = new AtomicBoolean();
         var sent = new AtomicLong(-1); // the rows re-sent, once the recovery committed
         Exception cleanup = null;
-        try (var c = ddl.newConnection()) {
+        try (var c = ddl.newConnection(); var bound = socket.on(c)) {
             c.setAutoCommit(true);
             underMaintenanceLock(c, call, () -> {
                 var check = recovery.check(c);
@@ -367,7 +369,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         var recovering = new AtomicBoolean();
         var moved = new AtomicLong();
         var stranded = new ArrayList<Integer>();
-        try (var c = ddl.newConnection()) {
+        try (var c = ddl.newConnection(); var bound = socket.on(c)) {
             c.setAutoCommit(true);
             underMaintenanceLock(c, call, () -> {
                 if (queryBoolean(c, "select exists (select 1 from " + names.halt() + ")")) {
@@ -572,7 +574,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         var error = "abandoned: " + reason;
         long keys = 0;
         long records = 0;
-        try (var c = db.newConnection()) {
+        try (var c = db.newConnection(); var bound = socket.on(c)) {
             c.setAutoCommit(true);
             for (int shard : waitingShards(c, topic, key)) {
                 long after = Long.MIN_VALUE;
@@ -684,7 +686,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         try (var ps = tx.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {
             ps.setInt(1, names.internalNamespace());
             ps.setInt(2, TableNames.LOCK_SHARD_BASE + shard);
-            ps.execute();
+            SocketBound.atLeast(tx, shardWait, ps::execute);
         } catch (SQLException e) {
             if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
                 throw e;
@@ -738,7 +740,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     private long bulk(String call, Where filter, boolean putsBack, Step step) {
         call = printable(call);
         long done = 0;
-        try (var c = db.newConnection()) {
+        try (var c = db.newConnection(); var bound = socket.on(c)) {
             c.setAutoCommit(true);
             Where where;
             try (var st = c.createStatement(); var rs = st.executeQuery("select max(id), now() from " + dead)) {
@@ -812,10 +814,10 @@ public final class PgOutboxAdmin implements OutboxAdmin {
      * {@link #readTimeout} (each statement's, lock waits included), so a slow read gives its pool connection back.
      */
     private <T> T read(Connection c, SqlFunction1<Connection, T> body) throws SQLException {
-        return inTx(c, tx -> {
+        return SocketBound.atLeast(c, readTimeout, () -> inTx(c, tx -> {
             execute(tx, "set local statement_timeout = " + readTimeout.toMillis());
             return body.apply(tx);
-        });
+        }));
     }
 
     /** {@code body} in one read-committed transaction on {@code c}, committed, or rolled back on any failure. */

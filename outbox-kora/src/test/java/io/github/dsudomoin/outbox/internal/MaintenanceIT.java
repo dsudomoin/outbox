@@ -1937,7 +1937,7 @@ class MaintenanceIT {
                 public String transactionHint() {
                     return "";
                 }
-            }, names, Duration.ofMinutes(1), Duration.ofMinutes(1));
+            }, names, Duration.ofMinutes(1), Duration.ofMinutes(1), new SocketBound(Duration.ZERO));
             execute(c, "create table " + foreign + " (id int)");
             holder.setAutoCommit(false);
             insertDead(holder, 2);
