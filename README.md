@@ -2246,7 +2246,7 @@ Gauge показывает, сколько xid осталось, а обслуж
 |---|---|
 | `outbox.dead.size` растёт, а `outbox.dead.pending` нет | Копятся оставленные (`kept`) письма: хука нет, он их оставил или Kafka DLQ их не принял. Разбор — [Dead letters](#dead-letters). |
 | `outbox.partitions.orphaned` > 0, `outbox.inbox.partitions.orphaned` > 0 | Отсоединённый диапазон со строками, который библиотека не вернула сама ([Осиротевшие партиции](#осиротевшие-партиции)). |
-| `outbox.partitions.overflow` = 1 дольше одного цикла расширения | Строки ушли в хвост, а своп не прошёл: держатель блокировки на outbox (WARN «deferred» и часовой ERROR «has not run on N due runs» называют его) или хвост больше `maxTailScan` (часовой ERROR «over outbox.partitions.maxTailScan»: его превратит окно `tailConversion`). Запись идёт, ничего не теряется ([Переполнение хвоста](#переполнение-хвоста-tail-overflow)). Одна выборка `overflow` = 1 — информация, а не авария. |
+| `outbox.partitions.overflow` = 1 дольше одного цикла расширения | Строки ушли в хвост, а своп не прошёл: держатель блокировки на outbox (WARN «deferred» и часовой ERROR «has not run on N due runs» называют его) или хвост больше `maxTailScan` вне окна (часовой ERROR «over outbox.partitions.maxTailScan»: его превратит окно `tailConversion`). Запись идёт, ничего не теряется ([Переполнение хвоста](#переполнение-хвоста-tail-overflow)). Одна выборка `overflow` = 1 — информация, а не авария. |
 | `outbox.partitions.premade` < 2 | Расширение отстаёт, строки скоро пойдут в хвост. |
 | `outbox.messages.route_unchecked` растёт | Heartbeat инстанса не читает отчёты других инстансов дольше 3 × `maintenanceInterval` (WARN «outbox heartbeat of instance ... failed»), и проверка при записи пропускает сообщения по последнему чтению (WARN «... through unchecked ...»). Ничего не теряется: запись, которую инстанс прочитать не сможет, ждёт. Чините heartbeat. Собственный пул heartbeat (в Kora по умолчанию) от исчерпанного пула приложения не зависит, поэтому смотрите сам источник heartbeat: WARN «outbox heartbeat connection source of ... failed, this beat uses the application's connections ...» (тогда beat ушёл в пул приложения), ERROR «outbox heartbeat connection source reaches another database ...», метры `hikaricp_*` с `pool="<db.poolName>-outbox-heartbeat"`, не выключен ли `outbox.heartbeat.dedicatedConnection` (тогда при старте INFO «outbox heartbeat shares the application's connections ...»). Медленная база и пулер в режиме transaction задерживают heartbeat и со своим пулом ([Версии контрактов и откат](#версии-контрактов-и-откат)). |
 | `outbox.parked.size` не возвращается к обычному уровню или растёт | Записи откладываются снова и снова: блокирующий их процесс не заканчивается. `outbox.shard.lag` отложенных записей не видит. Предел задаёт обработчик или `relay.requeue.maxRequeues` ([Свой обработчик](#свой-обработчик)). |
@@ -2610,15 +2610,16 @@ curl -s -H "$KEY" -H "$JSON" -d '{"ids":[1003]}' $API/dead-letters/discard
 скан ограничен размером:
 
 - хвост не больше `outbox.partitions.maxTailScan` (16 MB) лечится первым же свопом, который получил блокировку;
-- хвост больше остаётся горячим: запись идёт в него, ничего не теряется, растёт только диск; ERROR «outbox partition
-  tail ... holds N MB, over outbox.partitions.maxTailScan» не чаще раза в час называет окно и `maxStall`;
+- хвост больше вне окна остаётся горячим: запись идёт в него, ничего не теряется, растёт только диск; ERROR «outbox
+  partition tail ... holds N MB, over outbox.partitions.maxTailScan» не чаще раза в час называет окно и `maxStall`;
 - в окне `outbox.partitions.tailConversion.window` (по умолчанию 03:00–05:00 в поясе `tailConversion.zone`, по
   умолчанию это пояс JVM; контейнеры обычно работают в UTC — задайте пояс явно) обслуживание превращает в диапазон и
   такой хвост, тем же свопом, но удержание ограничено `tailConversion.maxStall` (1 с). Окно проверяется и после
   ожидания шагов relay, перед попыткой. Не уложившийся скан откатывает своп целиком, хвост остаётся присоединённым и
   горячим, WARN «did not fit outbox.partitions.tailConversion.maxStall» называет размер и `maxStall`; этот инстанс не
   пробует снова до конца окна, а когда окно кончилось без свопа, пишет один ERROR «... ended without a conversion» с
-  размером, `maxStall` и советом. Следующая ночь пробует снова. Если такие ERROR повторяются, поднимите `maxStall`.
+  размером, `maxStall` и советом. Следующая ночь пробует снова. Если такие ERROR повторяются, поднимите `maxStall`. Пока
+превращение в окне удаётся, ни WARN, ни ERROR о нём нет: они значат, что починка не вышла.
 
 **Правило для таймаутов писателей.** Это гарантия, а не замер: `lock_timeout` и `statement_timeout` сервисов, которые
 пишут в outbox (роль, база, параметры JDBC, `SET LOCAL` в транзакциях):
