@@ -74,7 +74,8 @@ class AccountOperation(
         }
         when (event.tag()) {
             "block" -> update(c, "insert into accounts.blocker (account) values (?) on conflict do nothing", account)
-            "unblock" -> update(c, "delete from accounts.blocker where account = ?", account)
+            // "wait+result": the same type as `wait`, the event that carries the result the older ones wait for
+            "unblock", "wait+result" -> update(c, "delete from accounts.blocker where account = ?", account)
             "wait" -> {
                 // the useful change commits even when the event is requeued
                 update(

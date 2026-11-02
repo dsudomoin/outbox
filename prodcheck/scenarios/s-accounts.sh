@@ -185,10 +185,11 @@ s_accounts_corrupt() { # a stored envelope that does not parse: the handler answ
   pc_finish --dead-tags corrupt --exempt-tags corrupt --timeout 120
 }
 
-s_accounts_requeue_storm() { # thousands of records parked with maxRequeues = 0 for a minute: what it costs the other accounts
-  acc_begin accounts-requeue-storm
+requeue_storm() { # requeue_storm NAME [-Dkey=value...]: thousands of records parked with maxRequeues = 0 for a minute: what it costs the other accounts
+  acc_begin "$1"
+  shift
   local i a
-  for i in 1001 1002; do acc "$i"; done
+  for i in 1001 1002; do acc "$i" "$@"; done
   for a in 0 1 2 3 4; do tx_send 1001 "topic=$ACC&key=k$a&tag=block" > /dev/null; done
   sleep 2
   pc_load 1001 'rate=400&writers=4&keys=5&tags=wait:1' # every record of the blocked accounts waits, nothing else there
@@ -206,6 +207,12 @@ s_accounts_requeue_storm() { # thousands of records parked with maxRequeues = 0 
   log "max requeues so far: $(acc_q 'select max(max_requeues) from seen')"
   ACC_FINISH=(--exempt-tags wait --report-order-within-tag wait --timeout 200 --slow-tags wait --slow-from "$from" --slow-to "$to")
   acc_end
+}
+
+s_accounts_requeue_storm() { requeue_storm accounts-requeue-storm; }
+
+s_accounts_requeue_storm_delay() { # the same with a longer requeue delay: arrivals and the others' p99 next to the default's
+  requeue_storm accounts-requeue-storm-delay -Doutbox.relay.requeue.delay=5s
 }
 
 s_accounts_pool_pressure() { # writers hold the whole pool of 10: the handler's business transaction and the relay compete for it
@@ -471,4 +478,40 @@ s_accounts_rollback_drain() { # the service's rollback in its production form: t
   log "blocked accounts left: $(acc_q 'select count(*) from blocker')"
   acc_checks
   pc_finish "${ACC_FINISH[@]}"
+}
+
+s_accounts_held_deadlock() { # the README's same-type rule against a later event of the type that carries the awaited result: the key stands
+  acc_begin accounts-held-deadlock
+  local i opts=-Daccounts.holdSameType=true
+  for i in 1001 1002; do acc "$i" $opts; acc_load "$i" 'rate=50&writers=2&keys=25'; done # k27 is left to the fault
+  tx_send 1001 "topic=$ACC&key=k27&tag=block" > /dev/null
+  sleep 2
+  tx_send 1001 "topic=$ACC&key=k27&tag=wait" > /dev/null
+  tx_send 1001 "topic=$ACC&key=k27&tag=wait" > /dev/null
+  tx_send 1001 "topic=$ACC&key=k27&tag=wait%2Bresult" > /dev/null
+  fault "счёт k27 заблокирован; две записи wait ждут результата, третья того же типа его несёт"
+  requeues() { acc_q "select coalesce(max(requeues), 0) from account_events_parked where convert_from(key, 'UTF8') = 'k27'"; }
+  local a b
+  sleep 15
+  a=$(requeues)
+  sleep 45
+  b=$(requeues)
+  log "after 60 s: requeues $a -> $b, parked $(acc_q "select count(*) from account_events_parked where convert_from(key, 'UTF8') = 'k27'")"
+  check "$(passes gt "$b" "$a")" "ключ крутится вхолостую: откладываний было $a, через 45 с $b"
+  check "$(passes is "$(acc_q "select count(*) from account_events_parked where convert_from(key, 'UTF8') = 'k27'")" = 3)" "ключ стоит: все три записи отложены"
+  check "$(passes is "$(acc_q "select count(*) from pc_arrival where tag = 'wait+result'")" = 0)" "запись с результатом ни разу не дошла до бизнес-операции: правило heldTypes держит её в обработчике"
+  check "$(passes is "$(acc_q "select count(*) from blocker where account = 'k27'")" = 1)" "блокировка на месте: снять её некому, дедлок ключа"
+  check "$(passes is "$(acc_q "select count(*) from pc_effect where key = 'k27' and tag <> 'block'")" = 0)" "за минуту ни одного эффекта на счёте"
+  check "$(passes effects_grow 5)" "другие счета идут"
+  fault "rolling-рестарт без holdSameType: запись с результатом проходит мимо ждущих"
+  for i in 1001 1002; do
+    inst_stop "$i"
+    acc "$i"
+    sleep 3
+  done
+  gone() { [ "$(acc_q "select count(*) from account_events_parked where convert_from(key, 'UTF8') = 'k27'")" = 0 ]; }
+  check "$(passes wait_for 30 gone)" "без правила ключ разошёлся сам: результат снял блокировку, ждущие доставлены"
+  REPAIRED="рестарт без правила: для таких типов правило heldTypes из README неприменимо"
+  ACC_FINISH=(--exempt-tags wait,wait+result --timeout 120)
+  acc_end
 }

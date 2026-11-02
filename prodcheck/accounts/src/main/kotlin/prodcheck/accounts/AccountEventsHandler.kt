@@ -39,7 +39,8 @@ class AccountEventsHandler(
     ): List<Outcome> {
         val failedKeys =
             mutableSetOf<Pair<String, ByteBuffer>>()
-        // accounts.holdSameType: the library README's rule for a blocking process that ends in the middle of a call
+        // accounts.holdSameType: the library README's rule for a blocking process that ends in the middle of a call;
+        // a type is the tag up to its '+'
         val heldTypes =
             mutableSetOf<Pair<ByteBuffer, String>>()
 
@@ -54,7 +55,7 @@ class AccountEventsHandler(
             ) {
                 Outcome.notAttempted()
             } else if (
-                config.holdSameType() && key != null && (key.second to tagOf(record)) in heldTypes
+                config.holdSameType() && key != null && (key.second to typeOf(record)) in heldTypes
             ) {
                 Outcome.requeue()
             } else {
@@ -69,7 +70,7 @@ class AccountEventsHandler(
 
                             AccountEventResult.REQUEUE -> {
                                 if (key != null) {
-                                    heldTypes.add(key.second to tagOf(record))
+                                    heldTypes.add(key.second to typeOf(record))
                                 }
                                 Outcome.requeue()
                             }
@@ -101,6 +102,7 @@ class AccountEventsHandler(
         }
     }
 
-    private fun tagOf(record: OutboxRecord): String =
+    private fun typeOf(record: OutboxRecord): String =
         runCatching { Payload.tag(BytesValue.parseFrom(record.payload()).value.toByteArray()) }.getOrDefault("")
+            .substringBefore('+')
 }
