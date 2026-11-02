@@ -11,22 +11,99 @@ tail_batch_stats() { # the mean of outbox.batch.duration over the last N seconds
   python3 -c "print(f'{($s1 - $s0) * 1000 / max($c1 - $c0, 1):.1f} ms per step, {($c1 - $c0) / $n:.1f} steps/s')"
 }
 
+tail_snapshot() { # what writers and the relay are doing, when a phase does not move
+  log "snapshot $1: sent $(psql_q "select key, count(*) from pc_sent where key like 'tail-%' group by 1" | tr '\n' ' '), retry $(retry_size), parked $(parked_size), stats $(stats 1001 | cut -c1-200)"
+  psql_q "select state, wait_event_type, wait_event, round(extract(epoch from clock_timestamp() - query_start)), left(query, 70) from pg_stat_activity where datname = 'outbox' and pid <> pg_backend_pid() and state <> 'idle' order by 4 desc limit 12" >&2 || true
+}
+
+tail_disk() { # tail_disk LABEL: the size and the update counters of both tables, into the result and build/results
+  local line
+  sleep 2 # the backends' table statistics reach the view about once a second
+  line=$(psql_q "select string_agg(format('%s: heap %s MB, total %s MB, updates %s, hot %s, dead %s, autovacuums %s', relname,
+      round(pg_relation_size(relid) / 1048576.0, 1), round(pg_total_relation_size(relid) / 1048576.0, 1),
+      n_tup_upd, n_tup_hot_upd, n_dead_tup, autovacuum_count), '; ' order by relname)
+    from pg_stat_user_tables where relname in ('outbox_parked', 'outbox_retry')")
+  log "disk $1: live retry $(retry_size), parked $(parked_size); $line"
+  echo "$(date -u +%T) $1: live retry $(retry_size), parked $(parked_size); $line" >> "$RESULT_DIR/retry-long-tail.disk"
+  check 0 "диск, $1 (retry $(retry_size), parked $(parked_size)): $line"
+}
+
+auto_explain_on() { # the plans and the row counts of the library's own statements, with their real parameters, in the server log
+  psql_q "alter system set session_preload_libraries = 'auto_explain'" > /dev/null
+  psql_q "alter system set auto_explain.log_min_duration = '5ms'" > /dev/null
+  psql_q "alter system set auto_explain.log_analyze = on" > /dev/null
+  psql_q "alter system set auto_explain.log_timing = off" > /dev/null
+  psql_q "alter system set auto_explain.log_buffers = on" > /dev/null
+  psql_q "select pg_reload_conf()" > /dev/null
+}
+
+auto_explain_report() { # per statement of interest: calls over the threshold, the slowest, rows written; the slowest plan goes to the file
+  docker logs "$PG" 2>&1 | STAMP="$(date -u +%T)" python3 -c '
+import os, re, sys
+text = sys.stdin.read()
+blocks = re.split(r"\n(?=[0-9-]+ [0-9:.]+ \w+ \[\d+\] LOG:  duration: )", text)
+kinds = {"postponeNewer": "update outbox_parked p set due_at", "selectOlder": "in_retry", "repark": "update outbox_parked set requeues",
+         "putOff": "update outbox_parked set due_at", "selectDue parked": "from outbox_parked where shard = $1 and due_at <=",
+         "minDue parked": "select min(due_at) from outbox_parked"}
+out, slowest = [], {}
+for name, needle in kinds.items():
+    hits = [b for b in blocks if "duration:" in b and needle in b]
+    ms = [float(re.search(r"duration: ([0-9.]+) ms", b).group(1)) for b in hits]
+    rows = [int(m.group(1)) for b in hits for m in [re.search(r"Update on \S+.*?rows=(\d+)", b) or re.search(r"\(actual rows=(\d+)", b)] if m]
+    if ms:
+        out.append(f"{name}: {len(ms)} calls over 5 ms, slowest {max(ms):.0f} ms, total {sum(ms)/1000:.1f} s, rows in the top node up to {max(rows) if rows else 0}")
+        slowest[name] = hits[ms.index(max(ms))]
+    else:
+        out.append(f"{name}: no call over 5 ms")
+print("; ".join(out))
+open(os.environ["PLANS"], "w").write("\n\n".join(f"== {k}\n{v}" for k, v in slowest.items()))
+' 
+}
+
+mate_latency() { # mate_latency LABEL SHARDS FROM TO: delivery latency of the other keys on those shards, sent in that window
+  local mates sent done
+  mates=$(psql_q "select string_agg(distinct format('(%L,%L)', topic, convert_from(key, 'UTF8')), ',') from outbox where shard in ($2) and convert_from(key, 'UTF8') not like 'tail-%'")
+  if [ -z "$mates" ]; then log "$1: no other key on shard $2"; return 0; fi
+  sent=$(psql_q "copy (select message_id, extract(epoch from at) from pc_sent where (topic, key) in ($mates) and at >= to_timestamp($3) and at <= to_timestamp($4)) to stdout with csv")
+  done=$(target_q "copy (select message_id, extract(epoch from at) from pc_effect where (topic, key) in ($mates)) to stdout with csv")
+  SENT=$sent DONE=$done LABEL=$1 python3 - >&2 << 'PY_MATES'
+import os
+rows = lambda v: dict(l.split(",") for l in os.environ[v].splitlines() if l)
+sent, done = rows("SENT"), rows("DONE")
+lat = sorted(float(done[i]) - float(t) for i, t in sent.items() if i in done)
+missing = sum(1 for i in sent if i not in done)
+pct = lambda q: round(lat[min(int(len(lat) * q), len(lat) - 1)], 3) if lat else None
+print(f"{os.environ['LABEL']}: shard mates' messages {len(sent)}, not yet delivered {missing}, p50 {pct(.5)} s, p99 {pct(.99)} s, max {pct(1)} s")
+PY_MATES
+}
+
 s_retry_long_tail() {
   pc_begin retry-long-tail
   pc_target
   local opts='-Doutbox.relay.batchSize=1000' i rows=100000 out=$RESULT_DIR/retry-long-tail.explain
+  AFTER='"${COMPOSE[@]}" --profile failover --profile pooler down -v' # the server settings below go with the stand
+  rm -f "$RESULT_DIR/retry-long-tail.disk"
+  auto_explain_on
   for i in 1001 1002; do pc_courier "$i" $opts; done
   hctl 1001 'route=main&failKeys=tail-f&waiting=true'
   hctl 1002 'route=main&failKeys=tail-f&waiting=true'
-  # a failing key's own rows reach the retry table slowly: the shard pauses and its calls halve down to one record
-  pc_load 1001 'rate=3000&writers=1&txMessages=500&bulk=true&bulkKey=tail-f&topics=deliveries'
-  local n0 n1
-  sleep 4
+  # neighbours, some on the shard of a tail; a failing key's backlog in the main stream, and how fast it clears the way
+  pc_load 1002 'rate=100&writers=2&keys=300&topics=deliveries,receipts'
+  sleep 3
+  local t0=$(now) written moved=0
+  pc_load 1001 'rate=20000&writers=1&txMessages=500&bulk=true&bulkKey=tail-f&topics=deliveries'
+  sleep 3
   pc_unload 1001
-  n0=$(retry_size)
-  sleep 20
-  n1=$(retry_size)
-  log "a failing key moves to the retry table at $(((n1 - n0) / 20)) rows/s, of $(psql_q "select count(*) from pc_sent where key = 'tail-f'") written"
+  written=$(psql_q "select count(*) from pc_sent where key = 'tail-f'")
+  all_moved() { [ "$(psql_q "select count(*) from outbox_retry where key = convert_to('tail-f', 'UTF8')")" -ge "$written" ]; }
+  check "$(passes wait_for 240 all_moved)" "бэклог сбойного ключа ушёл в retry-таблицу: $written строк"
+  moved=$(($(now) - t0))
+  log "a failing key's backlog: $written rows out of the main stream in $moved s, about $((written / (moved > 0 ? moved : 1))) rows/s"
+  sleep 3
+  local fshard
+  fshard=$(psql_q "select shard from outbox_retry where key = convert_to('tail-f', 'UTF8') limit 1")
+  mate_latency "behind the failing key's backlog" "$fshard" "$t0" "$(now)"
+  tail_disk "до хвоста"
   local t=$(now)
   # the retry tail behind a waiting head: no pause, whole batches
   tx_send 1001 'topic=deliveries&key=tail-r&tag=wait' > /dev/null
@@ -34,14 +111,18 @@ s_retry_long_tail() {
   pc_load 1001 'rate=3000&writers=1&txMessages=500&bulk=true&bulkKey=tail-r&topics=deliveries'
   pc_load 1002 'rate=3000&writers=1&txMessages=500&bulk=true&bulkKey=tail-p&topics=receipts&tags=hold:1'
   full() { [ "$(psql_q "select count(*) from pc_sent where key = '$1'")" -ge "$rows" ]; }
-  wait_for 300 full tail-r
+  ( for n in 10 30 60 120; do command sleep "$n"; tail_snapshot "+$n"; done ) &
+  local snap=$!
+  full tail-r || wait_for 120 full tail-r || { tail_snapshot "tail-r not written"; thread_dump 1001 stuck; exit 1; }
   pc_unload 1001
-  wait_for 300 full tail-p
+  wait_for 120 full tail-p || { tail_snapshot "tail-p not written"; thread_dump 1002 stuck; exit 1; }
   pc_unload 1002
+  kill "$snap" 2> /dev/null || true
   log "written in $(($(now) - t)) s"
   settled() { [ "$(psql_q "select count(*) from outbox_retry where key = convert_to('tail-r', 'UTF8')")" -ge "$rows" ] && [ "$(parked_size)" -ge "$((rows - 200))" ]; }
   local fill=$(now)
   check "$(passes wait_for 300 settled)" "хвост на месте через $(($(now) - fill)) с: retry $(retry_size), parked $(parked_size)"
+  tail_disk "хвост на месте"
   # others flow beside it
   local from=$(now)
   pc_load 1001 'rate=100&writers=2&keys=30&topics=deliveries,receipts'
@@ -53,8 +134,14 @@ s_retry_long_tail() {
   local mates
   mates=$(psql_q "select string_agg(distinct convert_from(key, 'UTF8'), ',') from outbox where shard in (select distinct shard from outbox_retry union select distinct shard from outbox_parked) and convert_from(key, 'UTF8') not like 'tail-%'")
   log "shard mates of the tails: ${mates:-none}"
+  mate_latency "beside the tails" "$(psql_q "select string_agg(distinct shard::text, ',') from (select shard from outbox_retry where key = convert_to('tail-r', 'UTF8') union select shard from outbox_parked) s")" "$from" "$to"
   local to=$(now)
   pc_unload 1001
+  tail_disk "после минуты рядом с хвостом"
+  local plans
+  plans=$(PLANS=$RESULT_DIR/retry-long-tail.autoexplain auto_explain_report)
+  log "auto_explain: $plans"
+  check 0 "планы из auto_explain, настоящие вызовы библиотеки: $plans"
   # the plans, with the tail in place and real values
   {
     local s
@@ -77,6 +164,14 @@ s_retry_long_tail() {
     psql_q "explain (analyze, buffers) select min(due_at) from outbox_parked where shard = $s"
     echo "== due heads (retry)"
     psql_q "explain (analyze, buffers) select id from outbox_retry where shard = $r and next_attempt_at <= now() order by waiting_since is not null, id limit 100"
+    echo "== selectOlder on the key with 100k retry rows, by hand"
+    psql_q "explain (analyze, buffers) select p.id, due_at, in_retry, head_due from unnest(array['deliveries']::text[], array[convert_to('tail-r', 'UTF8')]::bytea[], array[$(psql_q "select max(id) from outbox_retry")]::int8[]) u(t, b, below)
+      cross join lateral (select count(*) > 0 in_retry, min(r.next_attempt_at) head_due from outbox_retry r where r.shard = $r and r.topic = u.t and r.key = u.b) k
+      cross join lateral (select id, due_at from outbox_parked where shard = $r and topic = u.t and key = u.b and id < u.below and (not k.in_retry or due_at > now()) order by id limit case when k.in_retry then 1 else 1000 end) p order by in_retry desc, id limit 1001"
+    echo "== postponeNewer on the parked tail, by hand, every row due, rolled back"
+    local above
+    above=$(psql_q "select id from outbox_parked where key = convert_to('tail-p', 'UTF8') order by id offset 1000 limit 1")
+    docker exec "$PG" psql -U outbox -d outbox -Atq -c "begin" -c "explain (analyze, buffers) update outbox_parked p set due_at = now() + interval '5 seconds' from unnest(array['receipts']::text[], array[convert_to('tail-p', 'UTF8')]::bytea[], array[$above]::int8[]) k(t, b, above) where p.shard = $s and p.topic = k.t and p.key = k.b and p.id > k.above and p.due_at <= now() + interval '1 day'" -c "rollback"
     echo "== retry_due_at minimum"
     psql_q "explain (analyze, buffers) select min(next_attempt_at) from outbox_retry where shard = $r"
     echo "== retry rows behind a head of a key"
@@ -86,6 +181,7 @@ s_retry_long_tail() {
     psql_q "explain (analyze) select count(*) from outbox_retry"
   } > "$out" 2>&1
   grep -E '^==|Execution Time' "$out" >&2
+  grep -E '^==|Execution Time|Update on|rows=[0-9]+ loops' "$out" | grep -A3 -E '== (postponeNewer|selectOlder on the key)' | cut -c1-150 >&2 || true
   # the rest of the proof: the tails empty, in order, nothing lost
   local drained=$(now)
   for i in 1001 1002; do hctl "$i" 'route=main&failKeys=&waiting=false&oneRound=true'; done
@@ -93,5 +189,8 @@ s_retry_long_tail() {
     sleep 10
     log "draining: retry $(retry_size), parked $(parked_size), steps of 1001 $(tail_batch_stats 1001 1)"
   done
+  tails_empty() { [ "$(psql_q "select (select count(*) from outbox_retry) + (select count(*) from outbox_parked)")" = 0 ]; }
+  wait_for 400 tails_empty || true
+  tail_disk "хвосты разобраны"
   pc_finish --exempt-tags none --slow-keys "tail-r,tail-p,$mates" --slow-from "$from" --slow-to "$to" --timeout 400
 }

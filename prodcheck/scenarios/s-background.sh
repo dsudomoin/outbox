@@ -198,10 +198,11 @@ s_silent_drop_background() { # socketTimeout = 0: maintenance, the dead-letter p
   after=$(st "$i" 'd["premade"]')
   log "partitions $n, premade $after"
   check "$(passes is "$after" -ge 2)" "партиции продолжают создаваться: premade $after после 3000 xid при диапазоне 1000"
-  # what it takes today when a check above failed: a restart
-  pc_kill "$i"
-  PC_PG_URL=jdbc:postgresql://localhost:55432/outbox
-  pc_shop "$i" -Dprodcheck.hook=policy
-  REPAIRED="рестарт, если поток завис"
+  if [ "$mt" = -1 ] || [ "$dl" = -1 ]; then # a thread that did not come back: only a restart gets the ledger through
+    pc_kill "$i"
+    PC_PG_URL=jdbc:postgresql://localhost:55432/outbox
+    pc_shop "$i" -Dprodcheck.hook=policy
+    REPAIRED="kill -9 и рестарт: поток не вернулся"
+  fi
   pc_finish --dead-tags hook-keep --exempt-tags hook-keep --timeout 60
 }
