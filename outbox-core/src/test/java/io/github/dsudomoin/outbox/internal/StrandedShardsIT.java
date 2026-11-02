@@ -10,19 +10,25 @@ import io.github.dsudomoin.outbox.JdbcTransactions;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRuntime;
+import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
+import java.sql.Connection;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -33,6 +39,7 @@ import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.postgresql.ds.PGSimpleDataSource;
 
 /**
  * Shards whose tick was deleted, repaired by the one admin call on a running relay: the rows of those shards come back
@@ -309,6 +316,75 @@ class StrandedShardsIT {
         await(() -> delivered.containsAll(row));
         Thread.sleep(300);
         assertThat(times.get(row.get(0))).as("once: the relay's, no repair's").isEqualTo(1);
+    }
+
+    @Test
+    void aFailedStepLeavesItsConnectionInAutocommit() throws Exception {
+        var atClose = new ConcurrentLinkedQueue<Boolean>();
+        leaveTheOtherShardsOnANewerTick();
+        sendMany(1, 2);
+        makeATick();
+        deleteTheirTick();
+        relay = OutboxRuntime.builder(config, new JdbcTransactions(recordingAutocommit(direct, atClose)),
+                this::deliver).build();
+        relay.start();
+
+        await(() -> atClose.size() > 10);
+
+        assertThat(atClose).as("as every pass closes it, a stranded shard's step failing in each").containsOnly(true);
+    }
+
+    @Test
+    void aFailedStepCostsAHealthyShardNothingOnARepeatableReadSession() throws Exception {
+        var repeatableRead = new PGSimpleDataSource();
+        repeatableRead.setUrl(TestDataSources.jdbcUrl());
+        repeatableRead.setUser(TestDataSources.user());
+        repeatableRead.setPassword(TestDataSources.password());
+        repeatableRead.setOptions("-c default_transaction_isolation=repeatable\\ read");
+        // a tick attempt, and with it a read of the latest tick, between any two steps of a pass
+        config.idlePollInterval(Duration.ofMillis(1)).minTickInterval(Duration.ZERO);
+        leaveTheOtherShardsOnANewerTick();
+        sendMany(1, 2);
+        makeATick();
+        deleteTheirTick();
+        var failures = new ConcurrentLinkedQueue<String>();
+        relay = OutboxRuntime.builder(config, new JdbcTransactions(repeatableRead), this::deliver)
+                .telemetry(new OutboxTelemetry() {
+                    @Override
+                    public void relayFailed(Throwable error) {
+                        failures.add(error.toString());
+                    }
+                }).build();
+        relay.start();
+        var sent = new ArrayList<UUID>();
+        for (int i = 0; i < 300; i++) {
+            sent.addAll(sendMany(i % 2 == 0 ? 0 : 3, 1));
+            Thread.sleep(5);
+        }
+        await(() -> delivered.containsAll(sent));
+
+        assertThat(failures).as("the stranded shard's own failures, and only those").isNotEmpty()
+                .noneMatch(failure -> failure.contains("before any query"));
+    }
+
+    /** {@code source} whose connections add to {@code atClose}, closed by a worker: whether they are in autocommit. */
+    private static DataSource recordingAutocommit(DataSource source, Queue<Boolean> atClose) {
+        return (DataSource) Proxy.newProxyInstance(DataSource.class.getClassLoader(), new Class<?>[] {DataSource.class},
+                (ds, method, args) -> {
+                    var result = method.invoke(source, args);
+                    return !method.getName().equals("getConnection") ? result : Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(), new Class<?>[] {Connection.class}, (c, call, values) -> {
+                                if (call.getName().equals("close")
+                                        && Thread.currentThread().getName().startsWith("outbox-relay-")) {
+                                    atClose.add(((Connection) result).getAutoCommit());
+                                }
+                                try {
+                                    return call.invoke(result, values);
+                                } catch (InvocationTargetException e) {
+                                    throw e.getCause();
+                                }
+                            });
+                });
     }
 
     @Test

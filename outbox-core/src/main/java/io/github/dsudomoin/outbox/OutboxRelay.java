@@ -637,9 +637,11 @@ public final class OutboxRelay implements AutoCloseable {
         }
     }
 
+    /** Rolls back, and back into autocommit, as a statement after it would open a transaction left to the pool. */
     private static void rollback(Connection c, Throwable cause) {
         try {
             c.rollback();
+            c.setAutoCommit(true);
         } catch (SQLException | RuntimeException e) {
             cause.addSuppressed(e);
         }
