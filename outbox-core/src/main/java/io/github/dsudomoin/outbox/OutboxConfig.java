@@ -96,6 +96,17 @@ public interface OutboxConfig {
             return Duration.ofSeconds(30);
         }
 
+        /**
+         * How long a relay worker's connection waits on a silent socket ({@code Connection.setNetworkTimeout}), when the
+         * connection has no such bound of its own, as pgjdbc's default {@code socketTimeout = 0}: a connection the
+         * network dropped silently fails after this, and the worker goes on with a new one. Zero: no bound from here.
+         * Only relay workers: maintenance, index builds and the xid recovery run long statements on purpose. Longer
+         * than the longest statement of a step, or the step fails and is tried again.
+         */
+        default Duration networkTimeout() {
+            return Duration.ofMinutes(5);
+        }
+
         default int headFailuresBeforeDivert() {
             return 3;
         }

@@ -84,6 +84,8 @@ public final class OutboxRelay implements AutoCloseable {
     private final DatabaseClock clock;
     private final long idleNanos;
     private final long minTickNanos;
+    /** {@code relay.networkTimeout}; 0: none. */
+    private final int networkTimeoutMillis;
     /**
      * An idle tick attempt inserts only when the newest tick, any instance's, is older than this: so a cluster makes
      * about one idle tick per {@code idlePollInterval} (at most 4 per 3 intervals with many instances), not one per
@@ -179,6 +181,7 @@ public final class OutboxRelay implements AutoCloseable {
         this.heartbeat = new Heartbeat(db, schema, config, relay.enabled() && deadLetters.active());
         this.idleNanos = relay.idlePollInterval().toNanos();
         this.minTickNanos = relay.minTickInterval().toNanos();
+        this.networkTimeoutMillis = (int) relay.networkTimeout().toMillis();
         this.idleTickAge = Duration.ofNanos(Math.max(minTickNanos, idleNanos - idleNanos / 4));
         this.lastTickAttempt = System.nanoTime() - idleNanos; // the first pass ticks
         this.stepStarted = new AtomicLongArray(config.shards());
@@ -785,6 +788,7 @@ public final class OutboxRelay implements AutoCloseable {
          */
         private boolean pass(long seen) throws Exception {
             try (var c = db.newConnection()) {
+                boundSilentSocket(c);
                 c.setAutoCommit(true);
                 tickIfDue(c, seen);
                 readRound(c);
@@ -804,6 +808,17 @@ public final class OutboxRelay implements AutoCloseable {
                     worked |= step(c, r, group);
                 }
                 return worked;
+            }
+        }
+
+        /**
+         * {@code relay.networkTimeout} on a connection with no such bound of its own (pgjdbc's default
+         * {@code socketTimeout}): without one, a connection the network dropped silently holds this worker on its
+         * socket for good. Neither call goes to the database. A pool gives the connection back with its own value.
+         */
+        private void boundSilentSocket(Connection c) throws SQLException {
+            if (networkTimeoutMillis > 0 && c.getNetworkTimeout() == 0) {
+                c.setNetworkTimeout(Runnable::run, networkTimeoutMillis);
             }
         }
 

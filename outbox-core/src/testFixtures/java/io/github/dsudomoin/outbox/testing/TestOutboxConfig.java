@@ -25,6 +25,7 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     private Duration idlePollInterval = Duration.ofMillis(20);
     private Duration batchTimeout = Duration.ofSeconds(5);
     private Duration shutdownTimeout = Duration.ofSeconds(5);
+    private Duration networkTimeout = Duration.ofMinutes(5);
     private int headFailuresBeforeDivert = 3;
     private Duration cursorAnchorInterval = Duration.ofHours(1);
     private Duration retryInitial = Duration.ofMillis(50);
@@ -252,6 +253,16 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     @Override
     public int headFailuresBeforeDivert() {
         return headFailuresBeforeDivert;
+    }
+
+    public TestOutboxConfig networkTimeout(Duration networkTimeout) {
+        this.networkTimeout = networkTimeout;
+        return this;
+    }
+
+    @Override
+    public Duration networkTimeout() {
+        return networkTimeout;
     }
 
     public TestOutboxConfig headFailuresBeforeDivert(int headFailuresBeforeDivert) {

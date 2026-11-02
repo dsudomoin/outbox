@@ -236,6 +236,7 @@ class OutboxConfigTest {
         assertThat(relay.idlePollInterval()).isEqualTo(Duration.ofMillis(200));
         assertThat(relay.batchTimeout()).isEqualTo(Duration.ofSeconds(30));
         assertThat(relay.shutdownTimeout()).isEqualTo(Duration.ofSeconds(30));
+        assertThat(relay.networkTimeout()).isEqualTo(Duration.ofMinutes(5));
         assertThat(relay.headFailuresBeforeDivert()).isEqualTo(3);
         assertThat(relay.retry().initialDelay()).isEqualTo(Duration.ofSeconds(1));
         assertThat(relay.retry().maxDelay()).isEqualTo(Duration.ofMinutes(5));

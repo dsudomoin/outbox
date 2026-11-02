@@ -183,6 +183,9 @@ public final class OutboxSchema implements AutoCloseable {
                 "outbox.relay.batchTimeout must be positive: " + relay.batchTimeout());
         require(!relay.shutdownTimeout().isNegative(),
                 "outbox.relay.shutdownTimeout must not be negative: " + relay.shutdownTimeout());
+        require(relay.networkTimeout().isZero() || relay.networkTimeout().compareTo(Duration.ofMillis(1)) >= 0
+                && relay.networkTimeout().compareTo(Duration.ofMillis(Integer.MAX_VALUE)) <= 0,
+                "outbox.relay.networkTimeout must be 0 or within 1 ms and 24 days: " + relay.networkTimeout());
         require(relay.headFailuresBeforeDivert() >= 1,
                 "outbox.relay.headFailuresBeforeDivert must be at least 1: " + relay.headFailuresBeforeDivert());
         require(retry.initialDelay().compareTo(Duration.ZERO) > 0,

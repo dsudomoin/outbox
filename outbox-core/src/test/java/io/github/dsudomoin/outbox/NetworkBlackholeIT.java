@@ -3,22 +3,30 @@ package io.github.dsudomoin.outbox;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URI;
+import java.sql.Connection;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import javax.sql.DataSource;
@@ -141,6 +149,101 @@ class NetworkBlackholeIT {
         CompletableFuture.runAsync(runtime::close).get(60, TimeUnit.SECONDS);
     }
 
+    @Test
+    void aSilentDropHealsByItselfOnTheDefaultDataSource() throws Exception {
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(1));
+        Set<UUID> delivered = ConcurrentHashMap.newKeySet();
+        var relay = OutboxRuntime.builder(config, new JdbcTransactions(pool(throughTheHole(3, 0))),
+                record -> delivered.add(record.messageId())).build();
+        closing.add(relay);
+        relay.start();
+        var writerTransactions = new JdbcTransactions(DIRECT);
+        var writer = OutboxRuntime.builder(new TestOutboxConfig().table(config.table()).relayEnabled(false),
+                writerTransactions, record -> {}).build();
+        closing.add(writer);
+        writer.start();
+        var sent = new HashSet<UUID>();
+        sent.add(send(writer, writerTransactions, "before"));
+        await(() -> delivered.containsAll(sent));
+
+        hole.forget(); // each worker's next statement, on its pooled connection, waits on a silent socket
+        sent.add(send(writer, writerTransactions, "after"));
+
+        await(() -> delivered.containsAll(sent));
+        assertThat(relay.relay().running()).isTrue();
+    }
+
+    @Test
+    void aSocketTimeoutOfTheDataSourceWins() throws Exception {
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofHours(1));
+        Set<UUID> delivered = ConcurrentHashMap.newKeySet();
+        var relay = OutboxRuntime.builder(config, new JdbcTransactions(pool(throughTheHole(3, 1))),
+                record -> delivered.add(record.messageId())).build();
+        closing.add(relay);
+        relay.start();
+        var writerTransactions = new JdbcTransactions(DIRECT);
+        var writer = OutboxRuntime.builder(new TestOutboxConfig().table(config.table()).relayEnabled(false),
+                writerTransactions, record -> {}).build();
+        closing.add(writer);
+        writer.start();
+
+        hole.forget();
+        var after = send(writer, writerTransactions, "after");
+
+        await(() -> delivered.contains(after)); // within the await, so by the 1 s of the DataSource, not by the hour
+    }
+
+    @Test
+    void onlyRelayWorkersGetTheNetworkTimeout() throws Exception {
+        var calls = new ConcurrentLinkedQueue<String>();
+        var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(9))
+                .maintenanceInterval(Duration.ofMillis(100));
+        Set<UUID> delivered = ConcurrentHashMap.newKeySet();
+        var transactions = new JdbcTransactions(recordingTimeouts(DIRECT, calls));
+        var relay = OutboxRuntime.builder(config, transactions, record -> delivered.add(record.messageId())).build();
+        closing.add(relay);
+        relay.start();
+
+        var sent = send(relay, transactions, "k");
+        await(() -> delivered.contains(sent));
+        Thread.sleep(500); // some maintenance runs and beats
+
+        assertThat(calls).isNotEmpty().allMatch(call -> call.startsWith("outbox-relay-") && call.endsWith(":9000"));
+    }
+
+    @Test
+    void aZeroNetworkTimeoutSetsNone() throws Exception {
+        var calls = new ConcurrentLinkedQueue<String>();
+        var config = new TestOutboxConfig().networkTimeout(Duration.ZERO);
+        Set<UUID> delivered = ConcurrentHashMap.newKeySet();
+        var transactions = new JdbcTransactions(recordingTimeouts(DIRECT, calls));
+        var relay = OutboxRuntime.builder(config, transactions, record -> delivered.add(record.messageId())).build();
+        closing.add(relay);
+        relay.start();
+
+        var sent = send(relay, transactions, "k");
+        await(() -> delivered.contains(sent));
+
+        assertThat(calls).isEmpty();
+    }
+
+    @Test
+    void aPoolGivesItsNextBorrowerTheTimeoutOfTheConnection() throws Exception {
+        var config = new HikariConfig();
+        config.setDataSource(DIRECT);
+        config.setMaximumPoolSize(1);
+        try (var pool = new HikariDataSource(config)) {
+            try (var c = pool.getConnection()) {
+                assertThat(c.getNetworkTimeout()).isZero();
+                c.setNetworkTimeout(Runnable::run, 1000);
+                assertThat(c.getNetworkTimeout()).isEqualTo(1000);
+            }
+            try (var c = pool.getConnection()) {
+                assertThat(c.getNetworkTimeout()).as("not left to the next borrower").isZero();
+            }
+        }
+    }
+
     private static UUID send(OutboxRuntime runtime, JdbcTransactions transactions, String key) {
         return transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", key, "p".getBytes(UTF_8))));
     }
@@ -154,14 +257,52 @@ class NetworkBlackholeIT {
 
     /** Connections through {@link #hole}; {@code seconds}: connect, login and socket timeouts, 0 for none. */
     private DataSource throughTheHole(int seconds) {
+        return throughTheHole(seconds, seconds);
+    }
+
+    /** {@code connectSeconds}: connect and login timeouts; {@code socketSeconds}: socket timeout; 0 for none. */
+    private DataSource throughTheHole(int connectSeconds, int socketSeconds) {
         var ds = new PGSimpleDataSource();
         ds.setUrl("jdbc:postgresql://127.0.0.1:" + hole.port() + "/" + TARGET.getPath().substring(1));
         ds.setUser(TestDataSources.user());
         ds.setPassword(TestDataSources.password());
-        ds.setConnectTimeout(seconds);
-        ds.setLoginTimeout(seconds);
-        ds.setSocketTimeout(seconds);
+        ds.setConnectTimeout(connectSeconds);
+        ds.setLoginTimeout(connectSeconds);
+        ds.setSocketTimeout(socketSeconds);
         return ds;
+    }
+
+    /** {@code source} behind a pool, so a worker keeps its connection from pass to pass, as in a service. */
+    private DataSource pool(DataSource source) {
+        var config = new HikariConfig();
+        config.setDataSource(source);
+        config.setMaximumPoolSize(8);
+        var pool = new HikariDataSource(config);
+        closing.add(pool);
+        return pool;
+    }
+
+    /** {@code source} whose connections add to {@code calls}, per {@code setNetworkTimeout}: thread name:milliseconds. */
+    private static DataSource recordingTimeouts(DataSource source, Queue<String> calls) {
+        return (DataSource) Proxy.newProxyInstance(DataSource.class.getClassLoader(), new Class<?>[] {DataSource.class},
+                (ds, method, args) -> {
+                    var result = invoke(source, method, args);
+                    return !method.getName().equals("getConnection") ? result : Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(), new Class<?>[] {Connection.class}, (c, call, values) -> {
+                                if (call.getName().equals("setNetworkTimeout")) {
+                                    calls.add(Thread.currentThread().getName() + ":" + values[1]);
+                                }
+                                return invoke(result, call, values);
+                            });
+                });
+    }
+
+    private static Object invoke(Object target, Method method, Object[] args) throws Throwable {
+        try {
+            return method.invoke(target, args);
+        } catch (InvocationTargetException e) {
+            throw e.getCause();
+        }
     }
 
     private static void await(Check condition) throws Exception {
@@ -181,11 +322,15 @@ class NetworkBlackholeIT {
 
     private static final URI TARGET = URI.create(TestDataSources.jdbcUrl().substring("jdbc:".length()));
 
-    /** A TCP forwarder to the test's Postgres that, shut, keeps every connection open and forwards nothing. */
+    /**
+     * A TCP forwarder to the test's Postgres that, shut, keeps every connection open and forwards nothing; a connection
+     * it forgot stays so for good, as a firewall that lost track of it would keep it, while new ones go through.
+     */
     private static final class Blackhole implements AutoCloseable {
 
         private final ServerSocket server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
         private final Set<Socket> sockets = ConcurrentHashMap.newKeySet();
+        private final Set<Socket> forgotten = ConcurrentHashMap.newKeySet();
         private volatile boolean shut;
 
         Blackhole() throws IOException {
@@ -201,6 +346,12 @@ class NetworkBlackholeIT {
         }
 
         void open() {
+            shut = false;
+        }
+
+        /** Every connection stays silent for good, and the hole lets new ones through. */
+        void forget() {
+            forgotten.addAll(sockets);
             shut = false;
         }
 
@@ -233,7 +384,7 @@ class NetworkBlackholeIT {
                 var out = to.getOutputStream();
                 int read;
                 while ((read = in.read(buffer)) >= 0) {
-                    while (shut) {
+                    while (shut || forgotten.contains(from)) {
                         Thread.sleep(10);
                     }
                     out.write(buffer, 0, read);

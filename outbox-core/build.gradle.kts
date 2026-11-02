@@ -15,6 +15,7 @@ dependencies {
 
     testImplementation("jakarta.annotation:jakarta.annotation-api:2.1.1")
     testImplementation("com.google.protobuf:protobuf-java:3.25.8")
+    testImplementation("com.zaxxer:HikariCP:7.1.0")
 }
 
 // test fixtures are for this repository's tests only, not part of the published artifact
