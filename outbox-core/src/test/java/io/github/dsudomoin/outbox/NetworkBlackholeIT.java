@@ -212,6 +212,9 @@ class NetworkBlackholeIT {
         var relay = OutboxRuntime.builder(config, transactions, record -> delivered.add(record.messageId())).build();
         closing.add(relay);
         relay.start();
+        assertThat(calls).as("the start's: its statements may run for their statement_timeout")
+                .contains("Test worker:9000", "Test worker:65000");
+        calls.removeIf(call -> call.startsWith("Test worker"));
 
         var sent = send(relay, transactions, "k");
         await(() -> delivered.contains(sent));
