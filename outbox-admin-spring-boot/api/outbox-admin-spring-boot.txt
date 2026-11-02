@@ -1,0 +1,9 @@
+// Signature format: 4.0
+package io.github.dsudomoin.outbox.admin.spring {
+
+  @org.springframework.boot.autoconfigure.AutoConfiguration(after=OutboxAutoConfiguration.class) @org.springframework.boot.autoconfigure.condition.ConditionalOnBean(OutboxAdmin.class) @org.springframework.boot.autoconfigure.condition.ConditionalOnClass(RequestMappingHandlerAdapter.class) @org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication(type=org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication.Type.SERVLET) public final class OutboxAdminAutoConfiguration {
+    ctor public OutboxAdminAutoConfiguration();
+  }
+
+}
+
