@@ -63,12 +63,18 @@ s_pgbouncer_txn_all() { # everything through transaction pooling: maintenance se
   pooler_up transaction outbox 6
   PC_PG_URL=$POOLER_URL
   local opts="$NO_PREPARE -Doutbox.partitions.maintenanceInterval=2s"
-  # a pool in use: three queries in a row land on different server sessions, bootstrap must refuse
-  local name=kora-outbox-prodcheck-pooler log=$LOGS/pc-$SCN-busy-start.log rc=0
-  docker exec -d "$name" bash -c 'end=$((SECONDS + 25)); for n in 1 2 3 4 5 6 7 8; do (while [ $SECONDS -lt $end ]; do psql -h 127.0.0.1 -p 6432 -U outbox -d outbox -Atq -c "select pg_sleep(0.02)" > /dev/null 2>&1; done) & done; wait'
-  sleep 2
-  bounded 20 env HTTP_PORT=9080 METRICS_PORT=9085 POSTGRES_URL="$PC_PG_URL" TARGET_DB_URL="$PC_TARGET_DB_URL" TARGET_URL="$PC_TARGET_URL" INSTANCE_NAME=app-busy "JAVA_OPTS=-Xmx512m $opts" "$SHOP" > "$log" 2>&1 || rc=$?
-  log "bootstrap on a busy pool: exit $rc; $(grep -m1 -E 'session|pooling' "$log" | cut -c1-200)"
+  # a pool in use: three queries in a row land on different server sessions, bootstrap must refuse. Best effort, the
+  # README says: they can still land on one, so a start that got through gets another try
+  local name=kora-outbox-prodcheck-pooler log=$LOGS/pc-$SCN-busy-start.log rc=0 try
+  for try in 1 2 3; do
+    rc=0
+    docker exec -d "$name" bash -c 'end=$((SECONDS + 25)); for n in $(seq 24); do (while [ $SECONDS -lt $end ]; do psql -h 127.0.0.1 -p 6432 -U outbox -d outbox -Atq -c "select pg_sleep(0.02)" > /dev/null 2>&1; done) & done; wait'
+    sleep 2
+    bounded 20 env HTTP_PORT=9080 METRICS_PORT=9085 POSTGRES_URL="$PC_PG_URL" TARGET_DB_URL="$PC_TARGET_DB_URL" TARGET_URL="$PC_TARGET_URL" INSTANCE_NAME=app-busy "JAVA_OPTS=-Xmx512m $opts" "$SHOP" > "$log" 2>&1 || rc=$?
+    log "bootstrap on a busy pool, try $try: exit $rc; $(grep -m1 -E 'session|pooling' "$log" | cut -c1-200)"
+    grep -qE 'pg_backend_pid|one server session|transaction pooling' "$log" && break
+    sleep 8
+  done
   check "$(passes grep -qE 'pg_backend_pid|one server session|transaction pooling' "$log")" "старт на занятом пуле отвергнут и называет причину (код $rc): $(grep -m1 -E 'pg_backend_pid|one server session|transaction pooling' "$log" | cut -c1-160)"
   sleep 8
   # a pool of one server session passes the check: it is best effort, the README says; the problem shows in maintenance
