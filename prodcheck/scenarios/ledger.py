@@ -18,6 +18,9 @@ p.add_argument("--order-within-tag", action="append", default=[], help="exempt f
 p.add_argument("--report-order-within-tag", action="append", default=[], help="the same, counted and reported, no violation")
 p.add_argument("--late-block", action="append", default=[], metavar="KEY=MAX",
                help="a key larger than a call: its order may break by one late block of at most MAX overtaking rows, nothing more")
+p.add_argument("--parked-file", help="samples of each key's parked rows, epoch|key|count, as parked_watch writes them")
+p.add_argument("--parked-limit", type=int, help="relay.batchSize, with --parked-file: an overtaking on a key with at least that many "
+                                                "parked rows in the minute before it, by at most that many rows, is the README's limit")
 p.add_argument("--search-path", help="schema of the ledger tables, when not public")
 p.add_argument("--max-dups", type=int, help="arrivals beyond the first of a message, at most")
 p.add_argument("--min-dups", type=int, default=0, help="at least: the fault really hit a batch in flight")
@@ -132,9 +135,10 @@ def by_key(events, only_tag=None):
 def inversions(keys):
     bad = []
     for k, evs in keys.items():
-        for a, b in zip(evs, evs[1:]):
+        for i, (a, b) in enumerate(zip(evs, evs[1:])):
             if b["seq"] <= a["seq"]:
-                bad.append({"key": list(k), "seq": [a["seq"], b["seq"]], "ids": [a["id"], b["id"]]})
+                bad.append({"key": list(k), "seq": [a["seq"], b["seq"]], "ids": [a["id"], b["id"]], "at": a["at"],
+                            "overtakers": sum(e["seq"] > b["seq"] for e in evs[:i + 1])})
     return bad
 
 
@@ -164,6 +168,24 @@ arrival_order = inversions(strict(by_key(arrivals)))
 for tag in args.order_within_tag:
     effect_order += inversions(strict(by_key(effects, tag)))
     arrival_order += inversions(strict(by_key(arrivals, tag)))
+# Past the limit the README states (a key's parked rows do not fit a call) one portion may overtake; a sample every 2 s
+# can miss the step from limit to limit + 1, so at the limit counts. Anything else stays a violation.
+parked = {}
+if args.parked_file:
+    for line in open(args.parked_file):
+        f = line.strip().split("|")
+        if len(f) == 3:
+            parked.setdefault(f[1], []).append((float(f[0]), int(f[2])))
+
+
+def past_limit(bad):
+    return bad["overtakers"] <= (args.parked_limit or 0) and any(
+        bad["at"] - 60 <= t <= bad["at"] and n >= args.parked_limit for t, n in parked.get(bad["key"][2], []))
+
+
+result["past_limit_order"] = [b for b in effect_order + arrival_order if past_limit(b)]
+effect_order = [b for b in effect_order if not past_limit(b)]
+arrival_order = [b for b in arrival_order if not past_limit(b)]
 # The handler must not get message n+1 of a key before message n is delivered.
 overtakes = []
 if not args.no_time_checks:

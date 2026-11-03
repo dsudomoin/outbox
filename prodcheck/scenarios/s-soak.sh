@@ -3,7 +3,8 @@
 SOAK_SHOP='rate=60&writers=2&keys=30&topics=payments,ledger,projection&rollbackPercent=5'
 SOAK_ACC='rate=40&writers=2&keys=30&tags=block:97,unblock:101,wait:7&rollbackPercent=3'
 SOAK_PARTS='-Doutbox.partitions.xidsPerPartition=100000' # a few minutes a partition at these rates: rotation runs throughout
-SOAK_ACC_OPTS="$RECOMMENDED $SOAK_PARTS"
+SOAK_BATCH=${SOAK_BATCH:-100} # relay.batchSize of accounts: the random blocks of SOAK_ACC take some keys past it, with a limit of their own
+SOAK_ACC_OPTS="$RECOMMENDED $SOAK_PARTS -Doutbox.relay.batchSize=$SOAK_BATCH"
 SOAK_BLOCKED='k30 k31 k32 k33 k34' # accounts the load does not touch: only this cycle's unblock ends their block
 SOAK_STEPS='kill_one kill_all_but_one rolling pg_restart pg_pause conn_kills target_outage poison row_locks requeue_block'
 SOAK_GAP=30 # seconds of plain load after each fault
@@ -164,6 +165,7 @@ s_soak() {
   SERIES=$RESULT_DIR/soak.series
   soak_phase start
   acc_begin soak
+  parked_watch
   docker exec -i "$PG" psql -U outbox -d outbox -q -v ON_ERROR_STOP=1 < "$PC/scenarios/ledger.sql" # shop's, in public
   acc_q "insert into subscription (account, id) select 'k' || g, gen_random_uuid() from generate_series(30, 34) g" > /dev/null
   PC_OPTS=$SOAK_PARTS
@@ -191,9 +193,9 @@ s_soak() {
   unblock_all 1004
   local led rc=0
   led=$(python3 "$PC/scenarios/ledger.py" --source "$PG" --target "" --search-path accounts,public --base accounts.account_events \
-    --dead-tags corrupt --exempt-tags wait,corrupt --order-within-tag wait --timeout 300) || rc=$?
+    --dead-tags corrupt --exempt-tags wait,corrupt --order-within-tag wait --parked-file "$RESULT_DIR/soak.parked" --parked-limit "$SOAK_BATCH" --timeout 300) || rc=$?
   echo "$led" > "$RESULT_DIR/soak.accounts-ledger"
-  check "$rc" "accounts: $(echo "$led" | j '{k: d[k] for k in ("sent", "effects", "dead", "lost", "double_effects", "order_violations", "overtakes", "duplicates", "latency_p99", "drain_seconds", "violations")}')"
+  check "$rc" "accounts: $(echo "$led" | j '{k: d[k] for k in ("sent", "effects", "dead", "lost", "double_effects", "order_violations", "past_limit_order", "overtakes", "duplicates", "latency_p99", "drain_seconds", "violations")}')"
   check 0 "циклов: $cycle, минут: $minutes"
   # what pc_finish reads is the shop's: its ledger makes the table's row, accounts' is the check above
   BASES=(outbox)
