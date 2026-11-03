@@ -56,10 +56,14 @@ unblock_all() { # one unblock per blocked account: what ends the business wait i
 
 acc_checks() { # what the library must keep true whatever happened
   check "$(passes is "$(acc_q 'select count(*) from handle_called')" = 0)" "handle() не вызван ни разу: всё через handleBatch"
-  local m
+  local m lost=0
   m=$(acc_q 'select count(*) from mismatch')
   [ "$m" = 0 ] || log "mismatches: $(acc_q "select message_id, left(reason, 160) from mismatch limit 20")"
-  check "$(passes is "$m" = 0)" "id, message_id, created_at, ключ, payload и заголовки при повторах не менялись, счётчики не убывали (расхождений $m)"
+  # a step that did not commit takes back the requeues it counted, a row offered twice in it shows the lower count next:
+  # ShardProcessorIT.aLostStepTakesBackTheRequeuesItCounted. So in a run with faults, and by no more than such a step counts.
+  [ -z "$FAULTS" ] || lost=$(acc_q "select count(*) from (select regexp_match(reason, '^requeues went down from ([0-9]+) to ([0-9]+)$') r from mismatch) x where r[1]::int - r[2]::int <= 2")
+  m=$((m - lost))
+  check "$(passes is "$m" = 0)" "id, message_id, created_at, ключ, payload и заголовки при повторах не менялись, счётчики убывали только с потерянным шагом (расхождений $m, таких шагов $lost)"
 }
 
 acc_end() { # stop the writers, clear the blocks, then the usual reconciliation
@@ -75,7 +79,7 @@ acc_end() { # stop the writers, clear the blocks, then the usual reconciliation
 acc_load() { pc_load "$1" "${2:-$ACC_LOAD}"; }
 
 parked_watch() { # how many rows each key had parked, every 2 s; on the way out each overtaking in a type next to that number
-  ( while :; do acc_q "select extract(epoch from now()), convert_from(key, 'UTF8'), count(*) from account_events_parked group by 2" 2> /dev/null; command sleep 2; done ) > "$RESULT_DIR/$SCN.parked" &
+  ( while :; do acc_q "select extract(epoch from now()), convert_from(key, 'UTF8'), count(*) from account_events_parked group by 2" 2> /dev/null || true; command sleep 2; done ) > "$RESULT_DIR/$SCN.parked" &
   PARKED_WATCH=$!
   AFTER="$AFTER; parked_report"
 }

@@ -982,7 +982,8 @@ class AuditEventsHandler(deserializer: OutboxDeserializer<AuditEvent>, private v
   старшие предлагаются снова не чаще раза в `requeue.delay` на инстанс.
 - Это не сбой: попытка не тратится, шард не встаёт на паузу, backoff и число записей на вызов не меняются. Каждый
   `requeue` прибавляет 1 к `record.requeues()`: и ответ на запись, подмешанную перед новой записью ключа, и ответ на
-  запись, пришедшую раньше срока вместе с более новой. `requeue` сверх `outbox.relay.requeue.maxRequeues` (по умолчанию 0 — без предела) переносит запись в
+  запись, пришедшую раньше срока вместе с более новой. Шаг, не дошедший до коммита (`kill -9`, обрыв соединения),
+  забирает и свои `requeue`: запись вернётся с меньшим `requeues`, чем показал последний вызов. `requeue` сверх `outbox.relay.requeue.maxRequeues` (по умолчанию 0 — без предела) переносит запись в
   dead-таблицу с ошибкой «requeue limit reached».
 - Outcome вернувшейся записи: `Delivered` убирает её из `<base>_parked`; `Requeue` и `NotAttempted` оставляют там
   (срок не раньше `now + delay`); `Permanent` переносит в dead-таблицу; `Retry` делает её головой ключа в

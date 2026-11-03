@@ -2550,6 +2550,40 @@ class ShardProcessorIT {
         }
     }
 
+    /** A step that never commits takes back the requeues it counted, so the next offer can show a lower one than the last. */
+    @Test
+    void aLostStepTakesBackTheRequeuesItCounted() throws Exception {
+        bootstrap();
+        requeueAll();
+        send(msg("t", "k", "k#1"));
+        tick();
+        process();
+        now = now.plus(REQUEUE_DELAY);
+        send(msg("t", "k", "k#2"));
+        tick();
+        calls.clear();
+
+        long latest;
+        try (var c = TestDb.connect()) {
+            latest = ticks.latest(c).id();
+        }
+        try (var c = recording(TestDb.connect())) {
+            ShardProcessor.prepareTransaction(c, config.batchTimeout());
+            processor.tryProcess(c, 0, latest, now);
+            c.rollback();
+        }
+
+        assertThat(requeuesOfferedTo("k#1")).as("offered as due, then again ahead of k#2, in one step").containsExactly(1, 2);
+        calls.clear();
+        process();
+        assertThat(requeuesOfferedTo("k#1").get(0)).as("the step's answers are gone with it").isEqualTo(1);
+    }
+
+    private List<Integer> requeuesOfferedTo(String payload) {
+        return calls.stream().flatMap(List::stream).filter(r -> payloads(List.of(r)).contains(payload))
+                .map(OutboxRecord::requeues).toList();
+    }
+
     /** A portion leaving while the key's oldest just answered requeue: one more offer, not one per portion. */
     @Test
     void aPortionLeavingPullsRowsThatAnsweredRequeueOnceInADelay() throws Exception {
