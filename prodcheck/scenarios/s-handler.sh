@@ -81,7 +81,7 @@ s_max_attempts() { # retries run out: dead with the attempts counted, the key go
   pc_finish --dead-tags normal --exempt-topics payments
 }
 
-s_stuck_head_fix() { # maxAttempts = 0, the key fails for good: no code and no full stop: a rolling config change and the admin API
+s_stuck_head_fix() { # maxAttempts = 0, the key fails for good: one admin call, no restart and no config change
   pc_begin stuck-head-fix
   trio "$PAY"
   sleep 5
@@ -89,19 +89,22 @@ s_stuck_head_fix() { # maxAttempts = 0, the key fails for good: no code and no f
   sleep 15
   check "$(passes retry_rows)" "ключ стоит в retry-таблице, остальные идут"
   check "$(passes effects_grow 5 payments)" "остальные ключи доставляются"
-  local i
-  for i in 1001 1002 1003; do
-    inst_stop "$i"
-    pc_shop "$i" -Doutbox.relay.retry.maxAttempts=2
-    sleep 3
-  done
-  fault "rolling-рестарт с maxAttempts = 2"
-  sleep 10
-  for i in 1001 1002 1003; do pc_unload "$i"; done
+  local pids="${APP_PIDS[1001]} ${APP_PIDS[1002]} ${APP_PIDS[1003]}" dry real
+  dry=$(admin_body 1001 POST keys/abandon '{"topic":"payments","key":"k5","reason":"the target refuses this key","dryRun":true}')
+  check "$(passes is "$(psql_q 'select count(*) from outbox_dead')" = 0)" "dryRun ничего не перенёс: $dry"
+  real=$(admin_body 1001 POST keys/abandon '{"topic":"payments","key":"k5","reason":"the target refuses this key"}')
+  fault "POST keys/abandon на живом инстансе: $real"
+  check "$(passes is "$(echo "$real" | j 'd["records"] > 0')" = True)" "ключ снят одним вызовом: $real"
+  check "$(passes dead_for_key k5)" "его записи в dead-таблице"
   tfault 'failKeys='
-  check "$(passes wait_for 60 dead_for_key k5)" "записи ключа ушли в dead-таблицу"
+  check "$(passes is "$(psql_q "select count(*) from outbox_dead where error not like 'abandoned: %'")" = 0)" "ошибка писем называет причину: abandoned"
+  later() { [ "$(target_q "select count(*) from pc_effect where key = 'k5' and at > now() - interval '5 seconds'")" -gt 0 ]; }
+  check "$(passes wait_for 30 later)" "более поздние записи ключа доставляются"
+  check "$(passes is "$pids" = "${APP_PIDS[1001]} ${APP_PIDS[1002]} ${APP_PIDS[1003]}")" "те же процессы: ни рестарта, ни смены конфига"
+  local i
+  for i in 1001 1002 1003; do pc_unload "$i"; done
   redrive_until_empty 1001 '{"filter":{"topic":"payments"}}' 'topic=payments'
-  REPAIRED="rolling-рестарт с maxAttempts, затем POST dead-letters/redrive"
+  REPAIRED="POST keys/abandon, затем POST dead-letters/redrive"
   pc_finish --dead-tags normal --exempt-topics payments
 }
 dead_for_key() { [ "$(psql_q "select count(*) from outbox_dead where convert_from(key, 'UTF8') = '$1'")" -gt 0 ]; }

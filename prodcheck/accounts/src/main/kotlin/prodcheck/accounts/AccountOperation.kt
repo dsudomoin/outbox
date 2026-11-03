@@ -76,6 +76,13 @@ class AccountOperation(
             "block" -> update(c, "insert into accounts.blocker (account) values (?) on conflict do nothing", account)
             // "wait+result": the same type as `wait`, the event that carries the result the older ones wait for
             "unblock", "wait+result" -> update(c, "delete from accounts.blocker where account = ?", account)
+            // a block of its own, `<account>:ender`, keeps it parked; once through it ends the account's block
+            "ender" -> {
+                if (blocked(c, "$account:ender")) return AccountEventResult.REQUEUE
+                update(c, "delete from accounts.blocker where account = ?", account)
+            }
+            // fails until `<account>:flaky` goes: a Retry head of the key, with the records behind it in the retry table
+            "flaky" -> check(!blocked(c, "$account:flaky")) { "flaky while $account:flaky is there" }
             "wait" -> {
                 // the useful change commits even when the event is requeued
                 update(
@@ -84,16 +91,18 @@ class AccountOperation(
                        on conflict (account) do update set version = accounts.state.version + 1""",
                     account,
                 )
-                val blocked = c.prepareStatement("select 1 from accounts.blocker where account = ?").use {
-                    it.setString(1, account)
-                    it.executeQuery().use { rs -> rs.next() }
-                }
-                if (blocked) return AccountEventResult.REQUEUE
+                if (blocked(c, account)) return AccountEventResult.REQUEUE
             }
         }
         effect(c, event)
         return AccountEventResult.ACKNOWLEDGE
     }
+
+    private fun blocked(c: Connection, account: String?): Boolean =
+        c.prepareStatement("select 1 from accounts.blocker where account = ?").use {
+            it.setString(1, account)
+            it.executeQuery().use { rs -> rs.next() }
+        }
 
     private fun update(c: Connection, sql: String, account: String?) {
         c.prepareStatement(sql).use {

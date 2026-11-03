@@ -386,6 +386,34 @@ s_accounts_corrupt_fixed() { # the recommendation: an envelope that never parses
   acc_end
 }
 
+s_accounts_corrupt_abandon() { # the service's own form: Retry for ever on an envelope that does not parse; one admin call instead of a rolling restart
+  acc_begin accounts-corrupt-abandon
+  acc_full # the build with the admin API, every option as the service has it
+  local i pids
+  for i in 1001 1002; do acc "$i"; acc_load "$i" 'rate=50&writers=2&keys=30'; done
+  sleep 3
+  tx_send 1001 "topic=$ACC&key=k5&tag=corrupt&raw=garbage" > /dev/null
+  fault "в очереди запись, которая не разбирается"
+  sleep 15
+  local stuck
+  stuck=$(acc_q "select count(*) from account_events_retry where convert_from(key, 'UTF8') = 'k5'")
+  check "$(passes gt "$stuck" 0)" "ключ стоит в retry-таблице: $stuck записей"
+  check "$(passes is "$(acc_q 'select count(*) from account_events_dead')" = 0)" "сама запись в dead не уходит: maxAttempts = 0"
+  pids="${APP_PIDS[1001]} ${APP_PIDS[1002]}"
+  local body
+  body=$(admin_body 1001 POST keys/abandon "{\"topic\":\"$ACC\",\"key\":\"k5\",\"reason\":\"an envelope that does not parse\"}")
+  fault "POST keys/abandon: $body"
+  check "$(passes is "$(echo "$body" | j 'd["records"] > 0')" = True)" "ключ снят одним вызовом: $body"
+  check "$(passes is "$(acc_q "select count(*) from account_events_retry where convert_from(key, 'UTF8') = 'k5' and id <= (select max(id) from account_events_dead)")" = 0)" "снятых записей в retry не осталось"
+  tx_send 1001 "topic=$ACC&key=k5&tag=after" > /dev/null
+  after() { [ "$(acc_q "select count(*) from pc_effect where tag = 'after'")" = 1 ]; }
+  check "$(passes wait_for 30 after)" "следующее событие счёта прошло"
+  check "$(passes is "$pids" = "${APP_PIDS[1001]} ${APP_PIDS[1002]}")" "те же процессы: без рестарта и смены конфига"
+  REPAIRED="POST keys/abandon на живом инстансе; письма остаются у оператора"
+  ACC_FINISH=(--exempt-tags wait,corrupt,normal --dead-tags corrupt,normal --timeout 120)
+  acc_end
+}
+
 s_accounts_recommended() { # everything on: kill -9, a row lock, a corrupt envelope, an unknown source, Postgres restart
   acc_begin accounts-recommended
   acc_full
@@ -449,17 +477,15 @@ s_accounts_rollback_drain() { # the service's rollback in its production form: t
   check "$(passes is "$(echo "$status" | j "$empty")" = False)" "сама очередь не пустеет: запись ждёт релиз, запись откладывается вечно; /status это показывает, удалять нельзя"
   check "$(passes gt "$(echo "$status" | j 'd["parkedSize"]')" 0)" "отложенные видны: $(echo "$status" | j 'd["parkedSize"]')"
   check "$(passes gt "$(echo "$status" | j 'd["waitingSize"]')" 0)" "ждущие видны: $(echo "$status" | j 'd["waitingSize"]')"
-  # the waiting one: the admin API. The parked one: the API has nothing, only maxRequeues and a rolling restart
-  local body
+  # one call each, on the live instances: what waits, and what requeues for ever
+  local body pids="${APP_PIDS[1001]} ${APP_PIDS[1002]}"
   body=$(admin_body 1001 POST waiting/abandon "{\"topic\":\"$ACC\",\"reason\":\"rollback of the release\",\"dryRun\":false}")
-  log "abandon: $body"
+  log "waiting/abandon: $body"
   check "$(passes is "$(echo "$body" | j 'd["records"] > 0')" = True)" "waiting/abandon перенёс ждущие в dead: $body"
-  fault "rolling-рестарт с relay.requeue.maxRequeues = 1: вечное откладывание становится письмом"
-  for i in 1001 1002; do
-    inst_stop "$i"
-    acc "$i" $opts -Doutbox.relay.requeue.maxRequeues=1
-    sleep 2
-  done
+  body=$(admin_body 1001 POST keys/abandon "{\"topic\":\"$ACC\",\"key\":\"k9\",\"reason\":\"rollback of the release\"}")
+  log "keys/abandon: $body"
+  check "$(passes is "$(echo "$body" | j 'd["records"] > 0')" = True)" "keys/abandon снял вечно откладываемый счёт: $body"
+  check "$(passes is "$pids" = "${APP_PIDS[1001]} ${APP_PIDS[1002]}")" "те же процессы: без рестарта и смены конфига"
   emptied() { [ "$(admin_body 1001 GET status | j "$empty")" = True ]; }
   local t=$(now)
   check "$(passes wait_for 90 emptied)" "/status пуст через $(($(now) - t)) с: lag, retry, parked, waiting по нулям"
@@ -469,7 +495,7 @@ s_accounts_rollback_drain() { # the service's rollback in its production form: t
   letters=$(acc_q "select count(*) from account_events_dead")
   check "$(passes is "$undelivered" = 0)" "в этот момент недоставленных нет: $undelivered; писем у оператора $letters: их выгружают до удаления очереди"
   check "$(passes gt "$letters" 0)" "письма на месте: $letters"
-  REPAIRED="процедура: админ-API для ждущих, рестарт с maxRequeues для вечно отложенных; прямого вызова для отложенных в админ-API нет"
+  REPAIRED="процедура: waiting/abandon для ждущих, keys/abandon для вечно отложенных, затем письма выгружают"
   # the abandoned key takes the records behind its head along, whatever their tag; the block's key only its own
   local others
   others=$(acc_q "select count(*) from account_events_dead where convert_from(key, 'UTF8') not in ('k9', 'k11')")
@@ -513,5 +539,78 @@ s_accounts_held_deadlock() { # the README's same-type rule against a later event
   check "$(passes wait_for 30 gone)" "без правила ключ разошёлся сам: результат снял блокировку, ждущие доставлены"
   REPAIRED="рестарт без правила: для таких типов правило heldTypes из README неприменимо"
   ACC_FINISH=(--exempt-tags wait,wait+result --timeout 120)
+  acc_end
+}
+
+# A key's records whose wait another record of the key ends, with more of them parked than one call carries. The queue must
+# clear with no call from anyone, or the service's business waits end only by an operator.
+parked_of() { acc_q "select count(*) from account_events_parked where convert_from(key, 'UTF8') = '$1'"; }
+tail_evidence() { # tail_evidence KEY TAG: how often the older rows and the record that would end the wait reached the handler
+  log "$1 parked: $(parked_of "$1"), requeues of parked rows min/max: $(acc_q "select min(requeues), max(requeues) from account_events_parked where convert_from(key, 'UTF8') = '$1'"); arrivals of $2: $(acc_q "select count(*) from pc_arrival where key = '$1' and tag = '$2'"), of wait rows by count: $(acc_q "select min(n), max(n) from (select count(*) n from pc_arrival where key = '$1' and tag = 'wait' group by message_id) x"); blockers: $(acc_q "select string_agg(account, ',') from blocker where account like '$1%'")"
+}
+
+s_accounts_tail_liveness() { # the record that ends the wait is parked far past the first chunk, and its own block was lifted later
+  acc_begin accounts-tail-liveness
+  local i n key=k27 opts=-Doutbox.relay.batchSize=20
+  for i in 1001 1002; do acc "$i" $opts; acc_load "$i" 'rate=50&writers=2&keys=25'; done
+  acc_q "insert into blocker (account) values ('$key:ender')" > /dev/null
+  tx_send 1001 "topic=$ACC&key=$key&tag=block" > /dev/null
+  blocked_now() { [ "$(acc_q "select count(*) from blocker where account = '$key'")" = 1 ]; }
+  wait_for 20 blocked_now
+  for n in $(seq 1 50); do tx_send 1001 "topic=$ACC&key=$key&tag=wait" > /dev/null; done
+  tx_send 1001 "topic=$ACC&key=$key&tag=ender" > /dev/null
+  for n in $(seq 1 10); do tx_send 1001 "topic=$ACC&key=$key&tag=wait" > /dev/null; done
+  offered() { [ "$(acc_q "select count(*) from pc_arrival where key = '$key' and tag = 'ender'")" -ge 1 ] && [ "$(parked_of "$key")" = 61 ]; }
+  check "$(passes wait_for 60 offered)" "все 61 запись отложены, запись-развязка предложена один раз и заблокирована своей блокировкой"
+  tail_evidence "$key" ender
+  sleep 5
+  acc_q "delete from blocker where account = '$key:ender'" > /dev/null
+  fault "снята блокировка записи-развязки: она стоит за первым чанком, в вызов помещается 20"
+  local t=$(now)
+  clears() { [ "$(parked_of "$key")" = 0 ]; }
+  local verdict=0
+  wait_for 120 clears || verdict=1
+  tail_evidence "$key" ender
+  check "$verdict" "ключ сошёлся сам за $(($(now) - t)) с из 120: запись за первым чанком предлагается снова, никто не вызывал админ-API"
+  if [ "$verdict" != 0 ]; then
+    thread_dump 1001 stuck
+    acc_q "delete from blocker where account = '$key'" > /dev/null # only so that the rest of the ledger can be read
+    REPAIRED="руками: снята блокировка счёта; сам ключ не сходится"
+  fi
+  ACC_FINISH=(--exempt-tags wait,ender --timeout 120)
+  acc_end
+}
+
+s_accounts_tail_liveness_retry() { # a retry follower ends the wait, with more older parked rows than one call carries
+  acc_begin accounts-tail-liveness-retry
+  local i n key=k26 opts=-Doutbox.relay.batchSize=20
+  for i in 1001 1002; do acc "$i" $opts; acc_load "$i" 'rate=50&writers=2&keys=25'; done
+  tx_send 1001 "topic=$ACC&key=$key&tag=block" > /dev/null
+  blocked_now() { [ "$(acc_q "select count(*) from blocker where account = '$key'")" = 1 ]; }
+  wait_for 20 blocked_now
+  for n in $(seq 1 50); do tx_send 1001 "topic=$ACC&key=$key&tag=wait" > /dev/null; done
+  parked_all() { [ "$(parked_of "$key")" = 50 ]; }
+  check "$(passes wait_for 60 parked_all)" "50 записей отложены, в вызов помещается 20"
+  # the head that fails puts the key in the retry table; the record that ends the block stays behind it there
+  acc_q "insert into blocker (account) values ('$key:flaky')" > /dev/null
+  tx_send 1001 "topic=$ACC&key=$key&tag=flaky" > /dev/null
+  tx_send 1001 "topic=$ACC&key=$key&tag=unblock" > /dev/null
+  in_retry() { [ "$(acc_q "select count(*) from account_events_retry where convert_from(key, 'UTF8') = '$key'")" = 2 ]; }
+  check "$(passes wait_for 60 in_retry)" "голова сбоит, запись-развязка стоит за ней в retry-таблице"
+  tail_evidence "$key" unblock
+  sleep 5
+  acc_q "delete from blocker where account = '$key:flaky'" > /dev/null
+  fault "голова больше не сбоит: дальше решает запись-развязка в retry-таблице"
+  local t=$(now) verdict=0
+  clears() { [ "$(parked_of "$key")" = 0 ] && [ "$(acc_q "select count(*) from account_events_retry where convert_from(key, 'UTF8') = '$key'")" = 0 ]; }
+  wait_for 120 clears || verdict=1
+  tail_evidence "$key" unblock
+  check "$verdict" "ключ сошёлся сам за $(($(now) - t)) с из 120: запись из retry-таблицы дошла, хотя старых отложенных больше вызова"
+  if [ "$verdict" != 0 ]; then
+    thread_dump 1001 stuck
+    acc_q "delete from blocker where account = '$key'" > /dev/null
+    REPAIRED="руками: снята блокировка счёта; сам ключ не сходится"
+  fi
+  ACC_FINISH=(--exempt-tags wait,flaky,unblock --timeout 120)
   acc_end
 }
