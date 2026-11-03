@@ -20,6 +20,7 @@ import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.IntStream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -142,6 +143,8 @@ public final class Maintenance {
     private volatile boolean halted;
     /** Whether a check of the xid counter has answered yet. */
     private volatile boolean xidChecked;
+    /** One xid check at a time, as the halt it records must not race another's. */
+    private final ReentrantLock checking = new ReentrantLock();
     /** The first check ran into a lock and has no answer yet: no worker starts, and nothing was found. */
     private volatile boolean unanswered;
     /** The cursors' shard count when it differs from {@link #shards}, else null. */
@@ -286,6 +289,26 @@ public final class Maintenance {
      * recovery is replacing until maintenance's first run or a later check gets through.
      */
     public boolean checkHalt() {
+        // a run holding the check waits for the same lock, with none of its own timeouts: so does not this one
+        try {
+            if (!checking.tryLock(SHARDS_LOCK_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)) {
+                if (!xidChecked) {
+                    unanswered = true;
+                }
+                return halted();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("outbox halt check interrupted", e);
+        }
+        try {
+            return checkHaltHoldingTheCheck();
+        } finally {
+            checking.unlock();
+        }
+    }
+
+    private boolean checkHaltHoldingTheCheck() {
         try (var c = db.newConnection(); var bound = socket.on(c)) {
             c.setAutoCommit(false);
             try (var st = c.createStatement()) {
@@ -867,7 +890,16 @@ public final class Maintenance {
      * halted, else null. A halt found is recorded, with the highest tick xmax; one whose ticks were repaired is lifted.
      */
     @Nullable
-    private synchronized XidRecovery.Check checkXidCounter(Connection c) throws SQLException {
+    private XidRecovery.Check checkXidCounter(Connection c) throws SQLException {
+        checking.lock();
+        try {
+            return checkXidCounterHoldingTheCheck(c);
+        } finally {
+            checking.unlock();
+        }
+    }
+
+    private XidRecovery.Check checkXidCounterHoldingTheCheck(Connection c) throws SQLException {
         var check = recovery.check(c);
         xidChecked = true;
         unanswered = false;

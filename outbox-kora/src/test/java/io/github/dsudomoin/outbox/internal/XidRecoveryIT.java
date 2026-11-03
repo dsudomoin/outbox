@@ -334,6 +334,32 @@ class XidRecoveryIT {
         }
     }
 
+    /** Maintenance stuck on the same lock holds its check: a drain waits for neither past its bound, nor loses its session. */
+    @Test
+    void aDrainBesideAMaintenanceRunStuckOnTheLockNamesTheLock() throws Exception {
+        config.relayEnabled(false).batchTimeout(Duration.ofMillis(100));
+        bootstrap();
+        var maintenance = maintenance();
+        var relay = relay(new RecordingHandler(), maintenance);
+        relay.start();
+        var stuck = Executors.newSingleThreadExecutor();
+        try (var locker = TestDb.connect()) {
+            locker.setAutoCommit(false);
+            execute(locker, "lock table " + names.tick() + " in access exclusive mode");
+            var run = stuck.submit(maintenance::runOnce);
+            Thread.sleep(6000); // past the 5 s idle limit of a check that would wait in its transaction
+            assertThat(run.isDone()).as("stuck on the lock").isFalse();
+
+            assertThatThrownBy(relay::drain).isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("lock").hasMessageNotContaining("below a tick");
+
+            locker.rollback();
+            run.get(10, TimeUnit.SECONDS);
+        } finally {
+            stuck.shutdownNow();
+        }
+    }
+
     /** The workers of a starting instance wait for the same answer, which maintenance's first run gets them. */
     @Test
     void aLockOnTheHaltTableAtStartDelaysTheWorkersOnlyWhileItLasts() throws Exception {
