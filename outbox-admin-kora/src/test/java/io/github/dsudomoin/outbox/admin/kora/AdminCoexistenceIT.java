@@ -17,6 +17,7 @@ import java.net.http.HttpRequest.BodyPublishers;
 import java.net.http.HttpResponse;
 import java.net.http.HttpResponse.BodyHandlers;
 import java.sql.SQLException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -72,6 +73,9 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
 
     private final HttpClient client = HttpClient.newHttpClient();
     private final String table = TestDb.uniqueTable();
+    /** Another process can take the test's port on 127.0.0.1 and never answer. */
+    private static final Duration ANSWER = Duration.ofSeconds(60);
+
     private final int port = freePort();
 
     @Override
@@ -340,6 +344,7 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
     private HttpResponse<String> call(Route route, String apiKey) throws Exception {
         var request = HttpRequest.newBuilder(URI.create("http://localhost:" + port
                         + route.path().replace("{orphan}", orphan())))
+                .timeout(ANSWER)
                 .method(route.method(), route.body() == null ? BodyPublishers.noBody()
                         : BodyPublishers.ofString(route.body()));
         if (route.body() != null) {
@@ -360,7 +365,7 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
 
     /** The log lines of a POST to {@code pathAndQuery} without a key; asserts it was refused. */
     private String postWithoutKey(String pathAndQuery) throws Exception {
-        var request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + pathAndQuery))
+        var request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + pathAndQuery)).timeout(ANSWER)
                 .POST(BodyPublishers.noBody()).build();
         try (var stderr = new CapturedStderr()) {
             assertThat(client.send(request, BodyHandlers.ofString()).statusCode()).isEqualTo(401);
@@ -370,7 +375,7 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
 
     /** A GET of {@code path} with these header names and values. */
     private HttpResponse<String> send(String path, String... headers) throws Exception {
-        var request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path));
+        var request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path)).timeout(ANSWER);
         if (headers.length > 0) {
             request.headers(headers);
         }
@@ -378,7 +383,7 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
     }
 
     private HttpResponse<String> get(String path, String apiKey) throws Exception {
-        var request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path));
+        var request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path)).timeout(ANSWER);
         if (apiKey != null) {
             request.header("X-Api-Key", apiKey);
         }

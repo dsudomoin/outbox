@@ -31,6 +31,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse.BodyHandlers;
 import java.net.http.HttpResponse;
 import java.sql.SQLException;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
@@ -713,6 +714,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
 
     private HttpResponse<String> call(String method, String path, String body) throws Exception {
         var request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + API + path))
+                .timeout(Duration.ofSeconds(60)) // another process can take this port on 127.0.0.1 and never answer
                 .header("X-Api-Key", "secret")
                 .method(method, body == null ? BodyPublishers.noBody() : BodyPublishers.ofString(body));
         if (body != null) {
