@@ -2723,9 +2723,9 @@ class ShardProcessorIT {
         int diverted = retryRows().size();
 
         process();
-        assertThat(retryRows()).as("a whole batch in one step").hasSize(diverted + 10);
+        assertThat(retryRows()).as("the probe's row and a whole batch in one step").hasSize(diverted + 11);
         process();
-        assertThat(retryRows()).hasSize(diverted + 20);
+        assertThat(retryRows()).hasSize(diverted + 22);
         calls.clear();
         while (retryRows().size() < 35) {
             process();
@@ -2757,6 +2757,29 @@ class ShardProcessorIT {
 
         assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("u#1"));
         assertThat(parkedRows()).singleElement().satisfies(row -> assertThat(row).startsWith("k#1:"));
+    }
+
+    /** Put off with other work in the step: the end of the step reads the earliest due, so the put-off need not. */
+    @Test
+    void aPutOffWithWorkInTheStepReadsTheEarliestDueOnce() throws Exception {
+        bootstrap();
+        parkAll("k#1", "k#2");
+        script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.requeue(),
+                "k#3", Outcome.retry(new RuntimeException("k#3 down"))));
+        send(msg("t", "k", "k#3"), msg("t", "j", "j#1"));
+        tick();
+        process();
+        now = now.plus(REQUEUE_DELAY);
+        setParkedDue("k#1", now.plus(Duration.ofHours(24)));
+        setParkedDue("k#2", now);
+        script = answering(Map.of());
+        send(msg("t", "j", "j#2"));
+        tick();
+        statements.clear();
+
+        process();
+
+        assertThat(statements).filteredOn(sql -> sql.contains("min(due_at)")).hasSize(1);
     }
 
     /** Parked k#1, retry head k#2 with its follower k#3, the head due and k#1 not. */
@@ -3140,7 +3163,7 @@ class ShardProcessorIT {
         script = answering(Map.of("k#2", Outcome.notAttempted()));
         now = cursor().pausedUntil();
         calls.clear();
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, true));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, false));
         assertThat(calls).extracting(call -> payloads(call)).containsExactly(List.of("k#1", "k#2"), List.of("j#1"));
         assertThat(delivered()).containsExactly("k#1", "j#1");
         assertThat(parkedRows()).isEmpty();
@@ -3837,6 +3860,38 @@ class ShardProcessorIT {
             int shard = Integer.compare(x.charAt(1), y.charAt(1));
             return shard != 0 ? shard : Integer.compare(x.charAt(3), y.charAt(3));
         });
+    }
+
+    /** A probe asks its one row: a long queue on a probing shard does not take its group's read from the others. */
+    @Test
+    void aProbingShardWithALongQueueLeavesItsGroupItsRead() throws Exception {
+        config.shards(2).batchSize(3);
+        bootstrap();
+        var keys = keysOnShard(0, 3);
+        var later = now.plus(Duration.ofHours(1));
+        script = answering(Map.of("x#1", Outcome.retry(new RuntimeException("x"), later)));
+        send(msg("t", keys.get(0), "x#1"), msg("t", keys.get(1), "y#1"));
+        tick();
+        process(processor, 0);
+        assertThat(retryRows()).as("the shard has retry rows, so a read looks for blocked ones").hasSize(1);
+        script = records -> records.stream().anyMatch(r -> new String(r.payload(), UTF_8).startsWith("a#")) ? List.of()
+                : handler.handleBatch(records);
+        for (int i = 0; i < 6; i++) {
+            send(msg("t", keys.get(2), "a#" + i));
+        }
+        tick();
+        for (int failures = 1; failures <= 3; failures++) {
+            assertThat(process(processor, 0).status()).isEqualTo(PAUSED);
+            now = cursor(0).pausedUntil();
+        }
+        send(msg("t", keyOnShard(1), "b#1"));
+        tick();
+        calls.clear();
+
+        processGroup(0, 1);
+
+        assertThat(calls.stream().flatMap(call -> payloads(call).stream()))
+                .as("in the same step, the group's read not cut").contains("b#1");
     }
 
     @Test

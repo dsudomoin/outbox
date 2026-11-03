@@ -410,8 +410,6 @@ public final class ShardProcessor implements AutoCloseable {
                 s.probe = s.cursor.failures() >= relay.headFailuresBeforeDivert();
                 s.limit = s.probe ? 1 : limits.get(s.shard);
                 s.checkBlocked = s.full ? hasRetryRows(inTx, s.shard) : s.retryDue != null || s.wroteRetry;
-                // a probe tries one row; the rows of keys already in retry before it need no call
-                s.readLimit = s.probe && s.checkBlocked ? relay.batchSize() : s.limit;
                 reads.add(s);
             }
         }
@@ -420,26 +418,19 @@ public final class ShardProcessor implements AutoCloseable {
             for (var s : reads) {
                 // a parked row the retry pass made a retry head blocks its key here too
                 shardReads.add(new BatchReader.ShardRead(s.shard, s.prev.snapshot(), s.target.snapshot(),
-                        s.cursor.lastId(), s.readLimit, s.checkBlocked));
+                        s.cursor.lastId(), s.limit, s.checkBlocked));
             }
             var batch = reader.readMany(inTx, shardReads, relay.batchSize());
             // limits that fit in batchSize read all they asked for: a read of exactly batchSize rows then cuts nothing
-            boolean cut = batch.cut() && reads.stream().mapToLong(s -> s.readLimit).sum() > relay.batchSize();
+            boolean cut = batch.cut() && reads.stream().mapToLong(s -> s.limit).sum() > relay.batchSize();
             var shared = new ArrayList<Step>(reads.size());
             var alone = new ArrayList<Step>();
             for (var s : reads) {
                 s.rows = new ArrayList<>(batch.rows().get(s.shard));
                 s.cut = cut;
-                boolean finished = !cut && s.rows.size() < s.readLimit;
-                if (s.probe) { // its head is the first row it can hand, and it stops there
-                    int head = 0;
-                    while (head < s.rows.size() && s.rows.get(head).blocked()) {
-                        head++;
-                    }
-                    if (head + 1 < s.rows.size()) {
-                        s.rows.subList(head + 1, s.rows.size()).clear();
-                        finished = false;
-                    }
+                boolean finished = !cut && s.rows.size() < s.limit;
+                if (s.probe && !cut && s.rows.size() == 1 && s.rows.get(0).blocked()) {
+                    finished = readBehindABlockedRow(inTx, s);
                 }
                 s.segments.add(new Segment(s.cursor.tickId(), s.target, 0, s.rows.size(), finished));
             }
@@ -568,8 +559,6 @@ public final class ShardProcessor implements AutoCloseable {
         boolean called;
         boolean probe;
         int limit;
-        /** The rows its read asks for: {@link #limit}, or a batch of a probe that may find rows of keys in retry. */
-        int readLimit;
         boolean checkBlocked;
         /** Its chunk's rows, batch by batch ({@link #segments}), id order inside each. */
         List<BatchRow> rows = List.of();
@@ -719,6 +708,22 @@ public final class ShardProcessor implements AutoCloseable {
                 return;
             }
         }
+    }
+
+    /**
+     * A probe that read a row of a key in retry: that needs no call, so it goes on, in one read, through a batch of such
+     * rows up to the row it can hand, which it stops at. Returns whether that read all of the shard's batch.
+     */
+    private boolean readBehindABlockedRow(Connection c, Step s) throws SQLException {
+        var rest = reader.readMany(c, List.of(new BatchReader.ShardRead(s.shard, s.prev.snapshot(), s.target.snapshot(),
+                s.rows.get(0).record().id(), relay.batchSize(), true)), relay.batchSize()).rows().get(s.shard);
+        int head = 0;
+        while (head < rest.size() && rest.get(head).blocked()) {
+            head++;
+        }
+        boolean stopped = head + 1 < rest.size();
+        s.rows.addAll(stopped ? rest.subList(0, head + 1) : rest);
+        return !stopped && rest.size() < relay.batchSize();
     }
 
     /**
