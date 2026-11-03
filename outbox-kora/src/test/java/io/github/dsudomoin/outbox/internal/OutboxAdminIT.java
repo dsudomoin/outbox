@@ -772,6 +772,28 @@ class OutboxAdminIT {
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("message id");
     }
 
+    /** An abandon that empties the tables leaves no due time behind: the shard is not stepped for rows that went. */
+    @Test
+    void anAbandonLeavesNoStaleDueTimesOnTheCursor() throws Exception {
+        execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, created_at, attempts,"
+                + " next_attempt_at, waiting_since) values (70, 0, gen_random_uuid(), 't', 'w', now(), 0, now(), now())");
+        execute("insert into " + names.parked() + " (id, shard, message_id, topic, key, created_at, attempts, due_at)"
+                + " values (71, 0, gen_random_uuid(), 't', 'p', now(), 0, now())");
+        execute("update " + names.cursor() + " set retry_due_at = now(), parked_due_at = now() where shard = 0");
+
+        admin.abandonKey("t", bytes("p"), "gone", false);
+        assertThat(dues()).as("the retry row is left").matches("^[^n].* none$");
+        admin.abandonWaiting("t", bytes("w"), "gone", false);
+
+        assertThat(dues()).isEqualTo("none none");
+    }
+
+    /** The due times of shard 0's latest cursor. */
+    private String dues() throws SQLException {
+        return queryText("select coalesce(retry_due_at::text, 'none') || ' ' || coalesce(parked_due_at::text, 'none')"
+                + " from " + names.cursor() + " where shard = 0 order by seq desc limit 1");
+    }
+
     /** Chunks, the newest first: a call cut between them leaves the head with the rest, and calling again goes on. */
     @Test
     void abandonKeyCutBetweenChunksLeavesTheKeyWithItsHead() throws Exception {

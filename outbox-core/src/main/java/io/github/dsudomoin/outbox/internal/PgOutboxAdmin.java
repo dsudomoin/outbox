@@ -590,6 +590,9 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                     }
                     after = chunk.lastId();
                 }
+                if (!dryRun) {
+                    inTx(c, tx -> refreshDueTimes(tx, shard));
+                }
             }
         } catch (SQLException | RuntimeException e) {
             log.warn("outbox admin {} on {} failed after {} keys ({} records) {}; calling again goes on: {}", call,
@@ -650,6 +653,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                     moved = inTx(c, tx -> abandonRowsChunk(tx, shard, topic, condition, value, error));
                     records += moved;
                 } while (moved == CHUNK);
+                inTx(c, tx -> refreshDueTimes(tx, shard));
             }
         } catch (SQLException | RuntimeException e) {
             log.warn("outbox admin {} on {} failed after {} records {}; calling again goes on: {}", call, names.base(),
@@ -659,6 +663,20 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         var abandoned = new Abandoned(records > 0 ? 1 : 0, records);
         log.info("outbox admin {} on {} returned {}", call, names.base(), abandoned);
         return abandoned;
+    }
+
+    /**
+     * The shard's due times as the tables hold them after an abandon, under its lock, as a relay step writes them: rows
+     * gone would otherwise leave them in the past, and the shard stepped for nothing until its next full check.
+     */
+    private Void refreshDueTimes(Connection tx, int shard) throws SQLException {
+        lockShard(tx, shard);
+        var cursor = cursors.latest(tx, shard).cursor();
+        var refreshed = cursor.withRetryDueAt(retries.minDue(tx, shard)).withParkedDueAt(parked.minDue(tx, shard));
+        if (!refreshed.equals(cursor)) {
+            cursors.append(tx, refreshed);
+        }
+        return null;
     }
 
     /** The shards with such rows; refuses a record by message id that has a key. */
