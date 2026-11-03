@@ -189,7 +189,10 @@ public final class Ticks {
      * statement; as such it prunes the premade partitions above C.xmax when the executor starts (the redundant bound
      * in branch 2 is there for that), and the probes' lower bounds (P.xmax, a cluster's first xid) prune the rest as
      * the probes run. When the estimate of branch 2 goes over {@link #PROBE_BUDGET_MICROS}, the bitmap is null and the
-     * statement probes no shard (a CASE that skips the subquery).
+     * statement probes no shard (a CASE that skips the subquery). The shard count is a literal: a generic plan takes
+     * {@code generate_series} over a parameter for 1000 rows whatever the count, which on a big partition lifts the
+     * estimate over {@code jit_above_cost}, and JIT then compiles the probe at every execution, under the tick lock
+     * (with 4 shards and a partition of about 15 million rows, 130 to 230 ms against 2 ms of scans).
      */
     String probe(Connection c) throws SQLException {
         var sql = probe;
@@ -202,7 +205,7 @@ public final class Ticks {
                     // and no bit at all when no shard gained rows (an idle tick stores 0 bytes, not shards / 8)
                     + " (select case when bool_or(d.found is not null) then string_agg(case when d.found is null"
                     + " then '0' else '1' end, '' order by g.i)::varbit else ''::varbit end"
-                    + " from generate_series(0, ? - 1) with ordinality g(s, i)"
+                    + " from generate_series(0, " + (shards - 1) + ") with ordinality g(s, i)"
                     + " left join lateral ((select 1 found from " + names.base() + " o where o.shard = s"
                     + " and o.xid >= pg_snapshot_xmax(p.snapshot) and o.xid < pg_snapshot_xmax(c.snapshot)"
                     + " and o.xid <> all(x.running) limit 1)"
@@ -343,8 +346,7 @@ public final class Ticks {
         String dirty = null;
         SQLException failed = null;
         try (var ps = c.prepareStatement(probe(c))) {
-            ps.setInt(1, shards);
-            ps.setLong(2, micros);
+            ps.setLong(1, micros);
             try (var rs = ps.executeQuery()) {
                 young = !rs.next();
                 if (!young) {

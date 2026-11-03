@@ -142,7 +142,7 @@ class TickCostBenchmark {
                         execute(tick, takeXid);
                         assertThat(ticks.make(tick, Duration.ZERO)).isTrue(); // P: the E running
                         each(held, Connection::commit);
-                        long probed = probeNanos(ticks, tick, shards); // C's probe alone, P still the newest tick
+                        long probed = probeNanos(ticks, tick); // C's probe alone, P still the newest tick
                         long start = System.nanoTime();
                         boolean made = ticks.make(tick, Duration.ZERO); // C: the E ended since P
                         long took = System.nanoTime() - start;
@@ -179,13 +179,12 @@ class TickCostBenchmark {
      * probe statement bound as {@code Ticks.insert} binds it (minimum interval 0), executed and its row read; rolled
      * back, so no tick is made.
      */
-    private static long probeNanos(Ticks ticks, Connection c, int shards) throws SQLException {
+    private static long probeNanos(Ticks ticks, Connection c) throws SQLException {
         c.setAutoCommit(false);
         try {
             ticks.lockForTest(c);
             try (var ps = c.prepareStatement(ticks.probe(c))) {
-                ps.setInt(1, shards);
-                ps.setLong(2, 0);
+                ps.setLong(1, 0);
                 long start = System.nanoTime();
                 try (var rs = ps.executeQuery()) {
                     assertThat(rs.next()).isTrue();

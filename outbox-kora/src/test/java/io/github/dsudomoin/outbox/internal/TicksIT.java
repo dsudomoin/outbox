@@ -494,7 +494,7 @@ class TicksIT {
 
             // the plan Ticks.make runs: generic (see Ticks.lock), where an exists per shard may become one hashed pass
             // over all 20 000 rows
-            assertThat(probeBuffers(c, ticks, SHARDS)).as("buffers of a tick over 20 000 new rows on %d shards", SHARDS)
+            assertThat(probeBuffers(c, ticks)).as("buffers of a tick over 20 000 new rows on %d shards", SHARDS)
                     .isLessThan(200);
         }
     }
@@ -509,7 +509,7 @@ class TicksIT {
         try (var c = TestDb.connect()) {
             assertThat(ticks.make(c, Duration.ZERO)).isTrue();
 
-            assertThat(String.join("\n", probePlan(c, ticks, SHARDS)))
+            assertThat(String.join("\n", probePlan(c, ticks)))
                     .containsPattern("generate_series g +\\(cost=\\S+ rows=" + SHARDS + " ");
         }
     }
@@ -531,7 +531,7 @@ class TicksIT {
             first.commit();
             last.commit();
 
-            assertThat(probeBuffers(c, ticks, SHARDS))
+            assertThat(probeBuffers(c, ticks))
                     .as("buffers of a tick whose ended xids have 20 000 rows between them").isLessThan(200);
             assertThat(ticks.make(c, Duration.ZERO)).isTrue(); // C
             assertThat(shards(c)).containsExactly(2);
@@ -560,7 +560,7 @@ class TicksIT {
                 tx.commit();
             }
 
-            assertThat(probeBuffers(c, wide, 1024)).as("buffers of a probe that scans neither branch")
+            assertThat(probeBuffers(c, wide)).as("buffers of a probe that scans neither branch")
                     .isLessThan(100);
             assertThat(wide.make(c, Duration.ZERO)).isTrue(); // C
             assertThat(dirty(c)).as("about 30 000 rows estimated inside the cluster's range: every shard").isNull();
@@ -703,9 +703,9 @@ class TicksIT {
      * The shared buffers the probe of a tick made now touches, in the plan {@link Ticks#make} runs (generic, see
      * {@code Ticks.lock}); rolled back, so no tick is made.
      */
-    private static long probeBuffers(Connection c, Ticks ticks, int shards) throws Exception {
+    private static long probeBuffers(Connection c, Ticks ticks) throws Exception {
         long buffers = 0;
-        for (var line : probePlan(c, ticks, shards)) {
+        for (var line : probePlan(c, ticks)) {
             var m = Pattern.compile("(hit|read)=(\\d+)").matcher(line);
             while (m.find()) {
                 buffers += Long.parseLong(m.group(2));
@@ -718,14 +718,13 @@ class TicksIT {
     }
 
     /** The lines of {@code explain (analyze, buffers)} of the probe, on the generic plan {@link Ticks#make} runs. */
-    private static List<String> probePlan(Connection c, Ticks ticks, int shards) throws Exception {
+    private static List<String> probePlan(Connection c, Ticks ticks) throws Exception {
         c.setAutoCommit(false);
         execute(c, "set local plan_cache_mode = force_generic_plan");
-        execute(c, "prepare tick_probe(int, bigint) as " + ticks.probe(c).replaceFirst("\\?", "\\$1")
-                .replaceFirst("\\?", "\\$2"));
+        execute(c, "prepare tick_probe(bigint) as " + ticks.probe(c).replaceFirst("\\?", "\\$1"));
         var plan = new ArrayList<String>();
         try (var st = c.createStatement();
-                var rs = st.executeQuery("explain (analyze, buffers) execute tick_probe(" + shards + ", 0)")) {
+                var rs = st.executeQuery("explain (analyze, buffers) execute tick_probe(0)")) {
             while (rs.next()) {
                 plan.add(rs.getString(1));
             }
