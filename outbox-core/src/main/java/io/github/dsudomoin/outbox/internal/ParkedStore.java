@@ -57,6 +57,7 @@ public final class ParkedStore {
     private final String wholeKeys;
     private final String pullNext;
     private final String countOfKeys;
+    private final String lowestOfKeys;
     private final String minDue;
     private final String size;
 
@@ -113,6 +114,9 @@ public final class ParkedStore {
                 + " u.t, u.b from unnest(?::text[], ?::bytea[]) u(t, b)) k cross join lateral (select id, due_at from "
                 + parked + " where shard = ? and topic = k.t and key = k.b order by id limit ?) q where q.due_at >"
                 + " (select ahead from t))";
+        lowestOfKeys = "select k.t, k.b, l.id, l.due_at from (select distinct t, b from unnest(?::text[], ?::bytea[])"
+                + " u(t, b)) k cross join lateral (select id, due_at from " + parked + " where shard = ? and topic = k.t"
+                + " and key = k.b order by id limit 1) l";
         countOfKeys = "select k.t, k.b, count(*) from (select distinct t, b from unnest(?::text[], ?::bytea[]) u(t, b)) k"
                 + " join " + parked + " p on p.shard = ? and p.topic = k.t and p.key = k.b group by k.t, k.b";
         minDue = "select min(due_at) from " + parked + " where shard = ?";
@@ -373,18 +377,20 @@ public final class ParkedStore {
     }
 
     /**
-     * For each key of {@code handed} none of whose rows stays ({@code writes}: its {@link Park} or {@link Keep}), its
+     * For each key of {@code answered} none of whose rows stays ({@code writes}: its {@link Park} or {@link Keep}), its
      * lowest {@code batch} rows are due ahead of every other row of the shard, so its rows go on at once and in their
-     * order, whenever they would have come round, and at most the one chunk already read when its block ended has passed
-     * them; a row's own {@code notBefore} is cut short by that. The key takes the next steps until its rows stop leaving.
-     * One statement. Returns whether it wrote a row.
+     * order, whenever they would have come round, and at most what was read when its block ended has passed them; a
+     * row's own {@code notBefore} is cut short by that. The key takes the next steps until its rows stop leaving. When
+     * the rows that left were not the key's lowest, the lowest may be what just answered {@code requeue}, and offering
+     * them again would spend their requeues at full speed: those stay unless their due time, a key's round from when they
+     * answered, says that was a {@code delay} ago. Returns whether it wrote a row.
      */
-    public boolean pullNext(Connection c, int shard, List<Action> writes, List<OutboxRecord> handed, Instant now)
+    public boolean pullNext(Connection c, int shard, List<Action> writes, List<OutboxRecord> answered, Instant now)
             throws SQLException {
-        var gone = new LinkedHashMap<Object, OutboxRecord>();
-        for (var row : handed) {
+        var gone = new LinkedHashMap<Object, OutboxRecord>(); // the lowest of each key
+        for (var row : answered) {
             if (row.key() != null) {
-                gone.put(BatchClassifier.orderingKey(row), row);
+                gone.merge(BatchClassifier.orderingKey(row), row, (a, b) -> a.id() < b.id() ? a : b);
             }
         }
         for (var write : writes) {
@@ -395,11 +401,45 @@ public final class ParkedStore {
         if (gone.isEmpty()) {
             return false;
         }
+        var rowsOf = new HashMap<Object, Long>();
+        try (var ps = c.prepareStatement(countOfKeys)) {
+            ps.setArray(1, c.createArrayOf("text", gone.values().stream().map(OutboxRecord::topic).toArray()));
+            ps.setArray(2, c.createArrayOf("bytea", gone.values().stream().map(OutboxRecord::key).toArray(byte[][]::new)));
+            ps.setShort(3, (short) shard);
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    rowsOf.put(List.of(rs.getString(1), ByteBuffer.wrap(rs.getBytes(2))), rs.getLong(3));
+                }
+            }
+        }
+        var eligible = new ArrayList<OutboxRecord>();
+        try (var ps = c.prepareStatement(lowestOfKeys)) {
+            ps.setArray(1, c.createArrayOf("text", gone.values().stream().map(OutboxRecord::topic).toArray()));
+            ps.setArray(2, c.createArrayOf("bytea", gone.values().stream().map(OutboxRecord::key).toArray(byte[][]::new)));
+            ps.setShort(3, (short) shard);
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    var key = List.of(rs.getString(1), ByteBuffer.wrap(rs.getBytes(2)));
+                    var left = gone.get(key);
+                    long lowest = rs.getLong(3);
+                    long rows = rowsOf.getOrDefault(key, 0L);
+                    long round = batch == Integer.MAX_VALUE ? 1 : Math.max(1, (rows + batch - 1) / batch);
+                    var answeredADelayAgo = now.plus(delay.multipliedBy(round - 1));
+                    if (lowest > left.id()
+                            || !rs.getObject(4, OffsetDateTime.class).toInstant().isAfter(answeredADelayAgo)) {
+                        eligible.add(left);
+                    }
+                }
+            }
+        }
+        if (eligible.isEmpty()) {
+            return false;
+        }
         try (var ps = c.prepareStatement(pullNext)) {
             ps.setObject(1, timestamp(now));
             ps.setShort(2, (short) shard);
-            ps.setArray(3, c.createArrayOf("text", gone.values().stream().map(OutboxRecord::topic).toArray()));
-            ps.setArray(4, c.createArrayOf("bytea", gone.values().stream().map(OutboxRecord::key).toArray(byte[][]::new)));
+            ps.setArray(3, c.createArrayOf("text", eligible.stream().map(OutboxRecord::topic).toArray()));
+            ps.setArray(4, c.createArrayOf("bytea", eligible.stream().map(OutboxRecord::key).toArray(byte[][]::new)));
             ps.setShort(5, (short) shard);
             ps.setInt(6, batch);
             return ps.executeUpdate() > 0;

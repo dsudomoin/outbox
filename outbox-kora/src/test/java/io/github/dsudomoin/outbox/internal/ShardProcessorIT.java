@@ -2498,11 +2498,15 @@ class ShardProcessorIT {
 
         processUntilNoWork();
 
-        // larger than a call: k#8 passes the rows that had their turn and answered requeue, and they go on in order
+        // larger than a call: k#8 passes the rows that had their turn and answered requeue, and each comes in its time,
+        // until what is left fits in a call and comes whole, in its order
+        assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(List.of("k#8"));
+        while (!parkedRows().isEmpty()) {
+            now = now.plusSeconds(1);
+            processUntilNoWork();
+        }
         assertThat(calls).allSatisfy(call -> assertThat(call).allSatisfy(r -> assertThat(r.requeues()).isPositive()));
-        assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(List.of("k#8"),
-                List.of("k#1", "k#2", "k#3"), List.of("k#4", "k#5", "k#6"), List.of("k#7"));
-        assertThat(parkedRows()).isEmpty();
+        assertThat(delivered()).containsExactlyInAnyOrder(all).endsWith("k#1", "k#2", "k#3");
     }
 
     /** The parked rows above {@code above}, by id, each with its version: another xmin is another written version. */
@@ -2550,6 +2554,23 @@ class ShardProcessorIT {
         }
     }
 
+    /** A portion leaving while the key's oldest just answered requeue: those are not offered again at full speed. */
+    @Test
+    void aPortionLeavingDoesNotPullRowsThatJustAnsweredRequeue() throws Exception {
+        config.batchSize(3).maxRequeues(3);
+        bootstrap();
+        seedParked(30);
+        script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.requeue(), "k#3", Outcome.requeue()));
+        now = now.plus(REQUEUE_DELAY);
+        calls.clear();
+
+        processUntilNoWork();
+
+        assertThat(deadRows()).as("the sweep goes past them").isEmpty();
+        assertThat(calls.stream().filter(call -> payloads(call).contains("k#1"))).as("once in the sweep").hasSize(1);
+        assertThat(parkedRows()).hasSize(3);
+    }
+
     /** How many rows of {@code delivered}, keys k#n, went ahead of a lower row. */
     private static long overtakers(List<String> delivered) {
         long overtook = 0;
@@ -2572,6 +2593,7 @@ class ShardProcessorIT {
         now = now.plus(REQUEUE_DELAY);
         for (int i = 0; i < 4; i++) { // the sweep reaches past k#12, the rest of the key overdue
             process();
+            now = now.plus(REQUEUE_DELAY);
         }
         script = answering(Map.of()); // the block ends
 
