@@ -424,7 +424,8 @@ public final class ParkedStore {
      * row's own {@code notBefore} is cut short by that. The key takes the next steps until its rows stop leaving. When
      * the rows that left were not the key's lowest, the lowest may be what just answered {@code requeue}, and offering
      * them again would spend their requeues at full speed: such a pull happens at most once per {@code delay} for a key,
-     * so at most one portion passes them once their block ends. Returns whether it wrote a row.
+     * so once their block ends one portion passes them, or what leaves within {@code delay} of an earlier such pull;
+     * the limit is per instance. Returns whether it wrote a row.
      *
      * <p>What it costs its neighbours: no key has a minimum share, so while a key of N rows goes on, the due parked rows
      * of the shard's other keys wait behind it, about {@code N / batch} steps. Retry heads and the main stream do not

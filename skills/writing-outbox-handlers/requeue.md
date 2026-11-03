@@ -113,7 +113,8 @@ comes in portions in the order they came due, due `D = delay × ceil(N / batchSi
 `N / batchSize ×` the step time, main call included), as a later record may
 carry what the older ones wait for. When a key's offered records have all left, its next `batchSize` come at once, in order,
 whatever their due times, a `notBefore` included; where the key's oldest just answered `requeue` and newer ones left, they are
-offered again at most once per `delay`. An unkeyed record comes back only at its due time, alone.
+offered again at most once per `delay` per instance, so after a block ends one portion passes them, or what leaves within
+`delay` of an earlier such pull. An unkeyed record comes back only at its due time, alone.
 
 ## When a parked record is handed back
 
