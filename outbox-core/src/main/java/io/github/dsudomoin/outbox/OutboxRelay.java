@@ -330,8 +330,8 @@ public final class OutboxRelay implements AutoCloseable {
      * A parked row that answers requeue stays parked with a due time past that start, so a call offers it once and
      * ends, however long the handler takes and however often it requeues; so do the rows behind those that left, which
      * the next call offers, and of a row answering NotAttempted. Under sustained overload another instance parking rows
-     * of a key whose rows keep leaving could keep pulled rows within that start, for as long as it lasts, with retry
-     * heads due all the time or a parked row due by then that loses to them on id (seen in reading, not reproduced).
+     * of a key whose rows keep leaving can keep pulled rows within that start, for as long as it lasts and no longer,
+     * with retry heads due all the time or a parked row due by then that loses to them on id.
      * Works whether or not the relay
      * runs: it contends with the workers for shard locks. Handler failures are outcomes (see {@link OutboxHandler}); a
      * database failure of a step propagates. Ends with one run of the dead-letter pass, so the hook has had the letters

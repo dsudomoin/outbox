@@ -491,6 +491,60 @@ class OutboxRelayIT {
         assertThat(CompletableFuture.supplyAsync(relay::drain).get(30, TimeUnit.SECONDS)).isEqualTo(2);
     }
 
+    /**
+     * The one way a drain slides: a parked row due before its start that loses on id keeps every pull within that start,
+     * and another instance feeds the key. It goes on for as long as the feed lasts and ends once it stops.
+     */
+    @Test
+    void drainGoesOnWhileAnotherInstanceFeedsAKeyPulledAheadOfADueRowAndEndsWhenItStops() throws Exception {
+        config.relayEnabled(false).shards(1).batchSize(2).requeueDelay(Duration.ofHours(1));
+        bootstrap();
+        var requeue = new AtomicBoolean(true);
+        var feeds = new AtomicLong(20);
+        var parkedByOther = new AtomicLong(1_000_000);
+        var relay = relay(new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {
+            }
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                if (requeue.get()) {
+                    return records.stream().map(r -> (Outcome) Outcome.requeue()).toList();
+                }
+                if (feeds.getAndDecrement() > 0) {
+                    try (var c = TestDb.connect(); var st = c.createStatement()) {
+                        for (int i = 0; i < 2; i++) {
+                            st.execute("insert into " + schema.names().parked() + " (id, shard, message_id, topic, key,"
+                                    + " payload, created_at, attempts, requeues, due_at) values ("
+                                    + parkedByOther.incrementAndGet() + ", 0, gen_random_uuid(), 't', 'k'::bytea,"
+                                    + " 'other'::bytea, now(), 0, 1, now() + interval '1 hour')");
+                        }
+                    } catch (SQLException e) {
+                        throw new IllegalStateException(e);
+                    }
+                }
+                return records.stream().map(r -> (Outcome) Outcome.delivered()).toList();
+            }
+        });
+        send(outbox(relay::wake), IntStream.range(0, 6).mapToObj(i -> msg("t", "k", "k#" + i)).toArray(OutboxMessage[]::new));
+        assertThat(relay.drain()).isZero();
+        try (var c = TestDb.connect(); var st = c.createStatement()) {
+            st.execute("update " + schema.names().parked() + " set due_at = now() - interval '1 minute'"
+                    + " where convert_from(payload, 'UTF8') in ('k#0', 'k#1')");
+            st.execute("insert into " + schema.names().parked() + " (id, shard, message_id, topic, key, payload,"
+                    + " created_at, attempts, requeues, due_at) values (2000000, 0, gen_random_uuid(), 't', 'j'::bytea,"
+                    + " 'j'::bytea, now(), 0, 1, now() - interval '1 minute')");
+            st.execute("update " + schema.names().cursor() + " set parked_due_at = now() - interval '1 minute'"
+                    + " where parked_due_at is not null");
+        }
+        requeue.set(false);
+
+        // the key's 6, 40 fed while the drain ran, the due row of j last
+        assertThat(CompletableFuture.supplyAsync(relay::drain).get(60, TimeUnit.SECONDS)).isEqualTo(47);
+        assertThat(feeds.get()).as("the feed ran out before the drain ended").isNegative();
+    }
+
     /** A new record held out of a call by its key's rows is one this drain has to offer. */
     @Test
     void drainOffersARecordHeldOutOfACall() throws Exception {
