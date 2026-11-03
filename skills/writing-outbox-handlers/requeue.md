@@ -111,7 +111,8 @@ so its record may pass older ones, each of which was offered and answered `reque
 FEE_RELEASE#2 arrives → one call [#1, #2]; not-due records come with the rest, so a `notBefore` is no promise. A larger key
 comes in portions in the order they came due, each record back after `delay × ceil(N / batchSize)`, as a later record may
 carry what the older ones wait for. When a key's offered records have all left, its next `batchSize` come at once, in order,
-whatever their due times, a `notBefore` included. An unkeyed record comes back only at its due time, alone.
+whatever their due times, a `notBefore` included; where the key's oldest just answered `requeue` and newer ones left, they are
+offered again at most once per `delay`. An unkeyed record comes back only at its due time, alone.
 
 ## When a parked record is handed back
 

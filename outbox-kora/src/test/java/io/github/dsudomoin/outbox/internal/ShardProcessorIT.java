@@ -2498,15 +2498,11 @@ class ShardProcessorIT {
 
         processUntilNoWork();
 
-        // larger than a call: k#8 passes the rows that had their turn and answered requeue, and each comes in its time,
-        // until what is left fits in a call and comes whole, in its order
-        assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(List.of("k#8"));
-        while (!parkedRows().isEmpty()) {
-            now = now.plusSeconds(1);
-            processUntilNoWork();
-        }
+        // larger than a call: k#8 passes the rows that had their turn and answered requeue, and its leaving brings them
+        assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(List.of("k#8"),
+                List.of("k#1", "k#2", "k#3"), List.of("k#4", "k#5", "k#6"), List.of("k#7"));
+        assertThat(parkedRows()).isEmpty();
         assertThat(calls).allSatisfy(call -> assertThat(call).allSatisfy(r -> assertThat(r.requeues()).isPositive()));
-        assertThat(delivered()).containsExactlyInAnyOrder(all).endsWith("k#1", "k#2", "k#3");
     }
 
     /** The parked rows above {@code above}, by id, each with its version: another xmin is another written version. */
@@ -2554,9 +2550,9 @@ class ShardProcessorIT {
         }
     }
 
-    /** A portion leaving while the key's oldest just answered requeue: those are not offered again at full speed. */
+    /** A portion leaving while the key's oldest just answered requeue: one more offer, not one per portion. */
     @Test
-    void aPortionLeavingDoesNotPullRowsThatJustAnsweredRequeue() throws Exception {
+    void aPortionLeavingPullsRowsThatAnsweredRequeueOnceInADelay() throws Exception {
         config.batchSize(3).maxRequeues(3);
         bootstrap();
         seedParked(30);
@@ -2567,8 +2563,27 @@ class ShardProcessorIT {
         processUntilNoWork();
 
         assertThat(deadRows()).as("the sweep goes past them").isEmpty();
-        assertThat(calls.stream().filter(call -> payloads(call).contains("k#1"))).as("once in the sweep").hasSize(1);
+        assertThat(calls.stream().filter(call -> payloads(call).contains("k#1"))).as("its turn and one pull").hasSize(2);
         assertThat(parkedRows()).hasSize(3);
+    }
+
+    @Test
+    void aPortionLeavingPullsThemAgainADelayLater() throws Exception {
+        config.batchSize(3);
+        bootstrap();
+        seedParked(30);
+        script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.requeue(), "k#3", Outcome.requeue()));
+        now = now.plus(REQUEUE_DELAY);
+        calls.clear();
+        for (int i = 0; i < 4; i++) { // k#1, k#4 leaving pulls, k#1 again, k#7 leaving pulls nothing
+            process();
+        }
+        now = now.plus(REQUEUE_DELAY);
+
+        process(); // k#10 leaving
+        process();
+
+        assertThat(calls).extracting(call -> payloads(call).get(0)).containsExactly("k#1", "k#4", "k#1", "k#7", "k#10", "k#1");
     }
 
     /** A group the pass ran out of time for got no answer and left nothing: it pulls no row of its key. */
@@ -2623,9 +2638,8 @@ class ShardProcessorIT {
         seedParked(30);
         requeueAll();
         now = now.plus(REQUEUE_DELAY);
-        for (int i = 0; i < 4; i++) { // the sweep reaches past k#12, the rest of the key overdue
+        for (int i = 0; i < 4; i++) { // the sweep reaches past k#12, the rest of the key overdue, at the handler's speed
             process();
-            now = now.plus(REQUEUE_DELAY);
         }
         script = answering(Map.of()); // the block ends
 

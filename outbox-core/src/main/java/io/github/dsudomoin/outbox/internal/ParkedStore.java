@@ -22,7 +22,6 @@ import java.nio.ByteBuffer;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
@@ -37,11 +36,13 @@ import java.util.TreeMap;
 /**
  * Requeued records in {@code <base>_parked}: unlike retry rows they block nothing; each comes back right before the
  * next record of its (topic, key) or at its {@code due_at}, or that of a newer parked row of its key that fits a call
- * ({@link #dueWithOlder}). The only state is {@code due_at}. Every method runs
+ * ({@link #dueWithOlder}). The state is {@code due_at}, and in memory what limits a pull ({@link #pullNext}). Every method runs
  * on the caller's connection, so inside the shard step's transaction a rolled-back step leaves each record where it
  * was.
  */
 public final class ParkedStore {
+
+    private static final int PULLED_KEYS = 1024;
 
     private final Duration delay;
     private final int batch;
@@ -54,6 +55,16 @@ public final class ParkedStore {
     private final String fromRetry;
     private final String selectDue;
     private final String selectOfKeys;
+    /**
+     * When each key last had such a pull ({@link #pullNext}), newest {@link #PULLED_KEYS} keys, per instance: a lost
+     * entry, or a pull on another instance, costs one more offer of the key's lowest rows and nothing else.
+     */
+    private final Map<Object, Instant> pulledOffTheBottom = new LinkedHashMap<>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<Object, Instant> eldest) {
+            return size() > PULLED_KEYS;
+        }
+    };
     private final String fitting;
     private final String wholeKeys;
     private final String pullNext;
@@ -115,8 +126,8 @@ public final class ParkedStore {
                 + " u.t, u.b from unnest(?::text[], ?::bytea[]) u(t, b)) k cross join lateral (select id, due_at from "
                 + parked + " where shard = ? and topic = k.t and key = k.b order by id limit ?) q where q.due_at >"
                 + " (select ahead from t))";
-        lowestOfKeys = "select k.t, k.b, l.id, l.due_at from (select distinct t, b from unnest(?::text[], ?::bytea[])"
-                + " u(t, b)) k cross join lateral (select id, due_at from " + parked + " where shard = ? and topic = k.t"
+        lowestOfKeys = "select k.t, k.b, l.id from (select distinct t, b from unnest(?::text[], ?::bytea[])"
+                + " u(t, b)) k cross join lateral (select id from " + parked + " where shard = ? and topic = k.t"
                 + " and key = k.b order by id limit 1) l";
         countOfKeys = "select k.t, k.b, count(*) from (select distinct t, b from unnest(?::text[], ?::bytea[]) u(t, b)) k"
                 + " join " + parked + " p on p.shard = ? and p.topic = k.t and p.key = k.b group by k.t, k.b";
@@ -412,8 +423,8 @@ public final class ParkedStore {
      * order, whenever they would have come round, and at most what was read when its block ended has passed them; a
      * row's own {@code notBefore} is cut short by that. The key takes the next steps until its rows stop leaving. When
      * the rows that left were not the key's lowest, the lowest may be what just answered {@code requeue}, and offering
-     * them again would spend their requeues at full speed: those stay unless their due time, a key's round from when they
-     * answered, says that was a {@code delay} ago. Returns whether it wrote a row.
+     * them again would spend their requeues at full speed: such a pull happens at most once per {@code delay} for a key,
+     * so at most one portion passes them once their block ends. Returns whether it wrote a row.
      *
      * <p>What it costs its neighbours: no key has a minimum share, so while a key of N rows goes on, the due parked rows
      * of the shard's other keys wait behind it, about {@code N / batch} steps. Retry heads and the main stream do not
@@ -435,17 +446,6 @@ public final class ParkedStore {
         if (gone.isEmpty()) {
             return false;
         }
-        var rowsOf = new HashMap<Object, Long>();
-        try (var ps = c.prepareStatement(countOfKeys)) {
-            ps.setArray(1, c.createArrayOf("text", gone.values().stream().map(OutboxRecord::topic).toArray()));
-            ps.setArray(2, c.createArrayOf("bytea", gone.values().stream().map(OutboxRecord::key).toArray(byte[][]::new)));
-            ps.setShort(3, (short) shard);
-            try (var rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    rowsOf.put(List.of(rs.getString(1), ByteBuffer.wrap(rs.getBytes(2))), rs.getLong(3));
-                }
-            }
-        }
         var eligible = new ArrayList<OutboxRecord>();
         try (var ps = c.prepareStatement(lowestOfKeys)) {
             ps.setArray(1, c.createArrayOf("text", gone.values().stream().map(OutboxRecord::topic).toArray()));
@@ -455,12 +455,7 @@ public final class ParkedStore {
                 while (rs.next()) {
                     var key = List.of(rs.getString(1), ByteBuffer.wrap(rs.getBytes(2)));
                     var left = gone.get(key);
-                    long lowest = rs.getLong(3);
-                    long rows = rowsOf.getOrDefault(key, 0L);
-                    long round = batch == Integer.MAX_VALUE ? 1 : Math.max(1, (rows + batch - 1) / batch);
-                    var answeredADelayAgo = now.plus(delay.multipliedBy(round - 1));
-                    if (lowest > left.id()
-                            || !rs.getObject(4, OffsetDateTime.class).toInstant().isAfter(answeredADelayAgo)) {
+                    if (rs.getLong(3) > left.id() || offTheBottom(key, now)) {
                         eligible.add(left);
                     }
                 }
@@ -477,6 +472,18 @@ public final class ParkedStore {
             ps.setShort(5, (short) shard);
             ps.setInt(6, batch);
             return ps.executeUpdate() > 0;
+        }
+    }
+
+    /** Whether a pull of {@code key}'s lowest rows when rows above them left is due: none in the last {@code delay}. */
+    private boolean offTheBottom(Object key, Instant now) {
+        synchronized (pulledOffTheBottom) {
+            var last = pulledOffTheBottom.get(key);
+            if (last != null && !last.isAfter(now) && last.plus(delay).isAfter(now)) { // a clock stepped back: gone
+                return false;
+            }
+            pulledOffTheBottom.put(key, now);
+            return true;
         }
     }
 
