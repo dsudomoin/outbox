@@ -368,6 +368,47 @@ class OutboxRelayIT {
         assertThat(handler.delivered()).isEmpty();
     }
 
+    /** Every row answers requeue, so no position moves, and the sweep takes longer than a drain waits on a stuck shard. */
+    @Test
+    void drainGoesOnThroughASweepLongerThanItsStallBound() throws Exception {
+        config.relayEnabled(false).batchSize(1).batchTimeout(Duration.ofSeconds(1))
+                .requeueDelay(Duration.ofHours(1));
+        bootstrap();
+        var slow = new AtomicBoolean();
+        var relay = relay(new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {
+            }
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                if (slow.get()) {
+                    try {
+                        Thread.sleep(500); // within batchTimeout: it is slow, not cut
+                    } catch (InterruptedException e) {
+                        throw new IllegalStateException(e);
+                    }
+                }
+                return records.stream().map(r -> (Outcome) Outcome.requeue()).toList();
+            }
+        });
+        send(outbox(relay::wake), IntStream.range(0, 30).mapToObj(i -> msg("t", "k", "k#" + i)).toArray(OutboxMessage[]::new));
+        assertThat(relay.drain()).isZero();
+        try (var c = TestDb.connect(); var st = c.createStatement()) {
+            st.execute("update " + schema.names().parked() + " set due_at = now() - interval '1 minute'");
+            st.execute("update " + schema.names().cursor() + " set parked_due_at = now() - interval '1 minute'"
+                    + " where parked_due_at is not null");
+        }
+        slow.set(true);
+
+        assertThat(relay.drain()).isZero();
+
+        try (var c = TestDb.connect()) {
+            assertThat(queryString(c, "select count(*) from " + schema.names().parked() + " where due_at > now()"))
+                    .as("the whole sweep").isEqualTo("30");
+        }
+    }
+
     @Test
     void drainFailsOnAStuckShardWhileOtherShardsMove() throws Exception {
         config.batchTimeout(Duration.ofMillis(500)).headFailuresBeforeDivert(1000);

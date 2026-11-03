@@ -333,8 +333,9 @@ public final class OutboxRelay implements AutoCloseable {
      * of that run propagates too, a lock timeout while it writes the hook's decisions included. It holds one connection
      * at a time: the pass runs once the shards' is closed, after the dead-letter thread's run in progress, if any.
      *
-     * @throws IllegalStateException when no shard advanced for {@code 2 × (batchTimeout + 5 s)}, twice the longest a
-     *     tail swap waits for relay steps in flight, while work remains (e.g. a shard paused by a down target), or
+     * @throws IllegalStateException when no shard advanced and this call moved no row, delivered or answering requeue,
+     *     for {@code 2 × (batchTimeout + 5 s)}, twice the longest a tail swap waits for relay steps in flight, while
+     *     work remains (e.g. a shard paused by a down target), or
      *     while maintenance has halted the relay (xid regression), or when a lock on the halt table kept the first
      *     xid check from reading for that long
      */
@@ -403,9 +404,9 @@ public final class OutboxRelay implements AutoCloseable {
             if (pending.isEmpty()) {
                 return delivered;
             }
-            // a position change of a pending shard, by this call or a worker; a pause or due time alone is no
-            // progress (a requeue moves parked_due_at on every step), and drained shards moving under live traffic
-            // must not hide a stuck one
+            // a position change of a pending shard, by this call or a worker, or a row this call delivered or moved
+            // by its requeue answer; a pause or due time alone is no progress, and drained shards moving under live
+            // traffic must not hide a stuck one
             var current = pending.stream()
                     .map(cursor -> cursor.cleared().withRetryDueAt(null).withParkedDueAt(null)).toList();
             if (!current.equals(positions)) {
@@ -422,7 +423,7 @@ public final class OutboxRelay implements AutoCloseable {
                 for (var result : results) {
                     delivered += result.delivered();
                     worked |= result.status() == ShardStatus.PROGRESS || result.status() == ShardStatus.PAUSED;
-                    if (result.delivered() > 0) {
+                    if (result.delivered() > 0 || result.requeued()) {
                         progressed = System.nanoTime();
                     }
                 }

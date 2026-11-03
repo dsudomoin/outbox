@@ -88,16 +88,17 @@ public final class ShardProcessor implements AutoCloseable {
      * once it commits, the dead-letter pass has a new letter. {@code caughtUp}: the shard has nothing to do up to the
      * step's latest tick: no batch in progress, its position at that tick, and no retry head or parked row due at the
      * step's clock (one due later does not count); a further step before a newer tick would find nothing.
+     * {@code requeued}: a record of the step answered requeue, which moves no position.
      */
     public record ShardResult(ShardStatus status, int delivered, boolean batchFinished, boolean deadLettered,
-            boolean caughtUp) {
+            boolean caughtUp, boolean requeued) {
 
         public ShardResult(ShardStatus status, int delivered, boolean batchFinished) {
-            this(status, delivered, batchFinished, false, false);
+            this(status, delivered, batchFinished, false, false, false);
         }
 
         public ShardResult(ShardStatus status, int delivered, boolean batchFinished, boolean deadLettered) {
-            this(status, delivered, batchFinished, deadLettered, false);
+            this(status, delivered, batchFinished, deadLettered, false, false);
         }
     }
 
@@ -384,7 +385,7 @@ public final class ShardProcessor implements AutoCloseable {
                 }
                 boolean waits = deferred && (due(s.retryDue, now) || due(s.parkedDue, now));
                 results[s.index] = waits ? new ShardResult(ShardStatus.PROGRESS, 0, cursor.targetTickId() == null)
-                        : new ShardResult(ShardStatus.NO_WORK, 0, true, false, true);
+                        : new ShardResult(ShardStatus.NO_WORK, 0, true, false, true, false);
                 continue;
             }
             if (work.isEmpty()) { // the first shard with work: the step is observed from here
@@ -397,6 +398,7 @@ public final class ShardProcessor implements AutoCloseable {
             // the retry pass writes to the table of the rows it hands, and moves rows between the two
             s.wroteRetry = !heads.isEmpty() || pass.toRetry;
             s.wroteParked = !dueParked.isEmpty() || pass.wroteParked || pass.fromRetry;
+            s.requeued = pass.requeued;
             s.busy = pass.busy; // no handler thread free: the main pass would find none either
             s.called = pass.called; // a handler thread was free
             s.next = cursor;
@@ -527,7 +529,7 @@ public final class ShardProcessor implements AutoCloseable {
             boolean finished = s.status == ShardStatus.PROGRESS && s.next.targetTickId() == null;
             results[s.index] = new ShardResult(s.status, s.delivered, finished, s.deadLettered, finished
                     && !s.untouched && s.next.tickId() >= latestTickId && !due(s.next.retryDueAt(), now)
-                    && !due(s.next.parkedDueAt(), now));
+                    && !due(s.next.parkedDueAt(), now), s.requeued);
         }
         cursors.appendAll(inTx, appends);
         if (!work.isEmpty()) {
@@ -561,6 +563,7 @@ public final class ShardProcessor implements AutoCloseable {
         int delivered;
         boolean deadLettered;
         boolean wroteRetry;
+        boolean requeued;
         boolean wroteParked;
         boolean busy;
         boolean called;
@@ -906,6 +909,7 @@ public final class ShardProcessor implements AutoCloseable {
             var parkedIds = new HashSet<Long>();
             s.parkedRows.forEach(row -> parkedIds.add(row.id()));
             s.wroteParked |= apply(inTx, shard, decision.actions(), parkedIds, now);
+            s.requeued |= decision.actions().stream().anyMatch(Park.class::isInstance);
             s.wroteRetry |= decision.actions().stream()
                     .anyMatch(action -> action instanceof Head || action instanceof Follower);
             s.deadLettered |= decision.actions().stream().anyMatch(action -> action instanceof Dead);
@@ -1103,6 +1107,7 @@ public final class ShardProcessor implements AutoCloseable {
             writes.forEach(write -> written.add(write.r().id()));
             parked.apply(c, shard, writes, written, now);
             pass.wroteParked |= !writes.isEmpty();
+            pass.requeued |= writes.stream().anyMatch(Park.class::isInstance);
             var answered = offered.values().stream().filter(row -> pass.answered.contains(row.id())).toList();
             pass.wroteParked |= parked.pullNext(c, shard, writes, answered, now);
             if (probe && !pass.failed && !pass.busy) {
@@ -1192,6 +1197,7 @@ public final class ShardProcessor implements AutoCloseable {
         /** The rows that got an outcome. */
         final Set<Long> answered = new HashSet<>();
         /** A handed parked row was written. */
+        boolean requeued;
         boolean wroteParked;
         /** Re-parks, keeps and unparks of handed parked rows, written as JDBC batches when the round ends. */
         final List<Action> parkedWrites = new ArrayList<>();

@@ -1543,11 +1543,11 @@ class ShardProcessorIT {
                     .isEqualTo("read committed");
             ShardProcessor.prepareTransaction(first, config.batchTimeout());
             assertThat(processor.tryProcess(first, 0, latest, now))
-                    .isEqualTo(new ShardResult(PROGRESS, 2, true, false, true));
+                    .isEqualTo(new ShardResult(PROGRESS, 2, true, false, true, false));
             first.commit();
 
             assertThat(processor.tryProcess(second, 0, latest, now))
-                    .isEqualTo(new ShardResult(NO_WORK, 0, true, false, true));
+                    .isEqualTo(new ShardResult(NO_WORK, 0, true, false, true, false));
             second.commit();
         }
         assertThat(delivered()).containsExactly("a#1", "b#1");
