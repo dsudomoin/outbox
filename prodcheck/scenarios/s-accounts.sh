@@ -47,6 +47,7 @@ acc_checks() { # what the library must keep true whatever happened
   check "$(passes is "$(acc_q 'select count(*) from handle_called')" = 0)" "handle() не вызван ни разу: всё через handleBatch"
   local m
   m=$(acc_q 'select count(*) from mismatch')
+  [ "$m" = 0 ] || log "mismatches: $(acc_q "select message_id, left(reason, 160) from mismatch limit 20")"
   check "$(passes is "$m" = 0)" "id, message_id, created_at, ключ, payload и заголовки при повторах не менялись, счётчики не убывали (расхождений $m)"
 }
 
@@ -216,6 +217,7 @@ s_accounts_corrupt() { # a stored envelope that does not parse: the handler answ
 requeue_storm() { # requeue_storm NAME [-Dkey=value...]: thousands of records parked with maxRequeues = 0 for a minute: what it costs the other accounts
   acc_begin "$1"
   shift
+  parked_watch
   local i a
   for i in 1001 1002; do acc "$i" "$@"; done
   for a in 0 1 2 3 4; do tx_send 1001 "topic=$ACC&key=k$a&tag=block" > /dev/null; done
