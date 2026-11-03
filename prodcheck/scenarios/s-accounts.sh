@@ -22,6 +22,17 @@ acc_begin() { # acc_begin NAME: Postgres 17, the roles, the migration as the own
   LEDGER_ARGS=(--search-path accounts,public)
   EFFECTS_TABLE=accounts.pc_effect
   NO_ADMIN=1
+  AFTER=mismatch_dump
+}
+
+mismatch_dump() { # on the way out, the database still there: everything that explains a mismatch, none of it cut
+  local m
+  m=$(acc_q 'select count(*) from mismatch') || m=0
+  [ "$m" != 0 ] || return 0
+  psql_q 'copy accounts.mismatch to stdout with csv header' > "$RESULT_DIR/$SCN.mismatch"
+  psql_q 'copy accounts.seen to stdout with csv header' > "$RESULT_DIR/$SCN.seen"
+  psql_q 'copy (select * from accounts.pc_arrival where message_id in (select message_id from accounts.mismatch) order by no) to stdout with csv header' > "$RESULT_DIR/$SCN.arrivals"
+  cp "$LOGS/pc-$SCN-"*.log "$RESULT_DIR/"
 }
 
 acc() { # acc I [-Dkey=value...]: (re)starts instance I; its load comes back with it
@@ -57,7 +68,7 @@ acc_end() { # stop the writers, clear the blocks, then the usual reconciliation
   unblock_all "$alive_i"
   sleep 3
   unblock_all "$alive_i"
-  acc_checks
+  AFTER_LEDGER=acc_checks # a record's last redelivery may come in the drain
   pc_finish "${ACC_FINISH[@]}" "$@"
 }
 
@@ -66,7 +77,7 @@ acc_load() { pc_load "$1" "${2:-$ACC_LOAD}"; }
 parked_watch() { # how many rows each key had parked, every 2 s; on the way out each overtaking in a type next to that number
   ( while :; do acc_q "select extract(epoch from now()), convert_from(key, 'UTF8'), count(*) from account_events_parked group by 2" 2> /dev/null; command sleep 2; done ) > "$RESULT_DIR/$SCN.parked" &
   PARKED_WATCH=$!
-  AFTER='parked_report'
+  AFTER="$AFTER; parked_report"
 }
 
 parked_report() {

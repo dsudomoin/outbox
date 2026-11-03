@@ -18,7 +18,7 @@ PG=kora-outbox-prodcheck-source # the helpers' psql_q and cleanup act on this co
 KAFKA=kora-outbox-prodcheck-no-kafka # no Kafka yet: cleanup must not start the stand's
 TGT=kora-outbox-prodcheck-target
 SOURCE_B=kora-outbox-prodcheck-source-b
-RESULT_DIR=${RESULT_DIR:-$PC/build/results}
+RESULT_DIR=${RESULT_DIR:-$PC/build/results$([ "${PG_VERSION:-16}" = 16 ] || echo "-pg$PG_VERSION")}
 mkdir -p "$RESULT_DIR"
 ADMIN_KEY=prodcheck-admin
 READER_KEY=prodcheck-reader
@@ -183,6 +183,7 @@ pc_finish() {
   done
   for b in "${BASES[@]}"; do args+=(--base "$b"); done
   led=$(python3 "$PC/scenarios/ledger.py" --source "$PG" --target "$TGT" "${args[@]}" "$@") || rc=$?
+  [ -z "${AFTER_LEDGER:-}" ] || eval "$AFTER_LEDGER" # checks that need the run drained and the instances still up
   local status='{}'
   if [ -n "${NO_ADMIN:-}" ]; then
     : # this app has no admin API: the ledger's retry, parked and dead counts and the scenario's SQL stand for /status

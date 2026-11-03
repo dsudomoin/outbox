@@ -197,7 +197,7 @@ s_retry_long_tail() {
   pc_unload 1001
   tail_disk "после минуты рядом с хвостом"
   tail_wave 130
-  check 0 "волна: $(sed -n 1p "$RESULT_DIR/retry-long-tail.wave" | cut -c1-60) ...; ряд в build/results/retry-long-tail.wave"
+  check 0 "волна: $(sed -n 1p "$RESULT_DIR/retry-long-tail.wave" | cut -c1-60) ...; ряд в ${RESULT_DIR##*/}/retry-long-tail.wave"
   tail_disk "после волны"
   local plans
   plans=$(PLANS=$RESULT_DIR/retry-long-tail.autoexplain auto_explain_report)

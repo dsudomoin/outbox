@@ -76,8 +76,15 @@ docker compose -f prodcheck/docker-compose.yml down -v
 docker compose -f prodcheck/docker-compose.yml --profile tools build
 prodcheck/scenarios/run-all.sh                  # вся матрица, около полутора часов
 prodcheck/scenarios/run-all.sh kill-one admin   # отдельные сценарии
-python3 prodcheck/scenarios/summary.py          # итог по build/results
+python3 prodcheck/scenarios/summary.py          # итог по build/results (RESULT_DIR, PG_VERSION выбирают другой каталог)
+prodcheck/scenarios/run-pg17.sh                 # accounts-*, pg-*, steady, kill-one, xid-auto, inbox-rotation, retry-long-tail на 17
+prodcheck/scenarios/soak.sh 60                  # хаос-прогон на столько минут, в матрицу не входит
+prodcheck/scenarios/loop-held.sh 20             # accounts-same-type-held до первого расхождения, не больше 20 раз
 ```
+
+С `PG_VERSION=17` результаты ложатся в `build/results-pg17`, матрицу из `build/results` прогон не трогает; `results.py` выносит их во вторую секцию `RESULTS.md`.
+
+`soak` держит `shop` и `accounts` на одном Postgres, два outbox при умеренной нагрузке, и повторяет цикл сбоев: `kill -9` одного и всех, кроме одного, выкатка, рестарт и пауза Postgres, обрыв соединений, отказ цели, записи, которые не доставятся, блокировка строки, блокировка счетов с `requeue`, которая снимается. Каждую минуту `build/results/soak.series` пишет размер базы и обоих outbox, строки и размер retry и parked, dead letters, `n_dead_tup`, число партиций, отправленное и эффекты, старое поколение каждой JVM. Проверка: ноль потерь и двойных эффектов, строгий порядок по контракту, очередь пуста, retry и parked вернулись к порядку размера первой трети прогона (`soak_report.py`).
 
 Сборка варианта `accounts` с метриками и админ-API: `./gradlew -p prodcheck :accounts:installDist -PaccountsVariant=full`,
 ложится рядом с обычной в `accounts-full`. После правок в `common` собирайте заново все установки, `courier` с `:courier:clean`:

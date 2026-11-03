@@ -6,7 +6,7 @@ import argparse, bisect, csv, io, json, subprocess, sys, time
 
 p = argparse.ArgumentParser()
 p.add_argument("--source", default="kora-outbox-prodcheck-source")
-p.add_argument("--target", default="kora-outbox-prodcheck-target")
+p.add_argument("--target", default="kora-outbox-prodcheck-target", help="empty: this outbox's sinks are all on the source")
 p.add_argument("--base", action="append", default=[], help="outbox base table, repeatable")
 p.add_argument("--timeout", type=int, default=240)
 p.add_argument("--dead-tags", default="", help="tags that may end in the dead table")
@@ -51,7 +51,7 @@ def one(container, sql):
 def left():
     """What still waits: (undelivered, retry, parked, pending or scheduled dead letters)."""
     sent = one(args.source, "select count(*) from pc_sent")
-    done = sum(one(c, "select count(*) from pc_effect") for c in (args.source, args.target))
+    done = sum(one(c, "select count(*) from pc_effect") for c in (args.source, args.target) if c)
     dead = retry = parked = pending = 0
     for b in args.base:
         dead += one(args.source, f"select count(*) from {b}_dead")
@@ -88,6 +88,8 @@ sent = {r[0]: {"outbox": r[1], "topic": r[2], "key": r[3], "seq": int(r[4]), "ta
 rolled = {r[0] for r in rows(args.source, "select message_id from pc_rolled_back")}
 arrivals, effects = [], []
 for db, c in (("source", args.source), ("target", args.target)):
+    if not c:
+        continue
     arrivals += [{"db": db, "no": int(r[0]), "sink": r[1], "id": r[2], "at": float(r[3]), "xmin": r[4]} for r in rows(
         c, "select no, sink, message_id, extract(epoch from at), xmin from pc_arrival order by no")]
     effects += [{"db": db, "no": int(r[0]), "sink": r[1], "id": r[2], "at": float(r[3]), "xmin": r[4]} for r in rows(

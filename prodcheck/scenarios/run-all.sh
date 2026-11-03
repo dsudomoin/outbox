@@ -12,9 +12,10 @@ slept_since() { # slept_since "YYYY-MM-DD HH:MM:SS": system sleeps the power log
   command -v pmset > /dev/null || { echo 0; return; }
   pmset -g log | awk -v from="$1" '/Entering Sleep state/ && ($1 " " $2) >= from { n++ } END { print n + 0 }'
 }
-RESULT_DIR=${RESULT_DIR:-$HERE/../build/results}
+export RESULT_DIR=${RESULT_DIR:-$HERE/../build/results$([ "${PG_VERSION:-16}" = 16 ] || echo "-pg$PG_VERSION")}
 mkdir -p "$RESULT_DIR"
-ALL=$(grep -hoE '^s_[a-z0-9_]+\(\)' "$HERE"/s-*.sh | sed -e 's/^s_//' -e 's/()$//' -e 's/_/-/g')
+# soak is an hour by itself, run by soak.sh
+ALL=$(grep -hoE '^s_[a-z0-9_]+\(\)' "$HERE"/s-*.sh | sed -e 's/^s_//' -e 's/()$//' -e 's/_/-/g' | grep -vx soak)
 for s in ${*:-$ALL}; do
   rm -f "${RESULT_DIR:?}/${s:?}.json"
   from=$(date '+%Y-%m-%d %H:%M:%S')

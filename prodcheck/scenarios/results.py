@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""results.py [TEXT]: RESULTS.md from build/results, by the README section each scenario checks; TEXT says which code ran."""
+"""results.py [TEXT]: RESULTS.md from RESULT_DIR (default build/results), by the README section each scenario checks, and a
+section from the same directory with -pg17 when it is there; TEXT says which code ran."""
 import json, os, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -145,7 +146,27 @@ GROUPS = [
         ("accounts-recommended", "Все рекомендации вместе: `kill -9`, блокировка строки, нечитаемый конверт, неизвестный `source`, рестарт Postgres; порядок внутри типа, другие счета, метрики и `/status`"),
         ("accounts-rollback-drain", "Откат сервиса по-настоящему: приём остановлен, очередь удаляют только при пустом `/status`; ждущие через `waiting/abandon`, вечно отложенные через `keys/abandon`, без рестарта"),
     ]),
+    ("Долгий прогон", [
+        ("soak", "shop и accounts вместе час под повторяющимся циклом сбоев: `kill -9`, выкатка, Postgres, соединения, цель, poison, блокировки, requeue; ряд во времени в `soak.series`. В строке сверка shop, сверка accounts в проверках"),
+    ]),
 ]
+
+BASE = os.environ.get("RESULT_DIR", f"{HERE}/../build/results")
+HEADER = ["| Сценарий | Что проверяет | Итог | Как лечится | Отправлено | Потеряно | Повторные прибытия | Задержка |",
+          "|---|---|---|---|---|---|---|---|"]
+
+
+def row(base, name, text):
+    """(table row, passed) of one scenario, None when it did not run there."""
+    path = f"{base}/{name}.json"
+    if not os.path.exists(path):
+        return None
+    d = json.load(open(path))
+    led = d["ledger"]
+    verdict = "да" if d["verdict"] == "PASS" else f"**{d['verdict']}**"
+    return (f"| `{name}` | {text} | {verdict} | {d.get('repaired') or ''} | {led.get('sent', '')} | {led.get('lost', '')} | "
+            f"{led.get('duplicates', '')} | {led.get('latency_p99', '')} / {led.get('latency_max', '')} |", d["verdict"] == "PASS")
+
 
 out = ["# Итог проверки без Kafka", ""]
 if len(sys.argv) > 1:
@@ -155,25 +176,24 @@ out += ["«Повторные прибытия» считают все прих�
 total = passed = 0
 named = set()
 for title, rows in GROUPS:
-    out += [f"## {title}", "", "| Сценарий | Что проверяет | Итог | Как лечится | Отправлено | Потеряно | Повторные прибытия | Задержка |",
-            "|---|---|---|---|---|---|---|---|"]
+    out += [f"## {title}", "", *HEADER]
     for name, text in rows:
         named.add(name)
-        path = f"{HERE}/../build/results/{name}.json"
-        if not os.path.exists(path):
-            out.append(f"| `{name}` | {text} | не запускался | | | | | |")
-            continue
-        d = json.load(open(path))
-        led = d["ledger"]
-        total += 1
-        passed += d["verdict"] == "PASS"
-        verdict = "да" if d["verdict"] == "PASS" else f"**{d['verdict']}**"
-        out.append(f"| `{name}` | {text} | {verdict} | {d.get('repaired') or ''} | {led.get('sent', '')} | {led.get('lost', '')} | "
-                   f"{led.get('duplicates', '')} | {led.get('latency_p99', '')} / {led.get('latency_max', '')} |")
+        r = row(BASE, name, text)
+        out.append(r[0] if r else f"| `{name}` | {text} | не запускался | | | | | |")
+        if r:
+            total += 1
+            passed += r[1]
     out.append("")
 out.insert(4, f"Прошло {passed} из {total}.\n")
-missing = {f[:-5] for f in os.listdir(f"{HERE}/../build/results") if f.endswith(".json")} - named
+missing = {f[:-5] for f in os.listdir(BASE) if f.endswith(".json")} - named
+PG17 = f"{BASE}-pg17"
+second = [r for _, rows in GROUPS for r in (row(PG17, name, text) for name, text in rows) if r] if os.path.isdir(PG17) else []
+if second:
+    out += ["## На PostgreSQL 17", "", f"Те же сценарии с `PG_VERSION=17` (`run-pg17.sh`). Прошло {sum(r[1] for r in second)} из {len(second)}.", "",
+            *HEADER, *(r[0] for r in second), ""]
+    missing |= {f[:-5] for f in os.listdir(PG17) if f.endswith(".json")} - named
 if missing:
     print("not in the table:", sorted(missing), file=sys.stderr)
 open(f"{HERE}/../RESULTS.md", "w").write("\n".join(out))
-print(f"{passed}/{total}")
+print(f"{passed}/{total}" + (f", 17: {sum(r[1] for r in second)}/{len(second)}" if second else ""))
