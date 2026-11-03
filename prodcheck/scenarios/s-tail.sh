@@ -43,8 +43,8 @@ auto_explain_report() { # per statement of interest: calls over the threshold, t
 import os, re, sys
 text = sys.stdin.read()
 blocks = re.split(r"\n(?=[0-9-]+ [0-9:.]+ \w+ \[\d+\] LOG:  duration: )", text)
-kinds = {"postponeNewer": "update outbox_parked p set due_at", "selectOlder": "in_retry", "repark": "update outbox_parked set requeues",
-         "putOff": "update outbox_parked set due_at", "selectDue parked": "from outbox_parked where shard = $1 and due_at <=",
+kinds = {"repark": "update outbox_parked set requeues", "keep": "update outbox_parked set due_at = greatest",
+         "pullNext": "update outbox_parked p set due_at", "selectDue parked": "from outbox_parked where shard = $1 and due_at <=",
          "minDue parked": "select min(due_at) from outbox_parked"}
 out, slowest = [], {}
 for name, needle in kinds.items():
@@ -209,30 +209,14 @@ s_retry_long_tail() {
     s=$(psql_q "select shard from outbox_parked where key = convert_to('tail-p', 'UTF8') limit 1")
     local r
     r=$(psql_q "select shard from outbox_retry where key = convert_to('tail-r', 'UTF8') limit 1")
-    local below
-    below=$(psql_q "select max(id) from outbox_parked")
     echo "== selectDue (parked)"
     psql_q "explain (analyze, buffers) select id, shard, message_id, topic, key, payload, headers, created_at from outbox_parked where shard = $s and due_at <= now() order by id limit 100"
-    echo "== selectOlder (parked, in_retry and head_due lateral), key parked"
-    psql_q "explain (analyze, buffers) select p.id, due_at, in_retry, head_due from unnest(array['receipts']::text[], array[convert_to('tail-p', 'UTF8')]::bytea[], array[$below]::int8[]) u(t, b, below)
-      cross join lateral (select count(*) > 0 in_retry, min(r.next_attempt_at) head_due from outbox_retry r where r.shard = $s and r.topic = u.t and r.key = u.b) k
-      cross join lateral (select id, due_at from outbox_parked where shard = $s and topic = u.t and key = u.b and id < u.below and (not k.in_retry or due_at > now()) order by id limit case when k.in_retry then 1 else 100 end) p order by in_retry desc, id limit 101"
-    echo "== selectOlder's head_due on the key with 100k retry rows"
-    psql_q "explain (analyze, buffers) select count(*) > 0 in_retry, min(r.next_attempt_at) head_due from outbox_retry r where r.shard = $r and r.topic = 'deliveries' and r.key = convert_to('tail-r', 'UTF8')"
     echo "== selectOfKeys (parked)"
     psql_q "explain (analyze, buffers) select p.id from (select distinct t, b from unnest(array['receipts']::text[], array[convert_to('tail-p', 'UTF8')]::bytea[]) u(t, b)) k cross join lateral (select id from outbox_parked where shard = $s and topic = k.t and key = k.b order by id limit 100) p order by id limit 100"
     echo "== minDue (parked)"
     psql_q "explain (analyze, buffers) select min(due_at) from outbox_parked where shard = $s"
     echo "== due heads (retry)"
     psql_q "explain (analyze, buffers) select id from outbox_retry where shard = $r and next_attempt_at <= now() order by waiting_since is not null, id limit 100"
-    echo "== selectOlder on the key with 100k retry rows, by hand"
-    psql_q "explain (analyze, buffers) select p.id, due_at, in_retry, head_due from unnest(array['deliveries']::text[], array[convert_to('tail-r', 'UTF8')]::bytea[], array[$(psql_q "select max(id) from outbox_retry")]::int8[]) u(t, b, below)
-      cross join lateral (select count(*) > 0 in_retry, min(r.next_attempt_at) head_due from outbox_retry r where r.shard = $r and r.topic = u.t and r.key = u.b) k
-      cross join lateral (select id, due_at from outbox_parked where shard = $r and topic = u.t and key = u.b and id < u.below and (not k.in_retry or due_at > now()) order by id limit case when k.in_retry then 1 else 1000 end) p order by in_retry desc, id limit 1001"
-    echo "== postponeNewer on the parked tail, by hand, every row due, rolled back"
-    local above
-    above=$(psql_q "select id from outbox_parked where key = convert_to('tail-p', 'UTF8') order by id offset 1000 limit 1")
-    docker exec "$PG" psql -U outbox -d outbox -Atq -c "begin" -c "explain (analyze, buffers) update outbox_parked p set due_at = now() + interval '5 seconds' from unnest(array['receipts']::text[], array[convert_to('tail-p', 'UTF8')]::bytea[], array[$above]::int8[]) k(t, b, above) where p.shard = $s and p.topic = k.t and p.key = k.b and p.id > k.above and p.due_at <= now() + interval '1 day'" -c "rollback"
     echo "== retry_due_at minimum"
     psql_q "explain (analyze, buffers) select min(next_attempt_at) from outbox_retry where shard = $r"
     echo "== retry rows behind a head of a key"
@@ -242,7 +226,6 @@ s_retry_long_tail() {
     psql_q "explain (analyze) select count(*) from outbox_retry"
   } > "$out" 2>&1
   grep -E '^==|Execution Time' "$out" >&2
-  grep -E '^==|Execution Time|Update on|rows=[0-9]+ loops' "$out" | grep -A3 -E '== (postponeNewer|selectOlder on the key)' | cut -c1-150 >&2 || true
   # the rest of the proof: the tails empty, in order, nothing lost
   local drained=$(now)
   for i in 1001 1002; do hctl "$i" 'route=main&failKeys=&waiting=false&oneRound=true'; done
