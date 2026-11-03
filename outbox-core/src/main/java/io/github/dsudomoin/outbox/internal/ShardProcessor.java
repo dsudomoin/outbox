@@ -403,7 +403,7 @@ public final class ShardProcessor implements AutoCloseable {
                 step[0] = telemetry.stepStarted(List.copyOf(lockedShards));
             }
             anyCall |= !heads.isEmpty() || !dueParked.isEmpty();
-            var pass = retryPass(inTx, shard, heads, older, dueParked, s.parkedDue != null, now, parkedUntil);
+            var pass = retryPass(inTx, shard, heads, older, dueParked, s.parkedDue != null, now);
             s.delivered = pass.delivered;
             s.deadLettered = pass.deadLettered;
             // the retry pass writes to the table of the rows it hands, and moves rows between the two
@@ -1040,8 +1040,7 @@ public final class ShardProcessor implements AutoCloseable {
      * is no attempt and no failure; a wait is neither, it counts as {@code waiting{kind}}.
      */
     private Pass retryPass(Connection c, int shard, List<RetryStore.DueHead> heads, Older firstOlder,
-            List<OutboxRecord> dueParked, boolean parkedRows, Instant now, Instant parkedUntil)
-            throws SQLException, InterruptedException {
+            List<OutboxRecord> dueParked, boolean parkedRows, Instant now) throws SQLException, InterruptedException {
         int budget = relay.batchSize() - dueParked.size();
         var pass = new Pass(System.nanoTime() + relay.batchTimeout().toNanos());
         boolean probe = probing.get(shard) == 1; // the first round only: later rounds hand promoted rows
@@ -1098,7 +1097,7 @@ public final class ShardProcessor implements AutoCloseable {
             pass.wroteParked |= !writes.isEmpty();
             pass.requeued |= writes.stream().anyMatch(Park.class::isInstance);
             var answered = offered.values().stream().filter(row -> pass.answered.contains(row.id())).toList();
-            pass.wroteParked |= parked.pullNext(c, shard, writes, answered, now, parkedUntil);
+            pass.wroteParked |= parked.pullNext(c, shard, writes, answered, now);
             if (probe && !pass.failed && !pass.busy) {
                 probing.set(shard, 0); // no call of the probe failed as a whole: batch again
             }

@@ -328,7 +328,8 @@ public final class OutboxRelay implements AutoCloseable {
      * to D is not, so it is not stepped), none has a batch in progress, no retry head is due and no parked row was due
      * when this call started (one due later does not hold it up); returns the number of messages this call delivered.
      * A parked row that answers requeue stays parked with a due time past that start, so a call offers it once and
-     * ends, however long the handler takes and however often it requeues. Works whether or not the relay
+     * ends, however long the handler takes and however often it requeues; so do the rows behind those that left, which
+     * the next call offers. Works whether or not the relay
      * runs: it contends with the workers for shard locks. Handler failures are outcomes (see {@link OutboxHandler}); a
      * database failure of a step propagates. Ends with one run of the dead-letter pass, so the hook has had the letters
      * this call made, whether or not the relay runs; letters it redrives are new messages, after D. A database failure
@@ -394,8 +395,12 @@ public final class OutboxRelay implements AutoCloseable {
                 throw new IllegalStateException("outbox drain could not make a tick for " + stallAfter);
             }
         }
+        // a drain ends: what answers requeue, and what a row's leaving pulls, comes due after this, unless the shard
+        // still holds a row due by then, which ends too as each is offered and leaves that set; a database clock
+        // stepping back writes due times before this for a bounded while. Parked rows only: a retry head goes on by now,
+        // as what it promotes is due then, and the stall bound ends it
+        var parkedUntil = clock.now();
         long target = ticks.latest(c, clock).id();
-        var parkedUntil = clock.now(); // a drain ends: what answers requeue now comes due after it
         int delivered = 0;
         List<Cursor> positions = null;
         long progressed = System.nanoTime();

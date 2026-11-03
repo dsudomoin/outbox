@@ -33,6 +33,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
+import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -55,6 +56,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
@@ -445,6 +447,50 @@ class OutboxRelayIT {
         assertThat(parked()).isEqualTo("k#0,k#1,k#2,k#3,k#4");
     }
 
+    /** Live traffic on a big key: its rows keep leaving, another instance keeps parking new ones, and a drain ends. */
+    @Test
+    void drainEndsWhileAnotherInstanceKeepsParkingRowsOfTheKey() throws Exception {
+        config.relayEnabled(false).shards(1).batchSize(2).requeueDelay(Duration.ofHours(1));
+        bootstrap();
+        var requeue = new AtomicBoolean(true);
+        var parkedByOther = new AtomicLong(1_000_000);
+        var relay = relay(new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {
+            }
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                if (requeue.get()) {
+                    return records.stream().map(r -> (Outcome) Outcome.requeue()).toList();
+                }
+                try (var c = TestDb.connect(); var st = c.createStatement()) {
+                    for (int i = 0; i < 2; i++) {
+                        long id = parkedByOther.incrementAndGet();
+                        st.execute("insert into " + schema.names().parked() + " (id, shard, message_id, topic, key,"
+                                + " payload, created_at, attempts, requeues, due_at) values (" + id
+                                + ", 0, gen_random_uuid(), 't', 'k'::bytea, 'other'::bytea, now(), 0, 1,"
+                                + " now() + interval '1 hour')");
+                    }
+                } catch (SQLException e) {
+                    throw new IllegalStateException(e);
+                }
+                return records.stream().map(r -> (Outcome) Outcome.delivered()).toList();
+            }
+        });
+        send(outbox(relay::wake), IntStream.range(0, 6).mapToObj(i -> msg("t", "k", "k#" + i)).toArray(OutboxMessage[]::new));
+        assertThat(relay.drain()).isZero();
+        try (var c = TestDb.connect(); var st = c.createStatement()) {
+            st.execute("update " + schema.names().parked() + " set due_at = now() - interval '1 minute'"
+                    + " where convert_from(payload, 'UTF8') in ('k#0', 'k#1')");
+            st.execute("update " + schema.names().cursor() + " set parked_due_at = now() - interval '1 minute'"
+                    + " where parked_due_at is not null");
+        }
+        requeue.set(false);
+
+        assertThat(CompletableFuture.supplyAsync(relay::drain).get(30, TimeUnit.SECONDS)).isEqualTo(2);
+    }
+
     /** A new record held out of a call by its key's rows is one this drain has to offer. */
     @Test
     void drainOffersARecordHeldOutOfACall() throws Exception {
@@ -474,9 +520,9 @@ class OutboxRelayIT {
         assertThat(parked()).isNull();
     }
 
-    /** The rows behind a key's rows that left are this drain's too, however far their due times. */
+    /** The rows a key's leaving pulls are due past a drain's start: the next call offers them, in order. */
     @Test
-    void drainTakesTheWholeKeyWhenItsFirstRowsAreDelivered() throws Exception {
+    void drainLeavesTheRowsPulledBehindALeavingPortionToTheNextCall() throws Exception {
         config.relayEnabled(false).batchSize(2).requeueDelay(Duration.ofHours(1));
         bootstrap();
         var requeue = new AtomicBoolean(true);
@@ -500,9 +546,12 @@ class OutboxRelayIT {
         }
         requeue.set(false);
 
-        assertThat(relay.drain()).isEqualTo(6);
+        assertThat(relay.drain()).isEqualTo(2);
+        assertThat(parked()).isEqualTo("k#2,k#3,k#4,k#5");
 
-        assertThat(parked()).isNull();
+        assertThat(relay.drain()).isEqualTo(2);
+
+        assertThat(parked()).isEqualTo("k#4,k#5");
     }
 
     @Test
