@@ -368,7 +368,7 @@ class ParkedStoreIT {
         fits.apply(c, 0, List.of(new Park(next.get(0), 1, LATER), new Park(next.get(1), 1, LATER),
                 new Park(after, 1, LATER), new Park(stays, 1, LATER), new Park(other, 1, LATER)), Set.of(), NOW);
 
-        assertThat(fits.pullNext(c, 0, List.of(new Park(stays, 2, LATER)), List.of(gone, stays), NOW)).isTrue();
+        assertThat(fits.pullNext(c, 0, List.of(new Park(stays, 2, LATER)), List.of(gone, stays), NOW, NOW)).isTrue();
 
         assertThat(fits.due(c, 0, NOW, 10)).extracting(OutboxRecord::id)
                 .as("a's lowest 2; b has a row that stays").containsExactlyElementsOf(next.stream().map(OutboxRecord::id).toList());

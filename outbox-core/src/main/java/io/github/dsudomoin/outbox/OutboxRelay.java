@@ -325,8 +325,10 @@ public final class OutboxRelay implements AutoCloseable {
 
     /**
      * Makes a tick D, then processes shards until none is {@link Position#behind() behind} D (a shard without rows up
-     * to D is not, so it is not stepped), none has a batch in progress and no retry head or parked row is due (one due
-     * later does not hold it up); returns the number of messages this call delivered. Works whether or not the relay
+     * to D is not, so it is not stepped), none has a batch in progress, no retry head is due and no parked row was due
+     * when this call started (one due later does not hold it up); returns the number of messages this call delivered.
+     * A parked row that answers requeue stays parked with a due time past that start, so a call offers it once and
+     * ends, however long the handler takes and however often it requeues. Works whether or not the relay
      * runs: it contends with the workers for shard locks. Handler failures are outcomes (see {@link OutboxHandler}); a
      * database failure of a step propagates. Ends with one run of the dead-letter pass, so the hook has had the letters
      * this call made, whether or not the relay runs; letters it redrives are new messages, after D. A database failure
@@ -393,13 +395,14 @@ public final class OutboxRelay implements AutoCloseable {
             }
         }
         long target = ticks.latest(c, clock).id();
+        var parkedUntil = clock.now(); // a drain ends: what answers requeue now comes due after it
         int delivered = 0;
         List<Cursor> positions = null;
         long progressed = System.nanoTime();
         while (true) {
             requireNotHalted();
             var now = clock.now();
-            var pending = cursors.positions(c, target).stream().filter(p -> !drained(p, now))
+            var pending = cursors.positions(c, target).stream().filter(p -> !drained(p, now, parkedUntil))
                     .map(Position::cursor).toList();
             if (pending.isEmpty()) {
                 return delivered;
@@ -418,7 +421,7 @@ public final class OutboxRelay implements AutoCloseable {
             }
             boolean worked = false;
             for (var group : groups(pending.stream().map(Cursor::shard).toList())) {
-                var results = processInOwnTransaction(c, group, target, now);
+                var results = processInOwnTransaction(c, group, target, now, parkedUntil);
                 learn(group, results);
                 for (var result : results) {
                     delivered += result.delivered();
@@ -440,9 +443,9 @@ public final class OutboxRelay implements AutoCloseable {
         }
     }
 
-    private static boolean drained(Position p, Instant now) {
+    private static boolean drained(Position p, Instant now, Instant parkedUntil) {
         var c = p.cursor();
-        return !p.behind() && c.targetTickId() == null && !due(c.retryDueAt(), now) && !due(c.parkedDueAt(), now);
+        return !p.behind() && c.targetTickId() == null && !due(c.retryDueAt(), now) && !due(c.parkedDueAt(), parkedUntil);
     }
 
     private static boolean due(@Nullable Instant at, Instant now) {
@@ -454,11 +457,11 @@ public final class OutboxRelay implements AutoCloseable {
      * rolled back on failure. A step that moved a row of any of them to the dead table wakes the dead-letter thread
      * once committed.
      */
-    private List<ShardResult> processInOwnTransaction(Connection c, List<Integer> shards, long latest, Instant now)
-            throws SQLException, InterruptedException {
+    private List<ShardResult> processInOwnTransaction(Connection c, List<Integer> shards, long latest, Instant now,
+            Instant parkedUntil) throws SQLException, InterruptedException {
         try {
             ShardProcessor.prepareTransaction(c, relay.batchTimeout());
-            var results = processor.tryProcess(c, shards, latest, now);
+            var results = processor.tryProcess(c, shards, latest, now, parkedUntil);
             c.commit();
             c.setAutoCommit(true);
             // without a hook the letter is kept already
@@ -913,7 +916,7 @@ public final class OutboxRelay implements AutoCloseable {
             var now = clock.now();
             List<ShardResult> results;
             try {
-                results = processInOwnTransaction(c, group, r.latest, now);
+                results = processInOwnTransaction(c, group, r.latest, now, now);
             } catch (InterruptedException | VirtualMachineError e) {
                 throw e;
             } catch (Throwable e) { // rolled back

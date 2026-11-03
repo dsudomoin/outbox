@@ -395,7 +395,7 @@ public final class ParkedStore {
 
     /**
      * For each key of {@code answered} none of whose rows stays ({@code writes}: its {@link Park} or {@link Keep}), its
-     * lowest {@code batch} rows are due ahead of every other row of the shard, so its rows go on at once and in their
+     * lowest {@code batch} rows are due ahead of every other row of the shard and by {@code until}, so its rows go on at once and in their
      * order, whenever they would have come round, and at most what was read when its block ended has passed them; a
      * row's own {@code notBefore} is cut short by that. The key takes the next steps until its rows stop leaving. When
      * the rows that left were not the key's lowest, the lowest may be what just answered {@code requeue}, and offering
@@ -406,8 +406,8 @@ public final class ParkedStore {
      * of the shard's other keys wait behind it, about {@code N / batch} steps. Retry heads and the main stream do not
      * wait: a step takes the heads first and reads its chunk whatever the due pass took.
      */
-    public boolean pullNext(Connection c, int shard, List<Action> writes, List<OutboxRecord> answered, Instant now)
-            throws SQLException {
+    public boolean pullNext(Connection c, int shard, List<Action> writes, List<OutboxRecord> answered, Instant now,
+            Instant until) throws SQLException {
         var gone = new LinkedHashMap<Object, OutboxRecord>(); // the lowest of each key
         for (var row : answered) {
             if (row.key() != null) {
@@ -457,7 +457,7 @@ public final class ParkedStore {
             return false;
         }
         try (var ps = c.prepareStatement(pullNext)) {
-            ps.setObject(1, timestamp(now));
+            ps.setObject(1, timestamp(until));
             ps.setShort(2, (short) shard);
             ps.setArray(3, c.createArrayOf("text", eligible.stream().map(OutboxRecord::topic).toArray()));
             ps.setArray(4, c.createArrayOf("bytea", eligible.stream().map(OutboxRecord::key).toArray(byte[][]::new)));

@@ -409,6 +409,73 @@ class OutboxRelayIT {
         }
     }
 
+    /** A handler slower than requeue.delay that always requeues: rows are due again before the sweep ends, and it ends. */
+    @Test
+    void drainOffersARowOnceAndReturnsWithItStillParked() throws Exception {
+        config.relayEnabled(false).batchSize(2).batchTimeout(Duration.ofSeconds(1)).requeueDelay(Duration.ofMillis(100));
+        bootstrap();
+        var offers = new ConcurrentHashMap<String, Integer>();
+        var relay = relay(new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {
+            }
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                try {
+                    Thread.sleep(200); // within batchTimeout, longer than requeue.delay
+                } catch (InterruptedException e) {
+                    throw new IllegalStateException(e);
+                }
+                records.forEach(r -> offers.merge(new String(r.payload(), UTF_8), 1, Integer::sum));
+                return records.stream().map(r -> (Outcome) Outcome.requeue()).toList();
+            }
+        });
+        send(outbox(relay::wake), IntStream.range(0, 5).mapToObj(i -> msg("t", "k", "k#" + i)).toArray(OutboxMessage[]::new));
+
+        assertThat(CompletableFuture.supplyAsync(relay::drain).get(30, TimeUnit.SECONDS)).isZero();
+
+        assertThat(parked()).isEqualTo("k#0,k#1,k#2,k#3,k#4");
+        Thread.sleep(1000); // all due; the last step finds k#4 with room for a row that came due in this drain
+        offers.clear();
+
+        assertThat(CompletableFuture.supplyAsync(relay::drain).get(30, TimeUnit.SECONDS)).isZero();
+
+        assertThat(offers).hasSize(5).allSatisfy((payload, times) -> assertThat(times).as(payload).isEqualTo(1));
+        assertThat(parked()).isEqualTo("k#0,k#1,k#2,k#3,k#4");
+    }
+
+    /** The rows behind a key's rows that left are this drain's too, however far their due times. */
+    @Test
+    void drainTakesTheWholeKeyWhenItsFirstRowsAreDelivered() throws Exception {
+        config.relayEnabled(false).batchSize(2).requeueDelay(Duration.ofHours(1));
+        bootstrap();
+        var requeue = new AtomicBoolean(true);
+        var relay = relay(new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {
+            }
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                return records.stream().map(r -> requeue.get() ? (Outcome) Outcome.requeue() : Outcome.delivered()).toList();
+            }
+        });
+        send(outbox(relay::wake), IntStream.range(0, 6).mapToObj(i -> msg("t", "k", "k#" + i)).toArray(OutboxMessage[]::new));
+        assertThat(relay.drain()).isZero();
+        try (var c = TestDb.connect(); var st = c.createStatement()) {
+            st.execute("update " + schema.names().parked() + " set due_at = now() - interval '1 minute'"
+                    + " where convert_from(payload, 'UTF8') in ('k#0', 'k#1')");
+            st.execute("update " + schema.names().cursor() + " set parked_due_at = now() - interval '1 minute'"
+                    + " where parked_due_at is not null");
+        }
+        requeue.set(false);
+
+        assertThat(relay.drain()).isEqualTo(6);
+
+        assertThat(parked()).isNull();
+    }
+
     @Test
     void drainFailsOnAStuckShardWhileOtherShardsMove() throws Exception {
         config.batchTimeout(Duration.ofMillis(500)).headFailuresBeforeDivert(1000);

@@ -279,6 +279,15 @@ public final class ShardProcessor implements AutoCloseable {
      */
     public List<ShardResult> tryProcess(Connection inTx, List<Integer> shards, long latestTickId, Instant now)
             throws SQLException, InterruptedException {
+        return tryProcess(inTx, shards, latestTickId, now, now);
+    }
+
+    /**
+     * {@link #tryProcess(Connection, List, long, Instant)} where a parked row is due only at {@code parkedUntil}, not
+     * after {@code now}: a drain keeps it at its start, so a row it offered does not come due for it again.
+     */
+    public List<ShardResult> tryProcess(Connection inTx, List<Integer> shards, long latestTickId, Instant now,
+            Instant parkedUntil) throws SQLException, InterruptedException {
         if (new HashSet<>(shards).size() != shards.size()) {
             throw new IllegalArgumentException("shards are not distinct: " + shards);
         }
@@ -306,7 +315,8 @@ public final class ShardProcessor implements AutoCloseable {
         var step = new OutboxTelemetry.RelayStep[] {OutboxTelemetry.RelayStep.NONE}; // started by stepLocked
         List<ShardResult> stepped;
         try {
-            stepped = stepLocked(inTx, shards, lockable, lockedShards, results, latestTickId, now, started, step);
+            stepped = stepLocked(inTx, shards, lockable, lockedShards, results, latestTickId, now, parkedUntil, started,
+                    step);
         } catch (Throwable t) {
             step[0].failed(t);
             throw t;
@@ -321,8 +331,8 @@ public final class ShardProcessor implements AutoCloseable {
      * the step's telemetry into {@code step} at the first shard with work, the steps {@code stepFinished} measures.
      */
     private List<ShardResult> stepLocked(Connection inTx, List<Integer> shards, List<Integer> lockable,
-            List<Integer> lockedShards, ShardResult[] results, long latestTickId, Instant now, long started,
-            OutboxTelemetry.RelayStep[] step) throws SQLException, InterruptedException {
+            List<Integer> lockedShards, ShardResult[] results, long latestTickId, Instant now, Instant parkedUntil,
+            long started, OutboxTelemetry.RelayStep[] step) throws SQLException, InterruptedException {
         var steps = new ArrayList<Step>(lockable.size());
         // a statement after the locks: sees the previous holders' commits
         var currents = cursors.latest(inTx, lockedShards);
@@ -373,8 +383,8 @@ public final class ShardProcessor implements AutoCloseable {
             // the heads' older rows first: of what is left of the call a head cannot be short, the due rows can wait
             var older = olderOf(inTx, shard, dueHeads, s.parkedDue != null);
             var heads = older.heads();
-            var dueParked = !deferred && s.parkedDue != null && !s.parkedDue.isAfter(now)
-                    ? parked.dueWithOlder(inTx, shard, now, relay.batchSize() - heads.size(), 2L * relay.batchSize()
+            var dueParked = !deferred && s.parkedDue != null && !s.parkedDue.isAfter(parkedUntil)
+                    ? parked.dueWithOlder(inTx, shard, parkedUntil, relay.batchSize() - heads.size(), 2L * relay.batchSize()
                             - heads.size() - older.rows().size())
                     : List.<OutboxRecord>of();
             if (s.target == null && heads.isEmpty() && dueParked.isEmpty()) {
@@ -392,7 +402,7 @@ public final class ShardProcessor implements AutoCloseable {
                 step[0] = telemetry.stepStarted(List.copyOf(lockedShards));
             }
             anyCall |= !heads.isEmpty() || !dueParked.isEmpty();
-            var pass = retryPass(inTx, shard, heads, older, dueParked, s.parkedDue != null, now);
+            var pass = retryPass(inTx, shard, heads, older, dueParked, s.parkedDue != null, now, parkedUntil);
             s.delivered = pass.delivered;
             s.deadLettered = pass.deadLettered;
             // the retry pass writes to the table of the rows it hands, and moves rows between the two
@@ -1052,7 +1062,8 @@ public final class ShardProcessor implements AutoCloseable {
      * is no attempt and no failure; a wait is neither, it counts as {@code waiting{kind}}.
      */
     private Pass retryPass(Connection c, int shard, List<RetryStore.DueHead> heads, Older firstOlder,
-            List<OutboxRecord> dueParked, boolean parkedRows, Instant now) throws SQLException, InterruptedException {
+            List<OutboxRecord> dueParked, boolean parkedRows, Instant now, Instant parkedUntil)
+            throws SQLException, InterruptedException {
         int budget = relay.batchSize() - dueParked.size();
         var pass = new Pass(System.nanoTime() + relay.batchTimeout().toNanos());
         boolean probe = probing.get(shard) == 1; // the first round only: later rounds hand promoted rows
@@ -1109,7 +1120,7 @@ public final class ShardProcessor implements AutoCloseable {
             pass.wroteParked |= !writes.isEmpty();
             pass.requeued |= writes.stream().anyMatch(Park.class::isInstance);
             var answered = offered.values().stream().filter(row -> pass.answered.contains(row.id())).toList();
-            pass.wroteParked |= parked.pullNext(c, shard, writes, answered, now);
+            pass.wroteParked |= parked.pullNext(c, shard, writes, answered, now, parkedUntil);
             if (probe && !pass.failed && !pass.busy) {
                 probing.set(shard, 0); // no call of the probe failed as a whole: batch again
             }
