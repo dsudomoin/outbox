@@ -29,11 +29,12 @@ tail_disk() { # tail_disk LABEL: the size and the update counters of both tables
 }
 
 auto_explain_on() { # the plans and the row counts of the library's own statements, with their real parameters, in the server log
-  psql_q "alter system set session_preload_libraries = 'auto_explain'" > /dev/null
-  psql_q "alter system set auto_explain.log_min_duration = '5ms'" > /dev/null
-  psql_q "alter system set auto_explain.log_analyze = on" > /dev/null
-  psql_q "alter system set auto_explain.log_timing = off" > /dev/null
-  psql_q "alter system set auto_explain.log_buffers = on" > /dev/null
+  docker exec "$PG" psql -U outbox -d outbox -Atq -c "load 'auto_explain'" \
+    -c "alter system set session_preload_libraries = 'auto_explain'" \
+    -c "alter system set auto_explain.log_min_duration = '5ms'" \
+    -c "alter system set auto_explain.log_analyze = on" \
+    -c "alter system set auto_explain.log_timing = off" \
+    -c "alter system set auto_explain.log_buffers = on" > /dev/null
   psql_q "select pg_reload_conf()" > /dev/null
 }
 
@@ -49,9 +50,9 @@ out, slowest = [], {}
 for name, needle in kinds.items():
     hits = [b for b in blocks if "duration:" in b and needle in b]
     ms = [float(re.search(r"duration: ([0-9.]+) ms", b).group(1)) for b in hits]
-    rows = [int(m.group(1)) for b in hits for m in [re.search(r"Update on \S+.*?rows=(\d+)", b) or re.search(r"\(actual rows=(\d+)", b)] if m]
+    rows = [int(x) for b in hits for x in re.findall(r"actual rows=(\d+)", b)] # an Update node itself reports 0
     if ms:
-        out.append(f"{name}: {len(ms)} calls over 5 ms, slowest {max(ms):.0f} ms, total {sum(ms)/1000:.1f} s, rows in the top node up to {max(rows) if rows else 0}")
+        out.append(f"{name}: {len(ms)} calls over 5 ms, slowest {max(ms):.0f} ms, total {sum(ms)/1000:.1f} s, rows in a node up to {max(rows) if rows else 0}")
         slowest[name] = hits[ms.index(max(ms))]
     else:
         out.append(f"{name}: no call over 5 ms")
@@ -130,12 +131,12 @@ s_retry_long_tail() {
   local steps1
   steps1=$(tail_batch_stats 1001 30)
   log "beside the tail: $steps1"
+  local to=$(now)
   # the keys that share a shard with a tail wait behind its rows in id order until they are moved: named, apart from the rest
   local mates
   mates=$(psql_q "select string_agg(distinct convert_from(key, 'UTF8'), ',') from outbox where shard in (select distinct shard from outbox_retry union select distinct shard from outbox_parked) and convert_from(key, 'UTF8') not like 'tail-%'")
   log "shard mates of the tails: ${mates:-none}"
   mate_latency "beside the tails" "$(psql_q "select string_agg(distinct shard::text, ',') from (select shard from outbox_retry where key = convert_to('tail-r', 'UTF8') union select shard from outbox_parked) s")" "$from" "$to"
-  local to=$(now)
   pc_unload 1001
   tail_disk "после минуты рядом с хвостом"
   local plans
