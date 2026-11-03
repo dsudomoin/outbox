@@ -391,7 +391,7 @@ public final class ShardProcessor implements AutoCloseable {
                 step[0] = telemetry.stepStarted(List.copyOf(lockedShards));
             }
             anyCall |= !heads.isEmpty() || !dueParked.isEmpty();
-            var pass = retryPass(inTx, shard, heads, dueParked, s.parkedDue != null, now);
+            var pass = retryPass(inTx, shard, heads, dueParked, dueRows.turns(), s.parkedDue != null, now);
             s.delivered = pass.delivered;
             s.deadLettered = pass.deadLettered;
             // the retry pass writes to the table of the rows it hands, and moves rows between the two
@@ -845,8 +845,9 @@ public final class ShardProcessor implements AutoCloseable {
             var parkedIds = new HashSet<Long>();
             s.parkedRows.forEach(row -> parkedIds.add(row.id()));
             s.wroteParked |= apply(inTx, shard, decision.actions(), parkedIds, now);
-            if (!s.parkedRows.isEmpty()) { // the older rows gone: the rows behind them come back
-                s.wroteParked |= parked.settleTail(inTx, shard, decision.actions(), s.parkedRows, now, false);
+            if (!s.parkedRows.isEmpty()) { // the oldest gone: the rows behind them go on
+                s.wroteParked |= parked.pullNext(inTx, shard, decision.actions(), s.parkedRows, now,
+                        relay.batchSize());
             }
             s.wroteRetry |= decision.actions().stream()
                     .anyMatch(action -> action instanceof Head || action instanceof Follower);
@@ -971,14 +972,13 @@ public final class ShardProcessor implements AutoCloseable {
     /**
      * Each due head with its followers, in id order, in one handler call together with the other due heads and, in the
      * first round, the due parked rows with the older ones of their keys ({@code dueParked}, a group per key;
-     * {@link ParkedStore#dueWithOlder}, {@link ParkedStore#settleTail}), at most {@code batchSize} rows in all; the
+     * {@link ParkedStore#dueWithOlder}, {@link ParkedStore#settle}), at most {@code batchSize} rows in all; the
      * followers of keyed heads that do not wait share what the heads and parked rows leave of it, and a waiting head
      * is handed alone. In each round the parked rows of a key that come before its handed retry rows are offered ahead
      * of them, due or not, as the main pass offers them ahead of a new record of their key
      * ({@link ParkedStore#ofEachKey}, up to {@code batchSize} on top of the call, shared per key, none of it read while
-     * {@code parkedRows} and the pass say the shard has none). A retry row with parked rows of its key below it that did
-     * not fit does not go: a head then waits a requeue delay, attempts kept, and comes on a later round, the parked rows
-     * ahead of it gone or answered; a call one group at a time ({@link #handOver}: a probe,
+     * {@code parkedRows} and the pass say the shard has none), those that do not fit being overtaken, as any record may
+     * carry what they wait for; a call one group at a time ({@link #handOver}: a probe,
      * or after a call that failed as a whole) merges none, as a probe of the main pass. Per key the delivered rows are deleted, a permanent failure goes to dead and a requeued row is
      * parked (past {@code maxRequeues}: dead, attempts kept); the first row that fails transiently (an attempt,
      * backoff) or is not attempted (attempts kept) becomes the head and the rows after it stay followers. A key whose
@@ -992,7 +992,7 @@ public final class ShardProcessor implements AutoCloseable {
      * is no attempt and no failure; a wait is neither, it counts as {@code waiting{kind}}.
      */
     private Pass retryPass(Connection c, int shard, List<RetryStore.DueHead> heads, List<OutboxRecord> dueParked,
-            boolean parkedRows, Instant now) throws SQLException, InterruptedException {
+            Set<Long> onTurn, boolean parkedRows, Instant now) throws SQLException, InterruptedException {
         int budget = relay.batchSize() - dueParked.size();
         boolean parkedCut = heads.size() + dueParked.size() >= relay.batchSize(); // due parked rows may be left
         var pass = new Pass(System.nanoTime() + relay.batchTimeout().toNanos());
@@ -1011,14 +1011,6 @@ public final class ShardProcessor implements AutoCloseable {
             var highest = new HashMap<Object, Long>(); // of a key's handed retry rows
             for (var due : heads) {
                 var head = due.r();
-                var unread = older.unread().get(BatchClassifier.orderingKey(head));
-                if (unread != null && head.id() > unread) {
-                    // parked rows of its key that this call cannot bring lie below it: it waits for them, for a delay,
-                    // so a key whose rows keep requeueing is not stepped again at once
-                    retries.postpone(c, head, requeueDue(null, now));
-                    highest.merge(BatchClassifier.orderingKey(head), head.id(), Math::max);
-                    continue;
-                }
                 if (!handed.add(head.id())) {
                     // a second head of its key (written outside the relay), handed as a follower of a lower head of
                     // its key that does not wait; one that waits takes no followers, so a head after it is handed too
@@ -1030,8 +1022,7 @@ public final class ShardProcessor implements AutoCloseable {
                 } else {
                     rows.add(head);
                 }
-                var after = followers.getOrDefault(head.id(), List.of()).stream()
-                        .filter(row -> unread == null || row.id() < unread).toList();
+                var after = followers.getOrDefault(head.id(), List.of());
                 budget -= probe ? 0 : after.size(); // a probe hands heads alone: their followers wait for a round
                 rows.addAll(after);
                 after.forEach(row -> handed.add(row.id()));
@@ -1052,14 +1043,8 @@ public final class ShardProcessor implements AutoCloseable {
             // in the step's transaction, before a later round and the main pass read the parked table
             var writes = List.copyOf(pass.parkedWrites);
             pass.parkedWrites.clear();
-            var written = new HashSet<Long>();
-            writes.forEach(write -> written.add(write.r().id()));
-            parked.apply(c, shard, writes, written, now);
-            pass.wroteParked |= !writes.isEmpty();
-            if (!offered.isEmpty()) {
-                pass.wroteParked |= parked.settleTail(c, shard, writes, List.copyOf(offered.values()), now,
-                        firstRound && parkedCut);
-            }
+            pass.wroteParked |= parked.settle(c, shard, writes, List.copyOf(offered.values()), onTurn, now,
+                    requeue.delay(), relay.batchSize(), firstRound && parkedCut);
             firstRound = false;
             if (probe && !pass.failed && !pass.busy) {
                 probing.set(shard, 0); // no call of the probe failed as a whole: batch again
@@ -1075,29 +1060,19 @@ public final class ShardProcessor implements AutoCloseable {
 
     /**
      * What a round of the retry pass may offer ahead of {@code heads}: {@code rows}, a share of {@code batchSize} per
-     * key, in id order; {@code unread}, by key, the lowest id of its parked rows that did not fit; {@code charged}, how
-     * many of them are new to the call, below their head and not among {@code dueRows}.
+     * key, in id order, the rest of a key's being overtaken: a retry row may carry what they wait for; {@code charged},
+     * how many of them are new to the call, below their head and not among {@code dueRows}.
      */
-    private record Older(List<OutboxRecord> rows, Map<Object, Long> unread, int charged) {}
+    private record Older(List<OutboxRecord> rows, int charged) {}
 
     private Older olderOf(Connection c, int shard, List<RetryStore.DueHead> heads, List<OutboxRecord> dueRows,
             boolean hasParked) throws SQLException {
         var keyed = heads.stream().map(RetryStore.DueHead::r).filter(row -> row.key() != null).toList();
         if (!hasParked || keyed.isEmpty()) {
-            return new Older(List.of(), Map.of(), 0);
+            return new Older(List.of(), 0);
         }
         int share = Math.min(Math.max(1, relay.batchSize() / keyed.size()), Integer.MAX_VALUE - 1);
-        var seen = new HashMap<Object, Integer>();
-        var rows = new ArrayList<OutboxRecord>();
-        var unread = new HashMap<Object, Long>();
-        for (var row : parked.ofEachKey(c, shard, keyed, share + 1)) {
-            var key = BatchClassifier.orderingKey(row);
-            if (seen.merge(key, 1, Integer::sum) > share) {
-                unread.put(key, row.id());
-            } else {
-                rows.add(row);
-            }
-        }
+        var rows = parked.ofEachKey(c, shard, keyed, share);
         var lowestHead = new HashMap<Object, Long>();
         keyed.forEach(row -> lowestHead.merge(BatchClassifier.orderingKey(row), row.id(), Math::min));
         var dueIds = new HashSet<Long>();
@@ -1108,7 +1083,7 @@ public final class ShardProcessor implements AutoCloseable {
                 charged++;
             }
         }
-        return new Older(rows, unread, charged);
+        return new Older(rows, charged);
     }
 
     /** One group per (topic, key) of the parked {@code rows} (one per unkeyed row), each in id order. */

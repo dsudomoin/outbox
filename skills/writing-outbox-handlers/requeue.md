@@ -108,12 +108,13 @@ Per key, first delivery follows commit order, except that a requeued record is d
 that were delivered while it was parked. Parked records of a key come back in their original order, ahead of the
 newer record that brings them: FEE_RELEASE#1 requeued, then FEE_RELEASE#2 arrives → one call [#1, #2]. The same when a
 parked record's time comes: the older parked records of its key come first in its call, due or not; past `batchSize`
-of them, the newer ones wait with the older ones, written once and spending no requeue, and come back on the step after
-the older ones leave. An unkeyed record comes back only at its due
+of them, the rest get turns, `batchSize` records a turn at `delay` apart (a second at least): they go behind the oldest
+in the same call, up to 2 × `batchSize`, and may overtake the records between, which had their turn and answered
+`requeue`. They come back on the step after the oldest leave, at once. An unkeyed record comes back only at its due
 time, alone. A key in `<table>_retry` brings them too: when its head comes up, waiting or not, the older parked records
 of the key go first in its call, each answer spending a requeue; past what a call takes (`batchSize`, shared by the
-call's keys) the head waits behind them. A new record of the main stream cannot wait: past the chunk limit of parked
-records of its key, it goes ahead of those that did not fit. Until then such a record comes back only at its due
+call's keys) the head goes ahead of those that did not fit, as may a new record past the chunk limit: each of them had
+its turn and answered `requeue`, and a later record may carry what it waits for. Until then such a record comes back only at its due
 time, behind an older parked record of its key that is not due yet.
 
 ## When a parked record is handed back

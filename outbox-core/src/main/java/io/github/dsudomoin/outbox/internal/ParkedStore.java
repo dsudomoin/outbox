@@ -17,15 +17,19 @@ import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.nio.ByteBuffer;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 
@@ -37,14 +41,10 @@ import java.util.TreeMap;
  */
 public final class ParkedStore {
 
-    /**
-     * How far ahead the rows behind a key's older parked rows are put off ({@link #settleTail}), which their release
-     * ends: written once, not on each of the older rows' delays. Past any time a handler can set, so that a row is told
-     * from one with its own {@code notBefore}, and it is the most a row waits if no step sees the older rows go.
-     */
-    private static final Duration HOLD = Duration.ofDays(7);
-    /** A row due further ahead than this is held: above the 24 h a {@code notBefore} is capped at. */
-    private static final Duration HELD_ABOVE = Duration.ofHours(25);
+    /** A due time on a whole second marks a row's turn, written only by {@link #settle}: see {@link #dueWithOlder}. */
+    private static final String ON_A_TURN = "extract(microseconds from due_at)::bigint % 1000000 = 0";
+    /** The shortest gap between a key's turns: due times on whole seconds cannot be closer. */
+    private static final Duration SHORTEST_TURN = Duration.ofSeconds(1);
 
     private final String insert;
     private final String repark;
@@ -54,11 +54,13 @@ public final class ParkedStore {
     private final String toDead;
     private final String fromRetry;
     private final String selectDue;
+    private final String selectDueTurns;
     private final String selectOfKeys;
     private final String selectOlder;
     private final String putOff;
     private final String postponeNewer;
-    private final String release;
+    private final String pullNext;
+    private final String countOfKeys;
     private final String minDue;
     private final String size;
 
@@ -68,8 +70,7 @@ public final class ParkedStore {
         insert = "insert into " + parked + " (" + COLUMNS + ", attempts, requeues, due_at)"
                 + " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         repark = "update " + parked + " set requeues = ?, due_at = ? where id = ?";
-        keep = "update " + parked + " set due_at = case when due_at > ? then ? else greatest(due_at, ?) end"
-                + " where id = ?";
+        keep = "update " + parked + " set due_at = greatest(due_at, ?) where id = ?";
         delete = "delete from " + parked + " where id = any(?)";
         // every part sees the tables as before the statement; key = null matches nothing, so an unkeyed row moves alone
         toRetry = "with moved as (delete from " + parked + " where id = ? or (shard = ? and topic = ? and key = ?"
@@ -88,6 +89,8 @@ public final class ParkedStore {
                 + " select " + COLUMNS + ", attempts, ?, ? from moved";
         selectDue = "select " + RECORD_COLUMNS + " from " + parked
                 + " where shard = ? and due_at <= ? order by id limit ?";
+        selectDueTurns = "select " + RECORD_COLUMNS + " from " + parked
+                + " where shard = ? and due_at <= ? and " + ON_A_TURN + " order by id limit ?";
         // at most limit rows read per key: a key with thousands of parked rows costs no more than any other
         selectOfKeys = "select " + RECORD_COLUMNS + " from (select distinct t, b from unnest(?::text[], ?::bytea[])"
                 + " u(t, b)) k cross join lateral (select " + RECORD_COLUMNS + " from " + parked
@@ -106,12 +109,18 @@ public final class ParkedStore {
                 + " order by id limit case when k.in_retry then 1 else ? end) p"
                 + " order by coalesce(in_retry, false) desc, id limit ?";
         putOff = "update " + parked + " set due_at = ? where id = any(?)";
-        postponeNewer = "update " + parked + " p set due_at = ? from unnest(?::text[], ?::bytea[], ?::int8[])"
-                + " k(t, b, above) where p.shard = ? and p.topic = k.t and p.key = k.b and p.id > k.above"
-                + " and p.due_at <= ?";
-        release = "update " + parked + " p set due_at = ? from unnest(?::text[], ?::bytea[], ?::int8[])"
-                + " k(t, b, above) where p.shard = ? and p.topic = k.t and p.key = k.b and p.id > k.above"
-                + " and p.due_at > ?";
+        // each key's due rows above the handed ones get turns, a batch per delay
+        postponeNewer = "with t as (select p.id, (row_number() over (partition by k.t, k.b order by p.id) - 1) / ? turn"
+                + " from unnest(?::text[], ?::bytea[], ?::int8[]) k(t, b, above) join " + parked + " p on p.shard = ?"
+                + " and p.topic = k.t and p.key = k.b and p.id > k.above and p.due_at <= ?)"
+                + " update " + parked + " p set due_at = date_trunc('second', ?::timestamptz + (t.turn + 1)"
+                + " * make_interval(secs => ?)) + interval '1 second' from t where p.id = t.id";
+        pullNext = "update " + parked + " p set due_at = ? where p.id in (select q.id from unnest(?::text[], ?::bytea[],"
+                + " ?::int8[]) k(t, b, above) cross join lateral (select id from " + parked + " where shard = ?"
+                + " and topic = k.t and key = k.b and id > k.above and due_at > ? and " + ON_A_TURN
+                + " order by id limit ?) q)";
+        countOfKeys = "select k.t, k.b, count(*) from unnest(?::text[], ?::bytea[], ?::int8[]) k(t, b, above) join "
+                + parked + " p on p.shard = ? and p.topic = k.t and p.key = k.b group by k.t, k.b";
         minDue = "select min(due_at) from " + parked + " where shard = ?";
         size = "select count(*) from " + parked;
     }
@@ -179,10 +188,8 @@ public final class ParkedStore {
         if (!keeps.isEmpty()) {
             try (var ps = inTx.prepareStatement(keep)) {
                 for (var k : keeps) {
-                    ps.setObject(1, timestamp(now.plus(HELD_ABOVE))); // a held row is due when kept: nothing else ends it
-                    ps.setObject(2, timestamp(k.dueAt()));
-                    ps.setObject(3, timestamp(k.dueAt()));
-                    ps.setLong(4, k.r().id());
+                    ps.setObject(1, timestamp(k.dueAt()));
+                    ps.setLong(2, k.r().id());
                     ps.addBatch();
                 }
                 ps.executeBatch();
@@ -262,15 +269,17 @@ public final class ParkedStore {
     }
 
     /** What a due pass hands, and whether it moved the due time of rows it did not hand: {@link #minDue} changed. */
-    public record DueRows(List<OutboxRecord> rows, boolean putOff) {
+    public record DueRows(List<OutboxRecord> rows, boolean putOff, Set<Long> turns) {
 
-        public static final DueRows NONE = new DueRows(List.of(), false);
+        public static final DueRows NONE = new DueRows(List.of(), false, Set.of());
     }
 
     /**
      * What a due pass hands: the rows of {@code shard} due at {@code now} and, for each keyed one, the older parked
      * rows of its (topic, key), due or not, so a key's rows come back in their order whatever their due times; the
-     * oldest {@code limit} of all these, in id order, which keeps each key's a prefix of its rows. A key waiting in the
+     * oldest {@code limit} of all these, in id order, which keeps each key's a prefix of its rows; and the rows on their
+     * turn ({@link #settle}), {@code turns}, wherever they lie: such a row goes behind the key's oldest rows in the call,
+     * ahead of the rows between, each of which had its turn and answered {@code requeue}. A key waiting in the
      * retry table is blocked, so its rows are not offered ahead of time: its due rows come only up to its lowest row
      * not due, and those above that stay parked, no requeue spent, due with it or when the key's retry head comes up,
      * whichever is sooner, as the key may leave the retry table then, and at least {@code requeueDelay} from now, so
@@ -284,7 +293,23 @@ public final class ParkedStore {
 
     public DueRows dueWithOlder(Connection c, int shard, Instant now, int limit, Duration requeueDelay)
             throws SQLException {
-        var due = due(c, shard, now, limit);
+        var due = new ArrayList<>(due(c, shard, now, limit));
+        var turns = new HashSet<Long>();
+        if (!due.isEmpty()) { // also those on their turn beyond the limit: none of the oldest may keep them out
+            var seen = new HashSet<Long>();
+            due.forEach(row -> seen.add(row.id()));
+            try (var ps = c.prepareStatement(selectDueTurns)) {
+                ps.setShort(1, (short) shard);
+                ps.setObject(2, timestamp(now));
+                ps.setInt(3, limit);
+                for (var row : records(ps.executeQuery())) {
+                    turns.add(row.id());
+                    if (seen.add(row.id())) {
+                        due.add(row);
+                    }
+                }
+            }
+        }
         var newest = new LinkedHashMap<Object, OutboxRecord>();
         for (var row : due) { // in id order: the last of a key stays
             if (row.key() != null) {
@@ -292,7 +317,7 @@ public final class ParkedStore {
             }
         }
         if (newest.isEmpty()) {
-            return new DueRows(due, false);
+            return new DueRows(due, false, turns);
         }
         var rows = new TreeMap<Long, OutboxRecord>();
         due.forEach(row -> rows.put(row.id(), row));
@@ -321,13 +346,13 @@ public final class ParkedStore {
             }
         }
         if (notDue.isEmpty()) {
-            return new DueRows(rows.values().stream().limit(limit).toList(), false);
+            return new DueRows(withTurns(rows, limit, due, turns), false, turns);
         }
         var above = new HashMap<Object, List<Long>>();
         for (var row : due) {
             var key = BatchClassifier.orderingKey(row);
             var older = notDue.get(key);
-            if (older != null && row.id() > older.id()) {
+            if (older != null && row.id() > older.id() && !turns.contains(row.id())) {
                 rows.remove(row.id());
                 above.computeIfAbsent(key, k -> new ArrayList<>()).add(row.id());
             }
@@ -342,55 +367,151 @@ public final class ParkedStore {
             }
             ps.executeBatch();
         }
-        return new DueRows(rows.values().stream().limit(limit).toList(), true);
+        return new DueRows(withTurns(rows, limit, due, turns), true, turns);
+    }
+
+    /** The oldest {@code limit} of {@code rows} and those on their turn. */
+    private static List<OutboxRecord> withTurns(TreeMap<Long, OutboxRecord> rows, int limit, List<OutboxRecord> due,
+            Set<Long> turns) {
+        var handed = new TreeMap<Long, OutboxRecord>();
+        rows.values().stream().limit(limit).forEach(row -> handed.put(row.id(), row));
+        due.stream().filter(row -> turns.contains(row.id())).forEach(row -> handed.put(row.id(), row));
+        return List.copyOf(handed.values());
     }
 
     /**
-     * After a call that handed {@code handed}, the oldest parked rows of their keys, and wrote {@code writes}: a key one
-     * of whose handed rows stays ({@link Park} or {@link Keep}) with {@code cut} (due rows may be left unhanded) gets
-     * its due rows above the highest handed one held. They could not go before that row anyway, and each would bring
-     * the older rows along again ({@link #dueWithOlder}), in a loop of calls that spends their requeues without
-     * waiting. Held, they are written once however long the older rows keep requeueing, and not looked at. A key whose
-     * handed rows all left gets its held rows back, due now, in one statement: its next step goes on at once. Rows with
-     * a {@code notBefore} of their own keep it either way. Returns whether it wrote a row.
+     * Writes the parked rows of one call of the due pass ({@code writes}, the rows handed being {@code handed}) and gives
+     * the rows behind a key's oldest their turns, so every parked row is offered again in a bounded time however long
+     * the oldest keep requeueing, as a later row may carry what they wait for, at a cost per turn that does not grow with
+     * the key's rows ({@link #turns}). A key none of whose rows but those on their turn stays gets the next {@code batch}
+     * rows waiting for their turn above them due now, one statement per step, so its rows go on at once without a
+     * rewrite of the rest. Returns whether it wrote a row.
      */
-    public boolean settleTail(Connection c, int shard, List<Action> writes, List<OutboxRecord> handed, Instant now,
-            boolean cut) throws SQLException {
-        var highest = new LinkedHashMap<Object, OutboxRecord>();
+    public boolean settle(Connection c, int shard, List<Action> writes, List<OutboxRecord> handed, Set<Long> onTurn,
+            Instant now, Duration delay, int batch, boolean cut) throws SQLException {
+        var ofKey = new LinkedHashMap<Object, List<OutboxRecord>>();
         for (var row : handed) {
             if (row.key() != null) {
-                highest.put(BatchClassifier.orderingKey(row), row);
+                ofKey.computeIfAbsent(BatchClassifier.orderingKey(row), k -> new ArrayList<>()).add(row);
             }
         }
-        var stay = new LinkedHashMap<Object, OutboxRecord>();
+        var turned = turns(c, shard, writes, ofKey, onTurn, now, delay, batch, cut);
+        var ids = new HashSet<Long>();
+        turned.forEach(write -> ids.add(write.r().id()));
+        apply(c, shard, turned, ids, now);
+        return !turned.isEmpty() | pullNext(c, shard, writes, ofKey, onTurn, now, batch);
+    }
+
+    /** {@link #settle} of a main-pass call, whose rows are written already: only the rows of a key whose oldest left. */
+    public boolean pullNext(Connection c, int shard, List<Action> writes, List<OutboxRecord> handed, Instant now,
+            int batch) throws SQLException {
+        var ofKey = new LinkedHashMap<Object, List<OutboxRecord>>();
+        for (var row : handed) {
+            if (row.key() != null) {
+                ofKey.computeIfAbsent(BatchClassifier.orderingKey(row), k -> new ArrayList<>()).add(row);
+            }
+        }
+        return pullNext(c, shard, writes, ofKey, Set.of(), now, batch);
+    }
+
+    /** When a turn comes, {@code turns} turns from {@code now}: on a whole second, which is what marks it. */
+    private static Instant turn(Instant now, Duration delay, long turns) {
+        var gap = delay.compareTo(SHORTEST_TURN) < 0 ? SHORTEST_TURN : delay;
+        return now.plus(gap.multipliedBy(turns)).truncatedTo(ChronoUnit.SECONDS).plusSeconds(1);
+    }
+
+    private static Set<Long> staying(List<Action> writes) {
+        var stay = new HashSet<Long>();
+        for (var write : writes) {
+            if (write instanceof Park || write instanceof Keep) {
+                stay.add(write.r().id());
+            }
+        }
+        return stay;
+    }
+
+    /**
+     * Where a key has rows outside a call and some of the call stays, in a call of half a {@code batch} at least or with
+     * a row on its turn: its rows that are not on their turn are due in 2 turns, so they come along with the next turn,
+     * one call per turn; the rows on their turn that requeued go to the back, after as many turns as the key's other
+     * rows make batches; and with {@code cut} its due rows above the call get turns, a batch per turn (at least a second
+     * apart), written once. So every row's turn comes every (rows / batch) turns while the writes of a turn stay at about
+     * 2 batches, however many rows the key holds. A row with a {@code notBefore} of its own keeps it.
+     */
+    private List<Action> turns(Connection c, int shard, List<Action> writes, Map<Object, List<OutboxRecord>> ofKey,
+            Set<Long> onTurn, Instant now, Duration delay, int batch, boolean cut) throws SQLException {
+        var stay = staying(writes);
+        var full = new LinkedHashMap<Object, OutboxRecord>();
+        for (var e : ofKey.entrySet()) {
+            var rows = e.getValue();
+            if ((rows.size() >= Math.max(1, batch / 2) || rows.stream().anyMatch(row -> onTurn.contains(row.id())))
+                    && rows.stream().anyMatch(row -> stay.contains(row.id()))) {
+                full.put(e.getKey(), rows.get(rows.size() - 1));
+            }
+        }
+        if (full.isEmpty()) {
+            return writes;
+        }
+        var others = new HashMap<Object, Long>();
+        try (var ps = c.prepareStatement(countOfKeys)) {
+            bindKeys(c, ps, 1, full.values());
+            ps.setShort(4, (short) shard);
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    others.put(List.of(rs.getString(1), ByteBuffer.wrap(rs.getBytes(2))), rs.getLong(3));
+                }
+            }
+        }
+        var normal = now.plus(delay);
+        var soon = now.plus((delay.compareTo(SHORTEST_TURN) < 0 ? SHORTEST_TURN : delay).multipliedBy(2));
+        var turned = new ArrayList<Action>(writes.size());
         for (var write : writes) {
             var key = BatchClassifier.orderingKey(write.r());
-            var row = highest.get(key);
-            if (row != null && (write instanceof Park || write instanceof Keep)) {
-                stay.put(key, row);
+            var rows = ofKey.get(key);
+            long left = rows == null ? 0 : others.getOrDefault(key, 0L) - rows.size();
+            if (left > 0 && write instanceof Park p && p.dueAt().equals(normal)) {
+                var due = onTurn.contains(p.r().id()) ? turn(now, delay, 1 + (left + batch - 1) / batch) : soon;
+                turned.add(new Park(p.r(), p.requeues(), due));
+            } else {
+                turned.add(write);
             }
         }
-        highest.keySet().removeAll(stay.keySet());
-        int written = 0;
-        if (cut && !stay.isEmpty()) {
+        if (cut) {
             try (var ps = c.prepareStatement(postponeNewer)) {
-                ps.setObject(1, timestamp(now.plus(HOLD)));
-                bindKeys(c, ps, 2, stay.values());
+                ps.setInt(1, batch);
+                bindKeys(c, ps, 2, full.values());
                 ps.setShort(5, (short) shard);
                 ps.setObject(6, timestamp(now));
-                written += ps.executeUpdate();
+                ps.setObject(7, timestamp(now));
+                ps.setDouble(8, (delay.compareTo(SHORTEST_TURN) < 0 ? SHORTEST_TURN : delay).toNanos() / 1e9);
+                ps.executeUpdate();
             }
         }
-        if (!highest.isEmpty()) {
-            try (var ps = c.prepareStatement(release)) {
-                ps.setObject(1, timestamp(now));
-                bindKeys(c, ps, 2, highest.values());
-                ps.setShort(5, (short) shard);
-                ps.setObject(6, timestamp(now.plus(HELD_ABOVE)));
-                written += ps.executeUpdate();
+        return turned;
+    }
+
+    /** Rows waiting for their turn, of the keys none of whose handed rows but those on their turn stays, come at once. */
+    private boolean pullNext(Connection c, int shard, List<Action> writes, Map<Object, List<OutboxRecord>> ofKey,
+            Set<Long> onTurn, Instant now, int batch) throws SQLException {
+        var stay = staying(writes);
+        var gone = new ArrayList<OutboxRecord>();
+        for (var rows : ofKey.values()) {
+            if (rows.stream().noneMatch(row -> !onTurn.contains(row.id()) && stay.contains(row.id()))) {
+                gone.add(rows.stream().filter(row -> !onTurn.contains(row.id())).reduce((a, b) -> b)
+                        .orElse(rows.get(0)));
             }
         }
-        return written > 0;
+        if (gone.isEmpty()) {
+            return false;
+        }
+        try (var ps = c.prepareStatement(pullNext)) {
+            ps.setObject(1, timestamp(now));
+            bindKeys(c, ps, 2, gone);
+            ps.setShort(5, (short) shard);
+            ps.setObject(6, timestamp(now));
+            ps.setInt(7, batch);
+            return ps.executeUpdate() > 0;
+        }
     }
 
     /** Parameters {@code first..first+2} of a statement per (topic, key) and an id: each of {@code rows}'. */

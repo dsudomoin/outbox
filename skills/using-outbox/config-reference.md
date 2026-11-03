@@ -28,7 +28,7 @@ outbox {
 |---|---|---|
 | `enabled` | `true` | `false`: no relay workers, no partition maintenance and no dead-letter pass on this instance (the hook then gets letters only from the pass at the end of `drain()`); `OutboxRelay.drain()` still works; the heartbeat still runs. Keep it on for at least one production instance. |
 | `workers` | `4` | ≥ 1. Relay threads per instance; each holds a DB connection while working. |
-| `batchSize` | `1000` | ≥ 1. Rows per chunk read and per handler call, for every handler. A call may also carry up to the chunk limit of parked (requeued) records of the chunk's keys: up to 2 × `batchSize` records. |
+| `batchSize` | `1000` | ≥ 1. Rows per chunk read and per handler call, for every handler. A call may also carry up to the chunk limit of parked (requeued) records of the chunk's keys: up to 2 × `batchSize` records. A key with more parked records than that gets turns: see `requeue.md`. |
 | `maxTicksPerBatch` | `100` | ≥ 1. |
 | `minTickInterval` | `50ms` | ≥ 0. Under load, at most one tick per interval. |
 | `idlePollInterval` | `200ms` | > 0. Idle tick rate; how fast a commit on another instance is noticed. |

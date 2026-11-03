@@ -355,30 +355,23 @@ class ParkedStoreIT {
         assertThat(due.putOff()).isFalse();
     }
 
+    /** A row on its turn goes even past older rows not due and a key in retry: it may carry what they wait for. */
     @Test
-    void settleTailHoldsTheDueRowsAboveAKeysHandedRowThatStaysAndReleasesThemWhenItGoes() throws SQLException {
-        var handed = record("t", "a");
-        var newerDue = record("t", "a");
-        var newerLater = record("t", "a");
-        var goneHanded = record("t", "b");
-        var goneNewerDue = record("t", "b");
-        store.apply(c, 0, List.of(new Park(handed, 1, NOW), new Park(newerDue, 1, NOW), new Park(newerLater, 1, LATER),
-                new Park(goneHanded, 1, NOW), new Park(goneNewerDue, 1, NOW)), Set.of(), NOW);
-        var until = NOW.plusSeconds(5);
+    void aRowOnItsTurnIsHandedPastOlderRowsAndAKeyInRetry() throws SQLException {
+        var older = record("t", "a");
+        var turn = record("t", "a");
+        var plain = record("t", "a");
+        var onASecond = NOW.truncatedTo(java.time.temporal.ChronoUnit.SECONDS);
+        var inMicros = onASecond.plusNanos(1000);
+        store.apply(c, 0, List.of(new Park(older, 1, LATER), new Park(turn, 1, onASecond), new Park(plain, 1, inMicros)),
+                Set.of(), NOW);
+        retries.apply(c, 0, List.of(new Follower(record("t", "a"))), NOW);
 
-        store.settleTail(c, 0, List.of(new Park(handed, 2, until), new Unpark(goneHanded)),
-                List.of(handed, goneHanded), NOW, true);
+        var due = store.dueWithOlder(c, 0, NOW.plusSeconds(1), 10, Duration.ofSeconds(1));
 
-        assertThat(store.due(c, 0, NOW, 10)).extracting(OutboxRecord::id)
-                .as("a key whose handed row left goes on").containsExactly(handed.id(), goneHanded.id(),
-                        goneNewerDue.id());
-        assertThat(store.due(c, 0, NOW.plus(Duration.ofDays(2)), 10)).extracting(OutboxRecord::id)
-                .doesNotContain(newerDue.id());
-
-        store.settleTail(c, 0, List.of(new Unpark(handed)), List.of(handed), until, false);
-
-        assertThat(store.due(c, 0, until, 10)).extracting(OutboxRecord::id).as("released")
-                .contains(newerDue.id()).doesNotContain(newerLater.id());
+        assertThat(due.rows()).extracting(OutboxRecord::id).as("the plain row waits for the older one, as ever")
+                .contains(turn.id()).doesNotContain(plain.id());
+        assertThat(due.turns()).containsExactly(turn.id());
     }
 
     /** Rows returned and rows the retry table's scans bring back, from the plan of a real run of {@code selectOlder}. */
