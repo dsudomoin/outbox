@@ -85,8 +85,11 @@ class OperationsUnderLoadIT {
      * the chunk's own work and a loaded machine, as in {@link TailSwapIT}.
      */
     private static final Duration WRITER_BOUND = SWAP_LOCK_TIMEOUT.plusMillis(500);
-    /** A restore that meets {@link #HELD} moves the other rows and gives up within this: it waits for no key lock. */
-    private static final Duration FIRST_FAILURE_CAP = Duration.ofSeconds(1);
+    /**
+     * A restore that meets {@link #HELD} moves the other rows and gives up within this: it waits for no key lock. The
+     * holder lets go only after that, so any bound shows it; a starved CI runner took over 1 s to move the rows alone.
+     */
+    private static final Duration FIRST_FAILURE_CAP = Duration.ofSeconds(System.getenv("CI") == null ? 1 : 15);
     /** For every other wait on the library, and every loop of calls. */
     private static final Duration BOUND = Duration.ofSeconds(60);
     private static final long HOUR = Duration.ofHours(1).toMillis();
