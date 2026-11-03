@@ -109,7 +109,8 @@ that were delivered while it was parked. One rule on every path, whether a new r
 the call: a key whose parked records fit in `batchSize` comes whole and in order, and a larger key brings no older records,
 so its record may pass older ones, each of which was offered and answered `requeue`. FEE_RELEASE#1 requeued, then
 FEE_RELEASE#2 arrives → one call [#1, #2]; not-due records come with the rest, so a `notBefore` is no promise. A larger key
-comes in portions in the order they came due, each record back after `delay × ceil(N / batchSize)`, as a later record may
+comes in portions in the order they came due, due `D = delay × ceil(N / batchSize)` later (the turn takes the longer of `D` and
+`N / batchSize ×` the step time, main call included), as a later record may
 carry what the older ones wait for. When a key's offered records have all left, its next `batchSize` come at once, in order,
 whatever their due times, a `notBefore` included; where the key's oldest just answered `requeue` and newer ones left, they are
 offered again at most once per `delay`. An unkeyed record comes back only at its due time, alone.
@@ -133,9 +134,12 @@ A `requeue` of a retry-table head parks it and lets the next record of its key g
   requeue counted; the chunk, its cursor and other keys go on, and the key comes whole next. A retry head waits for the next
   step. Keep the blocked check
   cheap, or size the batch budget in SKILL.md for 2 ×.
-- The order rule gives way only where a call isolates a culprit and so carries one group: a probing shard's call is the
-  head row alone, which may go out ahead of its key's parked records, and after a retry call that failed as a whole each
-  group goes alone, the head with its own rows first.
+- The order rule gives way in three places. Two calls isolate a culprit and so carry one group: a probing shard's call is
+  the head row alone, which may go out ahead of its key's parked records, and after a retry call that failed as a whole each
+  group goes alone, the head with its own rows first. Third, a parked row of a shard whose `parked_due_at` is empty (written
+  by an instance of the previous release or by hand) is not merged until maintenance repairs the due time.
+- The chunk limit halves after a failure, the parked records of a key still come whole: a call that times out because of them
+  can cost up to 3 timeouts, with the shard paused, until the probe sends the head alone.
 - A call in which the handler only requeued (or left not attempted) the merged parked records and attempted none of
   the new ones fails as a whole, like a call with nothing attempted: shard pause, halved chunk, probe, divert. A
   handler that winds down right after requeuing costs a pause, never a spinning shard.
