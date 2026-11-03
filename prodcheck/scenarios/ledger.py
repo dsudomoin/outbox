@@ -2,7 +2,7 @@
 """The machine check of one scenario run. Waits until the run is drained, then compares what the writers committed
 (pc_sent, written in the transaction of the send) with what the sinks saw (pc_arrival, every arrival) and did
 (pc_effect, the effect, atomic with its dedupe). Prints JSON; exit 0 clean, 1 a violation, 2 not drained."""
-import argparse, csv, io, json, subprocess, sys, time
+import argparse, bisect, csv, io, json, subprocess, sys, time
 
 p = argparse.ArgumentParser()
 p.add_argument("--source", default="kora-outbox-prodcheck-source")
@@ -16,6 +16,8 @@ p.add_argument("--exempt-tags", default="", help="tags the order checks skip: a 
 p.add_argument("--exempt-topics", default="", help="topics the order checks skip: redrive by filter, restored rows")
 p.add_argument("--order-within-tag", action="append", default=[], help="exempt from the key order, but in order among themselves")
 p.add_argument("--report-order-within-tag", action="append", default=[], help="the same, counted and reported, no violation")
+p.add_argument("--late-block", action="append", default=[], metavar="KEY=MAX",
+               help="a key larger than a call: its order may break by one late block of at most MAX overtaking rows, nothing more")
 p.add_argument("--search-path", help="schema of the ledger tables, when not public")
 p.add_argument("--max-dups", type=int, help="arrivals beyond the first of a message, at most")
 p.add_argument("--min-dups", type=int, default=0, help="at least: the fault really hit a batch in flight")
@@ -32,6 +34,7 @@ split = lambda s: {x for x in s.split(",") if x}
 dead_tags, discard_tags, exempt = split(args.dead_tags), split(args.discard_tags), split(args.exempt_tags)
 exempt_topics = split(args.exempt_topics)
 allow_left = split(args.allow_left)
+late_keys = {k: int(v) for k, v in (x.split("=") for x in args.late_block)}
 
 
 def rows(container, sql):
@@ -85,10 +88,10 @@ sent = {r[0]: {"outbox": r[1], "topic": r[2], "key": r[3], "seq": int(r[4]), "ta
 rolled = {r[0] for r in rows(args.source, "select message_id from pc_rolled_back")}
 arrivals, effects = [], []
 for db, c in (("source", args.source), ("target", args.target)):
-    arrivals += [{"db": db, "no": int(r[0]), "sink": r[1], "id": r[2], "at": float(r[3])} for r in rows(
-        c, "select no, sink, message_id, extract(epoch from at) from pc_arrival order by no")]
-    effects += [{"db": db, "no": int(r[0]), "sink": r[1], "id": r[2], "at": float(r[3])} for r in rows(
-        c, "select no, sink, message_id, extract(epoch from at) from pc_effect order by no")]
+    arrivals += [{"db": db, "no": int(r[0]), "sink": r[1], "id": r[2], "at": float(r[3]), "xmin": r[4]} for r in rows(
+        c, "select no, sink, message_id, extract(epoch from at), xmin from pc_arrival order by no")]
+    effects += [{"db": db, "no": int(r[0]), "sink": r[1], "id": r[2], "at": float(r[3]), "xmin": r[4]} for r in rows(
+        c, "select no, sink, message_id, extract(epoch from at), xmin from pc_effect order by no")]
 dead = {}
 for b in args.base:
     for r in rows(args.source, f"select message_id, status, attempts, error, redrives from {b}_dead"):
@@ -133,24 +136,53 @@ def inversions(keys):
     return bad
 
 
-effect_order = inversions(by_key(effects))
-arrival_order = inversions(by_key(arrivals))
+def late_blocks(seqs):
+    """Of a key's rows in their order, each block of rows lower than one already seen: (rows that overtook it, its rows)."""
+    seen, blocks, i = [], [], 0
+    while i < len(seqs):
+        bisect.insort(seen, seqs[i])
+        if seqs[i] != seen[-1]:
+            over = len(seen) - bisect.bisect_right(seen, seqs[i])
+            n = 1
+            while i + 1 < len(seqs) and seqs[i + 1] < seen[-1]:
+                i += 1
+                bisect.insort(seen, seqs[i])
+                n += 1
+            blocks.append([over, n])
+        i += 1
+    return blocks
+
+
+def strict(keys):
+    return {k: evs for k, evs in keys.items() if k[2] not in late_keys}
+
+
+effect_order = inversions(strict(by_key(effects)))
+arrival_order = inversions(strict(by_key(arrivals)))
 for tag in args.order_within_tag:
-    effect_order += inversions(by_key(effects, tag))
-    arrival_order += inversions(by_key(arrivals, tag))
+    effect_order += inversions(strict(by_key(effects, tag)))
+    arrival_order += inversions(strict(by_key(arrivals, tag)))
 # The handler must not get message n+1 of a key before message n is delivered.
 overtakes = []
 if not args.no_time_checks:
-    first_effect = {}
+    first_effect, effect_tx = {}, {}
     for k, evs in by_key(effects).items():
         for ev in evs:
             first_effect[(k, ev["seq"])] = ev["at"]
+            effect_tx[(k, ev["seq"])] = ev["xmin"]
     for k, evs in by_key(arrivals).items():
         for a, b in zip(evs, evs[1:]):
             done = first_effect.get((k, a["seq"]))
             if done is not None and b["at"] < done:
-                overtakes.append({"key": list(k), "seq": [a["seq"], b["seq"]], "early_by": round(done - b["at"], 3)})
+                overtakes.append({"key": list(k), "seq": [a["seq"], b["seq"]], "early_by": round(done - b["at"], 6),
+                                  "arrival_tx": b["xmin"], "effect_tx": effect_tx[(k, a["seq"])], "arrival_at": b["at"], "effect_at": done})
 
+late = {}
+for name, events in (("effects", effects), ("first_arrivals", arrivals)):
+    for k, evs in by_key(events).items():
+        if k[2] in late_keys:
+            late.setdefault(k[2], {})[name] = late_blocks([e["seq"] for e in evs])
+result["late_blocks"] = late
 result["order_within_tag"] = {tag: len(inversions(by_key(effects, tag))) for tag in args.report_order_within_tag}
 dups = len(arrivals) - len({(a["sink"], a["id"]) for a in arrivals})
 latency = []
@@ -195,6 +227,10 @@ if arrival_order:
     v.append(f"first-arrival order violations: {len(arrival_order)}")
 if overtakes:
     v.append(f"overtakes: {len(overtakes)}")
+for key, limit in late_keys.items():
+    for name, blocks in late.get(key, {}).items():
+        if len(blocks) > 1 or any(over > limit for over, _ in blocks):
+            v.append(f"{key}: {name} late blocks {blocks[:5]} (of {len(blocks)}), allowed one of at most {limit} overtaking rows")
 if args.max_dups is not None and dups > args.max_dups:
     v.append(f"duplicates {dups} above the allowed {args.max_dups}")
 if dups < args.min_dups:

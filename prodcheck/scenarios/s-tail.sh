@@ -257,5 +257,5 @@ s_retry_long_tail() {
   inv=$(tail_inversions receipts tail-p)
   log "inversions: $inv"
   check 0 "обгоны: $inv"
-  pc_finish --exempt-tags none --slow-keys "tail-r,tail-p,$mates" --slow-from "$from" --slow-to "$to" --timeout 400
+  pc_finish --exempt-tags none --late-block tail-p=1000 --slow-keys "tail-r,tail-p,$mates" --slow-from "$from" --slow-to "$to" --timeout 400
 }
