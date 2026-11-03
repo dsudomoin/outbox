@@ -322,8 +322,8 @@ public final class ParkedStore {
      * other due rows, so its rows come back in their order whatever their due times. A key larger than that comes only
      * with the rows due: it would otherwise bring its oldest rows on every step of a sweep, spending their requeues
      * without a delay, and a row of it may go ahead of older ones, each of which was offered and answered requeue. A
-     * key that does not fit in what is left of the call stays due for the next step; the first always fits, so each step
-     * moves rows. An unkeyed row comes alone.
+     * key that does not fit in what is left of the call stays due for the next step; in a call with room for a batch
+     * the first always fits, so a step moves rows. An unkeyed row comes alone.
      */
     public List<OutboxRecord> dueWithOlder(Connection c, int shard, Instant now, int limit, long most)
             throws SQLException {
@@ -332,30 +332,16 @@ public final class ParkedStore {
         for (var row : due) {
             ofKey.computeIfAbsent(BatchClassifier.orderingKey(row), k -> new ArrayList<>()).add(row);
         }
-        var keyed = due.stream().filter(row -> row.key() != null).toList();
-        var rowsOfKey = new HashMap<Object, Long>();
-        if (!keyed.isEmpty()) {
-            try (var ps = c.prepareStatement(fitting)) {
-                ps.setArray(1, c.createArrayOf("text", keyed.stream().map(OutboxRecord::topic).toArray()));
-                ps.setArray(2, c.createArrayOf("bytea", keyed.stream().map(OutboxRecord::key).toArray(byte[][]::new)));
-                ps.setShort(3, (short) shard);
-                ps.setInt(4, batch == Integer.MAX_VALUE ? batch : batch + 1);
-                try (var rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        rowsOfKey.put(List.of(rs.getString(1), ByteBuffer.wrap(rs.getBytes(2))), rs.getLong(3));
-                    }
-                }
-            }
-        }
+        var rowsOfKey = rowsOfKeys(c, shard, due);
         var handed = new TreeMap<Long, OutboxRecord>();
         var whole = new ArrayList<OutboxRecord>(); // the highest row due of each key that fits
         long room = most;
         for (var e : ofKey.entrySet()) {
             var rows = e.getValue();
             long ofIt = rowsOfKey.getOrDefault(e.getKey(), 0L);
-            boolean fits = ofIt > 0 && ofIt <= batch;
+            boolean fits = fits(ofIt);
             long size = fits ? ofIt : rows.size();
-            if (size > room && !handed.isEmpty() || size > room && !whole.isEmpty()) {
+            if (size > room) {
                 break;
             }
             room -= size;
@@ -374,6 +360,37 @@ public final class ParkedStore {
             }
         }
         return List.copyOf(handed.values());
+    }
+
+    /**
+     * How many parked rows each key of {@code keyed} holds, those with none absent, up to a batch and one more: above a
+     * batch, the key does not fit in a call, and how far above does not matter.
+     */
+    public Map<Object, Long> rowsOfKeys(Connection c, int shard, Collection<OutboxRecord> keyed) throws SQLException {
+        var withKey = keyed.stream().filter(row -> row.key() != null).toList();
+        var rows = new HashMap<Object, Long>();
+        if (withKey.isEmpty()) {
+            return rows;
+        }
+        try (var ps = c.prepareStatement(fitting)) {
+            ps.setArray(1, c.createArrayOf("text", withKey.stream().map(OutboxRecord::topic).toArray()));
+            ps.setArray(2, c.createArrayOf("bytea", withKey.stream().map(OutboxRecord::key).toArray(byte[][]::new)));
+            ps.setShort(3, (short) shard);
+            ps.setInt(4, batch == Integer.MAX_VALUE ? batch : batch + 1);
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    if (rs.getLong(3) > 0) {
+                        rows.put(List.of(rs.getString(1), ByteBuffer.wrap(rs.getBytes(2))), rs.getLong(3));
+                    }
+                }
+            }
+        }
+        return rows;
+    }
+
+    /** Whether a key with these {@link #rowsOfKeys} fits in a call. */
+    public boolean fits(long rows) {
+        return rows > 0 && rows <= batch;
     }
 
     /**

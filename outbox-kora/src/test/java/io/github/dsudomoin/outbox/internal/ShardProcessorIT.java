@@ -2943,38 +2943,69 @@ class ShardProcessorIT {
         assertThat(parkedRows()).isEmpty();
     }
 
-    /** One key's many parked rows take no room from another's: each brings its share. */
-    @Test
-    void aKeyWithManyParkedRowsTakesNoRoomFromAnothersHead() throws Exception {
-        config.shards(1).batchSize(4);
-        bootstrap();
-        script = records -> records.stream().map(r -> Outcome.requeue()).toList();
-        send(msg("t", "a", "a#1"), msg("t", "a", "a#2"), msg("t", "a", "a#3"), msg("t", "a", "a#4"),
-                msg("t", "b", "b#1"));
+    /** Parks {@code payloads} of {@code key}, due in a day, and makes {@code head} its retry head, due now. */
+    private void parkBelowAHead(String key, List<String> payloads, String head) throws Exception {
+        var later = now.plus(Duration.ofHours(24));
+        var answers = new HashMap<String, Outcome>();
+        payloads.forEach(p -> answers.put(p, Outcome.requeue(later)));
+        answers.put(head, Outcome.retry(new RuntimeException(head), now.plusMillis(1)));
+        answers.put("go#" + key, Outcome.delivered());
+        script = answering(answers);
+        var rows = new ArrayList<OutboxMessage>();
+        payloads.forEach(p -> rows.add(msg("t", key, p)));
+        rows.add(msg("t", "go" + key, "go#" + key));
+        send(rows.toArray(OutboxMessage[]::new));
         tick();
         processUntilNoWork();
-        var later = now.plus(Duration.ofHours(24));
-        for (var row : List.of("a#1", "a#2", "a#3", "a#4", "b#1")) {
-            setParkedDue(row, later);
-        }
-        script = answering(Map.of("a#5", Outcome.retry(new RuntimeException("a"), now.plusMillis(1)),
-                "b#2", Outcome.retry(new RuntimeException("b"), now.plusMillis(1)),
-                "a#1", Outcome.requeue(later), "a#2", Outcome.requeue(later), "a#3", Outcome.requeue(later),
-                "a#4", Outcome.requeue(later), "b#1", Outcome.requeue(later)));
-        send(msg("t", "a", "a#5"), msg("t", "b", "b#2"), msg("t", "c", "c#1"));
+        send(msg("t", key, head), msg("t", "go" + key, "go2#" + key));
         tick();
         process();
-        assertThat(retryRows()).as("heads a#5 and b#2").hasSize(2);
+    }
+
+    /** A head does not overtake the older rows of a key that fits, however full the due pass would make the call. */
+    @Test
+    void aHeadOfAKeyThatFitsComesAfterItsOlderRowsWhateverTheCallHolds() throws Exception {
+        config.shards(1).batchSize(5);
+        bootstrap();
+        parkBelowAHead("k", List.of("k#1", "k#2", "k#3", "k#4"), "k#5");
+        script = answering(Map.of());
+        requeueAll();
+        var rows = new ArrayList<OutboxMessage>();
+        for (int i = 1; i <= 5; i++) {
+            rows.add(msg("t", "a", "a#" + i));
+            if (i <= 4) {
+                rows.add(msg("t", "b", "b#" + i));
+            }
+        }
+        send(rows.toArray(OutboxMessage[]::new));
+        tick();
+        processUntilNoWork();
+        now = now.plus(Duration.ofSeconds(30)); // those two keys' rows and the head all due, k's others not
+        script = answering(Map.of());
+
+        for (int i = 0; i < 5; i++) {
+            process();
+        }
+
+        assertThat(delivered()).containsSubsequence("k#1", "k#2", "k#3", "k#4", "k#5");
+        assertThat(calls).allSatisfy(call -> assertThat(payloads(call)).as("at most 2 x batchSize")
+                .hasSizeLessThanOrEqualTo(10));
+    }
+
+    /** Heads of several keys: each comes after all its older rows, not a share of them. */
+    @Test
+    void headsOfSeveralKeysEachBringAllTheirOlderRows() throws Exception {
+        config.shards(1).batchSize(4);
+        bootstrap();
+        parkBelowAHead("k", List.of("k#1", "k#2", "k#3"), "k#4");
+        parkBelowAHead("j", List.of("j#1", "j#2", "j#3"), "j#4");
         now = now.plus(Duration.ofMinutes(1));
-        calls.clear();
-        script = answering(Map.of("a#1", Outcome.requeue(later), "a#2", Outcome.requeue(later)));
+        script = answering(Map.of());
 
-        process();
+        processUntilNoWork();
 
-        assertThat(calls.get(0).stream().map(r -> new String(r.payload(), UTF_8)).toList())
-                .as("two of a's, and b's row with its head").containsSubsequence("a#1", "a#2", "a#5")
-                .contains("b#1", "b#2");
-        assertThat(delivered()).contains("b#1", "b#2");
+        assertThat(delivered()).containsSubsequence("k#1", "k#2", "k#3", "k#4");
+        assertThat(delivered()).containsSubsequence("j#1", "j#2", "j#3", "j#4");
     }
 
     /** Parked k#1, retry head k#2 with its follower k#3, the head due and k#1 not. */
