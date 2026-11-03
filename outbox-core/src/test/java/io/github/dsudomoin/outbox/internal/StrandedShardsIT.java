@@ -35,6 +35,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -332,6 +333,34 @@ class StrandedShardsIT {
         await(() -> atClose.size() > 10);
 
         assertThat(atClose).as("as every pass closes it, a stranded shard's step failing in each").containsOnly(true);
+    }
+
+    /**
+     * The shard with the oldest tick goes first in a round, and a failing shard's tick stays old. With a new tick, so a
+     * new round, after every step it would be all a worker ever steps.
+     */
+    @Test
+    void aFailingShardHoldsUpNoNeighbourWithANewRoundAfterEveryStep() throws Exception {
+        config.workers(1).idlePollInterval(Duration.ofMillis(1)).minTickInterval(Duration.ZERO);
+        leaveTheOtherShardsOnANewerTick();
+        sendMany(1, 2);
+        makeATick();
+        deleteTheirTick();
+        var failures = new AtomicInteger();
+        relay = OutboxRuntime.builder(config, transactions, this::deliver).telemetry(new OutboxTelemetry() {
+            @Override
+            public void relayFailed(Throwable error) {
+                failures.incrementAndGet();
+            }
+        }).build();
+        relay.start();
+        await(() -> failures.get() > 2);
+
+        var sent = sendMany(0, 5);
+
+        await(() -> delivered.containsAll(sent));
+        int before = failures.get();
+        await(() -> failures.get() > before + 2); // and it is still tried: a repair is not left waiting
     }
 
     @Test

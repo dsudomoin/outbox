@@ -964,7 +964,7 @@ public final class OutboxRelay implements AutoCloseable {
 
         /**
          * {@link Position#behind() Behind} the latest tick (a tick after its effective tick holds its rows), mid-batch
-         * or with a due retry head or parked row, and not paused; lowest effective tick first, ties from a random
+         * or with a due retry head or parked row, and not paused; lowest {@link #turn} first, ties from a random
          * shard on, so no shard is always last. All of it comes from the database, so every instance sees the same
          * candidates, whichever instance made the ticks.
          */
@@ -975,10 +975,19 @@ public final class OutboxRelay implements AutoCloseable {
                     .filter(p -> p.behind() || p.cursor().targetTickId() != null
                             || due(p.cursor().retryDueAt(), now) || due(p.cursor().parkedDueAt(), now))
                     .filter(p -> p.cursor().pausedUntil() == null || !p.cursor().pausedUntil().isAfter(now))
-                    .sorted(Comparator.comparingLong(Position::effectiveTickId)
+                    .sorted(Comparator.comparingLong(this::turn)
                             .thenComparingInt(p -> Math.floorMod(p.cursor().shard() - offset, shards)))
                     .map(p -> p.cursor().shard())
                     .toList();
+        }
+
+        /**
+         * The shard's effective tick, or for one that last failed alone the tick of that try: a failing shard's own tick
+         * stays old, and with a new round after every step it would be all a worker ever steps.
+         */
+        private long turn(Position p) {
+            int shard = p.cursor().shard();
+            return isolated.get(shard) == 1 ? Math.max(p.effectiveTickId(), steppedTick.get(shard)) : p.effectiveTickId();
         }
 
         private void warn(String what, Throwable t) {
