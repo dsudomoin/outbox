@@ -2782,6 +2782,69 @@ class ShardProcessorIT {
         assertThat(statements).filteredOn(sql -> sql.contains("min(due_at)")).hasSize(1);
     }
 
+    /** More older parked rows than a call takes: the head waits for them, never ahead of those it could not bring. */
+    @Test
+    void aHeadWhoseOlderParkedRowsDoNotFitWaitsForThem() throws Exception {
+        config.batchSize(3);
+        bootstrap();
+        parkAll("k#1", "k#2", "k#3", "k#4", "k#5");
+        var later = now.plus(Duration.ofHours(24));
+        script = records -> records.stream().map(r -> switch (new String(r.payload(), UTF_8)) {
+            case "k#6" -> Outcome.retry(new RuntimeException("k#6 down"), now.plus(Duration.ofSeconds(1)));
+            case "j#1" -> Outcome.delivered();
+            default -> Outcome.requeue(later);
+        }).toList();
+        send(msg("t", "k", "k#6"), msg("t", "k", "k#7"), msg("t", "j", "j#1"));
+        tick();
+        process();
+        assertThat(retryRows()).as("k#6 and its follower").hasSize(2);
+        now = now.plus(Duration.ofMinutes(1));
+        calls.clear();
+        script = answering(Map.of());
+
+        processUntilNoWork();
+        while (!retryRows().isEmpty() || !parkedRows().isEmpty()) {
+            now = now.plus(REQUEUE_DELAY);
+            processUntilNoWork();
+        }
+
+        assertThat(delivered()).containsSubsequence("k#1", "k#2", "k#3", "k#4", "k#5", "k#6", "k#7");
+    }
+
+    /** One key's many parked rows take no room from another's: each brings its own, whatever the first answers. */
+    @Test
+    void aKeyWithManyParkedRowsDoesNotHoldBackAnothersHead() throws Exception {
+        config.shards(1).batchSize(4);
+        bootstrap();
+        script = records -> records.stream().map(r -> Outcome.requeue()).toList();
+        send(msg("t", "a", "a#1"), msg("t", "a", "a#2"), msg("t", "a", "a#3"), msg("t", "a", "a#4"),
+                msg("t", "b", "b#1"));
+        tick();
+        processUntilNoWork();
+        var later = now.plus(Duration.ofHours(24));
+        for (var row : List.of("a#1", "a#2", "a#3", "a#4", "b#1")) {
+            setParkedDue(row, later);
+        }
+        script = answering(Map.of("a#5", Outcome.retry(new RuntimeException("a"), now.plusMillis(1)),
+                "b#2", Outcome.retry(new RuntimeException("b"), now.plusMillis(1)),
+                "a#1", Outcome.requeue(later), "a#2", Outcome.requeue(later), "a#3", Outcome.requeue(later),
+                "a#4", Outcome.requeue(later), "b#1", Outcome.requeue(later)));
+        send(msg("t", "a", "a#5"), msg("t", "b", "b#2"), msg("t", "c", "c#1"));
+        tick();
+        process();
+        assertThat(retryRows()).as("heads a#5 and b#2").hasSize(2);
+        now = now.plus(Duration.ofMinutes(1));
+        calls.clear();
+        script = answering(Map.of("a#1", Outcome.requeue(later), "a#2", Outcome.requeue(later)));
+
+        process();
+
+        assertThat(calls.get(0).stream().map(r -> new String(r.payload(), UTF_8)).toList())
+                .as("two of a's, and b's row with its head").containsSubsequence("a#1", "a#2").contains("b#1", "b#2")
+                .doesNotContain("a#5");
+        assertThat(delivered()).contains("b#1", "b#2").doesNotContain("a#5");
+    }
+
     /** Parked k#1, retry head k#2 with its follower k#3, the head due and k#1 not. */
     private void keyInRetryAboveAParkedRow() throws Exception {
         bootstrap();

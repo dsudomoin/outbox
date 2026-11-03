@@ -975,8 +975,10 @@ public final class ShardProcessor implements AutoCloseable {
      * followers of keyed heads that do not wait share what the heads and parked rows leave of it, and a waiting head
      * is handed alone. In each round the parked rows of a key that come before its handed retry rows are offered ahead
      * of them, due or not, as the main pass offers them ahead of a new record of their key
-     * ({@link ParkedStore#ofKeys}, up to {@code batchSize} on top of the call, none of it read while
-     * {@code parkedRows} and the pass say the shard has none); a call one group at a time ({@link #handOver}: a probe,
+     * ({@link ParkedStore#ofEachKey}, up to {@code batchSize} on top of the call, shared per key, none of it read while
+     * {@code parkedRows} and the pass say the shard has none). A retry row with parked rows of its key below it that did
+     * not fit does not go: a head then waits a requeue delay, attempts kept, and comes on a later round, the parked rows
+     * ahead of it gone or answered; a call one group at a time ({@link #handOver}: a probe,
      * or after a call that failed as a whole) merges none, as a probe of the main pass. Per key the delivered rows are deleted, a permanent failure goes to dead and a requeued row is
      * parked (past {@code maxRequeues}: dead, attempts kept); the first row that fails transiently (an attempt,
      * backoff) or is not attempted (attempts kept) becomes the head and the rows after it stay followers. A key whose
@@ -999,9 +1001,8 @@ public final class ShardProcessor implements AutoCloseable {
         boolean firstRound = true;
         while (!heads.isEmpty() || !dueRows.isEmpty()) {
             budget -= heads.size();
-            var older = !parkedRows && !pass.fromRetry ? List.<OutboxRecord>of() : parked.ofKeys(c, shard,
-                    heads.stream().map(RetryStore.DueHead::r).toList(), relay.batchSize());
-            budget -= older.size();
+            var older = olderOf(c, shard, heads, dueRows, parkedRows || pass.fromRetry);
+            budget -= older.charged();
             long followed = heads.stream().filter(RetryStore.DueHead::takesFollowers).count();
             int perKey = followed == 0 ? 0 : (int) (budget / followed);
             var followers = perKey <= 0 ? Map.<Long, List<OutboxRecord>>of() : retries.followers(c, heads, perKey);
@@ -1010,6 +1011,14 @@ public final class ShardProcessor implements AutoCloseable {
             var highest = new HashMap<Object, Long>(); // of a key's handed retry rows
             for (var due : heads) {
                 var head = due.r();
+                var unread = older.unread().get(BatchClassifier.orderingKey(head));
+                if (unread != null && head.id() > unread) {
+                    // parked rows of its key that this call cannot bring lie below it: it waits for them, for a delay,
+                    // so a key whose rows keep requeueing is not stepped again at once
+                    retries.postpone(c, head, requeueDue(null, now));
+                    highest.merge(BatchClassifier.orderingKey(head), head.id(), Math::max);
+                    continue;
+                }
                 if (!handed.add(head.id())) {
                     // a second head of its key (written outside the relay), handed as a follower of a lower head of
                     // its key that does not wait; one that waits takes no followers, so a head after it is handed too
@@ -1021,7 +1030,8 @@ public final class ShardProcessor implements AutoCloseable {
                 } else {
                     rows.add(head);
                 }
-                var after = followers.getOrDefault(head.id(), List.of());
+                var after = followers.getOrDefault(head.id(), List.of()).stream()
+                        .filter(row -> unread == null || row.id() < unread).toList();
                 budget -= probe ? 0 : after.size(); // a probe hands heads alone: their followers wait for a round
                 rows.addAll(after);
                 after.forEach(row -> handed.add(row.id()));
@@ -1030,7 +1040,7 @@ public final class ShardProcessor implements AutoCloseable {
             }
             var offered = new TreeMap<Long, OutboxRecord>();
             dueRows.forEach(row -> offered.put(row.id(), row));
-            for (var row : older) {
+            for (var row : older.rows()) {
                 var above = highest.get(BatchClassifier.orderingKey(row));
                 if (above != null && row.id() < above) {
                     offered.put(row.id(), row);
@@ -1061,6 +1071,44 @@ public final class ShardProcessor implements AutoCloseable {
             heads = retries.dueHeads(c, shard, now, budget); // promoted rows are due at now
         }
         return pass;
+    }
+
+    /**
+     * What a round of the retry pass may offer ahead of {@code heads}: {@code rows}, a share of {@code batchSize} per
+     * key, in id order; {@code unread}, by key, the lowest id of its parked rows that did not fit; {@code charged}, how
+     * many of them are new to the call, below their head and not among {@code dueRows}.
+     */
+    private record Older(List<OutboxRecord> rows, Map<Object, Long> unread, int charged) {}
+
+    private Older olderOf(Connection c, int shard, List<RetryStore.DueHead> heads, List<OutboxRecord> dueRows,
+            boolean hasParked) throws SQLException {
+        var keyed = heads.stream().map(RetryStore.DueHead::r).filter(row -> row.key() != null).toList();
+        if (!hasParked || keyed.isEmpty()) {
+            return new Older(List.of(), Map.of(), 0);
+        }
+        int share = Math.min(Math.max(1, relay.batchSize() / keyed.size()), Integer.MAX_VALUE - 1);
+        var seen = new HashMap<Object, Integer>();
+        var rows = new ArrayList<OutboxRecord>();
+        var unread = new HashMap<Object, Long>();
+        for (var row : parked.ofEachKey(c, shard, keyed, share + 1)) {
+            var key = BatchClassifier.orderingKey(row);
+            if (seen.merge(key, 1, Integer::sum) > share) {
+                unread.put(key, row.id());
+            } else {
+                rows.add(row);
+            }
+        }
+        var lowestHead = new HashMap<Object, Long>();
+        keyed.forEach(row -> lowestHead.merge(BatchClassifier.orderingKey(row), row.id(), Math::min));
+        var dueIds = new HashSet<Long>();
+        dueRows.forEach(row -> dueIds.add(row.id()));
+        int charged = 0;
+        for (var row : rows) {
+            if (row.id() < lowestHead.get(BatchClassifier.orderingKey(row)) && !dueIds.contains(row.id())) {
+                charged++;
+            }
+        }
+        return new Older(rows, unread, charged);
     }
 
     /** One group per (topic, key) of the parked {@code rows} (one per unkeyed row), each in id order. */

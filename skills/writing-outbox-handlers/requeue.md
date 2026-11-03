@@ -111,7 +111,9 @@ parked record's time comes: the older parked records of its key come first in it
 of them, the newer ones wait with the older ones, written once and spending no requeue, and come back on the step after
 the older ones leave. An unkeyed record comes back only at its due
 time, alone. A key in `<table>_retry` brings them too: when its head comes up, waiting or not, the older parked records
-of the key go first in its call, each answer spending a requeue. Until then such a record comes back only at its due
+of the key go first in its call, each answer spending a requeue; past what a call takes (`batchSize`, shared by the
+call's keys) the head waits behind them. A new record of the main stream cannot wait: past the chunk limit of parked
+records of its key, it goes ahead of those that did not fit. Until then such a record comes back only at its due
 time, behind an older parked record of its key that is not due yet.
 
 ## When a parked record is handed back

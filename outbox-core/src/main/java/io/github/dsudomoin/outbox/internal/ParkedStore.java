@@ -420,6 +420,25 @@ public final class ParkedStore {
         }
     }
 
+    /**
+     * The parked rows of the (topic, key) pairs of {@code keyed}: the oldest {@code perKey} of each, in id order, so a
+     * key with many rows takes none of another's. An unkeyed record matches nothing.
+     */
+    public List<OutboxRecord> ofEachKey(Connection c, int shard, Collection<OutboxRecord> keyed, int perKey)
+            throws SQLException {
+        if (keyed.isEmpty()) {
+            return List.of();
+        }
+        try (var ps = c.prepareStatement(selectOfKeys)) {
+            ps.setArray(1, c.createArrayOf("text", keyed.stream().map(OutboxRecord::topic).toArray()));
+            ps.setArray(2, c.createArrayOf("bytea", keyed.stream().map(OutboxRecord::key).toArray(byte[][]::new)));
+            ps.setShort(3, (short) shard);
+            ps.setInt(4, perKey);
+            ps.setInt(5, (int) Math.min((long) perKey * keyed.size(), Integer.MAX_VALUE));
+            return records(ps.executeQuery());
+        }
+    }
+
     /** Earliest {@code due_at} of the parked rows of {@code shard}; null without any. */
     public @Nullable Instant minDue(Connection c, int shard) throws SQLException {
         return RetryStore.minTimestamp(c, minDue, shard);
