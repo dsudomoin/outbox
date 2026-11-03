@@ -2528,10 +2528,10 @@ class ShardProcessorIT {
         var all = IntStream.rangeClosed(1, 20).mapToObj(i -> "k#" + i).toArray(String[]::new);
         parkAll(all);
         script = records -> records.stream().map(r -> Outcome.requeue()).toList();
-        now = now.plus(REQUEUE_DELAY);
-        process();
-        now = cursor().parkedDueAt();
-        process();
+        for (int i = 0; i < 7; i++) { // a whole sweep: k#1 is next again
+            now = cursor().parkedDueAt();
+            process();
+        }
         script = answering(Map.of()); // the block ends
         now = cursor().parkedDueAt();
         calls.clear();
@@ -2677,16 +2677,13 @@ class ShardProcessorIT {
         assertThat(retryRows()).as("its own time").hasSize(1);
     }
 
-    /** A new record of the key takes the head out in the main pass: the tail comes back there too. */
+    /** A new record of a key larger than a call goes by itself: the parked rows come at their own times, in their order. */
     @Test
-    void aTailComesBackWhenItsHeadGoesInTheMainPass() throws Exception {
+    void aNewRecordOfAKeyLargerThanACallLeavesItsParkedRowsToTheirTimes() throws Exception {
         config.batchSize(3);
         bootstrap();
         var all = IntStream.rangeClosed(1, 8).mapToObj(i -> "k#" + i).toArray(String[]::new);
         parkAll(all);
-        script = records -> records.stream().map(r -> Outcome.requeue()).toList();
-        now = now.plus(REQUEUE_DELAY);
-        process();
         script = answering(Map.of());
         send(msg("t", "k", "k#9"));
         tick();
@@ -2694,7 +2691,12 @@ class ShardProcessorIT {
 
         processUntilNoWork();
 
-        assertThat(delivered()).containsSubsequence("k#1", "k#2", "k#3", "k#4", "k#5", "k#6", "k#7", "k#8");
+        assertThat(delivered()).containsExactly("k#9");
+        now = cursor().parkedDueAt();
+
+        processUntilNoWork();
+
+        assertThat(delivered()).containsSubsequence(all);
         assertThat(parkedRows()).isEmpty();
     }
 
@@ -3429,34 +3431,79 @@ class ShardProcessorIT {
         });
     }
 
+    /** The one rule in the main stream too: a key larger than a call does not bring its oldest rows on every chunk. */
     @Test
-    void aHotKeyMergesAtMostTheChunkLimitOfParkedRows() throws Exception {
-        config.batchSize(5);
+    void aHotKeyLargerThanACallBringsNoParkedRowsToItsNewRecords() throws Exception {
+        config.batchSize(5).maxRequeues(3);
         bootstrap();
-        script = records -> records.stream().map(r -> Outcome.requeue()).toList();
-        send(IntStream.rangeClosed(1, 12).mapToObj(i -> msg("t", "k", "k#" + i)).toArray(OutboxMessage[]::new));
+        requeueAll();
+        send(IntStream.rangeClosed(1, 30).mapToObj(i -> msg("t", "k", "k#" + i)).toArray(OutboxMessage[]::new));
         tick();
-        processUntilNoWork(); // chunks of 5, each with the 5 oldest parked rows of k merged in
-        assertThat(parkedRows()).hasSize(12);
+
+        processUntilNoWork();
+
+        assertThat(deadRows()).as("no requeue a chunk").isEmpty();
+        assertThat(parkedRows()).hasSize(30);
         script = answering(Map.of());
         calls.clear();
-
         send(msg("t", "k", "k#new"));
         tick();
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 6, true));
-        assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call))
-                .containsExactly("k#1", "k#2", "k#3", "k#4", "k#5", "k#new"));
 
-        send(msg("t", "k", "k#newer"));
+        process();
+
+        assertThat(calls).first().satisfies(call -> assertThat(payloads(call)).containsExactly("k#new"));
+    }
+
+    /** Shards sharing a call share its room: a shard whose key finds none is read again by the next step. */
+    @Test
+    void aShardWhoseKeyFindsNoRoomInASharedCallWaitsForTheNextStep() throws Exception {
+        config.shards(2).batchSize(3);
+        bootstrap();
+        requeueAll();
+        var a = keyOnShard(0);
+        var b = keyOnShard(1);
+        send(msg("t", a, "a#1"), msg("t", a, "a#2"), msg("t", a, "a#3"), msg("t", b, "b#1"), msg("t", b, "b#2"),
+                msg("t", b, "b#3"));
         tick();
-        // the five oldest gone, the next five came due, and the rest come with the new record
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 8, true));
-        send(msg("t", "k", "k#newest"));
+        processGroup(0, 1);
+        processGroup(0, 1);
+        assertThat(parkedRows()).hasSize(6);
+        script = answering(Map.of());
+        send(msg("t", a, "a#4"), msg("t", b, "b#4"));
         tick();
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
-        assertThat(delivered()).containsExactly("k#1", "k#2", "k#3", "k#4", "k#5", "k#new", "k#6", "k#7", "k#8",
-                "k#9", "k#10", "k#11", "k#12", "k#newer", "k#newest");
+        calls.clear();
+
+        processGroup(0, 1);
+
+        assertThat(calls).hasSize(1);
+        assertThat(payloads(calls.get(0))).containsExactly("a#1", "a#2", "a#3", "a#4");
+
+        processGroup(0, 1);
+
+        assertThat(delivered()).containsSubsequence("b#1", "b#2", "b#3", "b#4");
         assertThat(parkedRows()).isEmpty();
+    }
+
+    /** A chunk of records whose keys fit, each with its parked rows whole: what does not fit waits for the next step. */
+    @Test
+    void aChunkStopsAtAKeyThatDoesNotFitInItsCall() throws Exception {
+        config.shards(1).batchSize(4);
+        bootstrap();
+        requeueAll();
+        send(msg("t", "a", "a#1"), msg("t", "a", "a#2"), msg("t", "a", "a#3"), msg("t", "b", "b#1"), msg("t", "b", "b#2"),
+                msg("t", "b", "b#3"));
+        tick();
+        processUntilNoWork();
+        script = answering(Map.of());
+        calls.clear();
+        send(msg("t", "a", "a#4"), msg("t", "b", "b#4"));
+        tick();
+
+        processUntilNoWork();
+
+        assertThat(calls).allSatisfy(call -> assertThat(payloads(call)).hasSizeLessThanOrEqualTo(8));
+        assertThat(delivered()).containsSubsequence("a#1", "a#2", "a#3", "a#4");
+        assertThat(delivered()).containsSubsequence("b#1", "b#2", "b#3", "b#4");
     }
 
     @Test

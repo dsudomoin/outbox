@@ -375,7 +375,7 @@ class ParkedStoreIT {
     }
 
     @Test
-    void ofKeysMatchesTopicAndKeyExactlyOldestFirst() throws SQLException {
+    void ofEachKeyMatchesTopicAndKeyExactlyOldestFirst() throws SQLException {
         var k1 = record("t", "k");
         var j1 = record("t", "j");
         var otherTopic = record("u", "k");
@@ -391,14 +391,14 @@ class ParkedStoreIT {
         var chunkK = record("t", "k");
         var chunkJ = record("t", "j");
 
-        assertThat(store.ofKeys(c, 0, List.of(chunkK, record("t", null)), 10)).as("an unkeyed record matches nothing")
+        assertThat(store.ofEachKey(c, 0, List.of(chunkK, record("t", null)), 10)).as("an unkeyed record matches nothing")
                 .extracting(OutboxRecord::id).containsExactly(k1.id(), k2.id(), k3.id());
-        assertThat(store.ofKeys(c, 0, List.of(chunkK, record("t", "k")), 2)).as("the two oldest, once each")
+        assertThat(store.ofEachKey(c, 0, List.of(chunkK, record("t", "k")), 2)).as("the two oldest, once each")
                 .extracting(OutboxRecord::id).containsExactly(k1.id(), k2.id());
-        assertThat(store.ofKeys(c, 0, List.of(chunkJ, chunkK), 10)).extracting(OutboxRecord::id)
+        assertThat(store.ofEachKey(c, 0, List.of(chunkJ, chunkK), 10)).extracting(OutboxRecord::id)
                 .containsExactly(k1.id(), j1.id(), k2.id(), k3.id());
-        assertThat(store.ofKeys(c, 0, List.of(), 10)).isEmpty();
-        assertSameRecord(store.ofKeys(c, 0, List.of(chunkK), 10).get(1), k2, 0, 2);
+        assertThat(store.ofEachKey(c, 0, List.of(), 10)).isEmpty();
+        assertSameRecord(store.ofEachKey(c, 0, List.of(chunkK), 10).get(1), k2, 0, 2);
     }
 
     @Test

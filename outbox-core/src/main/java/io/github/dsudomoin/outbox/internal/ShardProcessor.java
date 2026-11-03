@@ -253,8 +253,8 @@ public final class ShardProcessor implements AutoCloseable {
      * the shard, or the tail swap holds or awaits its lock (then every shard).
      *
      * <p>The shards share one statement for each of their locks, cursors, target ticks, batch read and cursor append,
-     * and one handler call: the rows of each shard (its parked rows of the chunk's keys first, see
-     * {@link ParkedStore#ofKeys}), shard by shard, in id order inside. Due retry heads and parked rows go first, a
+     * and one handler call: the rows of each shard (the parked rows of its chunk's keys first, see
+     * {@link #mergeParked}), shard by shard, in id order inside. Due retry heads and parked rows go first, a
      * shard at a time ({@link #retryPass}); no shard's retry pass starts once the step has spent {@code batchTimeout}.
      * Each shard is classified on its own, with these rules across shards:
      * <ul>
@@ -437,19 +437,26 @@ public final class ShardProcessor implements AutoCloseable {
             if (!cut) {
                 chain(inTx, reads, latestTickId, started);
             }
+            long sharedRoom = relay.batchSize();
             for (var s : reads) {
                 if (s.cut && s.rows.isEmpty()) {
                     s.untouched = true; // maybe unread: the shards after the cut have no rows they would have had
                     continue;
                 }
-                // a parked record comes back right before the next record of its key: the oldest limit parked rows
-                // of the chunk's keys go first in its call (a key blocked in the retry table hands no record, so
-                // none); a probe merges none, so the head it isolates is the only record of its call
-                s.parkedRows = s.probe || s.parkedDue == null && !s.wroteParked ? List.<OutboxRecord>of()
-                        : parked.ofKeys(inTx, s.shard, s.rows.stream()
-                                .filter(row -> !row.blocked() && row.record().key() != null).map(BatchRow::record)
-                                .toList(), s.limit);
-                (s.probe || solo.get(s.shard) == 1 ? alone : shared).add(s);
+                boolean byItself = s.probe || solo.get(s.shard) == 1;
+                // a parked record comes back right before the next record of its key: the parked rows of a chunk's key
+                // that fits in a call go first in its call (a key blocked in the retry table hands no record, so none);
+                // a probe merges none, so the head it isolates is the only record of its call
+                long room = byItself ? relay.batchSize() : sharedRoom;
+                long taken = s.probe || s.parkedDue == null && !s.wroteParked ? 0 : mergeParked(inTx, s, room);
+                if (!byItself) {
+                    sharedRoom -= taken;
+                }
+                if (s.rows.isEmpty() && s.cutAtParked) {
+                    s.untouched = true; // nothing of it fitted in the call
+                    continue;
+                }
+                (byItself ? alone : shared).add(s);
             }
             boolean called = deliverBatch(shared, now);
             anyCall |= called;
@@ -566,6 +573,8 @@ public final class ShardProcessor implements AutoCloseable {
         final List<Segment> segments = new ArrayList<>();
         /** The read was cut at {@code batchSize} rows. */
         boolean cut;
+        /** The chunk stopped at a key whose parked rows did not fit in the call. */
+        boolean cutAtParked;
         List<OutboxRecord> parkedRows = List.of();
         /** Its parked rows, then its chunk's rows, as handed (blocked ones without an outcome). */
         List<Item> items = List.of();
@@ -711,6 +720,58 @@ public final class ShardProcessor implements AutoCloseable {
     }
 
     /**
+     * The parked rows of each key of {@code s}'s chunk that fits in a call go into {@code s.parkedRows}, whole, as long as
+     * {@code room} lasts: at the first key that does not fit the chunk stops, its rows read again by the next step, so
+     * no record goes without the older rows of its key and the call stays within 2 × {@code batchSize}. A key larger than
+     * a call brings none: it would bring its oldest rows with every chunk, spending their requeues without a delay.
+     * Returns the rows taken.
+     */
+    private long mergeParked(Connection c, Step s, long room) throws SQLException {
+        var keyed = s.rows.stream().filter(row -> !row.blocked() && row.record().key() != null).map(BatchRow::record)
+                .toList();
+        var rowsOf = parked.rowsOfKeys(c, s.shard, keyed);
+        var seen = new HashSet<Object>();
+        var whole = new ArrayList<OutboxRecord>();
+        long taken = 0;
+        for (int i = 0; i < s.rows.size(); i++) {
+            var row = s.rows.get(i);
+            if (row.blocked() || row.record().key() == null) {
+                continue;
+            }
+            var key = BatchClassifier.orderingKey(row.record());
+            long rows = rowsOf.getOrDefault(key, 0L);
+            if (seen.add(key) && parked.fits(rows)) {
+                if (taken + rows > room) {
+                    keepRows(s, i);
+                    s.cutAtParked = true;
+                    break;
+                }
+                taken += rows;
+                whole.add(row.record());
+            }
+        }
+        s.parkedRows = whole.isEmpty() ? List.of() : parked.ofEachKey(c, s.shard, whole, relay.batchSize());
+        return taken;
+    }
+
+    /** Only the first {@code keep} rows of {@code s}'s step: what follows is read again by the next step. */
+    private static void keepRows(Step s, int keep) {
+        s.rows.subList(keep, s.rows.size()).clear();
+        var segments = new ArrayList<Segment>(s.segments.size());
+        for (var segment : s.segments) {
+            if (segment.from() + segment.count() <= keep) {
+                segments.add(segment);
+            } else {
+                segments.add(new Segment(segment.fromTickId(), segment.target(), segment.from(),
+                        Math.max(0, keep - segment.from()), false));
+                break;
+            }
+        }
+        s.segments.clear();
+        s.segments.addAll(segments);
+    }
+
+    /**
      * A probe that read a row of a key in retry: that needs no call, so it goes on, in one read, through a batch of such
      * rows up to the row it can hand, which it stops at. Returns whether that read all of the shard's batch.
      */
@@ -845,9 +906,6 @@ public final class ShardProcessor implements AutoCloseable {
             var parkedIds = new HashSet<Long>();
             s.parkedRows.forEach(row -> parkedIds.add(row.id()));
             s.wroteParked |= apply(inTx, shard, decision.actions(), parkedIds, now);
-            if (!s.parkedRows.isEmpty()) { // the oldest gone: the rows behind them go on
-                s.wroteParked |= parked.pullNext(inTx, shard, decision.actions(), s.parkedRows, now);
-            }
             s.wroteRetry |= decision.actions().stream()
                     .anyMatch(action -> action instanceof Head || action instanceof Follower);
             s.deadLettered |= decision.actions().stream().anyMatch(action -> action instanceof Dead);

@@ -8,7 +8,7 @@ another process of the same account running, a process that ends on its own.
 |---|---|---|
 | Means | the target failed | the record is not ready; the target is fine |
 | Its key | waits: later records queue behind it in `<table>_retry` | goes on: later records are delivered while it waits |
-| Comes back | after backoff (1 s doubling to 5 min), or at `notBefore` if later | whichever comes first: right before the next new record of its key (in the same call), or its due time `now + outbox.relay.requeue.delay` (1 s); with `requeue(notBefore)`, `max(now + delay, notBefore)`, at most 24 h ahead. A record whose time comes brings the older parked records of its key along, not yet due as they may be, so `notBefore` is no lower bound |
+| Comes back | after backoff (1 s doubling to 5 min), or at `notBefore` if later | whichever comes first: its due time `now + outbox.relay.requeue.delay`, or, while the key's parked records fit in `batchSize`, right before the next new record of its key (in the same call) (1 s); with `requeue(notBefore)`, `max(now + delay, notBefore)`, at most 24 h ahead. A record whose time comes brings the older parked records of its key along, not yet due as they may be, so `notBefore` is no lower bound |
 | Counts | `record.attempts()`, `relay.retry.maxAttempts` | `record.requeues()`, `relay.requeue.maxRequeues` |
 | Shard | pauses and backs off when nothing was delivered | no pause, no backoff, chunk size unchanged |
 
@@ -105,14 +105,13 @@ public final class AccountJobsHandler implements OutboxTopicHandler {
 ## Order
 
 Per key, first delivery follows commit order, except that a requeued record is delivered after the records of its key
-that were delivered while it was parked. While a key's parked records fit in `batchSize` they come back strictly in
-their original order, ahead of the newer record that brings them: FEE_RELEASE#1 requeued, then FEE_RELEASE#2 arrives →
-one call [#1, #2]; the key comes whole when one of its records is due, not-due ones included, so a `notBefore` is no
-promise. A larger key comes in portions in the order they came due, each record back after `delay × ceil(N / batchSize)`:
-a record may pass older ones, each of which was offered and answered `requeue`, as a later record may carry what they wait
-for. A retry head always goes, with the older parked records that fit. When a key's offered records have all left, its
-next `batchSize` come at once, in order, whatever their due times, a `notBefore` included. An unkeyed record comes back
-only at its due time, alone.
+that were delivered while it was parked. One rule on every path, whether a new record, a retry head or a due time starts
+the call: a key whose parked records fit in `batchSize` comes whole and in order, and a larger key brings no older records,
+so its record may pass older ones, each of which was offered and answered `requeue`. FEE_RELEASE#1 requeued, then
+FEE_RELEASE#2 arrives → one call [#1, #2]; not-due records come with the rest, so a `notBefore` is no promise. A larger key
+comes in portions in the order they came due, each record back after `delay × ceil(N / batchSize)`, as a later record may
+carry what the older ones wait for. When a key's offered records have all left, its next `batchSize` come at once, in order,
+whatever their due times, a `notBefore` included. An unkeyed record comes back only at its due time, alone.
 
 ## When a parked record is handed back
 
@@ -128,10 +127,12 @@ A `requeue` of a retry-table head parks it and lets the next record of its key g
 
 ## Call size and wind-down
 
-- A call carries the chunk plus up to the chunk limit (≤ `batchSize`) of parked records of the chunk's keys, oldest
-  first: up to 2 × `batchSize` records. Keep the blocked check cheap, or size the batch budget in SKILL.md for 2 ×.
-  A probing shard merges none: the probe call is the head row alone, which may go out ahead of its key's parked
-  records.
+- A call carries up to 2 × `batchSize` records: a chunk or due rows, with the parked records of their keys. Where a whole
+  key does not fit, the chunk stops before its record and a retry head waits for the next step. Keep the blocked check
+  cheap, or size the batch budget in SKILL.md for 2 ×.
+- The order rule gives way only where a call isolates a culprit and so carries one group: a probing shard's call is the
+  head row alone, which may go out ahead of its key's parked records, and after a retry call that failed as a whole each
+  group goes alone, the head with its own rows first.
 - A call in which the handler only requeued (or left not attempted) the merged parked records and attempted none of
   the new ones fails as a whole, like a call with nothing attempted: shard pause, halved chunk, probe, divert. A
   handler that winds down right after requeuing costs a pause, never a spinning shard.

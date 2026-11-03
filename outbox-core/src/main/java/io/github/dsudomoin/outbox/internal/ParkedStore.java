@@ -472,25 +472,6 @@ public final class ParkedStore {
     }
 
     /**
-     * The parked rows of the (topic, key) pairs of {@code keyed}: the oldest {@code limit} of them, in id order. An
-     * unkeyed record matches nothing.
-     */
-    public List<OutboxRecord> ofKeys(Connection c, int shard, Collection<OutboxRecord> keyed, int limit)
-            throws SQLException {
-        if (keyed.isEmpty()) {
-            return List.of();
-        }
-        try (var ps = c.prepareStatement(selectOfKeys)) {
-            ps.setArray(1, c.createArrayOf("text", keyed.stream().map(OutboxRecord::topic).toArray()));
-            ps.setArray(2, c.createArrayOf("bytea", keyed.stream().map(OutboxRecord::key).toArray(byte[][]::new)));
-            ps.setShort(3, (short) shard);
-            ps.setInt(4, limit);
-            ps.setInt(5, limit);
-            return records(ps.executeQuery());
-        }
-    }
-
-    /**
      * The parked rows of the (topic, key) pairs of {@code keyed}: the oldest {@code perKey} of each, in id order, so a
      * key with many rows takes none of another's. An unkeyed record matches nothing.
      */
