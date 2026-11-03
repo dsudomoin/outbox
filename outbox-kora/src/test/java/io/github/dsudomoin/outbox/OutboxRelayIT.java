@@ -673,6 +673,7 @@ class OutboxRelayIT {
     }
 
     @Test
+    @Tag("timing") // a delay bound: a starved CI runner misses it
     void aHangingHookDoesNotDelayDelivery() throws Exception {
         config.deadLettersTimeout(Duration.ofMinutes(1)); // the call is never cut while the test runs
         bootstrap();
