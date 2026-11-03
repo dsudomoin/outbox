@@ -2833,6 +2833,7 @@ class ShardProcessorIT {
         assertThat(retryRows()).as("one head, the lowest row").hasSize(3);
         assertThat(retryRows().stream().filter(row -> !row.endsWith(":-"))).singleElement()
                 .satisfies(head -> assertThat(head).startsWith("k#1:"));
+        assertThat(cursor().parkedDueAt()).as("no parked row left, so the shard is not stepped for one").isNull();
     }
 
     /** A wait keeps later rows of the key out, so the waiting head is alone but for what must come before it. */

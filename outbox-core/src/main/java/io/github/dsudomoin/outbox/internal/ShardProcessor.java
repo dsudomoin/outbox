@@ -1353,6 +1353,7 @@ public final class ShardProcessor implements AutoCloseable {
                         r.error().toString(), null);
                 telemetry.retried(row.topic());
                 pass.toRetry = true;
+                pass.wroteParked = true;
                 return;
             } else if (outcome instanceof Outcome.NotAttempted n) { // attempts and requeues stay
                 pass.parkedWrites.add(new Keep(row, requeueDue(n.notBefore(), now)));
@@ -1363,6 +1364,7 @@ public final class ShardProcessor implements AutoCloseable {
                         BatchClassifier.waitingError(w), now);
                 telemetry.waited(row.topic(), w.kind());
                 pass.toRetry = true;
+                pass.wroteParked = true;
                 return;
             } else {
                 throw new IllegalStateException("unknown outcome " + outcome);
@@ -1392,6 +1394,7 @@ public final class ShardProcessor implements AutoCloseable {
             throws SQLException {
         parked.toDead(c, row, attempts, error);
         pass.deadLettered = true;
+        pass.wroteParked = true;
         telemetry.deadLettered(row.topic());
         logDead(row, attempts, error);
     }
