@@ -401,6 +401,10 @@ public final class ParkedStore {
      * the rows that left were not the key's lowest, the lowest may be what just answered {@code requeue}, and offering
      * them again would spend their requeues at full speed: those stay unless their due time, a key's round from when they
      * answered, says that was a {@code delay} ago. Returns whether it wrote a row.
+     *
+     * <p>What it costs its neighbours: no key has a minimum share, so while a key of N rows goes on, the due parked rows
+     * of the shard's other keys wait behind it, about {@code N / batch} steps. Retry heads and the main stream do not
+     * wait: a step takes the heads first and reads its chunk whatever the due pass took.
      */
     public boolean pullNext(Connection c, int shard, List<Action> writes, List<OutboxRecord> answered, Instant now)
             throws SQLException {
