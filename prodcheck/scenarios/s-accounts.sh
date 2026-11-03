@@ -614,3 +614,40 @@ s_accounts_tail_liveness_retry() { # a retry follower ends the wait, with more o
   ACC_FINISH=(--exempt-tags wait,flaky,unblock --timeout 120)
   acc_end
 }
+
+s_parked_many_keys() { # many keys, each with a small parked tail, one shard: requeue.delay is honoured and no row is left out
+  acc_begin parked-many-keys
+  local i rows delay=1 window=60
+  acc_q "insert into subscription (account, id) select 'k' || g, gen_random_uuid() from generate_series(30, 199) g; insert into blocker (account) select 'k' || g from generate_series(0, 199) g" > /dev/null
+  local opts="-Doutbox.relay.batchSize=20 -Doutbox.relay.requeue.delay=${delay}s -Doutbox.shards=1"
+  for i in 1001 1002; do acc "$i" $opts; done
+  pc_load 1001 'rate=400&writers=4&keys=200&tags=wait:1'
+  sleep 5
+  pc_unload 1001
+  rows=$(acc_q "select count(*) from pc_sent")
+  all_parked() { [ "$(acc_q 'select count(*) from account_events_parked')" = "$rows" ]; }
+  check "$(passes wait_for 120 all_parked)" "отложены все $rows записей: $(acc_q 'select count(distinct key) from pc_sent') ключей, один шард, в вызов помещается 20"
+  # the window: every row answers requeue; nobody writes
+  local upd0 upd1 from to t0
+  upd0=$(psql_q "select n_tup_upd from pg_stat_user_tables where schemaname = 'accounts' and relname = 'account_events_parked'")
+  from=$(psql_q "select extract(epoch from clock_timestamp())")
+  t0=$(now)
+  sleep "$window"
+  to=$(psql_q "select extract(epoch from clock_timestamp())")
+  sleep 2 # table statistics reach the view about once a second
+  upd1=$(psql_q "select n_tup_upd from pg_stat_user_tables where schemaname = 'accounts' and relname = 'account_events_parked'")
+  local stats ups max_row min_row offered
+  stats=$(acc_q "with n as (select s.message_id, count(a.no) c from pc_sent s left join pc_arrival a on a.message_id = s.message_id and a.at >= to_timestamp($from) and a.at < to_timestamp($to) group by 1)
+    select min(c), percentile_disc(0.5) within group (order by c), percentile_disc(0.99) within group (order by c), max(c), sum(c), count(*) filter (where c > 0), count(*) from n")
+  IFS='|' read -r min_row p50 p99 max_row total offered all <<< "$stats"
+  ups=$(((upd1 - upd0) / window))
+  log "in $window s: arrivals total $total ($((total / window))/s), per row min $min_row p50 $p50 p99 $p99 max $max_row, offered $offered of $all; n_tup_upd $((upd1 - upd0)), $ups/s"
+  local allowed=$((window / delay + 6)) updates_allowed=$((2 * rows / delay))
+  check "$(passes is "$max_row" -le "$allowed")" "задержка соблюдается: на строку не больше $allowed прибытий за $window с при requeue.delay = $delay с; было p50 $p50, p99 $p99, max $max_row, всего $total"
+  check "$(passes is "$offered" = "$all")" "за окно предложена каждая строка: $offered из $all, минимум на строку $min_row"
+  check "$(passes is "$ups" -le "$updates_allowed")" "обновлений outbox_parked в секунду не больше двух на строку за задержку: $ups при пределе $updates_allowed"
+  acc_q "delete from blocker" > /dev/null
+  fault "блокировки сняты"
+  ACC_FINISH=(--exempt-tags wait --report-order-within-tag wait --timeout 240)
+  acc_end
+}
