@@ -499,6 +499,21 @@ class TicksIT {
         }
     }
 
+    /**
+     * A generic plan takes {@code generate_series} over a parameter for 1000 rows, whatever the shard count: on a big
+     * partition that lifts the plan's estimate over {@code jit_above_cost}, and JIT then compiles the probe at every
+     * execution, under the tick lock.
+     */
+    @Test
+    void theProbesGenericPlanKnowsTheShardCount() throws Exception {
+        try (var c = TestDb.connect()) {
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+
+            assertThat(String.join("\n", probePlan(c, ticks, SHARDS)))
+                    .containsPattern("generate_series g +\\(cost=\\S+ rows=" + SHARDS + " ");
+        }
+    }
+
     @Test
     void aClusterSplitsWhereManyRowsCommittedBetweenItsXids() throws Exception {
         try (var first = TestDb.connect(); var last = TestDb.connect(); var c = TestDb.connect()) {
@@ -689,24 +704,36 @@ class TicksIT {
      * {@code Ticks.lock}); rolled back, so no tick is made.
      */
     private static long probeBuffers(Connection c, Ticks ticks, int shards) throws Exception {
+        long buffers = 0;
+        for (var line : probePlan(c, ticks, shards)) {
+            var m = Pattern.compile("(hit|read)=(\\d+)").matcher(line);
+            while (m.find()) {
+                buffers += Long.parseLong(m.group(2));
+            }
+            if (buffers != 0) { // the first Buffers line: the whole statement's
+                break;
+            }
+        }
+        return buffers;
+    }
+
+    /** The lines of {@code explain (analyze, buffers)} of the probe, on the generic plan {@link Ticks#make} runs. */
+    private static List<String> probePlan(Connection c, Ticks ticks, int shards) throws Exception {
         c.setAutoCommit(false);
         execute(c, "set local plan_cache_mode = force_generic_plan");
         execute(c, "prepare tick_probe(int, bigint) as " + ticks.probe(c).replaceFirst("\\?", "\\$1")
                 .replaceFirst("\\?", "\\$2"));
-        long buffers = 0;
+        var plan = new ArrayList<String>();
         try (var st = c.createStatement();
                 var rs = st.executeQuery("explain (analyze, buffers) execute tick_probe(" + shards + ", 0)")) {
-            while (rs.next() && buffers == 0) { // the first Buffers line: the whole statement's
-                var m = Pattern.compile("(hit|read)=(\\d+)").matcher(rs.getString(1));
-                while (m.find()) {
-                    buffers += Long.parseLong(m.group(2));
-                }
+            while (rs.next()) {
+                plan.add(rs.getString(1));
             }
         }
         c.rollback();
         execute(c, "deallocate tick_probe");
         c.setAutoCommit(true);
-        return buffers;
+        return plan;
     }
 
     /** One row of {@code shard} in the caller's transaction (its own one in autocommit). */
