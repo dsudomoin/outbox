@@ -315,7 +315,7 @@ class OperationsUnderLoadIT {
                     var issued = new long[1];
                     try {
                         boolean accepted = db.inTx((SqlFunction0<Boolean>) () -> {
-                            issued[0] = System.nanoTime(); // its insert, which the detach makes fail
+                            issued[0] = System.nanoTime(); // before its insert, which the detach makes fail
                             return inbox.tryAccept(id);
                         });
                         commits.incrementAndGet();
@@ -326,8 +326,9 @@ class OperationsUnderLoadIT {
                             pool.add(id);
                         }
                     } catch (RuntimeSqlException e) {
-                        // no partition takes an id of the detached range (documented) until the attach
-                        if (range == 1 && issued[0] >= detachIssued.get() && issued[0] < attachedSeen.get()
+                        // no partition takes an id of the detached range (documented) until the attach. The insert runs
+                        // some time after issued[0], so a writer stalled in between can meet a detach issued later
+                        if (range == 1 && System.nanoTime() >= detachIssued.get() && issued[0] < attachedSeen.get()
                                 && e.getCause() instanceof SQLException s && NO_PARTITION.equals(s.getSQLState())) {
                             tolerated.incrementAndGet();
                         } else {
