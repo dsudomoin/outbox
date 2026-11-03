@@ -76,6 +76,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterEach;
@@ -2483,7 +2484,7 @@ class ShardProcessorIT {
     }
 
     @Test
-    void aKeysParkedRowsKeepTheirOrderAcrossCallsWithMoreOfThemThanBatchSize() throws Exception {
+    void aKeyLargerThanACallLetsADueRowPassRowsThatHadTheirTurnAndKeepsTheRestInOrder() throws Exception {
         config.batchSize(3);
         bootstrap();
         var all = IntStream.rangeClosed(1, 8).mapToObj(i -> "k#" + i).toArray(String[]::new);
@@ -2497,42 +2498,11 @@ class ShardProcessorIT {
 
         processUntilNoWork();
 
-        assertThat(calls).extracting(ShardProcessorIT::payloads)
-                .containsExactly(List.of("k#1", "k#2", "k#3"), List.of("k#4", "k#5", "k#6"), List.of("k#7", "k#8"));
-        assertThat(delivered()).containsExactly(all);
+        // larger than a call: k#8 passes the rows that had their turn and answered requeue, and they go on in order
+        assertThat(calls).allSatisfy(call -> assertThat(call).allSatisfy(r -> assertThat(r.requeues()).isPositive()));
+        assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(List.of("k#8"),
+                List.of("k#1", "k#2", "k#3"), List.of("k#4", "k#5", "k#6"), List.of("k#7"));
         assertThat(parkedRows()).isEmpty();
-    }
-
-    @Test
-    void aBlockedKeyWithMoreParkedRowsThanBatchSizeWaitsItsDelayAndKeepsItsOrder() throws Exception {
-        config.batchSize(3);
-        bootstrap();
-        var all = IntStream.rangeClosed(1, 8).mapToObj(i -> "k#" + i).toArray(String[]::new);
-        parkAll(all);
-        now = now.plusSeconds(1);
-        for (int i = 0; i < all.length; i++) {
-            setParkedDue(all[i], now.minusMillis(i));
-        }
-        script = records -> records.stream().map(r -> Outcome.requeue()).toList();
-        calls.clear();
-
-        process();
-        var first = List.of("k#1", "k#2", "k#3");
-        assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(first);
-        assertThat(process()).as("the newer rows wait with the older: no call again at once")
-                .isEqualTo(new ShardResult(NO_WORK, 0, true));
-        assertThat(calls).hasSize(1);
-        now = cursor().parkedDueAt();
-        process();
-        assertThat(calls).as("the next turn").hasSizeGreaterThanOrEqualTo(2);
-        assertThat(ShardProcessorIT.payloads(calls.get(1))).startsWith(first.toArray(String[]::new));
-
-        script = answering(Map.of()); // the block ends
-        now = cursor().parkedDueAt();
-        processUntilNoWork();
-        now = now.plusSeconds(5);
-        processUntilNoWork();
-        assertThat(delivered()).containsExactlyInAnyOrder(all);
     }
 
     /** The parked rows above {@code above}, by id, each with its version: another xmin is another written version. */
@@ -2544,32 +2514,6 @@ class ShardProcessorIT {
             versions.put(Long.parseLong(parts[0]), parts[1]);
         }
         return versions;
-    }
-
-    /** Disk: the rows behind a head that keeps requeueing are written once, then a batch per turn, not all per delay. */
-    @Test
-    void aTailBehindAHeadThatKeepsRequeueingIsWrittenOnceThenABatchPerTurn() throws Exception {
-        config.batchSize(3);
-        bootstrap();
-        parkAll(IntStream.rangeClosed(1, 20).mapToObj(i -> "k#" + i).toArray(String[]::new));
-        script = records -> records.stream().map(r -> Outcome.requeue()).toList();
-        long above = Long.parseLong(rows("select id from " + names.parked() + " order by id offset 2 limit 1",
-                rs -> rs.getString(1)).get(0));
-        now = now.plus(REQUEUE_DELAY);
-
-        long written = 0;
-        var before = tailVersions(above);
-        for (int delay = 0; delay < 6; delay++) {
-            process();
-            var after = tailVersions(above);
-            for (var row : after.entrySet()) {
-                written += row.getValue().equals(before.get(row.getKey())) ? 0 : 1;
-            }
-            before = after;
-            now = now.plus(REQUEUE_DELAY);
-        }
-
-        assertThat(written).as("17 rows behind the head over 6 delays: once, and at most a batch for a turn").isLessThan(17 + 2 * 3);
     }
 
     /** No wait for the rows behind once the head goes, whatever came before. */
@@ -2595,27 +2539,45 @@ class ShardProcessorIT {
         assertThat(delivered()).containsExactlyInAnyOrder(all);
     }
 
-    /** A record's own notBefore has no part in the turns: the rows given a turn come back at once, it stays. */
+    /** A pulled row's own notBefore is cut short: its older rows gone, it comes in its order, and answers again. */
     @Test
-    void aTailsOwnNotBeforeOutlivesTheTurns() throws Exception {
+    void aPulledRowsOwnNotBeforeIsCutShort() throws Exception {
         config.batchSize(2);
         bootstrap();
-        parkAll("k#1", "k#2", "k#3", "k#4");
-        script = records -> records.stream().map(r -> Outcome.requeue()).toList();
-        now = now.plus(REQUEUE_DELAY);
-        var later = now.plus(Duration.ofHours(23)).plusNanos(1000);
-        setParkedDue("k#4", later);
-        process();
-        script = answering(Map.of());
+        parkAll("k#1", "k#2", "k#3");
         now = cursor().parkedDueAt();
+        setParkedDue("k#3", now.plus(Duration.ofHours(23)));
+        script = answering(Map.of());
+        calls.clear();
+
+        processUntilNoWork();
+
+        assertThat(delivered()).containsExactly("k#1", "k#2", "k#3");
+    }
+
+    /** A key in retry: a due parked row goes all the same, its older rows ahead of it, and its head stays due in its time. */
+    @Test
+    void aDueParkedRowOfAKeyInRetryComesWithItsOlderRows() throws Exception {
+        bootstrap();
+        parkAll("k#1", "k#2");
+        script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.requeue(),
+                "k#3", Outcome.retry(new RuntimeException("k#3 down"), now.plus(Duration.ofHours(1))), "j#1",
+                Outcome.delivered()));
+        send(msg("t", "k", "k#3"), msg("t", "j", "j#1"));
+        tick();
+        process();
+        assertThat(retryRows()).hasSize(1);
+        now = now.plus(REQUEUE_DELAY);
+        setParkedDue("k#1", now.plus(Duration.ofHours(24)));
+        setParkedDue("k#2", now);
+        script = answering(Map.of());
         calls.clear();
 
         process();
-        process();
 
-        assertThat(delivered()).containsExactlyInAnyOrder("k#1", "k#2", "k#3");
-        assertThat(parkedRows()).singleElement().satisfies(row -> assertThat(row).startsWith("k#4:"));
-        assertThat(parkedRows().get(0)).endsWith(later.toString());
+        assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("k#1", "k#2"));
+        assertThat(parkedRows()).isEmpty();
+        assertThat(retryRows()).as("its own time").hasSize(1);
     }
 
     /** A new record of the key takes the head out in the main pass: the tail comes back there too. */
@@ -2628,7 +2590,6 @@ class ShardProcessorIT {
         script = records -> records.stream().map(r -> Outcome.requeue()).toList();
         now = now.plus(REQUEUE_DELAY);
         process();
-        assertThat(parkedRows().get(3)).as("on a turn").doesNotEndWith(now.plus(REQUEUE_DELAY).toString());
         script = answering(Map.of());
         send(msg("t", "k", "k#9"));
         tick();
@@ -2638,63 +2599,6 @@ class ShardProcessorIT {
 
         assertThat(delivered()).containsSubsequence("k#1", "k#2", "k#3", "k#4", "k#5", "k#6", "k#7", "k#8");
         assertThat(parkedRows()).isEmpty();
-    }
-
-    @Test
-    void aDueParkedRowWhoseKeyWaitsInRetryWaitsForItsOlderRowThatIsNotDue() throws Exception {
-        bootstrap();
-        parkAll("k#1", "k#2");
-        script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.requeue(),
-                "k#3", Outcome.retry(new RuntimeException("k#3 down"))));
-        send(msg("t", "k", "k#3"), msg("t", "j", "j#1"));
-        tick();
-        process();
-        now = now.plus(REQUEUE_DELAY);
-        var later = now.plusSeconds(60);
-        setParkedDue("k#1", later);
-        setParkedDue("k#2", now);
-        try (var c = TestDb.connect()) {
-            execute(c, "update " + names.retry() + " set next_attempt_at = now() + interval '1 hour'");
-        }
-        script = answering(Map.of());
-        calls.clear();
-
-        process();
-
-        assertThat(calls).as("neither handed").isEmpty();
-        assertThat(parkedRows()).as("k#2 waits for k#1, no requeue spent")
-                .containsExactly("k#1:2:" + later, "k#2:2:" + later);
-        assertThat(cursor().parkedDueAt()).as("not due, or the shard would be stepped again at once").isEqualTo(later);
-
-        now = later;
-        calls.clear();
-        process();
-
-        assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("k#1", "k#2"));
-        assertThat(parkedRows()).isEmpty();
-    }
-
-    @Test
-    void aDueParkedRowWhoseKeyWaitsInRetryIsNotHeldBackByAnOlderRowDueSoon() throws Exception {
-        bootstrap();
-        parkAll("k#1", "k#2");
-        script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.requeue(),
-                "k#3", Outcome.retry(new RuntimeException("k#3 down"))));
-        send(msg("t", "k", "k#3"), msg("t", "j", "j#1"));
-        tick();
-        process();
-        now = now.plus(REQUEUE_DELAY);
-        setParkedDue("k#1", now.plus(Duration.ofMillis(1)));
-        setParkedDue("k#2", now);
-        try (var c = TestDb.connect()) {
-            execute(c, "update " + names.retry() + " set next_attempt_at = now() + interval '1 hour'");
-        }
-        script = answering(Map.of());
-
-        process();
-
-        assertThat(parkedRows()).as("put off at least the requeue delay, so a shard is not stepped for a moment's wait")
-                .containsExactly("k#1:2:" + now.plus(Duration.ofMillis(1)), "k#2:2:" + now.plus(REQUEUE_DELAY));
     }
 
     /** A probing shard hands one row, but the rows of a key already in retry need no call: they move in whole batches. */
@@ -2755,27 +2659,122 @@ class ShardProcessorIT {
         assertThat(parkedRows()).singleElement().satisfies(row -> assertThat(row).startsWith("k#1:"));
     }
 
-    /** Put off with other work in the step: the end of the step reads the earliest due, so the put-off need not. */
+    private void requeueAll() {
+        script = records -> records.stream().map(r -> Outcome.requeue()).toList();
+    }
+
+    /** A handler slower than its rows come due: rows far along the tail are reached all the same. */
     @Test
-    void aPutOffWithWorkInTheStepReadsTheEarliestDueOnce() throws Exception {
+    void aSlowHandlerReachesEveryRowOfALongKey() throws Exception {
+        config.batchSize(3);
         bootstrap();
-        parkAll("k#1", "k#2");
-        script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.requeue(),
-                "k#3", Outcome.retry(new RuntimeException("k#3 down"))));
-        send(msg("t", "k", "k#3"), msg("t", "j", "j#1"));
-        tick();
-        process();
+        var all = IntStream.rangeClosed(1, 40).mapToObj(i -> "k#" + i).toArray(String[]::new);
+        parkAll(all);
+        requeueAll();
+        calls.clear();
+
+        for (int i = 0; i < 60; i++) {
+            now = now.plus(REQUEUE_DELAY.multipliedBy(5));
+            process();
+        }
+
+        assertThat(calls.stream().flatMap(call -> payloads(call).stream()).distinct()).containsExactlyInAnyOrder(all);
+    }
+
+    /** A sweep of a long key at one moment spends a requeue a row: its oldest rows do not come along on every step. */
+    @Test
+    void theFirstSweepOfALongKeyDoesNotBurnItsRequeues() throws Exception {
+        config.batchSize(3).maxRequeues(5);
+        bootstrap();
+        try (var c = TestDb.connect()) { // as many rows as a sweep takes steps, parked without their merges
+            execute(c, "insert into " + names.parked() + " (id, shard, message_id, topic, key, payload, created_at,"
+                    + " attempts, requeues, due_at) select i, 0, gen_random_uuid(), 't', 'k'::bytea, 'p'::bytea, now(), 0,"
+                    + " 1, '" + now + "'::timestamptz from generate_series(1, 30) i");
+            execute(c, "update " + names.cursor() + " set parked_due_at = '" + now + "'::timestamptz");
+        }
+        requeueAll();
         now = now.plus(REQUEUE_DELAY);
-        setParkedDue("k#1", now.plus(Duration.ofHours(24)));
-        setParkedDue("k#2", now);
-        script = answering(Map.of());
-        send(msg("t", "j", "j#2"));
+
+        for (int i = 0; i < 12; i++) {
+            process();
+        }
+
+        assertThat(deadRows()).isEmpty();
+        assertThat(rows("select max(requeues) from " + names.parked(), rs -> rs.getString(1)))
+                .as("one offer each so far, on top of the one that parked them").containsExactly("2");
+    }
+
+    /** Three keys in a call, all requeueing: no call again at once, however few rows each brings. */
+    @Test
+    void aStepAtOneMomentDoesNotRepeatItself() throws Exception {
+        config.shards(1).batchSize(6);
+        bootstrap();
+        requeueAll();
+        send(msg("t", "a", "a#1"), msg("t", "b", "b#1"), msg("t", "c", "c#1"), msg("t", "a", "a#2"),
+                msg("t", "b", "b#2"), msg("t", "c", "c#2"), msg("t", "a", "a#3"), msg("t", "b", "b#3"),
+                msg("t", "c", "c#3"), msg("t", "a", "a#4"), msg("t", "b", "b#4"), msg("t", "c", "c#4"));
         tick();
-        statements.clear();
+        processUntilNoWork();
+        now = now.plus(REQUEUE_DELAY);
+        calls.clear();
 
-        process();
+        for (int i = 0; i < 5; i++) {
+            process();
+        }
 
-        assertThat(statements).filteredOn(sql -> sql.contains("min(due_at)")).hasSize(1);
+        assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).hasSize(12));
+    }
+
+    /** A key that fits in a call is never split: a row of it does not go without the older ones. */
+    @Test
+    void aKeyThatFitsComesWholeHoweverManyKeysShareTheStep() throws Exception {
+        config.shards(1).batchSize(20);
+        bootstrap();
+        requeueAll();
+        var rows = new ArrayList<OutboxMessage>();
+        for (int k = 0; k < 8; k++) {
+            for (int i = 1; i <= 10; i++) {
+                rows.add(msg("t", "k" + k, "k" + k + "#" + i));
+            }
+        }
+        send(rows.toArray(OutboxMessage[]::new));
+        tick();
+        processUntilNoWork();
+        now = now.plus(REQUEUE_DELAY);
+        setParkedDue("k3#3", now.plusSeconds(100)); // k3#5 goes only with it
+        calls.clear();
+
+        processUntilNoWork();
+
+        assertThat(calls).hasSizeGreaterThan(1).allSatisfy(call -> {
+            assertThat(payloads(call)).as("at most 2 x batchSize").hasSizeLessThanOrEqualTo(40);
+            var ofKey = payloads(call).stream().collect(Collectors.groupingBy(p -> p.substring(0, 2)));
+            assertThat(ofKey.values()).allSatisfy(whole -> assertThat(whole).hasSize(10));
+        });
+    }
+
+    /** Writes per key per delay stay at about a batch however long the key: each row comes round once in N / B delays. */
+    @Test
+    void aLongKeyIsWrittenAboutABatchPerDelay() throws Exception {
+        config.batchSize(3);
+        bootstrap();
+        parkAll(IntStream.rangeClosed(1, 30).mapToObj(i -> "k#" + i).toArray(String[]::new));
+        requeueAll();
+        now = now.plus(REQUEUE_DELAY);
+        long written = 0;
+        var before = tailVersions(0);
+
+        for (int delay = 0; delay < 30; delay++) {
+            processUntilNoWork();
+            var after = tailVersions(0);
+            for (var row : after.entrySet()) {
+                written += row.getValue().equals(before.get(row.getKey())) ? 0 : 1;
+            }
+            before = after;
+            now = now.plus(REQUEUE_DELAY);
+        }
+
+        assertThat(written).as("30 delays x 3 rows, and the sweep they start with").isLessThanOrEqualTo(30 * 3 + 30);
     }
 
     /** Steps with the clock going on, up to {@code steps}, until no retry or parked row is left. */
@@ -2978,71 +2977,6 @@ class ShardProcessorIT {
         process();
 
         assertThat(calls).isNotEmpty().allSatisfy(call -> assertThat(payloads(call).get(0)).isEqualTo("k#1"));
-    }
-
-    @Test
-    void aPutOffParkedRowIsLookedAtAgainWhenItsRetryHeadComesUp() throws Exception {
-        bootstrap();
-        parkAll("k#1", "k#2");
-        script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.requeue(),
-                "k#3", Outcome.retry(new RuntimeException("k#3 down"))));
-        send(msg("t", "k", "k#3"), msg("t", "j", "j#1"));
-        tick();
-        process();
-        now = now.plus(REQUEUE_DELAY);
-        var farOff = now.plus(Duration.ofHours(24));
-        var headDue = now.plusSeconds(2);
-        setParkedDue("k#1", farOff);
-        setParkedDue("k#2", now);
-        try (var c = TestDb.connect(); var ps = c.prepareStatement("update " + names.retry()
-                + " set next_attempt_at = ?")) {
-            ps.setObject(1, headDue.atOffset(ZoneOffset.UTC));
-            ps.executeUpdate();
-        }
-        script = answering(Map.of());
-        calls.clear();
-
-        process();
-
-        assertThat(calls).isEmpty();
-        assertThat(parkedRows()).as("until its head comes up, not k#1's 24 h")
-                .containsExactly("k#1:2:" + farOff, "k#2:2:" + headDue);
-
-        now = headDue;
-        process();
-
-        assertThat(calls).as("the head brings the older rows of its key")
-                .singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("k#1", "k#2", "k#3"));
-        assertThat(parkedRows()).isEmpty();
-    }
-
-    @Test
-    void aPutOffRowInAStepWithOtherWorkLeavesTheCursorNotDue() throws Exception {
-        bootstrap();
-        parkAll("k#1", "k#2");
-        script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.requeue(),
-                "k#3", Outcome.retry(new RuntimeException("k#3 down"))));
-        send(msg("t", "k", "k#3"), msg("t", "j", "j#1"));
-        tick();
-        process();
-        now = now.plus(REQUEUE_DELAY);
-        var later = now.plusSeconds(60);
-        setParkedDue("k#1", later);
-        setParkedDue("k#2", now);
-        try (var c = TestDb.connect()) {
-            execute(c, "update " + names.retry() + " set next_attempt_at = now() + interval '1 hour'");
-        }
-        script = answering(Map.of());
-        send(msg("t", "other", "o#1")); // the step has work of its own
-        tick();
-        calls.clear();
-
-        process();
-
-        assertThat(delivered()).contains("o#1");
-        assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("o#1"));
-        assertThat(cursor().parkedDueAt()).as("not the old due time, or the shard is stepped again at once")
-                .isEqualTo(later);
     }
 
     @Test
@@ -3392,12 +3326,13 @@ class ShardProcessorIT {
 
         send(msg("t", "k", "k#newer"));
         tick();
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 6, true));
+        // the five oldest gone, the next five came due, and the rest come with the new record
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 8, true));
         send(msg("t", "k", "k#newest"));
         tick();
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 3, true));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
         assertThat(delivered()).containsExactly("k#1", "k#2", "k#3", "k#4", "k#5", "k#new", "k#6", "k#7", "k#8",
-                "k#9", "k#10", "k#newer", "k#11", "k#12", "k#newest");
+                "k#9", "k#10", "k#11", "k#12", "k#newer", "k#newest");
         assertThat(parkedRows()).isEmpty();
     }
 

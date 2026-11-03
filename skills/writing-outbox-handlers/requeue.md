@@ -105,17 +105,14 @@ public final class AccountJobsHandler implements OutboxTopicHandler {
 ## Order
 
 Per key, first delivery follows commit order, except that a requeued record is delivered after the records of its key
-that were delivered while it was parked. Parked records of a key come back in their original order, ahead of the
-newer record that brings them: FEE_RELEASE#1 requeued, then FEE_RELEASE#2 arrives → one call [#1, #2]. The same when a
-parked record's time comes: the older parked records of its key come first in its call, due or not; past `batchSize`
-of them, the rest get turns, `batchSize` records a turn at `delay` apart (a second at least): they go behind the oldest
-in the same call, up to 2 × `batchSize`, and may overtake the records between, which had their turn and answered
-`requeue`. They come back on the step after the oldest leave, at once. An unkeyed record comes back only at its due
-time, alone. A key in `<table>_retry` brings them too: when its head comes up, waiting or not, the older parked records
-of the key go first in its call, each answer spending a requeue; past what a call takes (`batchSize`, shared by the
-call's keys) the head goes ahead of those that did not fit, as may a new record past the chunk limit: each of them had
-its turn and answered `requeue`, and a later record may carry what it waits for. Until then such a record comes back only at its due
-time, behind an older parked record of its key that is not due yet.
+that were delivered while it was parked. While a key's parked records fit in `batchSize` they come back strictly in
+their original order, ahead of the newer record that brings them: FEE_RELEASE#1 requeued, then FEE_RELEASE#2 arrives →
+one call [#1, #2]; the key comes whole when one of its records is due, not-due ones included, so a `notBefore` is no
+promise. A larger key comes in portions in the order they came due, each record back after `delay × ceil(N / batchSize)`:
+a record may pass older ones, each of which was offered and answered `requeue`, as a later record may carry what they wait
+for. A retry head always goes, with the older parked records that fit. When a key's offered records have all left, its
+next `batchSize` come at once, in order, whatever their due times, a `notBefore` included. An unkeyed record comes back
+only at its due time, alone.
 
 ## When a parked record is handed back
 

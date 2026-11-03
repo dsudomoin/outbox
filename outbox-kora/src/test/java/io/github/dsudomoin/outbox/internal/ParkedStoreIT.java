@@ -285,7 +285,7 @@ class ParkedStoreIT {
     }
 
     @Test
-    void dueReturnsDueRowsInIdOrderUpToLimit() throws SQLException {
+    void dueReturnsDueRowsInTheOrderTheyCameDueUpToLimit() throws SQLException {
         var a = record("t", "a");
         var b = record("t", "b");
         var cc = record("t", null);
@@ -295,126 +295,83 @@ class ParkedStoreIT {
                 new Park(cc, 2, NOW.minusSeconds(1)), new Park(e, 1, NOW.minusSeconds(5))), Set.of(), NOW);
         store.apply(c, 1, List.of(new Park(otherShard, 1, NOW)), Set.of(), NOW);
 
-        assertThat(store.due(c, 0, NOW, 10)).extracting(OutboxRecord::id).containsExactly(a.id(), cc.id(), e.id());
-        assertThat(store.due(c, 0, NOW, 2)).extracting(OutboxRecord::id).containsExactly(a.id(), cc.id());
+        assertThat(store.due(c, 0, NOW, 10)).extracting(OutboxRecord::id).containsExactly(e.id(), cc.id(), a.id());
+        assertThat(store.due(c, 0, NOW, 2)).extracting(OutboxRecord::id).containsExactly(e.id(), cc.id());
         assertThat(store.due(c, 0, LATER, 10)).extracting(OutboxRecord::id)
-                .containsExactly(a.id(), b.id(), cc.id(), e.id());
+                .containsExactly(e.id(), cc.id(), a.id(), b.id());
         assertThat(store.due(c, 0, NOW.minusSeconds(6), 10)).isEmpty();
         assertSameRecord(store.due(c, 0, NOW, 10).get(1), cc, 0, 2);
     }
 
     @Test
-    void dueWithOlderBringsTheOlderRowsOfEachDueKeyOldestFirst() throws SQLException {
-        var older = record("t", "a");
-        var keyB = record("t", "b");
-        var unkeyedLater = record("t", null);
-        var dueRow = record("t", "a");
-        var newer = record("t", "a");
-        var unkeyedDue = record("t", null);
-        store.apply(c, 0, List.of(new Park(older, 1, LATER), new Park(keyB, 1, LATER),
-                new Park(unkeyedLater, 1, LATER), new Park(dueRow, 1, NOW), new Park(newer, 1, LATER),
-                new Park(unkeyedDue, 1, NOW)), Set.of(), NOW);
-
-        assertThat(store.dueWithOlder(c, 0, NOW, 10, DELAY).rows()).extracting(OutboxRecord::id)
-                .as("not the row above the due one, another key's or an unkeyed one's")
-                .containsExactly(older.id(), dueRow.id(), unkeyedDue.id());
-        assertThat(store.dueWithOlder(c, 0, NOW, 1, DELAY).rows()).extracting(OutboxRecord::id)
-                .as("cut to the limit, oldest first").containsExactly(older.id());
-    }
-
-    @Test
-    void dueWithOlderOfAKeyInRetryHandsItsDueRowsUpToItsLowestRowNotDue() throws SQLException {
-        var due1 = record("t", "a");
-        var older = record("t", "a");
-        var due2 = record("t", "a");
-        var alone = record("t", "b");
-        store.apply(c, 0, List.of(new Park(due1, 1, NOW), new Park(older, 1, LATER), new Park(due2, 1, NOW),
-                new Park(alone, 1, NOW)), Set.of(), NOW);
-        retries.apply(c, 0, List.of(new Head(record("t", "a"), 1, LATER, "down"),
-                new Head(record("t", "b"), 1, LATER, "down")), NOW);
-
-        var due = store.dueWithOlder(c, 0, NOW, 10, DELAY);
-
-        assertThat(due.rows()).extracting(OutboxRecord::id).containsExactly(due1.id(), alone.id());
-        assertThat(due.putOff()).isTrue();
-        assertThat(store.due(c, 0, LATER.minusNanos(1000), 10)).extracting(OutboxRecord::id)
-                .as("due2 waits with older").containsExactly(due1.id(), alone.id());
-        assertThat(store.due(c, 0, LATER, 10)).extracting(OutboxRecord::id).contains(older.id(), due2.id());
-    }
-
-    @Test
-    void dueWithOlderOfAKeyInRetryWithoutARowNotDueMovesNothing() throws SQLException {
-        var older = record("t", "a");
-        var dueRow = record("t", "a");
-        store.apply(c, 0, List.of(new Park(older, 1, NOW), new Park(dueRow, 1, NOW)), Set.of(), NOW);
-        retries.apply(c, 0, List.of(new Head(record("t", "a"), 1, LATER, "down")), NOW);
-
-        var due = store.dueWithOlder(c, 0, NOW, 10, DELAY);
-
-        assertThat(due.rows()).extracting(OutboxRecord::id).containsExactly(older.id(), dueRow.id());
-        assertThat(due.putOff()).isFalse();
-    }
-
-    /** A row on its turn goes even past older rows not due and a key in retry: it may carry what they wait for. */
-    @Test
-    void aRowOnItsTurnIsHandedPastOlderRowsAndAKeyInRetry() throws SQLException {
-        var older = record("t", "a");
-        var turn = record("t", "a");
-        var plain = record("t", "a");
-        var onASecond = NOW.truncatedTo(java.time.temporal.ChronoUnit.SECONDS);
-        var inMicros = onASecond.plusNanos(1000);
-        store.apply(c, 0, List.of(new Park(older, 1, LATER), new Park(turn, 1, onASecond), new Park(plain, 1, inMicros)),
-                Set.of(), NOW);
-        retries.apply(c, 0, List.of(new Follower(record("t", "a"))), NOW);
-
-        var due = store.dueWithOlder(c, 0, NOW.plusSeconds(1), 10, Duration.ofSeconds(1));
-
-        assertThat(due.rows()).extracting(OutboxRecord::id).as("the plain row waits for the older one, as ever")
-                .contains(turn.id()).doesNotContain(plain.id());
-        assertThat(due.turns()).containsExactly(turn.id());
-    }
-
-    /** Rows returned and rows the retry table's scans bring back, from the plan of a real run of {@code selectOlder}. */
-    private long[] olderReadCost(OutboxRecord due) throws SQLException {
-        try (var ps = c.prepareStatement("explain (analyze, format json) " + store.selectOlder())) {
-            ps.setArray(1, c.createArrayOf("text", new Object[] {due.topic()}));
-            ps.setArray(2, c.createArrayOf("bytea", new byte[][] {due.key()}));
-            ps.setArray(3, c.createArrayOf("int8", new Object[] {due.id()}));
-            ps.setShort(4, (short) 0);
-            ps.setShort(5, (short) 0);
-            ps.setObject(6, NOW.atOffset(java.time.ZoneOffset.UTC));
-            ps.setInt(7, 1000);
-            ps.setInt(8, 1001);
-            try (var rs = ps.executeQuery()) {
-                rs.next();
-                var plan = rs.getString(1);
-                var retry = java.util.regex.Pattern.compile("\"Relation Name\": \"" + names.retry()
-                        + "\"[^}]*?\"Actual Rows\": (\\d+)", java.util.regex.Pattern.DOTALL).matcher(plan);
-                var returned = java.util.regex.Pattern.compile("\"Actual Rows\": (\\d+)").matcher(plan);
-                returned.find();
-                return new long[] {Long.parseLong(returned.group(1)), retry.find() ? Long.parseLong(retry.group(1)) : -1};
-            }
+    void aDuePassBringsAKeyThatFitsWholeAndALargerKeyOnlyItsDueRows() throws SQLException {
+        var fits = new ParkedStore(names, retries, DELAY, 3);
+        var k1 = record("t", "k");
+        var k2 = record("t", "k");
+        var k3 = record("t", "k");
+        var big = new ArrayList<OutboxRecord>();
+        var parks = new ArrayList<BatchClassifier.Action>(List.of(new Park(k1, 1, LATER), new Park(k2, 1, NOW),
+                new Park(k3, 1, LATER)));
+        for (int i = 0; i < 4; i++) {
+            big.add(record("t", "b"));
+            parks.add(new Park(big.get(i), 1, i == 3 ? NOW : LATER));
         }
+        store.apply(c, 0, parks, Set.of(), NOW);
+
+        assertThat(fits.dueWithOlder(c, 0, NOW, 10, 20)).extracting(OutboxRecord::id).as("k3 is not due, and newer")
+                .containsExactly(k1.id(), k2.id(), big.get(3).id());
     }
 
-    /** Rows the due read brought already are not sent again, and a head costs one row of the retry table. */
     @Test
-    void theOlderRowsReadCostsNeitherTheDueRowsAgainNorTheKeysRetryRows() throws SQLException {
-        var rows = new ArrayList<BatchClassifier.Action>();
-        OutboxRecord last = null;
-        for (int i = 0; i < 300; i++) {
-            last = record("t", "a");
-            rows.add(new Park(last, 1, NOW));
-        }
-        store.apply(c, 0, rows, Set.of(), NOW);
-        assertThat(olderReadCost(last)[0]).as("all due: none to bring along").isZero();
+    void aKeyThatDoesNotFitInTheCallStaysForTheNextStep() throws SQLException {
+        var fits = new ParkedStore(names, retries, DELAY, 3);
+        var a = List.of(record("t", "a"), record("t", "a"), record("t", "a"));
+        var b = List.of(record("t", "b"), record("t", "b"), record("t", "b"));
+        var parks = new ArrayList<BatchClassifier.Action>();
+        a.forEach(row -> parks.add(new Park(row, 1, NOW)));
+        b.forEach(row -> parks.add(new Park(row, 1, NOW)));
+        fits.apply(c, 0, parks, Set.of(), NOW);
 
-        var inRetry = new ArrayList<BatchClassifier.Action>();
-        for (int i = 0; i < 300; i++) {
-            inRetry.add(new Follower(record("t", "a")));
+        assertThat(fits.dueWithOlder(c, 0, NOW, 6, 4)).extracting(OutboxRecord::id).as("the first key always fits")
+                .containsExactlyElementsOf(a.stream().map(OutboxRecord::id).toList());
+    }
+
+    @Test
+    void aRowAnsweringRequeueInALongKeyComesRoundAfterItsBatches() throws SQLException {
+        var fits = new ParkedStore(names, retries, DELAY, 2);
+        var rows = new ArrayList<OutboxRecord>();
+        var parks = new ArrayList<BatchClassifier.Action>();
+        for (int i = 0; i < 7; i++) {
+            rows.add(record("t", "a"));
+            parks.add(new Park(rows.get(i), 1, NOW.plus(DELAY)));
         }
-        retries.apply(c, 0, inRetry, NOW);
-        assertThat(olderReadCost(last)[1]).as("the head alone, of its key's 300 rows").isOne();
+        var ownLater = NOW.plus(DELAY.multipliedBy(100));
+        var own = record("t", "b");
+        parks.add(new Park(own, 1, ownLater));
+
+        fits.apply(c, 0, parks, Set.of(), NOW);
+
+        assertThat(fits.due(c, 0, NOW.plus(DELAY.multipliedBy(4)).minusNanos(1000), 10)).as("7 rows, 2 a batch: 4 delays")
+                .isEmpty();
+        assertThat(fits.due(c, 0, NOW.plus(DELAY.multipliedBy(4)), 10)).hasSize(7);
+        assertThat(fits.minDue(c, 0)).isEqualTo(NOW.plus(DELAY.multipliedBy(4)));
+    }
+
+    @Test
+    void pullNextBringsTheLowestRowsOfAKeyWhoseOfferedRowsAllLeft() throws SQLException {
+        var fits = new ParkedStore(names, retries, DELAY, 2);
+        var gone = record("t", "a");
+        var next = List.of(record("t", "a"), record("t", "a"));
+        var after = record("t", "a");
+        var stays = record("t", "b");
+        var other = record("t", "b");
+        fits.apply(c, 0, List.of(new Park(next.get(0), 1, LATER), new Park(next.get(1), 1, LATER),
+                new Park(after, 1, LATER), new Park(stays, 1, LATER), new Park(other, 1, LATER)), Set.of(), NOW);
+
+        assertThat(fits.pullNext(c, 0, List.of(new Park(stays, 2, LATER)), List.of(gone, stays), NOW)).isTrue();
+
+        assertThat(fits.due(c, 0, NOW, 10)).extracting(OutboxRecord::id)
+                .as("a's lowest 2; b has a row that stays").containsExactlyElementsOf(next.stream().map(OutboxRecord::id).toList());
     }
 
     @Test
