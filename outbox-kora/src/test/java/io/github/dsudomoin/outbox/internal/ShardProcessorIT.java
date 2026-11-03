@@ -3454,10 +3454,91 @@ class ShardProcessorIT {
         assertThat(calls).first().satisfies(call -> assertThat(payloads(call)).containsExactly("k#new"));
     }
 
-    /** Shards sharing a call share its room: a shard whose key finds none is read again by the next step. */
+    /** 30 keys of 60 parked rows each, not due, and a chunk of new records of them with a healthy key behind. */
+    private void seedAStorm() throws Exception {
+        try (var c = TestDb.connect()) {
+            execute(c, "insert into " + names.parked() + " (id, shard, message_id, topic, key, payload, created_at,"
+                    + " attempts, requeues, due_at) select -(30 - k) * 100 - 60 + i, 0, gen_random_uuid(), 't',"
+                    + " convert_to('k' || k, 'UTF8'), convert_to('k' || k || '#old' || i, 'UTF8'), now(), 0, 1, '"
+                    + now.plus(Duration.ofHours(1)) + "'::timestamptz from generate_series(0, 29) k,"
+                    + " generate_series(0, 59) i");
+            execute(c, "update " + names.cursor() + " set parked_due_at = '" + now.plus(Duration.ofHours(1))
+                    + "'::timestamptz");
+        }
+        var rows = new ArrayList<OutboxMessage>();
+        for (int round = 0; round < 3; round++) {
+            for (int k = 0; k < 30; k++) {
+                rows.add(msg("t", "k" + k, "k" + k + "#new" + round));
+            }
+        }
+        for (int i = 0; i < 10; i++) {
+            rows.add(msg("t", "h" + i, "h" + i));
+        }
+        send(rows.toArray(OutboxMessage[]::new));
+        tick();
+    }
+
+    /** A storm of keys that fit one at a time holds neither the cursor nor the healthy keys behind them. */
     @Test
-    void aShardWhoseKeyFindsNoRoomInASharedCallWaitsForTheNextStep() throws Exception {
-        config.shards(2).batchSize(3);
+    void aChunkGoesOnPastKeysThatFindNoRoomInItsCall() throws Exception {
+        config.shards(1).batchSize(100);
+        bootstrap();
+        seedAStorm();
+        script = records -> records.stream().map(r -> new String(r.payload(), UTF_8).startsWith("h")
+                ? (Outcome) Outcome.delivered() : Outcome.requeue()).toList();
+        calls.clear();
+
+        process();
+
+        assertThat(cursor().lastId()).as("the whole chunk").isEqualTo(maxOutboxId());
+        assertThat(calls).hasSize(1);
+        assertThat(payloads(calls.get(0))).as("the healthy keys go in this step")
+                .contains("h0", "h1", "h2", "h3", "h4", "h5", "h6", "h7", "h8", "h9");
+        assertThat(payloads(calls.get(0))).as("whole: k0").contains("k0#old0", "k0#old59", "k0#new2")
+                .noneMatch(payload -> payload.startsWith("k1#"));
+        assertThat(parkedRows()).filteredOn(row -> row.startsWith("k1#new0:"))
+                .as("no requeue counted, due at once").containsExactly("k1#new0:0:" + now);
+    }
+
+    /** Such a storm ending: every key in its order, its held rows behind its older ones. */
+    @Test
+    void aKeyHeldOutOfACallComesInItsOrder() throws Exception {
+        config.shards(1).batchSize(100);
+        bootstrap();
+        seedAStorm();
+        script = answering(Map.of());
+
+        for (int i = 0; i < 40 && !parkedRows().isEmpty(); i++) {
+            processUntilNoWork();
+            now = now.plus(Duration.ofMillis(1));
+        }
+
+        assertThat(parkedRows()).isEmpty();
+        var order = delivered();
+        assertThat(order).hasSize(1900);
+        for (int k = 0; k < 30; k++) {
+            var prefix = "k" + k + "#";
+            var expected = new ArrayList<String>();
+            for (int i = 0; i < 60; i++) {
+                expected.add(prefix + "old" + i);
+            }
+            for (int round = 0; round < 3; round++) {
+                expected.add(prefix + "new" + round);
+            }
+            assertThat(order.stream().filter(payload -> payload.startsWith(prefix)).toList()).isEqualTo(expected);
+        }
+    }
+
+    private long maxOutboxId() throws SQLException {
+        try (var c = TestDb.connect()) {
+            return queryLong(c, "select max(id) from " + names.base());
+        }
+    }
+
+    /** Shards sharing a call share its room: a key of the next shard that finds none is held, and its cursor moves. */
+    @Test
+    void aKeyOfAShardFindingNoRoomInASharedCallIsHeld() throws Exception {
+        config.shards(2).batchSize(4);
         bootstrap();
         requeueAll();
         var a = keyOnShard(0);
@@ -3477,6 +3558,7 @@ class ShardProcessorIT {
 
         assertThat(calls).hasSize(1);
         assertThat(payloads(calls.get(0))).containsExactly("a#1", "a#2", "a#3", "a#4");
+        assertThat(cursor(1).lastId() != 0 || cursor(1).targetTickId() == null).as("its chunk is settled").isTrue();
 
         processGroup(0, 1);
 
@@ -3484,9 +3566,9 @@ class ShardProcessorIT {
         assertThat(parkedRows()).isEmpty();
     }
 
-    /** A chunk of records whose keys fit, each with its parked rows whole: what does not fit waits for the next step. */
+    /** A chunk of records whose keys fit, each with its parked rows whole: what finds no room comes by the due pass. */
     @Test
-    void aChunkStopsAtAKeyThatDoesNotFitInItsCall() throws Exception {
+    void aKeyWithNoRoomInItsCallComesNextInItsOrder() throws Exception {
         config.shards(1).batchSize(4);
         bootstrap();
         requeueAll();

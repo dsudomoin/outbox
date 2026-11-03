@@ -12,6 +12,7 @@ import io.github.dsudomoin.outbox.internal.BatchClassifier.Action;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Dead;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Follower;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Head;
+import io.github.dsudomoin.outbox.internal.BatchClassifier.Hold;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Item;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Keep;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Park;
@@ -464,13 +465,9 @@ public final class ShardProcessor implements AutoCloseable {
                 if (!byItself) {
                     sharedRoom -= taken;
                 }
-                if (s.rows.isEmpty() && s.cutAtParked) {
-                    s.untouched = true; // nothing of it fitted in the call
-                    continue;
-                }
                 (byItself ? alone : shared).add(s);
             }
-            boolean called = deliverBatch(shared, now);
+            boolean called = deliverBatch(shared, now, parkedUntil);
             anyCall |= called;
             var handed = shared.stream().filter(Step::handed).toList();
             if (handed.size() > 1) {
@@ -494,7 +491,7 @@ public final class ShardProcessor implements AutoCloseable {
                 if (mainCalls) {
                     keepAlive(inTx); // a statement between two handler calls
                 }
-                boolean ran = deliverBatch(List.of(s), now);
+                boolean ran = deliverBatch(List.of(s), now, parkedUntil);
                 anyCall |= ran;
                 mainCalls |= ran;
                 if (ran && !s.whole && !s.items.stream().anyMatch(item -> item.outcome() == BUSY)) {
@@ -586,8 +583,8 @@ public final class ShardProcessor implements AutoCloseable {
         final List<Segment> segments = new ArrayList<>();
         /** The read was cut at {@code batchSize} rows. */
         boolean cut;
-        /** The chunk stopped at a key whose parked rows did not fit in the call. */
-        boolean cutAtParked;
+        /** Its chunk's rows whose key found no room in the call: not handed, see {@link #mergeParked}. */
+        final Set<Long> held = new HashSet<>();
         List<OutboxRecord> parkedRows = List.of();
         /** Its parked rows, then its chunk's rows, as handed (blocked ones without an outcome). */
         List<Item> items = List.of();
@@ -734,54 +731,35 @@ public final class ShardProcessor implements AutoCloseable {
 
     /**
      * The parked rows of each key of {@code s}'s chunk that fits in a call go into {@code s.parkedRows}, whole, as long as
-     * {@code room} lasts: at the first key that does not fit the chunk stops, its rows read again by the next step, so
-     * no record goes without the older rows of its key and the call stays within 2 × {@code batchSize}. A key larger than
-     * a call brings none: it would bring its oldest rows with every chunk, spending their requeues without a delay.
-     * Returns the rows taken.
+     * {@code room} lasts, so the call stays within 2 × {@code batchSize}. The chunk's rows of a key that finds no room
+     * are held ({@code s.held}): they go to the parked table behind the key's rows, due at once, with no call and no
+     * requeue counted, and the due pass offers the key whole next; the cursor and the other keys go on, and no record
+     * goes without the older rows of its key. A key larger than a call brings none: it would bring its oldest rows with
+     * every chunk, spending their requeues without a delay. Returns the rows taken.
      */
     private long mergeParked(Connection c, Step s, long room) throws SQLException {
         var keyed = s.rows.stream().filter(row -> !row.blocked() && row.record().key() != null).map(BatchRow::record)
                 .toList();
         var rowsOf = parked.rowsOfKeys(c, s.shard, keyed);
-        var seen = new HashSet<Object>();
+        var admitted = new HashSet<Object>();
         var whole = new ArrayList<OutboxRecord>();
         long taken = 0;
-        for (int i = 0; i < s.rows.size(); i++) {
-            var row = s.rows.get(i);
-            if (row.blocked() || row.record().key() == null) {
+        for (var row : keyed) {
+            var key = BatchClassifier.orderingKey(row);
+            long rows = rowsOf.getOrDefault(key, 0L);
+            if (!parked.fits(rows) || admitted.contains(key)) {
                 continue;
             }
-            var key = BatchClassifier.orderingKey(row.record());
-            long rows = rowsOf.getOrDefault(key, 0L);
-            if (seen.add(key) && parked.fits(rows)) {
-                if (taken + rows > room) {
-                    keepRows(s, i);
-                    s.cutAtParked = true;
-                    break;
-                }
+            if (taken + rows <= room) {
                 taken += rows;
-                whole.add(row.record());
+                admitted.add(key);
+                whole.add(row);
+            } else {
+                s.held.add(row.id());
             }
         }
         s.parkedRows = whole.isEmpty() ? List.of() : parked.ofEachKey(c, s.shard, whole, relay.batchSize());
         return taken;
-    }
-
-    /** Only the first {@code keep} rows of {@code s}'s step: what follows is read again by the next step. */
-    private static void keepRows(Step s, int keep) {
-        s.rows.subList(keep, s.rows.size()).clear();
-        var segments = new ArrayList<Segment>(s.segments.size());
-        for (var segment : s.segments) {
-            if (segment.from() + segment.count() <= keep) {
-                segments.add(segment);
-            } else {
-                segments.add(new Segment(segment.fromTickId(), segment.target(), segment.from(),
-                        Math.max(0, keep - segment.from()), false));
-                break;
-            }
-        }
-        s.segments.clear();
-        s.segments.addAll(segments);
     }
 
     /**
@@ -1513,12 +1491,12 @@ public final class ShardProcessor implements AutoCloseable {
      * each step its items, in that order (blocked rows without an outcome) and whether the call failed as a whole.
      * Returns whether the handler was called: not when there is no record to hand.
      */
-    private boolean deliverBatch(List<Step> steps, Instant now) throws InterruptedException {
+    private boolean deliverBatch(List<Step> steps, Instant now, Instant parkedUntil) throws InterruptedException {
         var records = new ArrayList<OutboxRecord>();
         for (var s : steps) {
             records.addAll(s.parkedRows);
             for (var row : s.rows) {
-                if (!row.blocked()) {
+                if (!row.blocked() && !s.held.contains(row.record().id())) {
                     records.add(row.record());
                 }
             }
@@ -1531,8 +1509,8 @@ public final class ShardProcessor implements AutoCloseable {
                 items.add(new Item(row, false, outcomes.get(i++), true));
             }
             for (var row : s.rows) {
-                items.add(row.blocked()
-                        ? new Item(row.record(), true, null)
+                items.add(row.blocked() ? new Item(row.record(), true, null)
+                        : s.held.contains(row.record().id()) ? Item.held(row.record(), parkedUntil)
                         : new Item(row.record(), false, outcomes.get(i++)));
             }
             s.items = items;
@@ -1551,7 +1529,7 @@ public final class ShardProcessor implements AutoCloseable {
         var mainStream = new ArrayList<Action>(actions.size());
         boolean toParked = false;
         for (var action : actions) {
-            if (action instanceof Park || parkedIds.contains(action.r().id())) {
+            if (action instanceof Park || action instanceof Hold || parkedIds.contains(action.r().id())) {
                 toParked = true;
             } else {
                 mainStream.add(action);
@@ -1587,7 +1565,8 @@ public final class ShardProcessor implements AutoCloseable {
                 logDead(d.r(), d.attempts(), d.error());
             } else if (action instanceof Park p) {
                 telemetry.requeued(p.r().topic());
-            } else if (!(action instanceof Follower || action instanceof Keep || action instanceof Unpark)) {
+            } else if (!(action instanceof Follower || action instanceof Keep || action instanceof Unpark
+                    || action instanceof Hold)) {
                 throw new IllegalStateException("unknown action " + action);
             }
         }

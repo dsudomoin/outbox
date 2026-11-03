@@ -16,9 +16,11 @@ public final class BatchClassifier {
 
     /**
      * A call row: {@code dbBlocked} rows were not handed to the handler and carry no outcome; {@code parked} rows come
-     * from the parked table.
+     * from the parked table; {@code heldDue}: a row of the main stream not handed, whose key found no room in the call:
+     * it goes to the parked table behind its key's rows, due then.
      */
-    public record Item(OutboxRecord record, boolean dbBlocked, @Nullable Outcome outcome, boolean parked) {
+    public record Item(OutboxRecord record, boolean dbBlocked, @Nullable Outcome outcome, boolean parked,
+            @Nullable Instant heldDue) {
         public Item {
             if (dbBlocked == (outcome != null)) {
                 throw new IllegalArgumentException("outcome must be null exactly when the row is blocked");
@@ -32,7 +34,16 @@ public final class BatchClassifier {
         }
 
         public Item(OutboxRecord record, boolean dbBlocked, @Nullable Outcome outcome) {
-            this(record, dbBlocked, outcome, false);
+            this(record, dbBlocked, outcome, false, null);
+        }
+
+        public Item(OutboxRecord record, boolean dbBlocked, @Nullable Outcome outcome, boolean parked) {
+            this(record, dbBlocked, outcome, parked, null);
+        }
+
+        /** A row held out of the call, see {@code heldDue}: no handler saw it, so nothing is counted against it. */
+        public static Item held(OutboxRecord record, Instant due) {
+            return new Item(record, true, null, false, due);
         }
     }
 
@@ -60,6 +71,9 @@ public final class BatchClassifier {
 
     /** Parks a main-stream record, or re-parks a parked one, with {@code requeues}, due at {@code dueAt}. */
     public record Park(OutboxRecord r, int requeues, Instant dueAt) implements Action {}
+
+    /** A main-stream record no handler saw goes to the parked table as it is, due at {@code dueAt}. */
+    public record Hold(OutboxRecord r, Instant dueAt) implements Action {}
 
     /** A parked record not attempted: stays parked, due at the later of its due and {@code dueAt}. */
     public record Keep(OutboxRecord r, Instant dueAt) implements Action {}
@@ -126,7 +140,9 @@ public final class BatchClassifier {
             var r = item.record();
             var key = orderingKey(r);
             var outcome = item.outcome();
-            if (item.dbBlocked() || blocked.contains(key)) {
+            if (item.heldDue() != null) {
+                actions.add(new Hold(r, item.heldDue()));
+            } else if (item.dbBlocked() || blocked.contains(key)) {
                 actions.add(new Follower(r));
                 blocked.add(key);
             } else if (outcome instanceof Outcome.Delivered) {

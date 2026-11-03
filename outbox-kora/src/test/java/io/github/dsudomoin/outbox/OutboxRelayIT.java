@@ -445,6 +445,35 @@ class OutboxRelayIT {
         assertThat(parked()).isEqualTo("k#0,k#1,k#2,k#3,k#4");
     }
 
+    /** A new record held out of a call by its key's rows is one this drain has to offer. */
+    @Test
+    void drainOffersARecordHeldOutOfACall() throws Exception {
+        config.relayEnabled(false).shards(1).batchSize(4).requeueDelay(Duration.ofHours(1));
+        bootstrap();
+        var requeue = new AtomicBoolean(true);
+        var relay = relay(new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {
+            }
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                return records.stream().map(r -> requeue.get() ? (Outcome) Outcome.requeue() : Outcome.delivered()).toList();
+            }
+        });
+        var outbox = outbox(relay::wake);
+        send(outbox, msg("t", "a", "a#1"), msg("t", "a", "a#2"), msg("t", "a", "a#3"));
+        assertThat(relay.drain()).isZero();
+        send(outbox, msg("t", "b", "b#1"), msg("t", "b", "b#2"), msg("t", "b", "b#3"));
+        assertThat(relay.drain()).isZero();
+        requeue.set(false);
+        send(outbox, msg("t", "a", "a#4"), msg("t", "b", "b#4"));
+
+        assertThat(relay.drain()).isEqualTo(8);
+
+        assertThat(parked()).isNull();
+    }
+
     /** The rows behind a key's rows that left are this drain's too, however far their due times. */
     @Test
     void drainTakesTheWholeKeyWhenItsFirstRowsAreDelivered() throws Exception {

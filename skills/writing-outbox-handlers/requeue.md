@@ -128,7 +128,9 @@ A `requeue` of a retry-table head parks it and lets the next record of its key g
 ## Call size and wind-down
 
 - A call carries up to 2 × `batchSize` records: a chunk or due rows, with the parked records of their keys. Where a whole
-  key does not fit, the chunk stops before its record and a retry head waits for the next step. Keep the blocked check
+  key does not fit, its new records go straight to `<table>_parked` behind its older ones, due at once, with no call and no
+  requeue counted; the chunk, its cursor and other keys go on, and the key comes whole next. A retry head waits for the next
+  step. Keep the blocked check
   cheap, or size the batch budget in SKILL.md for 2 ×.
 - The order rule gives way only where a call isolates a culprit and so carries one group: a probing shard's call is the
   head row alone, which may go out ahead of its key's parked records, and after a retry call that failed as a whole each

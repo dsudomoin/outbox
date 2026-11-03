@@ -10,6 +10,7 @@ import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Action;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Dead;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Head;
+import io.github.dsudomoin.outbox.internal.BatchClassifier.Hold;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Keep;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Park;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Unpark;
@@ -126,6 +127,7 @@ public final class ParkedStore {
     /**
      * Writes the actions of one handler call, routed by origin ({@code parkedIds}: rows handed from this table).
      * {@link Park}: a main-stream record is inserted, a parked one gets its new {@code requeues} and due time.
+     * {@link Hold}: a main-stream record is inserted as it is.
      * {@link Keep}: the due time moves later, never earlier. {@link Unpark}: {@link #unpark}. A parked {@link Head}:
      * {@link #toRetry}, a waiting one waiting since {@code now}; a parked {@link Dead}: {@link #toDead}. A parked
      * follower: nothing, as a parked head before it in the call blocks its key, and its {@link #toRetry} carries it.
@@ -139,6 +141,7 @@ public final class ParkedStore {
     public void apply(Connection inTx, int shard, List<Action> actions, Set<Long> parkedIds, Instant now)
             throws SQLException {
         var inserts = new ArrayList<Park>();
+        var holds = new ArrayList<Hold>();
         var reparks = new ArrayList<Park>();
         var aKeysTurn = comesRound(inTx, shard, actions, parkedIds, now);
         var keeps = new ArrayList<Keep>();
@@ -148,6 +151,8 @@ public final class ParkedStore {
             if (!parkedIds.contains(r.id())) {
                 if (action instanceof Park p) {
                     inserts.add(p);
+                } else if (action instanceof Hold h) {
+                    holds.add(h);
                 }
             } else if (action instanceof Park p) {
                 reparks.add(p);
@@ -161,14 +166,13 @@ public final class ParkedStore {
                 toDead(inTx, r, d.attempts(), d.error());
             }
         }
-        if (!inserts.isEmpty()) {
+        if (!inserts.isEmpty() || !holds.isEmpty()) {
             try (var ps = inTx.prepareStatement(insert)) {
                 for (var p : inserts) {
-                    RetryStore.bindRow(ps, shard, p.r());
-                    ps.setInt(9, p.r().attempts());
-                    ps.setInt(10, p.requeues());
-                    ps.setObject(11, timestamp(later(p, aKeysTurn)));
-                    ps.addBatch();
+                    bindInsert(ps, shard, p.r(), p.requeues(), later(p, aKeysTurn));
+                }
+                for (var h : holds) {
+                    bindInsert(ps, shard, h.r(), h.r().requeues(), h.dueAt());
                 }
                 ps.executeBatch();
             }
@@ -238,6 +242,15 @@ public final class ParkedStore {
             }
         });
         return turns;
+    }
+
+    private static void bindInsert(PreparedStatement ps, int shard, OutboxRecord r, int requeues, Instant due)
+            throws SQLException {
+        RetryStore.bindRow(ps, shard, r);
+        ps.setInt(9, r.attempts());
+        ps.setInt(10, requeues);
+        ps.setObject(11, timestamp(due));
+        ps.addBatch();
     }
 
     /** {@code p}'s due time, or its key's turn when that is later. */
