@@ -195,7 +195,7 @@ s_soak() {
   led=$(python3 "$PC/scenarios/ledger.py" --source "$PG" --target "" --search-path accounts,public --base accounts.account_events \
     --dead-tags corrupt --exempt-tags wait,corrupt --order-within-tag wait --parked-file "$RESULT_DIR/soak.parked" --parked-limit "$SOAK_BATCH" --timeout 300) || rc=$?
   echo "$led" > "$RESULT_DIR/soak.accounts-ledger"
-  check "$rc" "accounts: $(echo "$led" | j '{k: d[k] for k in ("sent", "effects", "dead", "lost", "double_effects", "order_violations", "past_limit_order", "overtakes", "duplicates", "latency_p99", "drain_seconds", "violations")}')"
+  check "$rc" "accounts: $(echo "$led" | j '{k: d[k] for k in ("sent", "effects", "dead", "lost", "double_effects", "order_violations", "past_limit_first_arrivals", "overtakes", "duplicates", "latency_p99", "drain_seconds", "violations")}')"
   check 0 "циклов: $cycle, минут: $minutes"
   # what pc_finish reads is the shop's: its ledger makes the table's row, accounts' is the check above
   BASES=(outbox)
