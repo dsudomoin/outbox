@@ -62,6 +62,34 @@ acc_end() { # stop the writers, clear the blocks, then the usual reconciliation
 
 acc_load() { pc_load "$1" "${2:-$ACC_LOAD}"; }
 
+parked_watch() { # how many rows each key had parked, every 2 s; on the way out each overtaking in a type next to that number
+  ( while :; do acc_q "select extract(epoch from now()), convert_from(key, 'UTF8'), count(*) from account_events_parked group by 2" 2> /dev/null; command sleep 2; done ) > "$RESULT_DIR/$SCN.parked" &
+  PARKED_WATCH=$!
+  AFTER='parked_report'
+}
+
+parked_report() {
+  kill "$PARKED_WATCH" 2> /dev/null || true
+  acc_q "copy (select key, tag, seq, extract(epoch from at) from pc_effect where tag = 'wait' order by no) to stdout with csv" | python3 -c "
+import collections, csv, sys
+samples = collections.defaultdict(list)
+for l in open(sys.argv[1]):
+    p = l.strip().split('|')
+    if len(p) == 3:
+        samples[p[1]].append((float(p[0]), int(p[2])))
+top, out = {}, []
+for key, tag, seq, at in csv.reader(sys.stdin):
+    seq, at = int(seq), float(at)
+    if key in top and seq < top[key][0]:
+        near = [n for t, n in samples[key] if t <= at]
+        out.append(f'{key}: seq {seq} after {top[key][0]}, parked on the key at the last sample before it {near[-1] if near else 0}, largest so far {max(near) if near else 0}')
+    if key not in top or seq > top[key][0]:
+        top[key] = (seq, at)
+print(f'overtakings within wait: {len(out)}; largest parked per key in the run: {max((n for v in samples.values() for _, n in v), default=0)}')
+print('\\n'.join(out[:40]))
+" "$RESULT_DIR/$SCN.parked" > "$RESULT_DIR/$SCN.inversions" 2>&1
+}
+
 s_accounts_start_check() { # the migration without SELECT on the sequence: a refusal that says what is missing; a grant repairs it
   NO_GRANT=1 acc_begin accounts-start-check
   local log=$LOGS/pc-$SCN-1001.log rc=0
@@ -284,6 +312,7 @@ s_accounts_pg_restart() { # Postgres 17 restarts and goes away for a minute: wit
 
 s_accounts_same_type_held() { # with the README's rule in the handler (hold a key's later records of the same type): parked rows of a key stay in order
   acc_begin accounts-same-type-held
+  parked_watch
   ACC_FINISH=(--exempt-tags wait --order-within-tag wait --timeout 120)
   local n i
   for i in 1001 1002 1003; do acc "$i" -Daccounts.holdSameType=true; acc_load "$i"; done
@@ -416,6 +445,7 @@ s_accounts_corrupt_abandon() { # the service's own form: Retry for ever on an en
 
 s_accounts_recommended() { # everything on: kill -9, a row lock, a corrupt envelope, an unknown source, Postgres restart
   acc_begin accounts-recommended
+  parked_watch
   acc_full
   local i n
   for i in 1001 1002 1003; do acc "$i" $RECOMMENDED; acc_load "$i"; done

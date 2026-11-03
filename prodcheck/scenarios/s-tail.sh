@@ -57,8 +57,65 @@ for name, needle in kinds.items():
     else:
         out.append(f"{name}: no call over 5 ms")
 print("; ".join(out))
+others = {}
+for b in blocks:
+    m = re.search(r"Query Text: (.{0,70})", b)
+    d = re.search(r"duration: ([0-9.]+) ms", b)
+    if m and d and ("_parked" in b or "_retry" in b):
+        c, x = others.get(m.group(1), (0, 0.0))
+        others[m.group(1)] = (c + 1, max(x, float(d.group(1))))
+print("every statement on the parked and retry tables over 5 ms: " + "; ".join(f"{k} x{v[0]} up to {v[1]:.0f} ms" for k, v in sorted(others.items(), key=lambda e: -e[1][1])[:12]))
 open(os.environ["PLANS"], "w").write("\n\n".join(f"== {k}\n{v}" for k, v in slowest.items()))
 ' 
+}
+
+tail_wave() { # tail_wave SECONDS: updates of the parked table and requeue answers per second, over time: the wave of d × N / B
+  local out=$RESULT_DIR/retry-long-tail.wave end=$(($(now) + $1)) t u r u0 r0 t0
+  : > "$out"
+  u0=$(psql_q "select n_tup_upd from pg_stat_user_tables where relname = 'outbox_parked'")
+  r0=$(($(on 1001 metric outbox_messages_requeued_total) + $(on 1002 metric outbox_messages_requeued_total)))
+  t0=$(now)
+  while [ "$(now)" -lt "$end" ]; do
+    sleep 2
+    t=$(now)
+    u=$(psql_q "select n_tup_upd from pg_stat_user_tables where relname = 'outbox_parked'")
+    r=$(($(on 1001 metric outbox_messages_requeued_total) + $(on 1002 metric outbox_messages_requeued_total)))
+    if [ "$t" -gt "$t0" ]; then echo "$(date -u -r "$t" +%T) updates/s $(((u - u0) / (t - t0))) requeues/s $(((r - r0) / (t - t0)))" >> "$out"; fi
+    u0=$u r0=$r t0=$t
+  done
+  python3 - "$out" << 'PY_WAVE' >&2
+import statistics as st, sys
+rows = [l.split() for l in open(sys.argv[1])]
+for name, col in (("updates/s", 2), ("requeues/s", 4)):
+    v = [int(r[col]) for r in rows]
+    print(f"{name}: samples {len(v)}, mean {st.mean(v):.0f}, p50 {st.median(v):.0f}, max {max(v)}, min {min(v)}, zero samples {sum(1 for x in v if x == 0)}")
+print("series:", " ".join(r[4] for r in rows))
+PY_WAVE
+}
+
+tail_inversions() { # tail_inversions SINK KEY: of the key's effects in their order: how many rows overtook how many, by size
+  target_q "copy (select seq from pc_effect where sink = '$1' and key = '$2' order by no) to stdout" | python3 -c "
+import bisect, collections, sys
+seqs = [int(l) for l in sys.stdin if l.strip()]
+seen, blocks, i, late_total = [], [], 0, 0
+while i < len(seqs):
+    bisect.insort(seen, seqs[i])
+    if i and seqs[i] < max(seqs[:1] + [seen[-1]]) and seen[-1] != seqs[i]:
+        overtakers = len(seen) - bisect.bisect_right(seen, seqs[i])
+        n = 1
+        while i + 1 < len(seqs) and seqs[i + 1] < seen[-1]:
+            i += 1
+            bisect.insort(seen, seqs[i])
+            n += 1
+        blocks.append((overtakers, n))
+        late_total += n
+    i += 1
+sizes = collections.Counter()
+for over, n in blocks:
+    sizes[(len(str(over)), len(str(n)))] += 1
+top = sorted(blocks, key=lambda b: -b[0] * b[1])[:10]
+print(f'$2: rows {len(seqs)}, late rows {late_total}, late blocks {len(blocks)}; largest (overtakers, rows overtaken): {top}; blocks by digits of (overtakers, overtaken): {dict(sizes)}')
+"
 }
 
 mate_latency() { # mate_latency LABEL SHARDS FROM TO: delivery latency of the other keys on those shards, sent in that window
@@ -139,6 +196,9 @@ s_retry_long_tail() {
   mate_latency "beside the tails" "$(psql_q "select string_agg(distinct shard::text, ',') from (select shard from outbox_retry where key = convert_to('tail-r', 'UTF8') union select shard from outbox_parked) s")" "$from" "$to"
   pc_unload 1001
   tail_disk "после минуты рядом с хвостом"
+  tail_wave 130
+  check 0 "волна: $(sed -n 1p "$RESULT_DIR/retry-long-tail.wave" | cut -c1-60) ...; ряд в build/results/retry-long-tail.wave"
+  tail_disk "после волны"
   local plans
   plans=$(PLANS=$RESULT_DIR/retry-long-tail.autoexplain auto_explain_report)
   log "auto_explain: $plans"
@@ -193,5 +253,9 @@ s_retry_long_tail() {
   tails_empty() { [ "$(psql_q "select (select count(*) from outbox_retry) + (select count(*) from outbox_parked)")" = 0 ]; }
   wait_for 400 tails_empty || true
   tail_disk "хвосты разобраны"
+  local inv
+  inv=$(tail_inversions receipts tail-p)
+  log "inversions: $inv"
+  check 0 "обгоны: $inv"
   pc_finish --exempt-tags none --slow-keys "tail-r,tail-p,$mates" --slow-from "$from" --slow-to "$to" --timeout 400
 }
