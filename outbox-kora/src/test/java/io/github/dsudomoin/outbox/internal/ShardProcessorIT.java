@@ -2571,6 +2571,38 @@ class ShardProcessorIT {
         assertThat(parkedRows()).hasSize(3);
     }
 
+    /** A group the pass ran out of time for got no answer and left nothing: it pulls no row of its key. */
+    @Test
+    void aGroupThatGotNoAnswerPullsNothing() throws Exception {
+        config.batchTimeout(Duration.ofMillis(300));
+        bootstrap();
+        requeueAll();
+        send(msg("t", "a", "a#1"), msg("t", "b", "b#1"), msg("t", "b", "b#2"));
+        tick();
+        processUntilNoWork();
+        var later = now.plus(Duration.ofHours(1));
+        setParkedDue("b#2", later);
+        now = now.plus(REQUEUE_DELAY);
+        script = records -> {
+            if (records.size() > 1) { // the call of all groups fails as a whole, and spends the pass's time
+                long until = System.nanoTime() + Duration.ofMillis(400).toNanos();
+                while (System.nanoTime() < until) {
+                    try {
+                        Thread.sleep(10);
+                    } catch (InterruptedException ignored) {
+                        // keeps going
+                    }
+                }
+                return List.of();
+            }
+            return handler.handleBatch(records);
+        };
+
+        process();
+
+        assertThat(parkedRows()).as("b#1 was not called, and b#2 keeps its time").contains("b#2:1:" + later);
+    }
+
     /** How many rows of {@code delivered}, keys k#n, went ahead of a lower row. */
     private static long overtakers(List<String> delivered) {
         long overtook = 0;

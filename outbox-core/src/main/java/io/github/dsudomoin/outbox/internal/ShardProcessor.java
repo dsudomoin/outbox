@@ -1041,7 +1041,8 @@ public final class ShardProcessor implements AutoCloseable {
             writes.forEach(write -> written.add(write.r().id()));
             parked.apply(c, shard, writes, written, now);
             pass.wroteParked |= !writes.isEmpty();
-            pass.wroteParked |= parked.pullNext(c, shard, writes, List.copyOf(offered.values()), now);
+            var answered = offered.values().stream().filter(row -> pass.answered.contains(row.id())).toList();
+            pass.wroteParked |= parked.pullNext(c, shard, writes, answered, now);
             if (probe && !pass.failed && !pass.busy) {
                 probing.set(shard, 0); // no call of the probe failed as a whole: batch again
             }
@@ -1123,6 +1124,8 @@ public final class ShardProcessor implements AutoCloseable {
         boolean fromRetry;
         /** A row went to the dead table. */
         boolean deadLettered;
+        /** The rows that got an outcome. */
+        final Set<Long> answered = new HashSet<>();
         /** A handed parked row was written. */
         boolean wroteParked;
         /** Re-parks, keeps and unparks of handed parked rows, written as JDBC batches when the round ends. */
@@ -1250,6 +1253,7 @@ public final class ShardProcessor implements AutoCloseable {
         }
         pass.delivered += done.size();
         pass.settled |= !outcomes.isEmpty();
+        pass.answered.addAll(outcomes.keySet());
         return promoted;
     }
 
