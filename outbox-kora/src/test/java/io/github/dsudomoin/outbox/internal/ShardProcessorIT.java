@@ -3549,6 +3549,27 @@ class ShardProcessorIT {
         }
     }
 
+    /** A held record takes its key past a call: it passes the key's older rows, and its leaving brings them next. */
+    @Test
+    void aHeldRecordTakingItsKeyPastACallPassesAtMostAPortion() throws Exception {
+        config.shards(1).batchSize(3);
+        bootstrap();
+        requeueAll();
+        send(msg("t", "a", "a#1"), msg("t", "a", "a#2"), msg("t", "a", "a#3"), msg("t", "b", "b#1"), msg("t", "b", "b#2"),
+                msg("t", "b", "b#3"));
+        tick();
+        processUntilNoWork();
+        assertThat(parkedRows()).hasSize(6);
+        script = answering(Map.of());
+        send(msg("t", "a", "a#4"), msg("t", "b", "b#4"));
+        tick();
+
+        processUntilNoWork();
+
+        assertThat(delivered()).containsExactly("a#1", "a#2", "a#3", "a#4", "b#4", "b#1", "b#2", "b#3");
+        assertThat(parkedRows()).isEmpty();
+    }
+
     /** Shards sharing a call share its room: a key of the next shard that finds none is held, and its cursor moves. */
     @Test
     void aKeyOfAShardFindingNoRoomInASharedCallIsHeld() throws Exception {
