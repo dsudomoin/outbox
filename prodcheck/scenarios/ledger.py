@@ -20,7 +20,7 @@ p.add_argument("--late-block", action="append", default=[], metavar="KEY=MAX",
                help="a key larger than a call: its order may break by one late block of at most MAX overtaking rows, nothing more")
 p.add_argument("--parked-file", help="samples of each key's parked rows, epoch|key|count, as parked_watch writes them")
 p.add_argument("--parked-limit", type=int, help="relay.batchSize, with --parked-file: an overtaking on a key with at least that many "
-                                                "parked rows in the minute before it, by at most that many rows, is the README's limit; its first arrivals are not checked")
+                                                "parked rows around it, by at most two calls' worth of rows, is the README's limit; its first arrivals are not checked")
 p.add_argument("--search-path", help="schema of the ledger tables, when not public")
 p.add_argument("--max-dups", type=int, help="arrivals beyond the first of a message, at most")
 p.add_argument("--min-dups", type=int, default=0, help="at least: the fault really hit a batch in flight")
@@ -169,8 +169,9 @@ for tag in args.order_within_tag:
     effect_order += inversions(strict(by_key(effects, tag)))
     arrival_order += inversions(strict(by_key(arrivals, tag)))
 # Past the limit the README states (a key's parked rows do not fit a call) a row may pass older ones that answered requeue,
-# by about a portion. Effects are held to that; a sample every 2 s can miss the step from limit to limit + 1, so at the limit
-# counts. First arrivals say nothing there: a held key's call answers requeue without reaching the handler's arrival, so the
+# by about a portion, and a call holds up to two batches. Effects are held to that. A sample every 2 s can miss the step
+# over the limit, and the rows of the step that crossed it can be in the next sample, so at the limit counts, up to 5 s after
+# the row. First arrivals say nothing there: a held key's call answers requeue without reaching the handler's arrival, so the
 # first row of each portion is what they show. Anything off such a key stays a violation.
 parked = {}
 if args.parked_file:
@@ -181,11 +182,11 @@ if args.parked_file:
 
 
 def at_limit(bad):
-    return any(bad["at"] - 60 <= t <= bad["at"] and n >= args.parked_limit for t, n in parked.get(bad["key"][2], []))
+    return any(bad["at"] - 60 <= t <= bad["at"] + 5 and n >= args.parked_limit for t, n in parked.get(bad["key"][2], []))
 
 
 def past_limit(bad):
-    return at_limit(bad) and bad["overtakers"] <= args.parked_limit
+    return at_limit(bad) and bad["overtakers"] <= 2 * args.parked_limit
 
 
 result["past_limit_order"] = [b for b in effect_order if past_limit(b)]
