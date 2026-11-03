@@ -106,9 +106,13 @@ public final class ParkedStore {
         wholeKeys = "select " + RECORD_COLUMNS + " from unnest(?::text[], ?::bytea[], ?::int8[]) k(t, b, above)"
                 + " cross join lateral (select " + RECORD_COLUMNS + " from " + parked
                 + " where shard = ? and topic = k.t and key = k.b and (id <= k.above or due_at <= ?)) p order by id";
-        pullNext = "update " + parked + " p set due_at = ? where p.id in (select q.id from (select distinct t, b from"
-                + " unnest(?::text[], ?::bytea[]) u(t, b)) k cross join lateral (select id, due_at from " + parked
-                + " where shard = ? and topic = k.t and key = k.b order by id limit ?) q where q.due_at > ?)";
+        // ahead of every row of the shard, its earliest due time, so the rows of a key whose block ended go in their order
+        // and no chunk of it already overdue passes them again
+        pullNext = "with t as (select least(?::timestamptz, min(due_at)) ahead from " + parked + " where shard = ?)"
+                + " update " + parked + " p set due_at = t.ahead from t where p.id in (select q.id from (select distinct"
+                + " u.t, u.b from unnest(?::text[], ?::bytea[]) u(t, b)) k cross join lateral (select id, due_at from "
+                + parked + " where shard = ? and topic = k.t and key = k.b order by id limit ?) q where q.due_at >"
+                + " (select ahead from t))";
         countOfKeys = "select k.t, k.b, count(*) from (select distinct t, b from unnest(?::text[], ?::bytea[]) u(t, b)) k"
                 + " join " + parked + " p on p.shard = ? and p.topic = k.t and p.key = k.b group by k.t, k.b";
         minDue = "select min(due_at) from " + parked + " where shard = ?";
@@ -370,8 +374,10 @@ public final class ParkedStore {
 
     /**
      * For each key of {@code handed} none of whose rows stays ({@code writes}: its {@link Park} or {@link Keep}), its
-     * lowest {@code batch} rows are due now, so its rows go on at once, in their order, whenever they would have come
-     * round; a row's own {@code notBefore} is cut short by that. One statement. Returns whether it wrote a row.
+     * lowest {@code batch} rows are due ahead of every other row of the shard, so its rows go on at once and in their
+     * order, whenever they would have come round, and at most the one chunk already read when its block ended has passed
+     * them; a row's own {@code notBefore} is cut short by that. The key takes the next steps until its rows stop leaving.
+     * One statement. Returns whether it wrote a row.
      */
     public boolean pullNext(Connection c, int shard, List<Action> writes, List<OutboxRecord> handed, Instant now)
             throws SQLException {
@@ -391,11 +397,11 @@ public final class ParkedStore {
         }
         try (var ps = c.prepareStatement(pullNext)) {
             ps.setObject(1, timestamp(now));
-            ps.setArray(2, c.createArrayOf("text", gone.values().stream().map(OutboxRecord::topic).toArray()));
-            ps.setArray(3, c.createArrayOf("bytea", gone.values().stream().map(OutboxRecord::key).toArray(byte[][]::new)));
-            ps.setShort(4, (short) shard);
-            ps.setInt(5, batch);
-            ps.setObject(6, timestamp(now));
+            ps.setShort(2, (short) shard);
+            ps.setArray(3, c.createArrayOf("text", gone.values().stream().map(OutboxRecord::topic).toArray()));
+            ps.setArray(4, c.createArrayOf("bytea", gone.values().stream().map(OutboxRecord::key).toArray(byte[][]::new)));
+            ps.setShort(5, (short) shard);
+            ps.setInt(6, batch);
             return ps.executeUpdate() > 0;
         }
     }

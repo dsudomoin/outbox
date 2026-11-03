@@ -2539,6 +2539,49 @@ class ShardProcessorIT {
         assertThat(delivered()).containsExactlyInAnyOrder(all);
     }
 
+    /** {@code rows} parked rows k#1.. of key k, all due now, without the merges of the main pass that would park them. */
+    private void seedParked(int rows) throws SQLException {
+        try (var c = TestDb.connect()) {
+            execute(c, "insert into " + names.parked() + " (id, shard, message_id, topic, key, payload, created_at,"
+                    + " attempts, requeues, due_at) select i, 0, gen_random_uuid(), 't', 'k'::bytea,"
+                    + " convert_to('k#' || i, 'UTF8'), now(), 0, 1, '" + now + "'::timestamptz"
+                    + " from generate_series(1, " + rows + ") i");
+            execute(c, "update " + names.cursor() + " set parked_due_at = '" + now + "'::timestamptz");
+        }
+    }
+
+    /** How many rows of {@code delivered}, keys k#n, went ahead of a lower row. */
+    private static long overtakers(List<String> delivered) {
+        long overtook = 0;
+        int lowestLeft = Integer.MAX_VALUE;
+        for (int i = delivered.size() - 1; i >= 0; i--) {
+            int n = Integer.parseInt(delivered.get(i).substring(2));
+            overtook += n > lowestLeft ? 1 : 0;
+            lowestLeft = Math.min(lowestLeft, n);
+        }
+        return overtook;
+    }
+
+    /** A block ends in the middle of a sweep: one overdue chunk goes ahead, once, and the rest come back in their order. */
+    @Test
+    void aBlockEndingInASweepLetsOneChunkOvertakeOnce() throws Exception {
+        config.batchSize(3);
+        bootstrap();
+        seedParked(30);
+        requeueAll();
+        now = now.plus(REQUEUE_DELAY);
+        for (int i = 0; i < 4; i++) { // the sweep reaches past k#12, the rest of the key overdue
+            process();
+        }
+        script = answering(Map.of()); // the block ends
+
+        processUntilNoWork();
+
+        var order = delivered();
+        assertThat(parkedRows()).isEmpty();
+        assertThat(overtakers(order)).as("in " + order).isLessThanOrEqualTo(3);
+    }
+
     /** A pulled row's own notBefore is cut short: its older rows gone, it comes in its order, and answers again. */
     @Test
     void aPulledRowsOwnNotBeforeIsCutShort() throws Exception {
@@ -2686,12 +2729,7 @@ class ShardProcessorIT {
     void theFirstSweepOfALongKeyDoesNotBurnItsRequeues() throws Exception {
         config.batchSize(3).maxRequeues(5);
         bootstrap();
-        try (var c = TestDb.connect()) { // as many rows as a sweep takes steps, parked without their merges
-            execute(c, "insert into " + names.parked() + " (id, shard, message_id, topic, key, payload, created_at,"
-                    + " attempts, requeues, due_at) select i, 0, gen_random_uuid(), 't', 'k'::bytea, 'p'::bytea, now(), 0,"
-                    + " 1, '" + now + "'::timestamptz from generate_series(1, 30) i");
-            execute(c, "update " + names.cursor() + " set parked_due_at = '" + now + "'::timestamptz");
-        }
+        seedParked(30);
         requeueAll();
         now = now.plus(REQUEUE_DELAY);
 
