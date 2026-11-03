@@ -45,6 +45,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
@@ -1051,6 +1052,7 @@ class MaintenanceIT {
     }
 
     @Test
+    @Tag("timing") // its runs must fit in the minute the WARN repeats after
     void fewPremadeRangesAreAWarnOnceAMinute() throws Exception {
         var config = new TestOutboxConfig().relayEnabled(false).xidsPerPartition(1000).premake(4);
         var schema = new OutboxSchema(db, config);
