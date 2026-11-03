@@ -51,7 +51,7 @@ Records a `handleBatch` override set aside with `Outcome.requeue()` (writing-out
 
 | Key | Default | Rule and meaning |
 |---|---|---|
-| `delay` | `1s` | > 0. A requeued record comes back after this unless a new record of its key, or a newer parked record of its key whose time has come, brings it back first; `requeue(notBefore)` due not before `notBefore` (capped at 24 h). A parked record handed back and not attempted waits at least this too. |
+| `delay` | `1s` | > 0. A requeued record comes back after this unless a new record of its key, its key's retry head, or a newer parked record of its key whose time has come, brings it back first, so a longer `delay` does not cut the repeats of a busy key (bound them with `maxRequeues` or the handler); `requeue(notBefore)` due not before `notBefore` (capped at 24 h). A parked record handed back and not attempted waits at least this too. |
 | `maxRequeues` | `0` | ≥ 0. The requeue past this moves the record to `<table>_dead` with «requeue limit reached», attempts unchanged. Every hand-back answered with `requeue` counts, merges ahead of a new record of the key and early offers ahead of a newer due record of the key included. `0` = unlimited. Global; a handler can bound per route with `record.requeues()`, or by time, since merges spend requeues at an unpredictable rate: `Duration.between(record.createdAt(), now)` past a limit → `permanent`. |
 
 ## `outbox.relay.waiting`

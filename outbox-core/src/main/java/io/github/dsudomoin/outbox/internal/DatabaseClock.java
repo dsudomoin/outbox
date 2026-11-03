@@ -18,6 +18,9 @@ import java.time.temporal.ChronoUnit;
  * Thread-safe; a later reading of another worker simply replaces the last. Message ids and the inbox's window follow it
  * too ({@link #millis}), as ids a clock off by more than the inbox's retention lie outside the window of dedup; there
  * the readings come from the heartbeat, the relay's ticks and the inbox's maintenance, never from a send or an accept.
+ * A suspend or a VM pause stops {@code nanoTime}, so it lags by that long until the next reading (a relay's next pass, at
+ * most {@code maintenanceInterval} elsewhere): a time made meanwhile is off by the pause at most. No guard against the
+ * JVM's wall clock: it could not tell a pause from a step of that clock, which this class exists to ignore.
  */
 public final class DatabaseClock {
 
