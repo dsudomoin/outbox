@@ -147,14 +147,15 @@ soak_requeue_block() { # fewer parked rows per key than a batch: such a key's or
 soak_settled() { # after the drain: the series' last rows and the verdict on size, till autovacuum has had its turn
   kill "$SERIES_PID" 2> /dev/null || true
   soak_phase drained
-  local n line rc
+  local n line rc report=0
   for n in $(seq 1 12); do
     soak_row
     python3 "$PC/scenarios/soak_report.py" "$SERIES" > /dev/null && break
     command sleep 15
   done
-  python3 "$PC/scenarios/soak_report.py" "$SERIES" > "$RESULT_DIR/soak.report" || true
+  python3 "$PC/scenarios/soak_report.py" "$SERIES" > "$RESULT_DIR/soak.report" || report=$?
   while IFS='|' read -r rc line; do check "$rc" "$line"; done < "$RESULT_DIR/soak.report"
+  [ "$report" = 0 ] || grep -q '^1|' "$RESULT_DIR/soak.report" || check 1 "soak_report.py не отработал: см. soak.log"
 }
 
 s_soak() {
