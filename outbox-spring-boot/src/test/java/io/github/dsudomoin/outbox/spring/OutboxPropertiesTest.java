@@ -73,6 +73,8 @@ class OutboxPropertiesTest {
         bind(p -> assertThat(p.partitions().tailConversion().window()).isEmpty(),
             "outbox.partitions.tail-conversion.window=");
         bind(p -> assertThat(p.shards()).isEqualTo(16), "outbox.shards=16");
+        bind(p -> assertThat(p.networkTimeout()).isEqualTo(java.time.Duration.ofSeconds(7)),
+            "outbox.network-timeout=7s");
     }
 
     @Test
