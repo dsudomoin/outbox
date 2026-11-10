@@ -6,6 +6,7 @@ import io.github.dsudomoin.outbox.OutboxAdmin;
 import io.github.dsudomoin.outbox.OutboxStatus;
 import jakarta.annotation.Nullable;
 import java.util.Collection;
+import java.util.UUID;
 
 /** The {@code OutboxAdmin} bean: the admin of the lifecycle's latest start. */
 final class LifecycleOutboxAdmin implements OutboxAdmin {
@@ -66,7 +67,22 @@ final class LifecycleOutboxAdmin implements OutboxAdmin {
     }
 
     @Override
+    public long recoverStrandedShards() {
+        return admin().recoverStrandedShards();
+    }
+
+    @Override
     public Abandoned abandonWaiting(String topic, @Nullable byte[] key, String reason, boolean dryRun) {
         return admin().abandonWaiting(topic, key, reason, dryRun);
+    }
+
+    @Override
+    public Abandoned abandonKey(String topic, byte[] key, String reason, boolean dryRun) {
+        return admin().abandonKey(topic, key, reason, dryRun);
+    }
+
+    @Override
+    public Abandoned abandonRecord(String topic, UUID messageId, String reason, boolean dryRun) {
+        return admin().abandonRecord(topic, messageId, reason, dryRun);
     }
 }

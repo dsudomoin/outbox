@@ -6,6 +6,7 @@ import io.github.dsudomoin.outbox.DeadLetterFilter;
 import io.github.dsudomoin.outbox.OutboxAdmin;
 import io.github.dsudomoin.outbox.OutboxStatus;
 import io.github.dsudomoin.outbox.admin.spring.api.OutboxAdminApi;
+import io.github.dsudomoin.outbox.admin.spring.model.AbandonKey;
 import io.github.dsudomoin.outbox.admin.spring.model.AbandonWaiting;
 import io.github.dsudomoin.outbox.admin.spring.model.Abandoned;
 import io.github.dsudomoin.outbox.admin.spring.model.Count;
@@ -169,6 +170,28 @@ class OutboxAdminController implements OutboxAdminApi {
     }
 
     @Override
+    public ResponseEntity<Count> recoverStrandedShards() {
+        return ResponseEntity.ok(new Count(admin().recoverStrandedShards()));
+    }
+
+    @Override
+    public ResponseEntity<Abandoned> abandonKey(AbandonKey parameter) {
+        var body = RequestReaders.read(AbandonKey.class);
+        boolean dryRun = Boolean.TRUE.equals(body.getDryRun());
+        var detail = new LinkedHashMap<String, String>(); // the reason goes into the audit line
+        detail.put("topic", body.getTopic());
+        detail.put("key", body.getKey());
+        detail.put("messageId", body.getMessageId() == null ? null : body.getMessageId().toString());
+        detail.put("reason", body.getReason());
+        detail.put("dryRun", String.valueOf(dryRun));
+        RequestContextHolder.currentRequestAttributes().setAttribute(DETAIL, detail, RequestAttributes.SCOPE_REQUEST);
+        var abandoned = body.getMessageId() != null
+            ? admin().abandonRecord(body.getTopic(), body.getMessageId(), body.getReason(), dryRun)
+            : admin().abandonKey(body.getTopic(), body.getKey().getBytes(UTF_8), body.getReason(), dryRun);
+        return ResponseEntity.ok(new Abandoned(abandoned.keys(), abandoned.records()));
+    }
+
+    @Override
     public ResponseEntity<Abandoned> abandonWaiting(AbandonWaiting parameter) {
         var body = RequestReaders.read(AbandonWaiting.class);
         boolean dryRun = Boolean.TRUE.equals(body.getDryRun());
@@ -188,7 +211,7 @@ class OutboxAdminController implements OutboxAdminApi {
      * of every route: no {@code Content-Type} is a missing body, as for the Kora adapter; another one is no JSON.
      */
     @PostMapping(path = {"/kora-outbox/admin/v1/dead-letters/redrive", "/kora-outbox/admin/v1/dead-letters/discard",
-            "/kora-outbox/admin/v1/waiting/abandon"}, produces = MediaType.APPLICATION_JSON_VALUE)
+            "/kora-outbox/admin/v1/waiting/abandon", "/kora-outbox/admin/v1/keys/abandon"}, produces = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<Error> notJson(@RequestHeader(value = HttpHeaders.CONTENT_TYPE, required = false)
             @Nullable String contentType) {
         return contentType == null
@@ -299,7 +322,7 @@ class OutboxAdminController implements OutboxAdminApi {
     }
 
     private static Instance instance(OutboxStatus.Instance i) {
-        return new Instance(i.id(), i.shards(), dateTime(i.lastSeen()), i.hookActive(), i.relay())
+        return new Instance(i.id(), i.shards(), dateTime(i.lastSeen()), i.hookActive(), i.relay(), i.live())
             .contracts(i.contracts() == null ? null : new TreeMap<>(i.contracts())).routes(i.routes());
     }
 

@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.admin.spring;
 
+import io.github.dsudomoin.outbox.admin.spring.model.AbandonKey;
 import io.github.dsudomoin.outbox.admin.spring.model.AbandonWaiting;
 import io.github.dsudomoin.outbox.admin.spring.model.DeadLetterStatus;
 import io.github.dsudomoin.outbox.admin.spring.model.Filter;
@@ -13,6 +14,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.function.Function;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -46,6 +48,7 @@ class RequestReaders extends RequestBodyAdviceAdapter {
     private static final Set<String> SELECTION = Set.of("ids", "filter");
     private static final Set<String> FILTER = Set.of("topic", "key", "error", "failedFrom", "failedTo", "status");
     private static final Set<String> ABANDON = Set.of("topic", "key", "reason", "dryRun");
+    private static final Set<String> ABANDON_KEY = Set.of("topic", "key", "messageId", "reason", "dryRun");
 
     private static final Logger log = LoggerFactory.getLogger(RequestReaders.class);
     private static final String BOUND = RequestReaders.class.getName() + ".bound";
@@ -97,7 +100,9 @@ class RequestReaders extends RequestBodyAdviceAdapter {
                 throw new IllegalArgumentException("Expecting a JSON object as the request body");
             }
             RequestContextHolder.currentRequestAttributes().setAttribute(BOUND,
-                targetType == Selection.class ? selection(map) : abandonWaiting(map), RequestAttributes.SCOPE_REQUEST);
+                targetType == Selection.class ? selection(map)
+                    : targetType == AbandonKey.class ? abandonKey(map) : abandonWaiting(map),
+                RequestAttributes.SCOPE_REQUEST);
         }
         return message;
     }
@@ -161,11 +166,38 @@ class RequestReaders extends RequestBodyAdviceAdapter {
             throw new IllegalArgumentException("missing field '" + (topic == null ? "topic" : "reason")
                 + "' in AbandonWaiting");
         }
+        return new AbandonWaiting(topic, reason).key(key).dryRun(dryRun(body));
+    }
+
+    private static AbandonKey abandonKey(Map<?, ?> body) {
+        known(body, "AbandonKey", ABANDON_KEY, "topic, key, messageId, reason, dryRun");
+        var topic = string(body, "topic");
+        var key = string(body, "key");
+        var messageId = string(body, "messageId");
+        var reason = string(body, "reason");
+        if (topic == null || reason == null) {
+            throw new IllegalArgumentException("missing field '" + (topic == null ? "topic" : "reason")
+                + "' in AbandonKey");
+        }
+        if ((key == null) == (messageId == null)) {
+            throw new IllegalArgumentException("AbandonKey needs exactly one of 'key' and 'messageId'");
+        }
+        UUID id;
+        try {
+            id = messageId == null ? null : UUID.fromString(messageId);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("field 'messageId' is not a UUID: " + messageId);
+        }
+        return new AbandonKey(topic, reason).key(key).messageId(id).dryRun(dryRun(body));
+    }
+
+    @Nullable
+    private static Boolean dryRun(Map<?, ?> body) {
         var dryRun = body.get("dryRun");
         if (dryRun != null && !(dryRun instanceof Boolean)) {
             throw new IllegalArgumentException("Expecting a boolean for field 'dryRun', got " + dryRun);
         }
-        return new AbandonWaiting(topic, reason).key(key).dryRun((Boolean) dryRun);
+        return (Boolean) dryRun;
     }
 
     private static void known(Map<?, ?> body, String type, Set<String> fields, String listed) {

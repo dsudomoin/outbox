@@ -157,6 +157,8 @@ class AdminHttpIT {
                     Thread.sleep(20);
                 }
             }
+            assertThat((Boolean) JsonPath.read(call("GET", "/status", null).body, "$.instances[0].live"))
+                .as("this app's own row, just beaten").isTrue();
             execute("delete from " + names.instance());
             execute("insert into " + names.instance() + " (instance_id, shards, last_seen, hook_active, relay,"
                 + " contracts, routes) values ('host-b/7/0000beef', 2, '2026-01-15T10:00:00Z', true, true,"
@@ -179,11 +181,11 @@ class AdminHttpIT {
                     + "\"orphans\":[{\"table\":\"" + orphan + "\",\"kind\":\"foreign\"}],\"tailOverflow\":false,"
                     + "\"premade\":2,\"maintenanceSinceSuccessSeconds\":\"S\",\"shards\":2,\"instances\":[{\"id\":"
                     + "\"host-b/7/0000beef\",\"shards\":2,\"lastSeen\":\"2026-01-15T10:00:00.000Z\","
-                    + "\"hookActive\":true,\"relay\":true,\"contracts\":{\"t1\":1,\"t2\":2},"
+                    + "\"hookActive\":true,\"relay\":true,\"live\":false,\"contracts\":{\"t1\":1,\"t2\":2},"
                     + "\"routes\":[\"t1\",\"t2\"]},"
                     + "{\"id\":\"host-c/8/0000cafe\",\"shards\":2,\"lastSeen\":\"2026-01-15T10:00:00.000Z\","
-                    + "\"hookActive\":false,\"relay\":false},{\"id\":\"host-d/9/0000d00d\",\"shards\":2,"
-                    + "\"lastSeen\":\"2026-01-15T10:00:00.000Z\",\"hookActive\":true,\"relay\":true,\"contracts\":{},"
+                    + "\"hookActive\":false,\"relay\":false,\"live\":false},{\"id\":\"host-d/9/0000d00d\",\"shards\":2,"
+                    + "\"lastSeen\":\"2026-01-15T10:00:00.000Z\",\"hookActive\":true,\"relay\":true,\"live\":false,\"contracts\":{},"
                     + "\"routes\":[]}]}");
         });
     }
@@ -588,6 +590,137 @@ class AdminHttpIT {
             assertThat(recovered.body).isEqualTo("{\"count\":3}");
             assertThat(outboxMessageIds()).as("re-sent with the same message ids").containsAll(sent);
             assertThat((Boolean) JsonPath.read(call("GET", "/status", null).body, "$.halted")).isFalse();
+        });
+    }
+
+    @Test
+    void repairsStrandedShardsOnlyWhenThereAreAny() {
+        app(() -> {
+            var none = call("POST", "/recovery/stranded-shards", null);
+
+            assertJson(none, 409);
+            assertThat(none.body).startsWith("{\"message\":\"no stranded shards");
+
+            var outbox = context.getBean(Outbox.class);
+            var sent = new TransactionTemplate(context.getBean(PlatformTransactionManager.class))
+                .execute(status -> outbox.sendAll(List.of(OutboxMessage.of("t", "a", bytes("1")),
+                    OutboxMessage.of("t", "b", bytes("2")), OutboxMessage.of("t", "c", bytes("3")))));
+            execute("insert into " + names.tick() + " (snapshot) values (pg_current_snapshot())");
+            execute("delete from " + names.tick() + " where id = (select min(tick_id) from " + names.cursor() + ")");
+            execute("delete from " + names.checkpoint());
+
+            var repaired = call("POST", "/recovery/stranded-shards", null);
+
+            assertJson(repaired, 200);
+            assertThat(repaired.body).isEqualTo("{\"count\":3}");
+            assertThat(outboxMessageIds()).as("re-sent with the same message ids").containsAll(sent);
+            assertJson(call("POST", "/recovery/stranded-shards", null), 409);
+        });
+    }
+
+    @Test
+    void abandonsAKeyOrAnUnkeyedRecord() {
+        app(() -> {
+            seedWaiting();
+
+            var dryRun = call("POST", "/keys/abandon",
+                "{\"topic\":\"t\",\"key\":\"k\",\"reason\":\"stuck\",\"dryRun\":true}");
+            assertJson(dryRun, 200);
+            assertSameJson(dryRun.body, "{\"keys\":1,\"records\":3}");
+            assertThat(deadIds()).isEmpty();
+
+            var key = call("POST", "/keys/abandon", "{\"topic\":\"t\",\"key\":\"k\",\"reason\":\"stuck\"}");
+            assertJson(key, 200);
+            assertSameJson(key.body, "{\"keys\":1,\"records\":3}"); // head, follower and parked row
+            assertThat(deadIds()).containsExactly(5L, 10L, 11L);
+
+            String unkeyed;
+            try (var c = connect()) {
+                unkeyed = TestSql.queryString(c, "select message_id::text from " + names.retry() + " where id = 20");
+            }
+            var record = call("POST", "/keys/abandon",
+                "{\"topic\":\"t\",\"messageId\":\"" + unkeyed + "\",\"reason\":\"poison\"}");
+            assertSameJson(record.body, "{\"keys\":1,\"records\":1}");
+            assertThat(deadIds()).containsExactly(5L, 10L, 11L, 20L);
+            try (var c = connect()) {
+                assertThat(TestSql.queryString(c, "select string_agg(distinct status || ' ' || error, ', ' order by"
+                    + " status || ' ' || error) from " + names.dead())).isEqualTo("kept abandoned: poison, kept"
+                    + " abandoned: stuck");
+            }
+
+            assertSameJson(call("POST", "/keys/abandon", "{\"topic\":\"t\",\"key\":\"k\",\"reason\":\"stuck\"}")
+                .body, "{\"keys\":0,\"records\":0}"); // a second call
+        });
+    }
+
+    @Test
+    void abandonKeyLeavesItsDetailForTheAuditLine() {
+        app(() -> {
+            seedWaiting();
+
+            var result = perform("POST", API + "/keys/abandon", "application/json",
+                "{\"topic\":\"t\",\"key\":\"ключ\",\"reason\":\"stuck\"}");
+
+            assertThat(result.getResponse().getStatus()).isEqualTo(200);
+            var detail = (Map<?, ?>) result.getRequest().getAttribute(OutboxAdminController.DETAIL);
+            assertThat(detail.keySet().stream().map(Object::toString))
+                .containsExactly("topic", "key", "messageId", "reason", "dryRun");
+            assertThat(detail.get("key")).isEqualTo("ключ");
+            assertThat(detail.get("reason")).isEqualTo("stuck");
+            assertThat(deadIds()).as("the key's UTF-8 bytes").containsExactly(30L);
+        });
+    }
+
+    /** Neither a typo nor a missing key may widen the call; a keyed record goes only with its key. */
+    @Test
+    void abandonKeyRefusesBadInput() {
+        app(() -> {
+            seedWaiting();
+            String keyed;
+            try (var c = connect()) {
+                keyed = TestSql.queryString(c, "select message_id::text from " + names.retry() + " where id = 10");
+            }
+
+            for (var body : List.of("{\"topic\":\"t\",\"reason\":\"r\"}",
+                "{\"topic\":\"t\",\"key\":\"k\",\"messageId\":\"" + UUID.randomUUID() + "\",\"reason\":\"r\"}",
+                "{\"topic\":\"t\",\"messageId\":\"not-a-uuid\",\"reason\":\"r\"}",
+                "{\"topic\":\"t\",\"messageId\":\"" + keyed + "\",\"reason\":\"r\"}",
+                "{\"topic\":\"t\",\"kye\":\"k\",\"reason\":\"r\"}", "{\"topic\":\"t\",\"key\":\"k\"}",
+                "{\"key\":\"k\",\"reason\":\"r\"}", "{\"topic\":\"\",\"key\":\"k\",\"reason\":\"r\"}",
+                "{\"topic\":\"t\",\"key\":\"k\",\"reason\":\" \"}",
+                "{\"topic\":\"t\",\"key\":\"k\",\"reason\":\"r\",\"dryRun\":\"no\"}",
+                "{\"topic\":\"t\",\"key\":1,\"reason\":\"r\"}", "null", "[]")) {
+                var response = call("POST", "/keys/abandon", body);
+
+                assertJson(response, 400);
+                assertThat(response.body).as(body).startsWith("{\"message\":\"");
+            }
+            assertJson(call("POST", "/keys/abandon", null), 400); // no body, no Content-Type
+            assertThat(call("POST", "/keys/abandon", "{\"topic\":\"t\",\"reason\":\"r\"}").body)
+                .isEqualTo("{\"message\":\"AbandonKey needs exactly one of 'key' and 'messageId'\"}");
+            assertThat(deadIds()).isEmpty();
+        });
+    }
+
+    @Test
+    void abandonKeyOnABusyShardIsAConflict() {
+        app(() -> {
+            seedWaiting();
+            try (var holder = connect()) {
+                holder.setAutoCommit(false);
+                try (var ps = holder.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {
+                    ps.setInt(1, names.resolve(holder).internalNamespace()); // the canonical schema.name's lock
+                    ps.setInt(2, TableNames.LOCK_SHARD_BASE);
+                    ps.execute();
+                }
+
+                var busy = call("POST", "/keys/abandon", "{\"topic\":\"t\",\"key\":\"k\",\"reason\":\"stuck\"}");
+
+                assertJson(busy, 409);
+                assertThat(busy.body).contains("busy, retry");
+                holder.rollback();
+            }
+            assertThat(deadIds()).isEmpty();
         });
     }
 
