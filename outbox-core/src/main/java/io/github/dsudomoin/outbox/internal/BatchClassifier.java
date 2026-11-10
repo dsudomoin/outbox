@@ -154,11 +154,11 @@ public final class BatchClassifier {
                         ? new Dead(r, r.attempts(), REQUEUE_LIMIT)
                         : new Park(r, r.requeues() + 1, dueAt(requeueDue, requeue.notBefore(), now)));
             } else if (outcome instanceof Outcome.Permanent p) {
-                actions.add(new Dead(r, r.attempts() + attempts, p.error().toString()));
+                actions.add(new Dead(r, r.attempts() + attempts, RetryStore.describe(p.error())));
             } else if (outcome instanceof Outcome.Retry retry) {
                 int total = r.attempts() + attempts;
                 var due = now.plus(Backoff.delay(total - 1, retryInitial, retryMax));
-                actions.add(new Head(r, total, dueAt(due, retry.notBefore(), now), retry.error().toString()));
+                actions.add(new Head(r, total, dueAt(due, retry.notBefore(), now), RetryStore.describe(retry.error())));
                 blocked.add(key);
             } else if (outcome instanceof Outcome.NotAttempted skipped && item.parked()) {
                 actions.add(new Keep(r, dueAt(requeueDue, skipped.notBefore(), now)));

@@ -452,7 +452,7 @@ public final class DeadLetterPass {
 
     /** Every letter of a failed call stays pending, due after a backoff by its failed calls so far. */
     private Batch failed(Connection tx, List<DeadLetters.Claimed> claimed, Throwable failure) throws SQLException {
-        var error = RetryStore.errorText(failure.toString());
+        var error = RetryStore.errorText(RetryStore.describe(failure));
         try (var ps = tx.prepareStatement(fail)) {
             for (var c : claimed) {
                 ps.setString(1, error);

@@ -9,6 +9,7 @@ import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
@@ -114,6 +115,58 @@ class FrameworkFreeIT {
                 .extracting(DeadLetter::messageId).containsExactly(ids.get(1));
         assertThat(telemetry.events).contains("enqueued", "deliveryStarted", "delivered", "retried", "deadLettered",
                 "requeued");
+    }
+
+    @Test
+    void aFailureWhoseToStringThrowsTakesTheRetryPathAndTheShardMovesOn() throws Exception {
+        var handler = new RecordingHandler().failAlways(r -> Arrays.equals(r.key(), bytes("poison")), Lazy::new);
+        var config = new TestOutboxConfig().relayEnabled(false).shards(1).headFailuresBeforeDivert(2);
+        var runtime = start(OutboxRuntime.builder(config, transactions, handler).build());
+        var retry = runtime.schema().names().retry();
+        var lazy = Lazy.class.getName() + " (its toString() threw " + NullPointerException.class.getName() + ")";
+
+        // alone in its batch: the shard pauses once, then the key is diverted
+        transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("orders", "poison", bytes("p"))));
+        runtime.relay().drain();
+        assertThat(lastError(retry)).isEqualTo(lazy);
+
+        var healthy = transactions.inTx(c -> runtime.outbox().sendAll(List.of(
+                OutboxMessage.of("orders", "k1", bytes("a")), OutboxMessage.of("orders", "k2", bytes("b")))));
+        runtime.relay().drain();
+        assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyElementsOf(healthy);
+
+        // the retry pass formats the error again
+        long attempts = attempts(retry);
+        await(Duration.ofSeconds(10), () -> {
+            runtime.relay().drain();
+            return attempts(retry) > attempts;
+        });
+        assertThat(lastError(retry)).isEqualTo(lazy);
+    }
+
+    private String lastError(String retry) throws Exception {
+        try (var c = transactions.newConnection()) {
+            return TestSql.queryString(c, "select last_error from " + retry);
+        }
+    }
+
+    private long attempts(String retry) {
+        try (var c = transactions.newConnection()) {
+            return TestSql.queryLong(c, "select attempts from " + retry);
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** An exception that builds its message from a field it never set. */
+    private static final class Lazy extends RuntimeException {
+
+        private Object response;
+
+        @Override
+        public String getMessage() {
+            return "status " + response.hashCode();
+        }
     }
 
     @Test

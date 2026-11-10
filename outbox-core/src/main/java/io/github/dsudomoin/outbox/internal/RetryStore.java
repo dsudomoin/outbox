@@ -365,6 +365,19 @@ public final class RetryStore {
         return instant.atOffset(ZoneOffset.UTC);
     }
 
+    /**
+     * {@code error.toString()}, or its class name when that throws: a handler's exception may build its message from
+     * state it never set, and a throw here would roll back the step that records the failure, again on every pass.
+     * {@link StackOverflowError} is named as the relay rethrows any other {@link VirtualMachineError}.
+     */
+    static String describe(Throwable error) {
+        try {
+            return error.toString();
+        } catch (RuntimeException | LinkageError | StackOverflowError e) {
+            return error.getClass().getName() + " (its toString() threw " + e.getClass().getName() + ")";
+        }
+    }
+
     @Nullable
     static String errorText(@Nullable String error) {
         if (error == null) {

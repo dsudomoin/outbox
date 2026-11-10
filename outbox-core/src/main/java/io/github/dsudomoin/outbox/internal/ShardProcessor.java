@@ -1351,15 +1351,15 @@ public final class ShardProcessor implements AutoCloseable {
                     pass.fromRetry = true;
                 }
             } else if (outcome instanceof Outcome.Permanent p) {
-                dead(c, pass, row, attempts, p.error().toString());
+                dead(c, pass, row, attempts, RetryStore.describe(p.error()));
             } else if (outcome instanceof Outcome.Retry r) {
                 if (exhausted(attempts)) {
-                    dead(c, pass, row, attempts, r.error().toString());
+                    dead(c, pass, row, attempts, RetryStore.describe(r.error()));
                     continue;
                 }
                 var due = now.plus(Backoff.delay(row.attempts(), retry.initialDelay(), retry.maxDelay()));
                 retries.reschedule(c, row, attempts, BatchClassifier.dueAt(due, r.notBefore(), now),
-                        r.error().toString());
+                        RetryStore.describe(r.error()));
                 telemetry.retried(row.topic());
                 return false;
             } else if (outcome instanceof Outcome.NotAttempted n) { // attempts, last error and wait stay
@@ -1428,15 +1428,15 @@ public final class ShardProcessor implements AutoCloseable {
                     stayed = true;
                 }
             } else if (outcome instanceof Outcome.Permanent p) {
-                deadFromParked(c, pass, row, attempts, p.error().toString());
+                deadFromParked(c, pass, row, attempts, RetryStore.describe(p.error()));
             } else if (outcome instanceof Outcome.Retry r) {
                 if (exhausted(attempts)) {
-                    deadFromParked(c, pass, row, attempts, r.error().toString());
+                    deadFromParked(c, pass, row, attempts, RetryStore.describe(r.error()));
                     continue;
                 }
                 var due = now.plus(Backoff.delay(row.attempts(), retry.initialDelay(), retry.maxDelay()));
                 parked.toRetry(c, shard, row, attempts, BatchClassifier.dueAt(due, r.notBefore(), now),
-                        r.error().toString(), null);
+                        RetryStore.describe(r.error()), null);
                 telemetry.retried(row.topic());
                 pass.toRetry = true;
                 pass.wroteParked = true;
@@ -1844,7 +1844,7 @@ public final class ShardProcessor implements AutoCloseable {
     private static String firstError(List<Item> items) {
         for (var item : items) {
             if (item.outcome() instanceof Outcome.Retry r) {
-                return r.error().toString();
+                return RetryStore.describe(r.error());
             }
         }
         return null;

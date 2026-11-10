@@ -140,6 +140,45 @@ class BatchClassifierTest {
     }
 
     @Test
+    void anErrorWhoseToStringThrowsIsRecordedUnderItsClassName() {
+        var k1 = record("t", "k1");
+        var k2 = record("t", "k2");
+        var lazy = Lazy.class.getName() + " (its toString() threw " + NullPointerException.class.getName() + ")";
+        var recursive = Recursive.class.getName() + " (its toString() threw " + StackOverflowError.class.getName()
+                + ")";
+
+        assertThat(classify(0, new Item(k1, false, Outcome.retry(new Lazy())), delivered(k2)))
+                .as("a mixed batch")
+                .isEqualTo(advance(new Head(k1, 1, NOW.plus(INITIAL), lazy)));
+        assertThat(classify(THRESHOLD - 1, new Item(k1, false, Outcome.retry(new Recursive()))))
+                .as("a divert")
+                .isEqualTo(advance(new Head(k1, THRESHOLD, NOW.plus(Duration.ofSeconds(4)), recursive)));
+        assertThat(classify(0, new Item(k1, false, Outcome.permanent(new Lazy()))))
+                .isEqualTo(advance(new Dead(k1, 1, lazy)));
+    }
+
+    /** An exception that builds its message from a field it never set. */
+    private static final class Lazy extends RuntimeException {
+
+        @Nullable
+        private Object response;
+
+        @Override
+        public String getMessage() {
+            return "status " + response.hashCode();
+        }
+    }
+
+    /** An exception whose message is its own {@link #toString()}. */
+    private static final class Recursive extends RuntimeException {
+
+        @Override
+        public String getMessage() {
+            return toString();
+        }
+    }
+
+    @Test
     void unkeyedFailuresCountAsDistinct() {
         var u1 = record("t", null);
         var u2 = record("t", null);
