@@ -2,6 +2,7 @@ package io.github.dsudomoin.outbox.micrometer;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.dsudomoin.outbox.OutboxGauge;
 import io.github.dsudomoin.outbox.OutboxHeader;
@@ -9,6 +10,7 @@ import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.Outcome;
 import io.micrometer.common.KeyValue;
+import io.micrometer.common.KeyValues;
 import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.config.MeterFilter;
 import io.micrometer.core.instrument.observation.DefaultMeterObservationHandler;
@@ -418,6 +420,91 @@ class ObservationOutboxTelemetryTest {
 
         assertThat(meters.get("custom.process").timer().count()).isEqualTo(1);
         assertThat(spans.getFinishedSpanItems()).extracting(SpanData::getName).containsExactly("custom.process");
+    }
+
+    @Test
+    void aConventionFailingOnOneRecordAtStartLeavesNoObservationRunning() {
+        var telemetry = ObservationOutboxTelemetry.builder(observations, new OutboxMetrics(meters))
+                .deliveryConvention(new OutboxDeliveryObservationConvention() {
+                    @Override
+                    public String getName() {
+                        return "outbox.deliver";
+                    }
+
+                    @Override
+                    public KeyValues getLowCardinalityKeyValues(OutboxDeliveryContext context) {
+                        if (context.record().topic().equals("bad")) {
+                            throw new IllegalStateException("unknown topic");
+                        }
+                        return KeyValues.empty();
+                    }
+                })
+                .build();
+        var bad = new OutboxRecord(2, UUID.randomUUID(), "bad", null, null, List.of(), NOW.minusSeconds(1), 0, 0);
+
+        assertThatThrownBy(() -> telemetry.deliveryStarted(List.of(record(List.of()), bad), NOW))
+                .isInstanceOf(IllegalStateException.class);
+
+        assertThat(meters.get("outbox.deliver.active").longTaskTimer().activeTasks()).isZero();
+    }
+
+    @Test
+    void aConventionFailingOnOneRecordAtStopStillStopsTheOthers() {
+        var telemetry = ObservationOutboxTelemetry.builder(observations, new OutboxMetrics(meters))
+                .deliveryConvention(new OutboxDeliveryObservationConvention() {
+                    @Override
+                    public String getName() {
+                        return "outbox.deliver";
+                    }
+
+                    @Override
+                    public String getContextualName(OutboxDeliveryContext context) {
+                        if (context.outcome() instanceof Outcome.Retry) {
+                            throw new IllegalStateException("no name for a retry");
+                        }
+                        return "deliver";
+                    }
+                })
+                .build();
+        var delivery = telemetry.deliveryStarted(List.of(record(List.of()), record(List.of())), NOW);
+        delivery.handed(List.of(record(List.of()), record(List.of())));
+
+        assertThatThrownBy(() -> delivery.finished(
+                List.of(Outcome.retry(new IOException("x")), Outcome.delivered())))
+                .isInstanceOf(IllegalStateException.class);
+
+        // the retried record's own stop failed inside Micrometer; the delivered one is stopped all the same
+        assertThat(meters.get("outbox.deliver.active").longTaskTimer().activeTasks()).isEqualTo(1);
+        assertThat(meters.get("outbox.deliver").timer().count()).isEqualTo(1);
+    }
+
+    @Test
+    void aHandlerFailingOnErrorStillStopsEveryObservation() {
+        observations.observationConfig().observationHandler(new ObservationHandler<>() {
+            @Override
+            public void onError(Observation.Context context) {
+                throw new IllegalStateException("handler");
+            }
+
+            @Override
+            public boolean supportsContext(Observation.Context context) {
+                return true;
+            }
+        });
+        var telemetry = telemetry();
+        var error = new SQLException("x");
+
+        var enqueue = telemetry.enqueueStarted();
+        assertThatThrownBy(() -> enqueue.failed(error)).isInstanceOf(IllegalStateException.class);
+        var step = telemetry.stepStarted(List.of(1));
+        assertThatThrownBy(() -> step.failed(error)).isInstanceOf(IllegalStateException.class);
+        var delivery = telemetry.deliveryStarted(List.of(record(List.of()), record(List.of())), NOW);
+        assertThatThrownBy(() -> delivery.failed(error)).isInstanceOf(IllegalStateException.class);
+
+        assertThat(meters.get("outbox.enqueue.active").longTaskTimer().activeTasks()).isZero();
+        assertThat(meters.get("outbox.relay.step.active").longTaskTimer().activeTasks()).isZero();
+        assertThat(meters.get("outbox.deliver.active").longTaskTimer().activeTasks()).isZero();
+        assertThat(observations.getCurrentObservation()).isNull();
     }
 
     @Test

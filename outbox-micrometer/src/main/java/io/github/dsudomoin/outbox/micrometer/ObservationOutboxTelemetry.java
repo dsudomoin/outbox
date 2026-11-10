@@ -75,16 +75,62 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
     public Delivery deliveryStarted(List<OutboxRecord> records, Instant now) {
         var started = new Observation[records.size()];
         var contexts = new OutboxDeliveryContext[records.size()];
-        for (int i = 0; i < started.length; i++) {
-            if (!observeUnsampled && unsampled(records.get(i).headers())) {
-                continue; // not observed: no observation, no context
+        try {
+            for (int i = 0; i < started.length; i++) {
+                if (!observeUnsampled && unsampled(records.get(i).headers())) {
+                    continue; // not observed: no observation, no context
+                }
+                var context = new OutboxDeliveryContext(records.get(i), now);
+                contexts[i] = context;
+                started[i] = Observation.createNotStarted(deliveryConvention,
+                        DefaultOutboxDeliveryObservationConvention.INSTANCE, () -> context, observations).start();
             }
-            var context = new OutboxDeliveryContext(records.get(i), now);
-            contexts[i] = context;
-            started[i] = Observation.createNotStarted(deliveryConvention,
-                    DefaultOutboxDeliveryObservationConvention.INSTANCE, () -> context, observations).start();
+        } catch (Throwable e) {
+            // the caller gets no Delivery to stop them with: stop the ones already started, or they never end
+            for (var observation : started) {
+                if (observation != null) {
+                    end(observation, e, e);
+                }
+            }
+            throw e;
         }
         return new ObservedDelivery(records, started, contexts);
+    }
+
+    /**
+     * Records {@code error} (when not null) and stops the observation, which a convention, filter or handler that
+     * throws cannot prevent unless it throws in {@code stop()} itself. Returns {@code first}, or the failure when
+     * there was none; a later failure is added to {@code first} as suppressed.
+     */
+    @Nullable
+    private static Throwable end(Observation observation, @Nullable Throwable error, @Nullable Throwable first) {
+        try {
+            try {
+                if (error != null) {
+                    observation.error(error);
+                }
+            } finally {
+                observation.stop();
+            }
+        } catch (Throwable e) {
+            if (first == null) {
+                return e;
+            }
+            if (e != first) { // a handler may rethrow the error it is given
+                first.addSuppressed(e);
+            }
+        }
+        return first;
+    }
+
+    private static void rethrow(@Nullable Throwable failure) {
+        if (failure instanceof RuntimeException e) {
+            throw e;
+        } else if (failure instanceof Error e) {
+            throw e;
+        } else if (failure != null) {
+            throw new IllegalStateException(failure);
+        }
     }
 
     /**
@@ -250,17 +296,22 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
 
         @Override
         public void failed(Throwable error) {
-            observation.error(error);
-            observation.stop();
+            rethrow(end(observation, error, null));
         }
     }
 
-    /** The scope is closed even when recording the error fails: no step stays current on the relay thread. */
+    /**
+     * The scope is closed and the observation stopped even when recording the error fails: no step stays current on
+     * the relay thread, none stays running.
+     */
     private record ObservedStep(Observation observation, Observation.Scope scope) implements RelayStep {
         @Override
         public void finished() {
-            scope.close();
-            observation.stop();
+            try {
+                scope.close();
+            } finally {
+                observation.stop();
+            }
         }
 
         @Override
@@ -268,9 +319,12 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
             try {
                 observation.error(error);
             } finally {
-                scope.close();
+                try {
+                    scope.close();
+                } finally {
+                    observation.stop();
+                }
             }
-            observation.stop();
         }
     }
 
@@ -327,33 +381,34 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
             }
         }
 
+        /** Every record's observation is stopped even when another's fails; the first failure is thrown after. */
         @Override
         public void finished(List<Outcome> outcomes) {
+            Throwable failure = null;
             for (int i = 0; i < started.length; i++) {
                 if (started[i] == null) {
                     continue;
                 }
                 var outcome = outcomes.get(i);
                 contexts[i].outcome(outcome);
-                if (outcome instanceof Outcome.Retry r) {
-                    started[i].error(r.error());
-                } else if (outcome instanceof Outcome.Permanent p) {
-                    started[i].error(p.error());
-                }
-                started[i].stop();
+                Throwable error = outcome instanceof Outcome.Retry r ? r.error()
+                        : outcome instanceof Outcome.Permanent p ? p.error() : null;
+                failure = end(started[i], error, failure);
             }
+            rethrow(failure);
         }
 
         @Override
         public void failed(Throwable error) {
+            Throwable failure = null;
             for (int i = 0; i < started.length; i++) {
                 if (started[i] == null) {
                     continue;
                 }
                 contexts[i].markFailed();
-                started[i].error(error);
-                started[i].stop();
+                failure = end(started[i], error, failure);
             }
+            rethrow(failure);
         }
     }
 
