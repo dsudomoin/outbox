@@ -54,6 +54,8 @@ final class DeadIndexBuilder {
     private Connection ddlConnection;
     /** Runs of maintenance in a row that found {@link #inDdl}'s backend not running it; on maintenance's thread. */
     private int silentRuns;
+    /** Whether {@link #letGoIfStopped} has said that it cannot see the build's state; on maintenance's thread. */
+    private boolean stateHiddenLogged;
     private volatile int failures;
     private volatile long retryAt = System.nanoTime();
 
@@ -109,18 +111,29 @@ final class DeadIndexBuilder {
      * hold its thread for good. From the client that looks the same as a long build; the database can tell: a backend
      * that no longer runs its statement, at two runs of maintenance in a row (between the build's own statements it
      * idles a moment), has answered into the void. {@code on} is aborted, which ends the thread as any failed build.
+     * A state Postgres hides (another role's backend without {@code pg_read_all_stats}, as during a credential
+     * rotation; {@code track_activities = off}) counts as running, logged once: only a vanished backend is seen then.
      */
     private void letGoIfStopped(Connection c, int pid, Connection on) throws SQLException {
-        try (var ps = c.prepareStatement("select exists (select 1 from pg_stat_activity where pid = ? and state ="
-                + " 'active')")) {
+        String state;
+        try (var ps = c.prepareStatement("select coalesce(state, 'hidden') from pg_stat_activity where pid = ?")) {
             ps.setInt(1, pid);
             try (var rs = ps.executeQuery()) {
-                rs.next();
-                if (rs.getBoolean(1)) {
-                    silentRuns = 0;
-                    return;
-                }
+                state = rs.next() ? rs.getString(1) : "gone";
             }
+        }
+        if (state.equals("hidden") || state.equals("disabled")) {
+            if (!stateHiddenLogged) {
+                stateHiddenLogged = true;
+                log.warn("outbox build of {}: Postgres hides the state of its backend {} from maintenance's role, so"
+                        + " only a backend that is gone counts as stopped; grant pg_read_all_stats (or pg_monitor)"
+                        + " to the role that runs maintenance", index, pid);
+            }
+            state = "active";
+        }
+        if (state.equals("active")) {
+            silentRuns = 0;
+            return;
         }
         if (++silentRuns >= 2) {
             silentRuns = 0;

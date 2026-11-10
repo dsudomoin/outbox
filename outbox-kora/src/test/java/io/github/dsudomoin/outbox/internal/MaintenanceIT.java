@@ -1972,6 +1972,46 @@ class MaintenanceIT {
         }
     }
 
+    /**
+     * Maintenance on a connection of another role, as during a credential rotation, and without pg_read_all_stats:
+     * Postgres hides the build's state from it, which is no sign that the build stopped.
+     */
+    @Test
+    void aBuildWhoseStateIsHiddenFromMaintenanceGoesOn() throws Exception {
+        bootstrap();
+        deadTableWithoutIndex(1);
+        var role = "rotated_" + Long.toHexString(System.nanoTime());
+        try (var c = TestDb.connect()) {
+            execute(c, "create role " + role + " login password 'pw'");
+        }
+        var props = new java.util.Properties();
+        props.setProperty("user", role);
+        props.setProperty("password", "pw");
+        var builder = new DeadIndexBuilder(db, names, Duration.ofMinutes(1), Duration.ofMinutes(1),
+                new SocketBound(Duration.ZERO));
+        try (var c = TestDb.connect(); var other = TestDb.connect(props); var holder = openDeadInsert(2);
+                var err = new CapturedStderr()) {
+            builder.startIfDue(c);
+            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
+            long pid = queryLong(c, "select pid from pg_stat_activity where query like 'create index concurrently%'");
+            assertThat(queryString(other, "select coalesce(state, 'hidden') from pg_stat_activity where pid = " + pid))
+                    .as("what the other role sees").isEqualTo("hidden");
+
+            for (int i = 0; i < 3; i++) {
+                builder.startIfDue(other);
+            }
+            assertThat(err.text()).doesNotContain("no longer runs it").contains("pg_read_all_stats");
+            holder.commit();
+            await(Duration.ofSeconds(30), () -> !builder.running());
+            assertThat(indexState()).endsWith(":true");
+        } finally {
+            builder.close(Duration.ofSeconds(10));
+            try (var c = TestDb.connect()) {
+                execute(c, "drop role if exists " + role);
+            }
+        }
+    }
+
     @Test
     void closeCancelsABuildInFlight() throws Exception {
         bootstrap();
