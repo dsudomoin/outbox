@@ -313,6 +313,12 @@ public final class PgInbox implements Inbox, AutoCloseable {
 
     private void bootstrap(Connection c) throws SQLException {
         int ns = names.resolve(c).internalNamespace();
+        if (!config.schema().bootstrap()) { // the application's migrations own it
+            // before the lock: it only reads catalogs, and a lock timeout below must not skip it
+            try (var app = db.newConnection(); var appBound = socket.on(app)) {
+                SchemaCheck.run(app, c, SchemaObjects.inbox(names), names.base(), "OutboxSql.inbox");
+            }
+        }
         try {
             advisory(c, "pg_advisory_lock", ns); // waits for another instance's bootstrap or maintenance run
             try {
@@ -320,10 +326,6 @@ public final class PgInbox implements Inbox, AutoCloseable {
                     execute(c, "create table if not exists " + names.base() + " (message_id uuid not null,"
                             + " consumer text not null default '', received_at timestamptz not null default now(),"
                             + " primary key (message_id, consumer)) partition by range (message_id)");
-                } else { // the application's migrations own it
-                    try (var app = db.newConnection(); var appBound = socket.on(app)) {
-                        SchemaCheck.run(app, c, SchemaObjects.inbox(names), names.base(), "OutboxSql.inbox");
-                    }
                 }
                 partitions.ensurePremade(c, clock.millis());
             } finally {

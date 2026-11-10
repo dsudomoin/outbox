@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 import io.github.dsudomoin.outbox.ConnectionSource;
 import io.github.dsudomoin.outbox.Inbox;
+import io.github.dsudomoin.outbox.OutboxSql;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
@@ -461,6 +462,33 @@ class PgInboxIT {
             inbox = null;
         } finally {
             app.release();
+        }
+    }
+
+    @Test
+    void schemaCheckRunsWhileMaintenanceElsewhereHoldsTheLock() throws Exception {
+        config.schemaBootstrap(false);
+        try (var c = TestDb.connect()) {
+            execute(c, OutboxSql.inbox(config, null));
+        }
+        start(); // makes the ranges, so the window covers now
+        inbox.close();
+        inbox = null;
+        try (var c = TestDb.connect()) { // a migration that differs from OutboxSql.inbox
+            execute(c, "alter table " + table() + " alter column received_at set default current_timestamp");
+        }
+        try (var holder = TestDb.connect()) { // a maintenance run elsewhere holds the lock past lock_timeout
+            try (var ps = holder.prepareStatement("select pg_advisory_lock(?, ?)")) {
+                ps.setInt(1, TableNames.of("public." + table()).internalNamespace());
+                ps.setInt(2, TableNames.LOCK_INBOX_MAINTENANCE);
+                ps.execute();
+            }
+            var other = new PgInbox(db, config, new OutboxMetrics(null));
+
+            assertThatThrownBy(other::start)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("outbox schema check")
+                    .hasMessageContaining("received_at");
         }
     }
 
