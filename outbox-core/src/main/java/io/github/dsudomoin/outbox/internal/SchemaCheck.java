@@ -275,8 +275,12 @@ final class SchemaCheck {
         return definition.toLowerCase(Locale.ROOT).replaceAll("[()\\s]", "");
     }
 
-    /** Partition DDL needs the parent's owner role (or membership of it) and {@code CREATE} on its schema. */
+    /**
+     * Partition DDL needs the parent's owner role (or membership of it) and {@code CREATE} on its schema, and the
+     * right to give each partition to that owner ({@link PartitionDdl#ownerProblem}).
+     */
     private static void partitionRights(Connection ddl, String table, List<String> problems) throws SQLException {
+        boolean member = true;
         try (var ps = ddl.prepareStatement("select pg_has_role(r.relowner, 'USAGE'), has_schema_privilege("
                 + "r.relnamespace, 'CREATE'), pg_get_userbyid(r.relowner), n.nspname from pg_class r join"
                 + " pg_namespace n on n.oid = r.relnamespace where r.oid = to_regclass(?)")) {
@@ -286,6 +290,7 @@ final class SchemaCheck {
                     return; // missing, as the application connection already said
                 }
                 if (!rs.getBoolean(1)) {
+                    member = false;
                     problems.add(role(ddl) + " does not own " + table + ", which its partition DDL needs (owner "
                             + rs.getString(3) + ": make this role a member of it, or give the outbox a connection"
                             + " source of the owner)");
@@ -295,6 +300,10 @@ final class SchemaCheck {
                             + " of " + table + " are made");
                 }
             }
+        }
+        var owner = member ? PartitionDdl.ownerProblem(ddl, table, "the partitions of " + table) : null;
+        if (owner != null) {
+            problems.add(owner);
         }
     }
 

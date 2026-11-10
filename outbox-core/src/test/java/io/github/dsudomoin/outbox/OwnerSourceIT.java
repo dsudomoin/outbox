@@ -4,6 +4,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.internal.UuidV7;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
@@ -96,6 +97,70 @@ class OwnerSourceIT {
         assertThatThrownBy(runtime::start).isInstanceOf(IllegalStateException.class)
                 .hasMessageStartingWith("outbox schema check of " + config.table() + " failed")
                 .hasMessageContaining("role " + app + " does not own " + names.base());
+    }
+
+    /**
+     * Two login roles that are members of the owner, as per-instance credentials are: partitions one of them makes
+     * belong to the owner, so the other can swap the tail and drop ranges past it.
+     */
+    @Test
+    void ownerMembersShareThePartitions() throws Exception {
+        var members = memberRoles();
+        sql("alter schema " + schema + " owner to current_user"); // dropping a range then needs owning it
+        sql("grant usage, create on schema " + schema + " to " + owner);
+        migrate();
+        config.xidsPerPartition(1000).premake(2);
+        try (var first = new OutboxSchema(new JdbcTransactions(as(app)), new JdbcTransactions(as(members[0])),
+                config)) {
+            first.start();
+        }
+        assertThat(foreignTables()).as("tables owned by another role than " + owner).isEmpty();
+        sql("do $$ begin for i in 1..1000 loop perform pg_current_xact_id(); commit; end loop; end $$");
+
+        try (var second = new OutboxSchema(new JdbcTransactions(as(app)), new JdbcTransactions(as(members[1])),
+                config)) {
+            second.start(); // an extension is due: it reads the tail and swaps it
+        }
+        assertThat(foreignTables()).as("tables owned by another role than " + owner).isEmpty();
+    }
+
+    /** A member cannot give a partition to an owner without CREATE on the schema: the start names the grant. */
+    @Test
+    void ownerWithoutCreateOnSchemaFails() throws Exception {
+        var members = memberRoles();
+        sql("alter schema " + schema + " owner to current_user");
+        sql("grant usage, create on schema " + schema + " to " + owner);
+        migrate();
+        sql("revoke create on schema " + schema + " from " + owner);
+        sql("grant create on schema " + schema + " to " + members[0]);
+
+        assertThatThrownBy(() -> new OutboxSchema(new JdbcTransactions(as(app)),
+                new JdbcTransactions(as(members[0])), config).start())
+                .hasMessageContaining("GRANT CREATE ON SCHEMA " + schema + " TO " + owner);
+        assertThat(foreignTables()).as("no partition left behind").isEmpty();
+    }
+
+    private String[] memberRoles() throws SQLException {
+        var members = new String[] {"m" + TestSql.uniqueTable(), "m" + TestSql.uniqueTable()};
+        for (var member : members) {
+            sql("create role " + member + " login password 'pw' in role " + owner);
+            sql("grant pg_read_all_stats to " + member);
+        }
+        return members;
+    }
+
+    /** The schema's tables whose owner is not {@link #owner}. */
+    private List<String> foreignTables() throws SQLException {
+        var tables = new ArrayList<String>();
+        try (var c = TestDataSources.newDataSource().getConnection(); var st = c.createStatement();
+                var rs = st.executeQuery("select r.relname || ' (' || pg_get_userbyid(r.relowner) || ')' from pg_class r"
+                        + " join pg_namespace n on n.oid = r.relnamespace where n.nspname = '" + schema + "' and"
+                        + " r.relkind in ('r', 'p') and pg_get_userbyid(r.relowner) <> '" + owner + "'")) {
+            while (rs.next()) {
+                tables.add(rs.getString(1));
+            }
+        }
+        return tables;
     }
 
     /**

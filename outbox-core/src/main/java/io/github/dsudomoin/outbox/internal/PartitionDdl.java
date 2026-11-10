@@ -80,9 +80,75 @@ public final class PartitionDdl {
     static void create(Connection c, String parent, String table, Duration lockTimeout, boolean indexes)
             throws SQLException {
         if (!exists(c, table)) {
+            var owner = foreignOwner(c, parent, table);
+            // one statement batch, one implicit transaction: no table is left behind under the creating role
             execute(c, lockTimeout, "create table " + name(table) + " (like " + name(parent) + " including defaults"
-                    + (indexes ? " including indexes)" : ")"));
+                    + (indexes ? " including indexes)" : ")")
+                    + (owner == null ? "" : "; alter table " + name(table) + " owner to " + owner));
             log.info("created table {} like {}", table, parent);
+        }
+    }
+
+    /**
+     * {@code parent}'s owner, quoted, when it is not the current role, else null. A table the library makes belongs to
+     * it, so any other member of that role (per-instance credentials) can later lock, rename, attach or drop it. Fails
+     * naming the grant when the current role cannot give {@code table} to it: on Postgres 16+ membership needs the SET
+     * option, and the owner needs {@code CREATE} on the schema.
+     */
+    @Nullable
+    private static String foreignOwner(Connection c, String parent, String table) throws SQLException {
+        var problem = ownerProblem(c, parent, table);
+        if (problem != null) {
+            throw new IllegalStateException(problem);
+        }
+        try (var ps = c.prepareStatement("select quote_ident(pg_get_userbyid(relowner)) from pg_class"
+                + " where oid = to_regclass(?) and pg_get_userbyid(relowner) <> current_user")) {
+            ps.setString(1, parent);
+            try (var rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        }
+    }
+
+    /**
+     * Why the current role cannot give a new partition {@code table} of {@code parent} to {@code parent}'s owner, with
+     * the statement to run; null when it can, or when the owner is the current role or the parent is missing.
+     */
+    @Nullable
+    static String ownerProblem(Connection c, String parent, String table) throws SQLException {
+        // before 16 membership is enough to SET ROLE, and pg_has_role knows no 'SET'
+        var set = c.getMetaData().getDatabaseMajorVersion() >= 16 ? "SET" : "MEMBER";
+        try (var ps = c.prepareStatement("select pg_get_userbyid(p.relowner), n.nspname, r.rolsuper"
+                + " or pg_has_role(p.relowner, '" + set + "'), r.rolsuper or has_schema_privilege(p.relowner,"
+                + " p.relnamespace, 'CREATE') from pg_class p join pg_namespace n on n.oid = p.relnamespace,"
+                + " pg_roles r where p.oid = to_regclass(?) and r.rolname = current_user"
+                + " and pg_get_userbyid(p.relowner) <> current_user")) {
+            ps.setString(1, parent);
+            try (var rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    return null;
+                }
+                var owner = rs.getString(1);
+                var schema = rs.getString(2);
+                var cannot = "role " + role(c) + " cannot make " + table + " belong to " + owner + ", the owner of "
+                        + parent + ", as every partition must for the owner's other members to maintain it: ";
+                if (!rs.getBoolean(3)) {
+                    return cannot + "run GRANT " + owner + " TO " + role(c)
+                            + (set.equals("SET") ? " WITH SET TRUE" : "");
+                }
+                if (!rs.getBoolean(4)) {
+                    return cannot + owner + " lacks CREATE on schema " + schema + "; run GRANT CREATE ON SCHEMA "
+                            + schema + " TO " + owner;
+                }
+                return null;
+            }
+        }
+    }
+
+    private static String role(Connection c) throws SQLException {
+        try (var st = c.createStatement(); var rs = st.executeQuery("select current_user")) {
+            rs.next();
+            return rs.getString(1);
         }
     }
 

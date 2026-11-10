@@ -298,7 +298,10 @@ for ops:
      `public` on PG 14 and on databases moved from it): what it creates there runs as the owner. Startup WARNs with
      the `REVOKE`.
 
-   Either way: `pg_read_all_stats` recommended for the role that runs maintenance; no role `statement_timeout` of
+   Either way, every partition is given to the parent table's owner right after its `CREATE TABLE`, so any member
+   of the owner role (per-instance credentials) can maintain it: a role that is only a member needs the `SET` option
+   on PG 16+, and the owner role itself needs `CREATE` on the schema; otherwise startup fails naming the `GRANT`.
+   `pg_read_all_stats` recommended for the role that runs maintenance; no role `statement_timeout` of
    seconds.
 3. **Connections**: direct or session-mode pooler for whatever runs startup and maintenance. Behind transaction pooling
    only the app's own `DataSource` may go, with `prepareThreshold=0`, the `search_path` set on the role or a
