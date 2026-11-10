@@ -3,15 +3,25 @@ package io.github.dsudomoin.outbox.kafka.kora;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.OutboxConfig;
+import io.github.dsudomoin.outbox.OutboxRecord;
+import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.kafka.KafkaOutboxConfig;
 import io.github.dsudomoin.outbox.kafka.KafkaOutboxSender;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import jakarta.annotation.Nullable;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
 import java.util.Properties;
+import java.util.UUID;
+import org.apache.kafka.common.serialization.ByteArraySerializer;
+import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.Test;
 
-/** The warnings {@link KafkaOutboxModule} gives when a Kafka call can outlast the caller's own time limit. */
+/**
+ * The warnings {@link KafkaOutboxModule} gives when a Kafka call can outlast the caller's own time limit, and the
+ * producer settings of its sender.
+ */
 class KafkaOutboxModuleTest {
 
     private static final String TEMPLATE = "{topic}.dlq";
@@ -58,6 +68,28 @@ class KafkaOutboxModuleTest {
         try (var err = new CapturedStderr()) {
             module.kafkaDeadLetterHandler(slow, new KafkaOutboxSender(slow), outbox);
             assertThat(err.text()).contains("WARN").contains("outbox.deadLetters.timeout");
+        }
+    }
+
+    /**
+     * The module's sender builds its producers with what {@link KafkaOutboxSender} forces and defaults, as the
+     * producer's own config log shows it: the module passes {@code driverProperties} on and adds nothing.
+     */
+    @Test
+    void theSendersProducersGetTheForcedSettings() throws Exception {
+        KafkaOutboxConfig config = () -> props("bootstrap.servers", "localhost:9092",
+                "key.serializer", StringSerializer.class.getName());
+        var sender = new KafkaOutboxModule() {}.kafkaOutboxSender(config, null);
+        var record = new OutboxRecord(1, UUID.randomUUID(), "t", null, new byte[0], List.of(), Instant.now(), 0, 0);
+        try (var err = new CapturedStderr()) {
+            Thread.currentThread().interrupt(); // the call builds its producer, then stops before sending: no broker
+            assertThat(sender.value().send(List.of(record))).containsExactly(Outcome.notAttempted());
+            assertThat(Thread.interrupted()).isTrue();
+            assertThat(err.text()).contains("ProducerConfig values", "acks = -1", "enable.idempotence = true",
+                    "delivery.timeout.ms = 20000", "request.timeout.ms = 15000", "max.block.ms = 5000",
+                    "key.serializer = class " + ByteArraySerializer.class.getName());
+        } finally {
+            sender.release();
         }
     }
 

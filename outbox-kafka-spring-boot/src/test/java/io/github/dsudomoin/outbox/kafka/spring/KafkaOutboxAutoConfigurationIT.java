@@ -438,6 +438,27 @@ class KafkaOutboxAutoConfigurationIT {
         });
     }
 
+    /**
+     * The auto-configured sender builds its producers with what {@link KafkaOutboxSender} forces and defaults, as the
+     * producer's own config log shows it: the adapter binds {@code driver-properties} and adds nothing.
+     */
+    @Test
+    void theSendersProducersGetTheForcedSettings() {
+        var topic = TestKafka.createTopic(1);
+        try (var err = new CapturedStderr()) {
+            runner("outbox.enabled=false",
+                "outbox.kafka.driver-properties.key.serializer=org.apache.kafka.common.serialization.StringSerializer")
+                .run(context -> {
+                    var record = new OutboxRecord(1, UUID.randomUUID(), topic, null, "v".getBytes(UTF_8), List.of(),
+                        Instant.now(), 0, 0);
+                    context.getBean(KafkaOutboxSender.class).send(List.of(record));
+                });
+            assertThat(err.text()).contains("ProducerConfig values", "acks = -1", "enable.idempotence = true",
+                "delivery.timeout.ms = 20000", "request.timeout.ms = 15000", "max.block.ms = 5000",
+                "key.serializer = class org.apache.kafka.common.serialization.ByteArraySerializer");
+        }
+    }
+
     @Test
     void kafkaInUseWithoutServersFails() {
         withoutKafka().run(context -> assertThat(failure(context)).contains("bootstrap.servers is required"));
