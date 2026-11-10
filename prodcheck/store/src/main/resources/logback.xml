@@ -1,0 +1,8 @@
+<!-- Shadows common's logback.xml (Kora's appenders): Boot's console defaults, levels from application.properties -->
+<configuration>
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+    <include resource="org/springframework/boot/logging/logback/console-appender.xml"/>
+    <root level="WARN">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>

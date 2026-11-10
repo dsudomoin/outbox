@@ -9,4 +9,4 @@ dependencyResolutionManagement {
     }
 }
 
-include("common", "target", "shop", "courier", "accounts")
+include("common", "target", "shop", "courier", "accounts", "store")

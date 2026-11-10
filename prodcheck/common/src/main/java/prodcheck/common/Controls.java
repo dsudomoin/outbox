@@ -6,6 +6,7 @@ import jakarta.annotation.Nullable;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -19,8 +20,15 @@ import ru.tinkoff.kora.http.common.body.HttpBody;
 import ru.tinkoff.kora.http.server.common.HttpServerRequest;
 import ru.tinkoff.kora.http.server.common.HttpServerResponse;
 
-/** What the control routes do; each app's controller maps its routes here, because Kora generates controllers per app. */
+/**
+ * What the control routes do; each app's controller maps its routes here, because Kora generates controllers per app.
+ * The core takes the query parameters and answers a {@link Reply}, so a controller of another framework uses it too;
+ * the Kora-typed methods only adapt.
+ */
 public final class Controls {
+
+    /** Status and JSON body of a control route's answer. */
+    public record Reply(int status, String json) {}
 
     private static final Logger log = LoggerFactory.getLogger(Controls.class);
 
@@ -41,7 +49,7 @@ public final class Controls {
         this.handlers = handlers;
     }
 
-    public HttpServerResponse startLoad(HttpServerRequest r) {
+    public Reply startLoad(Map<String, ? extends Collection<String>> r) {
         try {
             var outbox = param(r, "outbox", "main");
             var topics = param(r, "topics");
@@ -62,59 +70,59 @@ public final class Controls {
                 throw new IllegalArgumentException("unknown outbox " + outbox + ", this app has " + loads.keySet());
             }
             load.start(settings);
-            return stats();
+            return statsReply();
         } catch (IllegalArgumentException e) {
-            return json(400, Map.of("message", String.valueOf(e.getMessage())));
+            return reply(400, Map.of("message", String.valueOf(e.getMessage())));
         }
     }
 
     /** Stops the writers of {@code outbox=}, or all of them. */
-    public HttpServerResponse stopLoad(HttpServerRequest r) {
+    public Reply stopLoad(Map<String, ? extends Collection<String>> r) {
         var outbox = param(r, "outbox");
         loads.forEach((name, load) -> {
             if (outbox == null || outbox.equals(name)) {
                 load.stop();
             }
         });
-        return stats();
+        return statsReply();
     }
 
     /** The main outbox's writers, the others' under their names. */
-    public HttpServerResponse stats() {
+    public Reply statsReply() {
         var map = new LinkedHashMap<>(loads.get("main").stats());
         loads.forEach((name, load) -> {
             if (!name.equals("main")) {
                 map.put(name, load.stats());
             }
         });
-        return json(200, map);
+        return reply(200, map);
     }
 
-    public HttpServerResponse txSend(HttpServerRequest r) {
+    public Reply txSend(Map<String, ? extends Collection<String>> r) {
         var sender = senderOf(r);
         if (sender == null) {
-            return json(400, Map.of("message", "unknown outbox"));
+            return reply(400, Map.of("message", "unknown outbox"));
         }
         var topic = param(r, "topic");
         if (topic == null) {
-            return json(400, Map.of("message", "topic is required"));
+            return reply(400, Map.of("message", "topic is required"));
         }
         try {
             UUID id = db.inTx(c -> {
                 return sendOne(c, sender, topic, param(r, "key"), param(r, "tag", "normal"), param(r, "raw"));
             });
-            return json(200, Map.of("id", id.toString()));
+            return reply(200, Map.of("id", id.toString()));
         } catch (Exception e) {
             return refusal(e);
         }
     }
 
-    public HttpServerResponse txHold(HttpServerRequest r) {
+    public Reply txHold(Map<String, ? extends Collection<String>> r) {
         var sender = senderOf(r);
         var topic = param(r, "topic");
         var ms = param(r, "ms");
         if (sender == null || topic == null || ms == null) {
-            return json(400, Map.of("message", "ms, topic and a known outbox are required"));
+            return reply(400, Map.of("message", "ms, topic and a known outbox are required"));
         }
         var key = param(r, "key");
         var tag = param(r, "tag", "normal");
@@ -139,16 +147,16 @@ public final class Controls {
         thread.setDaemon(true);
         thread.start();
         try {
-            return json(200, Map.of("id", sent.get(30, TimeUnit.SECONDS).toString()));
+            return reply(200, Map.of("id", sent.get(30, TimeUnit.SECONDS).toString()));
         } catch (Exception e) {
             return refusal(e);
         }
     }
 
-    public HttpServerResponse txOutside(HttpServerRequest r) {
+    public Reply txOutside(Map<String, ? extends Collection<String>> r) {
         var sender = senderOf(r);
         if (sender == null) {
-            return json(400, Map.of("message", "unknown outbox"));
+            return reply(400, Map.of("message", "unknown outbox"));
         }
         var result = new LinkedHashMap<String, Object>();
         try {
@@ -157,21 +165,21 @@ public final class Controls {
         } catch (Exception e) {
             result.put("exception", LoadGenerator.rootCause(e).getClass().getName());
         }
-        return json(200, result);
+        return reply(200, result);
     }
 
-    public HttpServerResponse putHandler(HttpServerRequest r) {
+    public Reply putHandler(Map<String, ? extends Collection<String>> r) {
         try {
             handlers.update(param(r, "route"), param(r, "mode"), param(r, "delayMs"), param(r, "failKeys"),
                     param(r, "poisonFixed"), param(r, "waiting"), param(r, "oneRound"));
-            return json(200, handlers.asMap());
+            return reply(200, handlers.asMap());
         } catch (IllegalArgumentException e) {
-            return json(400, Map.of("message", String.valueOf(e.getMessage())));
+            return reply(400, Map.of("message", String.valueOf(e.getMessage())));
         }
     }
 
     /** {@code OutboxRelay.drain()} on this request's thread: what it returned, or what it threw, and how long it took. */
-    public static HttpServerResponse drain(OutboxRelay relay) {
+    public static Reply drainReply(OutboxRelay relay) {
         var started = System.nanoTime();
         var body = new LinkedHashMap<String, Object>();
         int status = 200;
@@ -185,11 +193,11 @@ public final class Controls {
             body.put("message", e.getMessage());
         }
         body.put("ms", (System.nanoTime() - started) / 1_000_000);
-        return json(status, body);
+        return reply(status, body);
     }
 
-    public HttpServerResponse getHandler() {
-        return json(200, handlers.asMap());
+    public Reply handlerReply() {
+        return reply(200, handlers.asMap());
     }
 
     /** {@code raw}: past the app's typed path, {@code garbage} as bytes no decoder reads, {@code null} as a tombstone. */
@@ -205,16 +213,16 @@ public final class Controls {
     }
 
     @Nullable
-    private Sender senderOf(HttpServerRequest r) {
+    private Sender senderOf(Map<String, ? extends Collection<String>> r) {
         return senders.get(param(r, "outbox", "main"));
     }
 
-    private static HttpServerResponse refusal(Exception e) {
+    private static Reply refusal(Exception e) {
         var root = LoadGenerator.rootCause(e);
         var body = new LinkedHashMap<String, Object>();
         body.put("exception", root.getClass().getName());
         body.put("message", root.getMessage());
-        return json(409, body);
+        return reply(409, body);
     }
 
     private static int positive(String name, String value) {
@@ -241,20 +249,75 @@ public final class Controls {
     }
 
     @Nullable
-    public static String param(HttpServerRequest r, String name) {
-        var values = r.queryParams().get(name);
+    public static String param(Map<String, ? extends Collection<String>> q, String name) {
+        var values = q.get(name);
         if (values == null) {
             return null;
         }
         return values.isEmpty() ? "" : values.iterator().next(); // Kora drops the empty value of `failKeys=`, not the key
     }
 
-    public static String param(HttpServerRequest r, String name, String orElse) {
-        var value = param(r, name);
+    public static String param(Map<String, ? extends Collection<String>> q, String name, String orElse) {
+        var value = param(q, name);
         return value == null ? orElse : value;
     }
 
+    public static Reply reply(int status, Object body) {
+        return new Reply(status, Json.write(body));
+    }
+
+    // Kora's routes
+
+    public HttpServerResponse startLoad(HttpServerRequest r) {
+        return kora(startLoad(r.queryParams()));
+    }
+
+    public HttpServerResponse stopLoad(HttpServerRequest r) {
+        return kora(stopLoad(r.queryParams()));
+    }
+
+    public HttpServerResponse stats() {
+        return kora(statsReply());
+    }
+
+    public HttpServerResponse txSend(HttpServerRequest r) {
+        return kora(txSend(r.queryParams()));
+    }
+
+    public HttpServerResponse txHold(HttpServerRequest r) {
+        return kora(txHold(r.queryParams()));
+    }
+
+    public HttpServerResponse txOutside(HttpServerRequest r) {
+        return kora(txOutside(r.queryParams()));
+    }
+
+    public HttpServerResponse putHandler(HttpServerRequest r) {
+        return kora(putHandler(r.queryParams()));
+    }
+
+    public HttpServerResponse getHandler() {
+        return kora(handlerReply());
+    }
+
+    public static HttpServerResponse drain(OutboxRelay relay) {
+        return kora(drainReply(relay));
+    }
+
+    @Nullable
+    public static String param(HttpServerRequest r, String name) {
+        return param(r.queryParams(), name);
+    }
+
+    public static String param(HttpServerRequest r, String name, String orElse) {
+        return param(r.queryParams(), name, orElse);
+    }
+
     public static HttpServerResponse json(int status, Object body) {
-        return HttpServerResponse.of(status, HttpBody.json(Json.write(body)));
+        return kora(reply(status, body));
+    }
+
+    private static HttpServerResponse kora(Reply reply) {
+        return HttpServerResponse.of(reply.status(), HttpBody.json(reply.json()));
     }
 }

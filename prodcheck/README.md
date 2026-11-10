@@ -10,6 +10,7 @@
 | `shop` | Java: только `OutboxTopicHandler` (`payments`, `ledger`, `projection`, `orders`, `audit`), три релиза контракта |
 | `accounts` | Kotlin 2.1 + KSP: outbox как долговечная очередь входных событий по счёту: своя схема, роль приложения и роль-владелец, миграция вместо bootstrap, `ProtobufOutbox`, `handleBatch` с `requeue`, бизнес-транзакция с блокировкой строки счёта в обработчике, один воркер, значения библиотеки по умолчанию, без метрик и админки |
 | `courier` | Kotlin + KSP: `OutboxHandler` с `handleBatch` на все топики, маршрут `routed`, второй outbox в том же процессе |
+| `store` | Java, Spring Boot 3.5 или 4.1: двойник `shop-n` на адаптере Spring. Запись в транзакции JPA (строка заказа через Hibernate, журнал и `send` в ней же), `projection` — обработчик с `@Transactional` и inbox, `ledger` — на втором DataSource, админ-API на Spring MVC, метрики и readiness через Actuator. Те же топики и контракты, что у `shop-n`, поэтому оба работают на одних таблицах |
 
 ## Сборка
 
@@ -19,6 +20,8 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 21)
 ./gradlew -p prodcheck installDist -Prelease=n            # target, courier и shop-n
 ./gradlew -p prodcheck :shop:installDist -Prelease=n1     # shop-n1 рядом
 ./gradlew -p prodcheck :shop:installDist -Prelease=n2     # shop-n2 рядом
+./gradlew -p prodcheck :store:installDist -PbootLine=4.1  # store-boot41
+./gradlew -p prodcheck :store:installDist -PbootLine=3.5  # store-boot35 рядом
 ```
 
 `POST /tx/send?raw=garbage|null` пишет мимо `TypedOutbox` байты `not json` или tombstone, со строкой в `pc_sent`. Нагрузка
@@ -76,6 +79,8 @@ docker compose -f prodcheck/docker-compose.yml down -v
 docker compose -f prodcheck/docker-compose.yml --profile tools build
 prodcheck/scenarios/run-all.sh                  # вся матрица, около полутора часов
 prodcheck/scenarios/run-all.sh kill-one admin   # отдельные сценарии
+SHOP_BIN=$PWD/prodcheck/store/build/install/store-boot41/bin/store RESULT_DIR=$PWD/prodcheck/build/results-spring41 \
+  prodcheck/scenarios/run-all.sh kill-one       # те же сценарии на Spring Boot вместо shop-n
 python3 prodcheck/scenarios/summary.py          # итог по build/results (RESULT_DIR, PG_VERSION выбирают другой каталог)
 prodcheck/scenarios/run-pg17.sh                 # accounts-*, pg-*, steady, kill-one, xid-auto, inbox-rotation, retry-long-tail на 17
 prodcheck/scenarios/soak.sh 60                  # хаос-прогон на столько минут, в матрицу не входит

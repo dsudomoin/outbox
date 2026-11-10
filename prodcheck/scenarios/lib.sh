@@ -22,9 +22,11 @@ RESULT_DIR=${RESULT_DIR:-$PC/build/results$([ "${PG_VERSION:-16}" = 16 ] || echo
 mkdir -p "$RESULT_DIR"
 ADMIN_KEY=prodcheck-admin
 READER_KEY=prodcheck-reader
-SHOP=$PC/shop/build/install/shop-n/bin/shop
+SHOP=${SHOP_BIN:-$PC/shop/build/install/shop-n/bin/shop} # SHOP_BIN: another app in shop-n's place, the store say
 SHOP_N1=$PC/shop/build/install/shop-n1/bin/shop
 SHOP_N2=$PC/shop/build/install/shop-n2/bin/shop
+STORE35=$PC/store/build/install/store-boot35/bin/store # the Spring Boot twin of shop-n, Boot 3.5
+STORE41=$PC/store/build/install/store-boot41/bin/store # and Boot 4.1
 COURIER=$PC/courier/build/install/courier/bin/courier
 TARGET=$PC/target/build/install/target/bin/target
 ACCOUNTS=$PC/accounts/build/install/accounts/bin/accounts
@@ -92,6 +94,7 @@ pc_app() {
   if [ -n "${LOADS[$i]:-}" ]; then pc_load "$i" "${LOADS[$i]}"; fi
 }
 pc_shop() { pc_app "$SHOP" "$@"; }
+pc_store() { pc_app "${STORE:-$STORE41}" "$@"; } # STORE picks the Boot line, 4.1 by default
 pc_courier() { pc_app "$COURIER" "$@"; }
 
 # thread_dump I LABEL: the instance's stacks into build/results, and the outbox threads' top frames to the log.
