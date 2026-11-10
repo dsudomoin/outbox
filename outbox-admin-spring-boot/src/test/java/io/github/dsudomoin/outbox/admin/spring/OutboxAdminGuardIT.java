@@ -155,9 +155,10 @@ class OutboxAdminGuardIT {
             var routes = server.routes();
             assertThat(routes.stream().map(AdminServer.Route::handler)).as("the contract's and the extra one")
                 .contains("getStatus", "findDeadLetters", "countDeadLetters", "redriveDeadLetters",
-                    "discardDeadLetters", "restoreOrphan", "recoverXidRegression", "abandonWaiting", "notJson");
+                    "discardDeadLetters", "restoreOrphan", "recoverStrandedShards", "recoverXidRegression", "abandonKey",
+                    "abandonWaiting", "notJson");
             assertThat(routes.stream().filter(r -> r.path().endsWith("/orphans/x/restore"))).isNotEmpty();
-            assertThat(routes).as("eight of the contract and three of notJson").hasSizeGreaterThanOrEqualTo(11);
+            assertThat(routes).as("ten of the contract and four of notJson").hasSizeGreaterThanOrEqualTo(14);
             if (app == MovesTheRoutes.class) {
                 assertThat(routes).allSatisfy(r -> assertThat(r.path()).startsWith("/api/"));
             }

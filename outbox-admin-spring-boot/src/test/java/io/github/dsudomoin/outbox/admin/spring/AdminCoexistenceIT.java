@@ -63,7 +63,9 @@ class AdminCoexistenceIT {
         new Route("redriveDeadLetters", "POST", API + "/dead-letters/redrive", "{\"ids\":[1]}"),
         new Route("discardDeadLetters", "POST", API + "/dead-letters/discard", "{\"ids\":[1]}"),
         new Route("restoreOrphan", "POST", API + "/orphans/{orphan}/restore?fromXid=0", null),
+        new Route("recoverStrandedShards", "POST", API + "/recovery/stranded-shards", null),
         new Route("recoverXidRegression", "POST", API + "/recovery/xid-regression", null),
+        new Route("abandonKey", "POST", API + "/keys/abandon", "{\"topic\":\"t\",\"key\":\"k\",\"reason\":\"test\"}"),
         new Route("abandonWaiting", "POST", API + "/waiting/abandon", "{\"topic\":\"t\",\"reason\":\"test\"}"));
 
     /** Its own routes, its own key, the interceptor that checks it, and its own way of answering a failure. */
@@ -292,8 +294,11 @@ class AdminCoexistenceIT {
             var expected = new ArrayList<String>();
             for (var route : ROUTES) {
                 var call = "outbox admin " + route.method() + " \"" + path(server, route) + "\"";
-                var allowed = call + " by \"tester\"" + (route.operation().equals("abandonWaiting")
-                    ? " with topic \"t\", key null, reason \"test\", dryRun \"false\"" : "") + ": 200";
+                var allowed = call + " by \"tester\"" + switch (route.operation()) {
+                    case "abandonWaiting" -> " with topic \"t\", key null, reason \"test\", dryRun \"false\"";
+                    case "abandonKey" -> " with topic \"t\", key \"k\", messageId null, reason \"test\", dryRun \"false\"";
+                    default -> "";
+                } + ": 200";
                 expected.addAll(List.of(call + " denied: 401", call + " denied: 403", allowed));
             }
             assertThat(server.settledAudit(stderr, lines)).as("one INFO line per call")
@@ -305,8 +310,8 @@ class AdminCoexistenceIT {
 
     /**
      * Something for every mutating route to change: kept dead letter 1, the foreign orphan {@code <table>_x1000} with
-     * one row, one outbox row, a tick whose snapshot xmax lies 10⁹ xids past the counter, as after a dump/restore, and
-     * waiting retry head 2.
+     * one row, one outbox row, a tick whose snapshot xmax lies 10⁹ xids past the counter, as after a dump/restore,
+     * waiting retry head 2, retry head 3 of key k, and the shards stranded.
      */
     private static void seed(AdminServer server) throws SQLException {
         var names = server.names;
@@ -314,6 +319,8 @@ class AdminCoexistenceIT {
             + " values (1, 0, gen_random_uuid(), 't', now(), 3)");
         server.execute("insert into " + names.retry() + " (id, shard, message_id, topic, created_at, next_attempt_at,"
             + " waiting_since) values (2, 0, gen_random_uuid(), 't', now(), now(), now())");
+        server.execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, created_at,"
+            + " next_attempt_at) values (3, 0, gen_random_uuid(), 't', 'k', now(), now())");
         server.execute("create table " + orphan(server) + " (like " + names.base() + " including defaults)");
         server.execute("insert into " + orphan(server) + " (id, shard, xid, message_id, topic)"
             + " values (1, 0, '10', gen_random_uuid(), 't')");
@@ -323,9 +330,11 @@ class AdminCoexistenceIT {
             + " select (x || ':' || x || ':')::pg_snapshot, now() - interval '1 minute'"
             + " from (select pg_snapshot_xmax(pg_current_snapshot())::text::bigint"
             + " + 1000000000 x) s");
+        // the cursors' tick gone, so the shards stranded; the forged tick above is the latest
+        server.execute("delete from " + names.tick() + " where id = (select min(tick_id) from " + names.cursor() + ")");
     }
 
-    /** What the mutating routes change: dead letter ids, outbox message ids, the orphan's rows, the ticks. */
+    /** What the mutating routes change: dead letter ids, outbox message ids, the orphan's rows, ticks and cursors. */
     private static String state(AdminServer server) throws SQLException {
         var names = server.names;
         try (var c = server.bean(DataSource.class).getConnection()) {
@@ -335,7 +344,8 @@ class AdminCoexistenceIT {
                 TestSql.queryString(c, "select string_agg(id::text, ',' order by id) from " + names.dead()),
                 TestSql.queryString(c, "select string_agg(message_id::text, ',' order by id) from " + names.base()),
                 orphanRows,
-                TestSql.queryString(c, "select string_agg(id::text, ',' order by id) from " + names.tick()));
+                TestSql.queryString(c, "select string_agg(id::text, ',' order by id) from " + names.tick()),
+                TestSql.queryString(c, "select string_agg(seq::text, ',' order by seq) from " + names.cursor()));
         }
     }
 
