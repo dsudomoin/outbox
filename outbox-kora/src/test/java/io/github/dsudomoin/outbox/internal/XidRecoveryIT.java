@@ -532,6 +532,39 @@ class XidRecoveryIT {
     }
 
     @Test
+    void aLockOnAStandaloneRangeFailsBeforeTheCopyAndIsTriedAgain() throws Exception {
+        config.xidsPerPartition(1000).premake(10);
+        bootstrap();
+        var standalone = names.partitionPrefix() + "900000000";
+        try (var c = TestDb.connect()) {
+            PartitionDdl.create(c, names.base(), standalone, Duration.ofSeconds(5));
+        }
+        send(outbox(null), messages("m", 3));
+        forgeRegression();
+        var maintenance = maintenance();
+        try (var holder = TestDb.connect()) { // a session in manual-commit mode that read the range, not the outbox
+            holder.setAutoCommit(false);
+            queryLong(holder, "select count(*) from " + standalone);
+
+            try (var err = new CapturedStderr()) {
+                assertThat(maintenance.runOnce()).isTrue();
+
+                assertThat(err.text()).contains("55P03").contains("the next maintenance run retries it");
+            }
+            assertThat(maintenance.halted()).isTrue();
+            try (var c = TestDb.connect()) {
+                assertThat(queryString(c, "select recovery_failed from " + names.halt())).isNull();
+            }
+            holder.rollback();
+        }
+
+        assertThat(maintenance.runOnce()).isTrue();
+        assertThat(maintenance.halted()).isFalse();
+        assertThat(haltRows()).isZero();
+        assertThat(exists(standalone)).as("empty: dropped").isFalse();
+    }
+
+    @Test
     void rowsOutsideTheOutboxStayWhereTheyAre() throws Exception {
         config.headFailuresBeforeDivert(1);
         bootstrap();

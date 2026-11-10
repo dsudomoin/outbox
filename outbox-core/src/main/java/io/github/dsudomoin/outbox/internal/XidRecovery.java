@@ -8,6 +8,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -267,8 +268,10 @@ public final class XidRecovery {
      * ACCESS EXCLUSIVE on the cursor, checkpoint and tick tables, in the order every relay statement opens them, so no
      * relay transaction holds one of them while waiting for an earlier one (a step that read its cursor ends first, one
      * that reads it later sees the new one), then on the outbox, which writers wait for, not fail; a detach found
-     * pending since that finish fails it at once (see the throws); the rows to re-send ({@link #saved}) copied into
-     * {@code <base>_recovery}; every standalone range, and a tail that is not attached, set aside as
+     * pending since that finish fails it at once (see the throws); ACCESS EXCLUSIVE on every standalone range and a
+     * tail that is not attached (the outbox's lock holds its attached partitions), so a lock someone else holds on one
+     * fails the recovery before the copy, where the next run tries again; the rows to re-send ({@link #saved}) copied
+     * into {@code <base>_recovery}; every standalone range, and a tail that is not attached, set aside as
      * {@code <base>_o<digits>} when it holds rows (they lie outside the outbox and are never re-sent by themselves:
      * {@code restoreOrphan} moves them back) and dropped when empty; the id sequence set above every id of the outbox,
      * retry, parked and dead tables; every partition dropped; ticks, cursors, checkpoints, dropping markers and the
@@ -331,10 +334,20 @@ public final class XidRecovery {
                         + " cursors for " + shardsPresent + " shards: the recovery keeps the shard of every row it"
                         + " re-sends, so set outbox.shards back to " + shardsPresent);
             }
+            // before the copy too: a session holding a lock on one of them fails the recovery while it may still be
+            // tried again; the outbox's lock above covers its attached partitions, which are dropped below
+            timeLeft(st, deadline);
+            var aside = toSetAside(c);
+            if (!aside.isEmpty()) {
+                timeLeft(st, deadline);
+                st.execute("lock table " + String.join(", ", aside.keySet()) + " in access exclusive mode");
+            }
             timeLeft(st, deadline);
             outboxLocked = true; // from the copy on, writers have waited for it
             st.execute("create unlogged table " + holding + " as " + saved);
-            setAside(c, st, deadline);
+            for (var table : aside.entrySet()) {
+                setAside(st, table.getKey(), table.getValue(), deadline);
+            }
             timeLeft(st, deadline);
             // above the ids the retry, parked and dead rows keep, which may outlive every outbox row of theirs
             try (var ps = c.prepareStatement("select setval(pg_get_serial_sequence(?, 'id'), greatest("
@@ -389,26 +402,30 @@ public final class XidRecovery {
     }
 
     /**
-     * The tables outside the outbox's partition tree whose rows the parent does not show: every standalone range (but
-     * one whose digits fit no long, no table of the library's) and a standalone tail is set aside.
+     * The tables outside the outbox's partition tree whose rows the parent does not show, each to its digits: every
+     * standalone range (but one whose digits fit no long, no table of the library's) and a standalone tail (null).
+     * Stable while the recovery holds the outbox's lock, which attach and detach need, and {@code LOCK_MAINTENANCE}.
      */
-    private void setAside(Connection c, Statement st, long deadline) throws SQLException {
+    private LinkedHashMap<String, String> toSetAside(Connection c) throws SQLException {
+        var tables = new LinkedHashMap<String, String>();
         int prefix = names.unqualified(names.partitionPrefix()).length();
         for (var table : PartitionDdl.standalone(c, names.base(), "_x[0-9]+")) {
             var digits = names.unqualified(table).substring(prefix);
             if (XidPartitions.xidOf(digits) != null) {
-                setAside(st, table, digits, deadline);
+                tables.put(table, digits);
             }
         }
         if (PartitionDdl.attachment(c, names.base(), names.tail()) == Attachment.STANDALONE) {
-            setAside(st, names.tail(), null, deadline);
+            tables.put(names.tail(), null);
         }
+        return tables;
     }
 
-    /** Drops {@code table} when empty, else renames it {@code <base>_o<digits>}, by default its lowest xid. */
+    /**
+     * Drops {@code table}, locked before the copy, when empty, else renames it {@code <base>_o<digits>}, by default
+     * its lowest xid.
+     */
     private void setAside(Statement st, String table, @Nullable String digits, long deadline) throws SQLException {
-        timeLeft(st, deadline);
-        st.execute("lock table " + table + " in access exclusive mode");
         timeLeft(st, deadline);
         String lowest;
         // not min(xid): Postgres 14 has no min(xid8)
