@@ -63,7 +63,7 @@ final class LocalOnly implements OutboxHandler {
             }
         }
         if (!rest.isEmpty()) {
-            var delegated = calls.handleBatch(delegate, rest);
+            var delegated = calls.handleBatch(delegate, rest, false);
             for (int i = 0; i < positions.size(); i++) {
                 outcomes[positions.get(i)] = delegated.get(i);
             }

@@ -1291,6 +1291,54 @@ class OutboxRelayIT {
     }
 
     @Test
+    void byTopicRouteThrowingPermanentForItsOnlyRecordDeadLettersIt() throws Exception {
+        bootstrap();
+        var audit = new RecordingHandler();
+        var relay = start(OutboxHandler.byTopic(Map.of("audit", throwingOnPoison(audit)), new RecordingHandler()));
+
+        var id = send(outbox(relay::wake), msg("audit", "k1", "poison")).get(0);
+        await(Duration.ofSeconds(10), () -> deadStatus(id) != null);
+
+        assertThat(retryRows("k1")).isZero();
+    }
+
+    @Test
+    void byTopicRouteThrowingBesideAnotherRouteDoesNotHoldItsHealthyKeys() throws Exception {
+        config.retry(Duration.ofMillis(100), Duration.ofMillis(100), 0);
+        bootstrap();
+        var audit = new RecordingHandler();
+        var fallback = new RecordingHandler();
+        var relay = start(OutboxHandler.byTopic(Map.of("audit", throwingOnPoison(audit)), fallback));
+
+        var ids = send(outbox(relay::wake),
+                msg("audit", "k1", "poison"), msg("audit", "k2", "ok"), msg("t", "k3", "other"));
+        // both audit keys go to the retry table together; the retry pass then calls them together
+        await(Duration.ofSeconds(10), () -> audit.delivered().size() == 1 && deadStatus(ids.get(0)) != null);
+
+        assertThat(audit.delivered()).extracting(OutboxRecord::messageId).containsExactly(ids.get(1));
+        assertThat(fallback.delivered()).extracting(OutboxRecord::messageId).containsExactly(ids.get(2));
+        assertThat(retryRows("k1") + retryRows("k2")).isZero();
+    }
+
+    /** A route whose handleBatch throws OutboxPermanentException for a call with a {@code poison} payload. */
+    private static OutboxHandler throwingOnPoison(RecordingHandler delivering) {
+        return new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                if (records.stream().anyMatch(r -> "poison".equals(payload(r)))) {
+                    throw new OutboxPermanentException("bad payload");
+                }
+                return delivering.handleBatch(records);
+            }
+        };
+    }
+
+    @Test
     void idleRelayDoesNotSpin() throws Exception {
         config.idlePollInterval(Duration.ofMillis(200)); // the default; a spin would still burn ~2 s of CPU
         bootstrap();

@@ -29,9 +29,12 @@ final class RouteCalls {
      * {@code route}'s outcomes for {@code records}, one per record. A route that throws {@link OutboxWaitException}
      * gives {@code Waiting} (its kind and message) for all of them; one that throws another exception, or returns an
      * invalid list (null, wrong size, a null element; logged at ERROR, at most once per 10 s), gives {@code Retry} for
-     * all of them. An {@link Error} propagates.
+     * all of them. An {@link Error} propagates, and so does any exception but a wait when {@code records} is the
+     * {@code whole} call: the relay then treats it as the failed call it is (a lone record's
+     * {@link OutboxPermanentException} goes to dead letters, a call of several is halved until the failing one is
+     * alone), which per-record {@code Retry} would hide.
      */
-    List<Outcome> handleBatch(OutboxHandler route, List<OutboxRecord> records) {
+    List<Outcome> handleBatch(OutboxHandler route, List<OutboxRecord> records, boolean whole) {
         List<Outcome> outcomes;
         try {
             outcomes = route.handleBatch(records);
@@ -39,6 +42,9 @@ final class RouteCalls {
             Outcome waiting = new Outcome.Waiting(e.kind(), e.getMessage(), null);
             outcomes = records.stream().map(r -> waiting).toList();
         } catch (Exception e) { // one broken route must not fail the records of others; Errors propagate
+            if (whole) {
+                throw e;
+            }
             outcomes = records.stream().map(r -> Outcome.retry(e)).toList();
         }
         if (outcomes == null || outcomes.size() != records.size()

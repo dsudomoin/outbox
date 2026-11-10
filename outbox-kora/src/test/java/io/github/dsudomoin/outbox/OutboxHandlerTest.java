@@ -273,6 +273,24 @@ class OutboxHandlerTest {
     }
 
     @Test
+    void byTopicRouteGivenTheWholeCallThrowsItsException() {
+        var a = new RecordingHandler();
+        var fallback = new RecordingHandler();
+        var poison = new OutboxPermanentException("poison");
+        var handler = OutboxHandler.byTopic(Map.of("a", a), fallback);
+
+        a.throwFromBatch(() -> poison);
+        assertThatThrownBy(() -> handler.handleBatch(List.of(record("a", "k"))))
+                .as("the relay's own failed call: one record goes to dead letters").isSameAs(poison);
+        a.throwFromBatch(() -> poison);
+        assertThatThrownBy(() -> handler.handleBatch(List.of(record("a", "k"), record("a", null))))
+                .as("the relay halves it").isSameAs(poison);
+        var down = new IllegalStateException("fallback down");
+        fallback.throwFromBatch(() -> down);
+        assertThatThrownBy(() -> handler.handleBatch(List.of(record("c", "k")))).isSameAs(down);
+    }
+
+    @Test
     void byTopicRouteThrowingAWaitMakesAllItsRecordsWait() {
         var a = new RecordingHandler();
         var b = new RecordingHandler();
@@ -285,6 +303,8 @@ class OutboxHandlerTest {
         var waiting = new Outcome.Waiting(Outcome.Waiting.Kind.NO_ROUTE, "no route for a", null);
         assertThat(handler.handleBatch(List.of(a1, b1, a2))).containsExactly(waiting, Outcome.delivered(), waiting);
         assertThat(b.delivered()).containsExactly(b1);
+        a.throwFromBatch(() -> new OutboxWaitException(Outcome.Waiting.Kind.NO_ROUTE, "no route for a"));
+        assertThat(handler.handleBatch(List.of(a1, a2))).as("given the whole call too").containsExactly(waiting, waiting);
     }
 
     @Test
