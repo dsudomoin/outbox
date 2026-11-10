@@ -17,6 +17,7 @@ against the library's tables**; run only the README's SQL, on a staging copy fir
 |---|---|---|
 | `outbox.shard.lag` growing | Target down, slow handler, too few workers; ERROR «outbox shards [...] start from ticks [...] that no longer exist»: stranded shards, one `POST /recovery/stranded-shards` | «Обработка сбоев», «Застрявшие шарды» |
 | `outbox.maintenance.since_success` > 5 × `maintenanceInterval` | No maintenance anywhere; `transaction_pooling` = 1: a pooler | «Обслуживание работает там же, где relay» |
+| `outbox.inbox.window.remaining` < `outbox.inbox.premake` / 2 (43 200 s by default), or `outbox.inbox.outside_window` growing faster than usual | The instance's inbox stops deduplicating new ids soon (or did): no instance makes inbox ranges (ERROR «outbox inbox maintenance of ... failed», the cause in it), or this instance's schedule stopped (ERROR «... stopped by a fatal error»: restart). Normally between `premake − partitionInterval` and `premake`. The counter also counts non-v7 ids | «Алерты», «Потребление через inbox» |
 | `outbox.partitions.xids_left` not NaN | Tail detached: inserts fail at 0 | «Партиции» |
 | `outbox.dead.pending.oldest` > X (X > `relay.retry.maxDelay`) and `outbox.dead.hook.failures` growing | Hook failing: letters wait | «Dead letters» |
 | ERROR «outbox xid regression detected» | «recovered»: done; «relay halted»: its reason, maybe `POST /recovery/xid-regression` | «Восстановление после регрессии xid» |

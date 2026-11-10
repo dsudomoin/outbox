@@ -97,8 +97,9 @@ again, and the partition stops for this consumer group.
 
 ## Dedup window
 
-Ids younger than `outbox.inbox.retention − partitionInterval` (24 h − 1 h = 23 h) are always deduplicated; older ones
-are accepted again (WARN, counter `outbox.inbox.outside_window`). Set `retention` above the largest consumer lag or
+Ids younger than `outbox.inbox.retention − partitionInterval` (24 h − 1 h = 23 h) are always deduplicated while inbox
+maintenance makes ranges ahead (gauge `outbox.inbox.window.remaining`, the seconds left until the window's top); older
+ones are accepted again (WARN, counter `outbox.inbox.outside_window`). Set `retention` above the largest consumer lag or
 replay to cover; change it and `partitionInterval` on all instances at once.
 
 ## Wiring and database

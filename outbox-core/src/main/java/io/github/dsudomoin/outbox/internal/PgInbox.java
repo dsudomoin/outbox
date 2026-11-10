@@ -105,6 +105,10 @@ public final class PgInbox implements Inbox, AutoCloseable {
                 + " on conflict (message_id, consumer) do nothing returning message_id";
         telemetry.gauge(OutboxGauge.INBOX_MAINTENANCE_TRANSACTION_POOLING, () -> transactionPooling);
         telemetry.gauge(OutboxGauge.INBOX_PARTITIONS_ORPHANED, () -> orphaned);
+        telemetry.gauge(OutboxGauge.INBOX_WINDOW_REMAINING, () -> {
+            var w = window;
+            return w == Window.EMPTY ? Double.NaN : (w.to() - clock.millis()) / 1000.0;
+        });
     }
 
     @Override
@@ -269,18 +273,41 @@ public final class PgInbox implements Inbox, AutoCloseable {
      * logged and the next step still runs). That part is skipped when the connection does not keep one server session
      * ({@link PartitionDdl#backendChanges}), with an ERROR at most once a minute and the gauge
      * {@code outbox.inbox.maintenance.transaction_pooling} at 1 (0 otherwise). Then, on every instance, the window
-     * refresh.
+     * refresh; when that connection or its run fails before the refresh is done, the refresh runs on an application
+     * connection (the catalogs it reads need no owner rights), and the run's failure is thrown after it. A window not
+     * refreshed for {@code premake - partitionInterval} ends dedup of new ids: the gauge
+     * {@code outbox.inbox.window.remaining} counts down to that.
      */
     public void runMaintenance() {
+        Exception failure = null;
         try (var c = ddl.newConnection(); var bound = socket.on(c)) {
             c.setAutoCommit(true);
             clock.read(c);
             if (sessionStable(c)) {
                 maintain(c);
             }
-            step("window refresh", () -> window = partitions.window(c));
-        } catch (SQLException e) {
+            if (step("window refresh", () -> window = partitions.window(c))) {
+                return;
+            }
+        } catch (SQLException | RuntimeException e) {
+            failure = e;
+        }
+        try (var app = db.newConnection(); var bound = socket.on(app)) {
+            app.setAutoCommit(true);
+            clock.read(app);
+            window = partitions.window(app);
+        } catch (SQLException | RuntimeException e) {
+            if (failure == null) {
+                failure = e;
+            } else {
+                failure.addSuppressed(e);
+            }
+        }
+        if (failure instanceof SQLException e) {
             throw db.translate(e);
+        }
+        if (failure != null) {
+            throw (RuntimeException) failure;
         }
     }
 
@@ -423,10 +450,11 @@ public final class PgInbox implements Inbox, AutoCloseable {
         }
     }
 
-    /** A failed step is logged (the next run retries it), so the remaining steps still run. */
-    private void step(String name, SqlRunnable step) {
+    /** A failed step is logged (the next run retries it), so the remaining steps still run; false when it failed. */
+    private boolean step(String name, SqlRunnable step) {
         try {
             step.run();
+            return true;
         } catch (SQLException e) {
             log.warn("outbox inbox maintenance step '{}' on {} failed (SQLState {}); the next run retries it: {}",
                     name, names.base(), e.getSQLState(), e.getMessage());
@@ -434,6 +462,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
             log.error("outbox inbox maintenance step '{}' on {} failed; the next run retries it", name, names.base(),
                     e);
         }
+        return false;
     }
 
     private Connection currentConnection() {

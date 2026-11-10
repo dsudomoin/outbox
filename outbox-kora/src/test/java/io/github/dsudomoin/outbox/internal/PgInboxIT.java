@@ -5,8 +5,10 @@ import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.within;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
+import io.github.dsudomoin.outbox.ConnectionSource;
 import io.github.dsudomoin.outbox.Inbox;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
@@ -16,6 +18,8 @@ import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
@@ -38,6 +42,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -822,6 +827,80 @@ class PgInboxIT {
         assertThat(accept(nextTop)).isTrue();
         assertThat(accept(nextTop)).isFalse();
         assertThat(highest()).isGreaterThan(before + Duration.ofHours(4).toMillis());
+    }
+
+    @Test
+    void anInstanceWhoseOwnerSourceFailsStillTakesTheWindowAnotherInstanceExtended() throws Exception {
+        var broken = new AtomicBoolean();
+        refreshesWithTheOwnerBroken(broken, () -> {
+            if (broken.get()) { // a rotated owner password: the owner's pool no longer connects
+                throw new SQLException("password authentication failed", "28P01");
+            }
+            return TestDb.connect();
+        });
+    }
+
+    @Test
+    void aMaintenanceRunCutOffBeforeItsRefreshStillRefreshesTheWindow() throws Exception {
+        var broken = new AtomicBoolean();
+        refreshesWithTheOwnerBroken(broken, () -> {
+            var c = TestDb.connect();
+            // maintain fails outside its steps: its lock statement throws
+            return broken.get() ? failing(c, "pg_try_advisory_lock") : c;
+        });
+    }
+
+    @Test
+    void theWindowGaugeCountsTheSecondsOfDedupLeft() throws Exception {
+        start();
+        double expected = (highest() - HOUR - System.currentTimeMillis()) / 1000.0;
+
+        assertThat(registry.get("outbox.inbox.window.remaining").gauge().value())
+                .isCloseTo(expected, within(5.0));
+    }
+
+    /**
+     * An instance whose owner connections fail after its start, while another instance extends the ranges: its runs
+     * fail, and the window still follows, so the ids above its old top are deduplicated.
+     */
+    private void refreshesWithTheOwnerBroken(AtomicBoolean broken, ConnectionSource owner) throws Exception {
+        var staleRegistry = new SimpleMeterRegistry();
+        var stale = new PgInbox(db, new OwnerTransactions(db, owner), config, new OutboxMetrics(staleRegistry));
+        stale.start();
+        try {
+            long top = highest();
+            broken.set(true);
+            try (var c = TestDb.connect()) { // another instance's premake
+                attach(c, table() + "_t_a", top);
+                attach(c, table() + "_t_b", top + HOUR);
+            }
+
+            assertThatThrownBy(stale::runMaintenance).as("the run itself fails");
+
+            var id = v7(top + HOUR / 2); // above the old window's top (top - 1h), below the new one's (top + 1h)
+            assertThat(accept(stale, id)).isTrue();
+            assertThat(accept(stale, id)).isFalse();
+            assertThat(rows()).isEqualTo(1);
+            assertThat(staleRegistry.get("outbox.inbox.window.remaining").gauge().value())
+                    .isCloseTo((top + HOUR - System.currentTimeMillis()) / 1000.0, within(5.0));
+        } finally {
+            stale.close();
+        }
+    }
+
+    /** {@code c}, whose statements containing {@code sql} fail to prepare. */
+    private static Connection failing(Connection c, String sql) {
+        return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[] {Connection.class},
+                (proxy, method, args) -> {
+                    if (method.getName().equals("prepareStatement") && ((String) args[0]).contains(sql)) {
+                        throw new SQLException("connection reset", "08006");
+                    }
+                    try {
+                        return method.invoke(c, args);
+                    } catch (InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
     }
 
     @Test

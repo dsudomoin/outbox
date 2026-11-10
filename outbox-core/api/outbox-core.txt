@@ -246,6 +246,7 @@ package io.github.dsudomoin.outbox {
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge HANDLER_THREADS_FREE;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge INBOX_MAINTENANCE_TRANSACTION_POOLING;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge INBOX_PARTITIONS_ORPHANED;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge INBOX_WINDOW_REMAINING;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge MAINTENANCE_SINCE_SUCCESS;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge MAINTENANCE_TRANSACTION_POOLING;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge PARKED_SIZE;

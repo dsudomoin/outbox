@@ -1327,10 +1327,11 @@ fun process(records: ConsumerRecords<String, ByteArray>) = db.inTx<Unit> { _: Co
   одной транзакции могут попасть в deadlock с параллельным потребителем (SQLState 40P01); тогда poll повторяется, как
   любая неудавшаяся транзакция.
 - **Окно дедупликации.** Id дедуплицируется, пока его время UUIDv7 лежит в окне: id возрастом до
-  `outbox.inbox.retention − outbox.inbox.partitionInterval` (по умолчанию 23 ч) дедуплицируются всегда. Id вне окна или
-  не в формате UUIDv7 принимается без дедупликации (`true`, ничего не записывается, WARN не чаще раза в минуту и
-  счётчик `outbox.inbox.outside_window`); транзакцию это никогда не валит. Задайте `retention` больше самого большого
-  лага потребителя или повторного чтения (replay), которое нужно покрыть.
+  `outbox.inbox.retention − outbox.inbox.partitionInterval` (по умолчанию 23 ч) дедуплицируются всегда, пока
+  обслуживание inbox создаёт диапазоны впрок (за этим следит gauge `outbox.inbox.window.remaining`, см.
+  [Алерты](#алерты)). Id вне окна или не в формате UUIDv7 принимается без дедупликации (`true`, ничего не
+  записывается, WARN не чаще раза в минуту и счётчик `outbox.inbox.outside_window`); транзакцию это никогда не валит.
+  Задайте `retention` больше самого большого лага потребителя или повторного чтения (replay), которое нужно покрыть.
 
 ## Spring Boot
 
@@ -2696,7 +2697,7 @@ Spring Boot — в [Настройке в `application.yml`](#настройка
 | `table` | `"inbox"` | Имя таблицы inbox, правила те же, что для `outbox.table`. Создаётся, только когда какой-то компонент использует `Inbox`. |
 | `partitionInterval` | `1h` | ≥ 1m. Длина одного диапазона inbox по времени UUIDv7. |
 | `premake` | `24h` | ≥ 2 × `partitionInterval`, и `premake − partitionInterval` должно превышать `outbox.partitions.maintenanceInterval`. Диапазоны поддерживаются до `now + premake`. |
-| `retention` | `24h` | ≥ 2 × `partitionInterval`. Диапазоны удаляются, когда становятся старше этого значения. Id возрастом до `retention − partitionInterval` дедуплицируются всегда. `(retention + premake) / partitionInterval` ≤ 1000. |
+| `retention` | `24h` | ≥ 2 × `partitionInterval`. Диапазоны удаляются, когда становятся старше этого значения. Id возрастом до `retention − partitionInterval` дедуплицируются всегда, пока обслуживание inbox создаёт диапазоны впрок (`outbox.inbox.window.remaining`). `(retention + premake) / partitionInterval` ≤ 1000. |
 | `attachOrphans` | `true` | Диапазон, отсоединённый внутри окна дедупликации, обслуживание inbox присоединяет обратно по границам из его имени; `false` — только ERROR ([Осиротевшие партиции](#осиротевшие-партиции)). |
 
 Inbox также читает `outbox.partitions.maintenanceInterval` (расписание своего обслуживания) и
@@ -3186,6 +3187,7 @@ Gauge показывает, сколько xid осталось, а обслуж
 | Цель недоступна или `outbox.shard.lag` растёт | Самый медленный шард отстаёт: цель недоступна, медленный обработчик, мало воркеров. Если при этом `since_success` остаётся малым, а в логе ERROR «outbox shards ... start from ticks ... that no longer exist» — застрявшие шарды: нужен один вызов ([Застрявшие шарды](#застрявшие-шарды)). |
 | `outbox.handler.threads.free` = 0 дольше `batchTimeout` | Зависшие вызовы обработчика заняли все его потоки, и этот инстанс не доставляет ничего. Heartbeat при этом жив, `relay.running()` и `live` в `status()` остаются true: они говорят, что процесс работает, а не что очередь движется. Поставьте обработчику таймауты HTTP и JDBC меньше `batchTimeout` ([Таймауты и зависания](#таймауты-и-зависания)). |
 | `outbox.maintenance.since_success` > 5 × `maintenanceInterval` | Ни один запуск обслуживания не завершился ни на одном инстансе: партиции не расширяются и не удаляются. В логах также WARN; при `outbox.maintenance.transaction_pooling` = 1 причина — transaction pooler. |
+| `outbox.inbox.window.remaining` < `outbox.inbox.premake` / 2 (43 200 с по умолчанию) или `outbox.inbox.outside_window` растёт быстрее обычного | Inbox этого инстанса скоро перестанет дедуплицировать или уже перестал: новые id выше верхней границы его окна принимаются без записи, и повторные доставки обрабатываются снова. Обычно gauge держится между `premake − partitionInterval` и `premake`. Падает он, когда диапазоны inbox не создаёт ни один инстанс (ERROR «outbox inbox maintenance of ... failed» каждые `maintenanceInterval`, причина в нём), или когда расписание обслуживания этого инстанса остановилось (ERROR «... stopped by a fatal error»: нужен перезапуск). Если у инстанса не работают только соединения владельца таблиц, окно он берёт через соединения приложения, пока диапазоны создают другие инстансы. Счётчик растёт и от id не в формате UUIDv7, поэтому порог для него берите от его обычного уровня. |
 | `outbox.partitions.xids_left` не NaN | Хвост не присоединён; вставки начнут падать, когда значение дойдёт до 0. Обслуживание чинит это само, как только ему не мешает длинная транзакция ([Партиции](#партиции)). |
 | `outbox.dead.pending.oldest` > X, а `outbox.dead.hook.failures` растёт | Хук dead letters падает дольше X: письма ждут, ничего не теряется, но алерт из хука не уходит. X берите больше `relay.retry.maxDelay` (5 мин), потолка backoff хука. |
 | ERROR «outbox xid regression detected» | Регрессия xid. С «recovered: N rows re-sent» библиотека восстановилась сама. С «relay halted» причина в конце строки: блокировку обслуживания держит другая сессия или восстановление упало — следующий запуск повторит сам; режим `halt` или строк больше `maxRows` — нужен один вызов ([Восстановление после регрессии xid](#восстановление-после-регрессии-xid-xid-regression-recovery)). |
@@ -4392,6 +4394,7 @@ Boot](#метрики-и-трассы-в-spring-boot)); без фреймвор�
 | `outbox.maintenance.since_success` | gauge, с | — | Время с последнего завершённого запуска обслуживания на любом инстансе (по часам базы). |
 | `outbox.inbox.outside_window` | counter | — | Id, принятые без дедупликации (вне окна или не UUIDv7). |
 | `outbox.inbox.maintenance.transaction_pooling`, `outbox.inbox.partitions.orphaned` | gauges | — | То же для inbox. |
+| `outbox.inbox.window.remaining` | gauge, с | — | Сколько осталось до верхней границы окна дедупликации этого инстанса (по часам базы): id новее неё принимаются без дедупликации. Окно обновляет каждый запуск обслуживания inbox. NaN до старта inbox. Читается при опросе ([Алерты](#алерты)). |
 
 `outbox.messages.delivered` и `outbox.delivery.delay` пишутся, когда relay разбирает outcomes вызова, до коммита шага:
 записи шага, который потом откатился, при повторной доставке считаются снова (at-least-once видно и в счётчике).

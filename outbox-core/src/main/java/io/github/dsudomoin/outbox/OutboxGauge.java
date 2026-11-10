@@ -18,7 +18,8 @@ public enum OutboxGauge {
     MAINTENANCE_TRANSACTION_POOLING("outbox.maintenance.transaction_pooling"),
     MAINTENANCE_SINCE_SUCCESS("outbox.maintenance.since_success"),
     INBOX_MAINTENANCE_TRANSACTION_POOLING("outbox.inbox.maintenance.transaction_pooling"),
-    INBOX_PARTITIONS_ORPHANED("outbox.inbox.partitions.orphaned");
+    INBOX_PARTITIONS_ORPHANED("outbox.inbox.partitions.orphaned"),
+    INBOX_WINDOW_REMAINING("outbox.inbox.window.remaining");
 
     private final String metricName;
 

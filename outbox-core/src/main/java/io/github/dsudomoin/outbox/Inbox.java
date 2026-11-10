@@ -18,9 +18,10 @@ import java.util.UUID;
  *
  * <p>The window goes back {@code outbox.inbox.retention} from now, by the UUIDv7 timestamp of the id (the outbox
  * message id, Kafka header {@code outbox-message-id}), less up to one {@code outbox.inbox.partitionInterval} of margin:
- * ids up to {@code retention - partitionInterval} old are always deduplicated. An id outside the window, or an id that
- * is not UUIDv7, is accepted without dedup ({@code true}, nothing recorded, a rate-limited WARN and
- * {@code outbox.inbox.outside_window}); it never fails the transaction.
+ * ids up to {@code retention - partitionInterval} old are always deduplicated while inbox maintenance makes ranges ahead
+ * (the gauge {@code outbox.inbox.window.remaining}). An id outside the window, or an id that is not UUIDv7, is accepted
+ * without dedup ({@code true}, nothing recorded, a rate-limited WARN and {@code outbox.inbox.outside_window}); it never
+ * fails the transaction.
  */
 public interface Inbox {
 
