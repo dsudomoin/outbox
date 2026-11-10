@@ -410,16 +410,17 @@ public final class PgInbox implements Inbox, AutoCloseable {
         return pids == null;
     }
 
+    /** Never throws: a throw would cancel every later run without a word, a fatal error (OutOfMemoryError) included. */
     private void scheduledMaintenance() {
         try {
             runMaintenance();
-        } catch (VirtualMachineError e) { // rethrown, the scheduler cancels all later runs without a word
-            log.error("outbox inbox maintenance of {} stopped by a fatal error; no further runs until restart",
-                    names.base(), e);
-            throw e;
         } catch (Throwable t) {
-            log.error("outbox inbox maintenance of {} failed; next run in {}", names.base(),
-                    config.partitions().maintenanceInterval(), t);
+            try {
+                log.error("outbox inbox maintenance of {} failed; next run in {}", names.base(),
+                        config.partitions().maintenanceInterval(), t);
+            } catch (VirtualMachineError ignored) {
+                // logging ran out of memory too; the next run reports again
+            }
         }
     }
 

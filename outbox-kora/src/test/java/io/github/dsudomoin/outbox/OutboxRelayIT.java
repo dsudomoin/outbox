@@ -243,7 +243,8 @@ class OutboxRelayIT {
     }
 
     @Test
-    void fatalErrorInMaintenanceIsLogged() throws Exception {
+    void fatalErrorInMaintenanceIsLoggedAndTheNextRunComes() throws Exception {
+        config.maintenanceInterval(Duration.ofMillis(100));
         bootstrap();
         var connections = new AtomicInteger();
         var failing = new JdbcConnectionFactory() {
@@ -275,9 +276,10 @@ class OutboxRelayIT {
                     maintenance(failing), noHook(db)));
             relays.get(0).start();
 
-            // the scheduler swallows what a run throws and silently cancels all later runs: only the log tells
+            // a run that throws would cancel all later runs without a word: the run logs it and the next one comes
             await(Duration.ofSeconds(5), () -> err.text().contains("maintenance out of memory (test)"));
             assertThat(err.text()).contains("ERROR " + OutboxRelay.class.getName());
+            await(Duration.ofSeconds(5), () -> connections.get() >= 3);
         }
     }
 

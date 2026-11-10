@@ -588,30 +588,42 @@ public final class OutboxRelay implements AutoCloseable {
                 failures = 0;
                 var wait = due == null || due.compareTo(interval) > 0 ? interval : due;
                 park(System.nanoTime() + wait.toNanos(), () -> deadLettered.get() != seen);
-            } catch (VirtualMachineError e) {
-                log.error("outbox dead-letter thread stopped by a fatal error", e);
-                throw e;
-            } catch (Throwable t) {
+            } catch (Throwable t) { // a fatal error (OutOfMemoryError) too: the pass goes on, later
                 if (stopping) { // e.g. the pass closed under it
                     log.debug("outbox dead-letter pass failed while stopping", t);
                     return;
                 }
                 Thread.interrupted(); // not stopping: a stray interrupt is one more failure
                 var backoff = Backoff.delay(failures++, relay.retry().initialDelay(), interval);
-                log.warn("outbox dead-letter pass failed, retrying in {}", backoff, t);
+                if (t instanceof VirtualMachineError) {
+                    fatal(() -> log.error("outbox dead-letter pass hit a fatal error, retrying in {}", backoff, t));
+                } else {
+                    log.warn("outbox dead-letter pass failed, retrying in {}", backoff, t);
+                }
                 park(System.nanoTime() + backoff.toNanos(), () -> false);
             }
         }
     }
 
+    /** Never throws: a throw would cancel every later run without a word, a fatal error (OutOfMemoryError) included. */
     private void runMaintenance() {
         try {
             maintenance.runOnce();
-        } catch (VirtualMachineError e) { // rethrown, the scheduler cancels all later runs without a word
-            log.error("outbox maintenance stopped by a fatal error; no further runs until restart", e);
-            throw e;
         } catch (Throwable t) {
-            log.error("outbox maintenance failed; next run in {}", config.partitions().maintenanceInterval(), t);
+            fatal(() -> log.error("outbox maintenance failed; next run in {}",
+                    config.partitions().maintenanceInterval(), t));
+        }
+    }
+
+    /**
+     * {@code report} of a failure, at most one more fatal error swallowed: logging may itself run out of memory, and
+     * a thread of the relay must outlive that, not end on it.
+     */
+    static void fatal(Runnable report) {
+        try {
+            report.run();
+        } catch (VirtualMachineError ignored) {
+            // nothing left to report with; the thread goes on, its next failure is reported again
         }
     }
 
@@ -759,6 +771,8 @@ public final class OutboxRelay implements AutoCloseable {
 
         private long lastWarn = System.nanoTime() - WARN_INTERVAL;
         private int suppressed;
+        /** Fatal errors in a row: each pauses the worker twice as long, from retry.initialDelay up to maxDelay. */
+        private int fatal;
 
         @Override
         public void run() {
@@ -773,9 +787,17 @@ public final class OutboxRelay implements AutoCloseable {
                 boolean worked;
                 try {
                     worked = pass(seen);
-                } catch (VirtualMachineError e) {
-                    log.error("outbox relay worker {} stopped by a fatal error", Thread.currentThread().getName(), e);
-                    throw e;
+                    fatal = 0;
+                } catch (VirtualMachineError e) { // OutOfMemoryError, StackOverflowError: the worker goes on, later
+                    if (stopping) {
+                        return;
+                    }
+                    var backoff = Backoff.delay(fatal++, relay.retry().initialDelay(), relay.retry().maxDelay());
+                    fatal(() -> log.error("outbox relay worker {} hit a fatal error, going on in {}",
+                            Thread.currentThread().getName(), backoff, e));
+                    fatal(() -> telemetry.relayFailed(e));
+                    park(System.nanoTime() + backoff.toNanos(), false, seen, seenTicks, seenRequeued);
+                    continue;
                 } catch (Throwable t) { // outside a shard step (tick, cursor read, connection)
                     if (stopping) {
                         log.debug("outbox relay worker failed while stopping", t);
