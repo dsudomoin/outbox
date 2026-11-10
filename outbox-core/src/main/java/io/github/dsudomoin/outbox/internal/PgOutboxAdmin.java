@@ -18,6 +18,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
@@ -31,6 +32,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -48,8 +50,9 @@ import org.slf4j.LoggerFactory;
  * their whole run, so maintenance's steps never run beside them. The reads, {@code status} and the dead-letter find
  * and count, give up on a statement after 60 s (57014).
  * {@code abandonWaiting}, {@code abandonKey} and {@code abandonRecord} move each chunk under its shard's lock, which
- * every relay step holds while it writes the retry and parked tables, so no step adds a record to a key it moves or
- * makes a key it reads wait meanwhile.
+ * every relay step holds while it writes the retry and parked tables, so no step adds a record to a key a chunk moves
+ * or makes a key it reads wait meanwhile; {@code abandonKey} moves only the rows its first chunk finds, so what a step
+ * adds between its chunks stays, with a head.
  */
 public final class PgOutboxAdmin implements OutboxAdmin {
 
@@ -649,10 +652,14 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                     records += read(c, tx -> countRows(tx, shard, topic, condition, value));
                     continue;
                 }
+                var upTo = new AtomicReference<Long>();
                 int moved;
                 do {
-                    moved = inTx(c, tx -> abandonRowsChunk(tx, shard, topic, condition, value, error));
+                    moved = inTx(c, tx -> abandonRowsChunk(tx, shard, topic, condition, value, upTo, error));
                     records += moved;
+                    if (afterChunk != null) {
+                        afterChunk.accept(c);
+                    }
                 } while (moved == CHUNK);
                 inTx(c, tx -> refreshDueTimes(tx, shard));
             }
@@ -729,26 +736,58 @@ public final class PgOutboxAdmin implements OutboxAdmin {
      * Up to {@link #CHUNK} such rows moved to the dead table with {@code error}, read after the shard's lock
      * ({@link #lockShard}), so after any relay step that held it. The retry table first and its newest rows first: a
      * call that stops between chunks leaves the key's retry rows with their head, and its parked rows, which block
-     * nothing.
+     * nothing. Only rows up to {@code bound}, the highest id of such rows the first chunk finds: a relay step between
+     * chunks reads the key's new records as followers of its head, and they stay. The last chunk makes the lowest one
+     * the key's head, due now, or nothing would ever send them. A writer's transaction committing a record of the key
+     * with an id below the bound during the call still sees it go.
      */
-    private int abandonRowsChunk(Connection tx, int shard, String topic, String condition, Object value, String error)
-            throws SQLException {
+    private int abandonRowsChunk(Connection tx, int shard, String topic, String condition, Object value,
+            AtomicReference<Long> bound, String error) throws SQLException {
         lockShard(tx, shard);
+        if (bound.get() == null) {
+            try (var ps = tx.prepareStatement("select coalesce(greatest((select max(id) from " + names.retry()
+                    + " where shard = ? and topic = ?" + condition + "), (select max(id) from " + names.parked()
+                    + " where shard = ? and topic = ?" + condition + ")), " + Long.MIN_VALUE + ")")) {
+                ps.setShort(1, (short) shard);
+                ps.setString(2, topic);
+                ps.setObject(3, value);
+                ps.setShort(4, (short) shard);
+                ps.setString(5, topic);
+                ps.setObject(6, value);
+                try (var rs = ps.executeQuery()) {
+                    rs.next();
+                    bound.set(rs.getLong(1));
+                }
+            }
+        }
         int moved = 0;
         for (var table : List.of(names.retry(), names.parked())) {
             if (moved == CHUNK) {
                 break;
             }
             var delete = "delete from " + table + " where id in (select id from " + table + " where shard = ? and"
-                    + " topic = ?" + condition + " order by id desc limit ?) returning " + RetryStore.COLUMNS
-                    + ", attempts";
+                    + " topic = ?" + condition + " and id <= ? order by id desc limit ?) returning "
+                    + RetryStore.COLUMNS + ", attempts";
             try (var ps = tx.prepareStatement(retries.toDead(delete, "attempts", "?"))) {
                 ps.setShort(1, (short) shard);
                 ps.setString(2, topic);
                 ps.setObject(3, value);
-                ps.setInt(4, CHUNK - moved);
-                ps.setString(5, RetryStore.errorText(error));
+                ps.setLong(4, bound.get());
+                ps.setInt(5, CHUNK - moved);
+                ps.setString(6, RetryStore.errorText(error));
                 moved += ps.executeUpdate();
+            }
+        }
+        if (moved < CHUNK && value instanceof byte[]) {
+            // coalesce: a record failing in such a step, with no retry row of the key before it, is a head already
+            try (var ps = tx.prepareStatement("update " + names.retry() + " set next_attempt_at ="
+                    + " coalesce(next_attempt_at, ?) where id = (select id from " + names.retry() + " where shard = ?"
+                    + " and topic = ?" + condition + " order by id limit 1)")) {
+                ps.setObject(1, RetryStore.timestamp(Instant.now()));
+                ps.setShort(2, (short) shard);
+                ps.setString(3, topic);
+                ps.setObject(4, value);
+                ps.executeUpdate();
             }
         }
         return moved;

@@ -818,6 +818,51 @@ class OutboxAdminIT {
         assertThat(count(names.retry())).isZero();
     }
 
+    /**
+     * A relay step between chunks reads a record of the key the call is moving and adds it as a follower, its head
+     * still there: the call leaves it, as the head of the key, and the relay delivers it.
+     */
+    @Test
+    void abandonKeyLeavesWhatARelayStepAddsBetweenChunks() throws Exception {
+        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
+        var ticks = new Ticks(names, config.shards());
+        int shard = Hashing.shard(Hashing.keyHash("t", bytes("k")), config.shards());
+        var handed = new CopyOnWriteArrayList<String>();
+        var processor = new ShardProcessor(names, config, record -> handed.add(new String(record.payload(), UTF_8)),
+                TestTelemetry.kora(), false);
+        try {
+            // below the outbox's ids; the lowest the head, due in an hour
+            execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, payload, created_at,"
+                    + " attempts, next_attempt_at) select -i, " + shard + ", gen_random_uuid(), 't', 'k', 'old', now(),"
+                    + " case when i = 1500 then 3 else 0 end, case when i = 1500 then now() + interval '1 hour' end"
+                    + " from generate_series(1, 1500) i");
+            execute("update " + names.cursor() + " set retry_due_at = now() + interval '1 hour' where shard = "
+                    + shard);
+            db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("t", "k", bytes("fresh"))));
+            var first = new AtomicBoolean(true);
+            admin.afterChunk = c -> {
+                if (first.compareAndSet(true, false)) {
+                    try {
+                        step(processor, ticks, shard, Instant.now());
+                    } catch (Exception e) {
+                        throw new IllegalStateException(e);
+                    }
+                }
+            };
+
+            assertThat(admin.abandonKey("t", bytes("k"), "gone", false)).isEqualTo(new Abandoned(1, 1500));
+
+            assertThat(payloads(names.dead())).doesNotContain("fresh");
+            assertThat(payloads(names.retry())).containsExactly("fresh");
+            assertThat(count(names.retry() + " where next_attempt_at is not null")).as("its head").isOne();
+            step(processor, ticks, shard, Instant.now().plusSeconds(1));
+            assertThat(handed).containsExactly("fresh");
+            assertThat(count(names.retry())).isZero();
+        } finally {
+            processor.close();
+        }
+    }
+
     /** The letters redrive as any: new messages of the key, and a record sent after the abandon needs no call of it. */
     @Test
     void anAbandonedKeyFlowsAgainAndItsLettersRedrive() throws Exception {
