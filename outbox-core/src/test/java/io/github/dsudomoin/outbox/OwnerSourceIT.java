@@ -12,6 +12,7 @@ import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import java.io.IOException;
+import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -122,6 +123,69 @@ class OwnerSourceIT {
             second.start(); // an extension is due: it reads the tail and swaps it
         }
         assertThat(foreignTables()).as("tables owned by another role than " + owner).isEmpty();
+    }
+
+    /**
+     * An owner without USAGE on PL/pgSQL cannot run the tail swap's DO block. Once an extension is due, a start still
+     * succeeds, as inserts go to the attached tail: it logs the missing right as ERROR and leaves the swap to
+     * maintenance. The right is revoked in a database of the test's own, as it is per database and granted to PUBLIC.
+     */
+    @Test
+    void ownerWithoutPlpgsqlStartsWhileTheTailTakesInserts() throws Exception {
+        var database = "d" + TestSql.uniqueTable();
+        sql("create database " + database);
+        try {
+            var admin = (PGSimpleDataSource) TestDataSources.newDataSource();
+            admin.setDatabaseName(database);
+            var ownerSource = as(owner);
+            ownerSource.setDatabaseName(database);
+            var appSource = as(app);
+            appSource.setDatabaseName(database);
+            try (var c = admin.getConnection()) {
+                TestSql.execute(c, "create schema " + schema + " authorization " + owner);
+                TestSql.execute(c, "grant usage on schema " + schema + " to " + app);
+            }
+            config.xidsPerPartition(1000).premake(2);
+            try (var c = ownerSource.getConnection()) {
+                TestSql.execute(c, OutboxSql.outbox(config, app));
+            }
+            try (var first = new OutboxSchema(new JdbcTransactions(appSource), new JdbcTransactions(ownerSource),
+                    config)) {
+                first.start();
+            }
+            List<String> partitions;
+            try (var c = admin.getConnection()) {
+                TestSql.execute(c, "do $$ begin for i in 1..1000 loop perform pg_current_xact_id(); commit; end loop;"
+                        + " end $$");
+                TestSql.execute(c, "revoke usage on language plpgsql from public");
+                partitions = partitions(c);
+            }
+
+            try (var log = new CapturedStderr(); var second = new OutboxSchema(new JdbcTransactions(appSource),
+                    new JdbcTransactions(ownerSource), config)) {
+                second.start(); // an extension is due: the swap fails with 42501
+                assertThat(log.text()).contains("ERROR").contains("SQLState 42501")
+                        .contains("permission denied for language plpgsql");
+            }
+            try (var c = admin.getConnection()) {
+                assertThat(partitions(c)).as("partitions unchanged, the tail attached").isEqualTo(partitions);
+            }
+        } finally {
+            sql("drop database " + database + " with (force)");
+        }
+    }
+
+    /** The partitions of the outbox table with their bounds. */
+    private List<String> partitions(Connection c) throws SQLException {
+        var partitions = new ArrayList<String>();
+        try (var st = c.createStatement(); var rs = st.executeQuery("select r.relname || ' ' || pg_get_expr("
+                + "r.relpartbound, r.oid) from pg_inherits i join pg_class r on r.oid = i.inhrelid where i.inhparent = '"
+                + names.base() + "'::regclass order by 1")) {
+            while (rs.next()) {
+                partitions.add(rs.getString(1));
+            }
+        }
+        return partitions;
     }
 
     /** A member cannot give a partition to an owner without CREATE on the schema: the start names the grant. */

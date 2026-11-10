@@ -77,6 +77,7 @@ public final class OutboxSchema implements AutoCloseable {
     private static final int SCHEMA_LOCK_ATTEMPTS = 12;
     private static final String LOCK_NOT_AVAILABLE = "55P03";
     private static final String QUERY_CANCELED = "57014";
+    private static final String INSUFFICIENT_PRIVILEGE = "42501";
     private static final String DUPLICATE_TABLE = "42P07";
     /** Bound of {@code deadLetters.retention} and {@code redriveHistory}: 10 years, an age maintenance compares. */
     private static final Duration MAX_DEAD_LETTER_AGE = Duration.ofDays(3650);
@@ -925,8 +926,16 @@ public final class OutboxSchema implements AutoCloseable {
             }
         } catch (SQLException e) {
             var state = e.getSQLState();
-            if (!(LOCK_NOT_AVAILABLE.equals(state) || QUERY_CANCELED.equals(state)) || !partitions.acceptsInserts(c)) {
+            boolean denied = INSUFFICIENT_PRIVILEGE.equals(state); // as without USAGE on PL/pgSQL, the swap's DO block
+            if (!(denied || LOCK_NOT_AVAILABLE.equals(state) || QUERY_CANCELED.equals(state))
+                    || !partitions.acceptsInserts(c)) {
                 throw e;
+            }
+            if (denied) { // fails alike on every run until an operator grants it: maintenance keeps reporting it
+                log.error("outbox partition extension of {} at startup lacks a right of the owner role (SQLState {}):"
+                        + " {}; inserts go to the attached tail until the right is granted", n.base(), state,
+                        e.getMessage());
+                return;
             }
             log.warn("outbox partition extension of {} gave up at startup (SQLState {}); maintenance retries it: {}",
                     n.base(), state, e.getMessage());
