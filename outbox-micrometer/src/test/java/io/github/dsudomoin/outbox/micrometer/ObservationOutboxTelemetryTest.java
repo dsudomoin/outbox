@@ -9,6 +9,7 @@ import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.Outcome;
+import io.github.dsudomoin.outbox.internal.GuardedTelemetry;
 import io.micrometer.common.KeyValue;
 import io.micrometer.common.KeyValues;
 import io.micrometer.core.instrument.Meter;
@@ -81,6 +82,7 @@ class ObservationOutboxTelemetryTest {
 
     @AfterEach
     void close() {
+        observations.setCurrentObservationScope(null); // thread-local and shared by registries: no leak between tests
         provider.close();
     }
 
@@ -508,6 +510,53 @@ class ObservationOutboxTelemetryTest {
     }
 
     @Test
+    void aHandlerFailingToOpenOrCloseTheStepScopeLeavesNoStepCurrentOrRunning() {
+        for (boolean onOpen : new boolean[] {true, false}) {
+            var registry = ObservationRegistry.create(); // no tracing handlers: their thread-local is not the subject
+            throwingOnScope(registry, OutboxStepContext.class, onOpen);
+            var stopped = stoppedSteps(registry);
+            var telemetry = GuardedTelemetry.of(
+                    ObservationOutboxTelemetry.builder(registry, new OutboxMetrics(meters)).build());
+
+            telemetry.stepStarted(List.of(1)).finished();
+            telemetry.stepStarted(List.of(2)).failed(new SQLException("x"));
+
+            assertThat(registry.getCurrentObservation()).as("onOpen=" + onOpen).isNull();
+            assertThat(stopped).as("onOpen=" + onOpen).hasSize(2);
+        }
+    }
+
+    @Test
+    void aHandlerFailingToOpenOrCloseTheRecordScopeLeavesNoDeliveryCurrent() throws Exception {
+        for (boolean onOpen : new boolean[] {true, false}) {
+            var registry = ObservationRegistry.create();
+            throwingOnScope(registry, OutboxDeliveryContext.class, onOpen);
+            var telemetry = GuardedTelemetry.of(
+                    ObservationOutboxTelemetry.builder(registry, new OutboxMetrics(meters)).build());
+            var records = List.of(record(List.of()), record(List.of()));
+            var delivery = telemetry.deliveryStarted(records, NOW);
+            var handed = delivery.handed(records);
+
+            for (var record : handed) {
+                assertThat(delivery.inRecordScope(record, () -> 1)).isEqualTo(1);
+                assertThat(registry.getCurrentObservation()).as("onOpen=" + onOpen).isNull();
+            }
+            delivery.finished(List.of(Outcome.delivered(), Outcome.delivered()));
+        }
+    }
+
+    @Test
+    void releasingAHandlerThreadDropsTheObservationItsCallLeftCurrent() {
+        var registry = ObservationRegistry.create();
+        registry.observationConfig().observationHandler(context -> true); // a real observation, not a no-op one
+        Observation.start("left.open", registry).openScope(); // a handler that never closes its scope
+
+        ObservationOutboxTelemetry.builder(registry, new OutboxMetrics(meters)).build().releaseThread();
+
+        assertThat(registry.getCurrentObservation()).isNull();
+    }
+
+    @Test
     void meterFilterRenamesGauge() {
         meters.config().meterFilter(new MeterFilter() {
             @Override
@@ -529,8 +578,12 @@ class ObservationOutboxTelemetryTest {
 
     /** The step contexts as they stop. */
     private List<OutboxStepContext> stoppedSteps() {
+        return stoppedSteps(observations);
+    }
+
+    private static List<OutboxStepContext> stoppedSteps(ObservationRegistry registry) {
         var stopped = new CopyOnWriteArrayList<OutboxStepContext>();
-        observations.observationConfig().observationHandler(new ObservationHandler<OutboxStepContext>() {
+        registry.observationConfig().observationHandler(new ObservationHandler<OutboxStepContext>() {
             @Override
             public void onStop(OutboxStepContext context) {
                 stopped.add(context);
@@ -542,6 +595,30 @@ class ObservationOutboxTelemetryTest {
             }
         });
         return stopped;
+    }
+
+    /** A handler of {@code type} contexts that throws when their scope opens, or when it closes. */
+    private static void throwingOnScope(ObservationRegistry registry, Class<?> type, boolean onOpen) {
+        registry.observationConfig().observationHandler(new ObservationHandler<>() {
+            @Override
+            public void onScopeOpened(Observation.Context context) {
+                if (onOpen) {
+                    throw new IllegalStateException("onScopeOpened");
+                }
+            }
+
+            @Override
+            public void onScopeClosed(Observation.Context context) {
+                if (!onOpen) {
+                    throw new IllegalStateException("onScopeClosed");
+                }
+            }
+
+            @Override
+            public boolean supportsContext(Observation.Context context) {
+                return type.isInstance(context);
+            }
+        });
     }
 
     private SpanData finished(String name) {

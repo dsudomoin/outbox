@@ -180,13 +180,33 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
         return b >= '0' && b <= '9' ? b - '0' : b >= 'a' && b <= 'f' ? b - 'a' + 10 : -1;
     }
 
-    /** Opens the step observation's scope on the thread that steps; the step closes it there before it stops. */
+    /**
+     * Opens the step observation's scope on the thread that steps; the step closes it there before it stops. A
+     * Micrometer scope makes itself current before it notifies the handlers and restores the previous one only after
+     * they are notified on close, so a handler that throws there would leave it current: the thread's previous scope is
+     * restored either way.
+     */
     @Override
     public RelayStep stepStarted(List<Integer> shards) {
         var context = new OutboxStepContext(shards);
         var observation = Observation.createNotStarted(stepConvention, DefaultOutboxStepObservationConvention.INSTANCE,
                 () -> context, observations).start();
-        return new ObservedStep(observation, observation.openScope());
+        var previous = observations.getCurrentObservationScope();
+        Observation.Scope scope;
+        try {
+            scope = observation.openScope();
+        } catch (Throwable e) {
+            observations.setCurrentObservationScope(previous);
+            end(observation, null, e); // the caller gets no RelayStep to stop it with
+            throw e;
+        }
+        return new ObservedStep(observations, observation, scope, previous);
+    }
+
+    /** On a handler or dead-letter hook thread, which the library owns: no observation stays current there. */
+    @Override
+    public void releaseThread() {
+        observations.setCurrentObservationScope(null);
     }
 
     @Override
@@ -304,11 +324,12 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
      * The scope is closed and the observation stopped even when recording the error fails: no step stays current on
      * the relay thread, none stays running.
      */
-    private record ObservedStep(Observation observation, Observation.Scope scope) implements RelayStep {
+    private record ObservedStep(ObservationRegistry observations, Observation observation, Observation.Scope scope,
+            @Nullable Observation.Scope previous) implements RelayStep {
         @Override
         public void finished() {
             try {
-                scope.close();
+                close();
             } finally {
                 observation.stop();
             }
@@ -320,10 +341,18 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
                 observation.error(error);
             } finally {
                 try {
-                    scope.close();
+                    close();
                 } finally {
                     observation.stop();
                 }
+            }
+        }
+
+        private void close() {
+            try {
+                scope.close();
+            } finally {
+                observations.setCurrentObservationScope(previous);
             }
         }
     }
@@ -376,8 +405,11 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
             if (observation == null) {
                 return call.call();
             }
+            var previous = observations.getCurrentObservationScope(); // restored however it ends: see stepStarted
             try (var scope = observation.openScope()) {
                 return call.call();
+            } finally {
+                observations.setCurrentObservationScope(previous);
             }
         }
 
