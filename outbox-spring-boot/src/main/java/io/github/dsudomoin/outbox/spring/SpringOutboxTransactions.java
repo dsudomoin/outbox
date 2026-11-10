@@ -79,11 +79,17 @@ public final class SpringOutboxTransactions implements OutboxTransactions {
         return dataSource;
     }
 
-    /** The connection bound for this DataSource by the actual transaction on this thread; null without one. */
+    /**
+     * The connection bound for this DataSource by the actual transaction on this thread; null without one, and null in
+     * its afterCompletion (where every {@code @TransactionalEventListener} after-phase runs): Spring has turned
+     * synchronization off there, but the finished transaction's connection is still bound, without autocommit, and a
+     * write on it would commit when Spring restores autocommit, even after a rollback.
+     */
     @Nullable
     @Override
     public Connection currentConnection() {
-        if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()
+            || !TransactionSynchronizationManager.isSynchronizationActive()) {
             return null;
         }
         return TransactionSynchronizationManager.getResource(dataSource) instanceof ConnectionHolder holder
