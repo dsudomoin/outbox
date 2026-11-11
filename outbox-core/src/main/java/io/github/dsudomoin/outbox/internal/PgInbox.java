@@ -72,6 +72,11 @@ public final class PgInbox implements Inbox, AutoCloseable {
     private volatile double transactionPooling = Double.NaN;
     private volatile double orphaned = Double.NaN;
     private volatile Window window = Window.EMPTY;
+    /**
+     * The top of the last window that had ranges, {@link Long#MIN_VALUE} before start: once none is left the gauge
+     * {@code outbox.inbox.window.remaining} keeps falling from it instead of going NaN.
+     */
+    private volatile long windowTo = Long.MIN_VALUE;
     private final DatabaseClock clock;
     @Nullable
     private volatile ScheduledExecutorService scheduler;
@@ -106,8 +111,8 @@ public final class PgInbox implements Inbox, AutoCloseable {
         telemetry.gauge(OutboxGauge.INBOX_MAINTENANCE_TRANSACTION_POOLING, () -> transactionPooling);
         telemetry.gauge(OutboxGauge.INBOX_PARTITIONS_ORPHANED, () -> orphaned);
         telemetry.gauge(OutboxGauge.INBOX_WINDOW_REMAINING, () -> {
-            var w = window;
-            return w == Window.EMPTY ? Double.NaN : (w.to() - clock.millis()) / 1000.0;
+            long to = windowTo;
+            return to == Long.MIN_VALUE ? Double.NaN : (to - clock.millis()) / 1000.0;
         });
     }
 
@@ -228,7 +233,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
                         + " (the ids it recorded go with it) and restart to have it made with the primary key"
                         + " (message_id, consumer)");
             }
-            window = partitions.window(c);
+            refreshWindow(c);
         }
         var w = window;
         log.info("outbox inbox {} ready: ids from {} to {} deduplicated", names.base(),
@@ -286,7 +291,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
             if (sessionStable(c)) {
                 maintain(c);
             }
-            if (step("window refresh", () -> window = partitions.window(c))) {
+            if (step("window refresh", () -> refreshWindow(c))) {
                 return;
             }
         } catch (SQLException | RuntimeException e) {
@@ -295,7 +300,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
         try (var app = db.newConnection(); var bound = socket.on(app)) {
             app.setAutoCommit(true);
             clock.read(app);
-            window = partitions.window(app);
+            refreshWindow(app);
         } catch (SQLException | RuntimeException e) {
             if (failure == null) {
                 failure = e;
@@ -308,6 +313,17 @@ public final class PgInbox implements Inbox, AutoCloseable {
         }
         if (failure != null) {
             throw (RuntimeException) failure;
+        }
+    }
+
+    /** Takes the {@link Window} of {@code c}'s ranges; one with no range left at start ends at once. */
+    private void refreshWindow(Connection c) throws SQLException {
+        var w = partitions.window(c);
+        window = w;
+        if (w != Window.EMPTY) {
+            windowTo = w.to();
+        } else if (windowTo == Long.MIN_VALUE) {
+            windowTo = clock.millis();
         }
     }
 

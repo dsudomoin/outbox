@@ -955,11 +955,38 @@ class PgInboxIT {
 
     @Test
     void theWindowGaugeCountsTheSecondsOfDedupLeft() throws Exception {
-        start();
+        inbox = new PgInbox(db, config, new OutboxMetrics(registry));
+        assertThat(registry.get("outbox.inbox.window.remaining").gauge().value()).as("before start").isNaN();
+        inbox.start();
         double expected = (highest() - HOUR - System.currentTimeMillis()) / 1000.0;
 
         assertThat(registry.get("outbox.inbox.window.remaining").gauge().value())
                 .isCloseTo(expected, within(5.0));
+    }
+
+    @Test
+    void theWindowGaugeKeepsFallingOnceNoRangeIsLeft() throws Exception {
+        var broken = new AtomicBoolean();
+        inbox = new PgInbox(db, new OwnerTransactions(db, () -> {
+            if (broken.get()) { // no instance makes ranges any more
+                throw new SQLException("password authentication failed", "28P01");
+            }
+            return TestDb.connect();
+        }), config, new OutboxMetrics(registry));
+        inbox.start();
+        long top = highest() - HOUR;
+        broken.set(true);
+        try (var c = TestDb.connect()) { // every range gone: by retention, or an operator's detach
+            for (var b : ranges()) {
+                execute(c, "alter table " + table() + " detach partition " + b.name());
+            }
+        }
+
+        assertThatThrownBy(inbox::runMaintenance).as("the run itself fails");
+
+        assertThat(registry.get("outbox.inbox.window.remaining").gauge().value())
+                .as("dedup has stopped: the gauge stays below every threshold instead of going NaN")
+                .isCloseTo((top - System.currentTimeMillis()) / 1000.0, within(5.0));
     }
 
     /**
@@ -1061,6 +1088,34 @@ class PgInboxIT {
         var id = UuidV7.next();
         assertThat(accept(id)).isTrue();
         assertThat(accept(id)).isFalse();
+    }
+
+    @Test
+    void aTopOffTheWholeMinuteIsRealignedByTheNextRange() throws Exception {
+        start();
+        var minutes = DateTimeFormatter.ofPattern("yyyyMMddHHmm").withZone(ZoneOffset.UTC);
+        long top = highest();
+        try (var c = TestDb.connect()) { // a 90s range on top, as a sub-minute interval of an earlier version made
+            PartitionDdl.createAndAttach(c, table(), table() + "_t" + minutes.format(Instant.ofEpochMilli(top)),
+                    bound(top), bound(top + 90_000), PartitionDdl.CREATE_LOCK_TIMEOUT);
+        }
+        inbox.close();
+        config.inboxPremake(Duration.ofHours(6)); // ranges made above it
+        var restarted = new SimpleMeterRegistry(); // the closed inbox's gauge stays registered in the other
+        inbox = new PgInbox(db, config, new OutboxMetrics(restarted));
+        inbox.runMaintenance();
+
+        assertThat(millis(rangeOf(top + 90_000).to())).as("ends on the next whole interval").isEqualTo(top + HOUR);
+        var next = rangeOf(top + HOUR + HOUR / 2);
+        assertThat(millis(next.from())).isEqualTo(top + HOUR);
+        try (var c = TestDb.connect()) { // an operator's detach
+            execute(c, "alter table " + table() + " detach partition " + next.name());
+        }
+
+        inbox.runMaintenance();
+
+        assertThat(ranges()).as("its name holds its bounds: attached back").contains(next);
+        assertThat(restarted.get("outbox.inbox.partitions.orphaned").gauge().value()).isZero();
     }
 
     private void rejected(TestOutboxConfig invalid, String message) {

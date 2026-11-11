@@ -35,6 +35,7 @@ final class InboxPartitions {
 
     private static final Logger log = LoggerFactory.getLogger(InboxPartitions.class);
     private static final long HOUR = Duration.ofHours(1).toMillis();
+    private static final long MINUTE = Duration.ofMinutes(1).toMillis();
     private static final long LOG_INTERVAL = TimeUnit.MINUTES.toNanos(1);
     private static final DateTimeFormatter HOURS = DateTimeFormatter.ofPattern("yyyyMMddHH").withZone(ZoneOffset.UTC);
     private static final DateTimeFormatter MINUTES =
@@ -110,9 +111,14 @@ final class InboxPartitions {
             from = Math.max(from, millis(b.to()));
         }
         int made = 0;
-        for (; from < now + premake; from += interval, made++) {
+        while (from < now + premake) {
+            // a top off the whole minute, from a table made under a sub-minute interval: the range ends on the next
+            // multiple of the interval, so every later lower bound is one its name holds
+            long to = from % MINUTE == 0 ? from + interval : floor(from) + interval;
             PartitionDdl.createAndAttach(c, table, table + "_t" + suffix(from),
-                    bound(from), bound(from + interval), PartitionDdl.CREATE_LOCK_TIMEOUT);
+                    bound(from), bound(to), PartitionDdl.CREATE_LOCK_TIMEOUT);
+            from = to;
+            made++;
         }
         return made;
     }
@@ -204,7 +210,10 @@ final class InboxPartitions {
         PartitionDdl.attach(c, table, orphan.table(), orphan.from(), orphan.to(), PartitionDdl.CREATE_LOCK_TIMEOUT);
     }
 
-    /** A range's name after its lower bound {@code from} (ms), which is a whole minute. */
+    /**
+     * A range's name after its lower bound {@code from} (ms), to the minute: a bound off the whole minute (only on a
+     * table made under a sub-minute interval) is named up to a minute low.
+     */
     private String suffix(long from) {
         return (wholeHours && from % HOUR == 0 ? HOURS : MINUTES).format(Instant.ofEpochMilli(from));
     }

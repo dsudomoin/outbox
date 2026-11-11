@@ -50,7 +50,7 @@ README «Наблюдаемость» → «Контракт по этапам»
 | `outbox.maintenance.since_success` | gauge, seconds | | Since the last finished maintenance run on any instance. |
 | `outbox.inbox.outside_window` | counter | | Ids accepted without dedup (outside the window, or not UUIDv7). |
 | `outbox.inbox.maintenance.transaction_pooling`, `outbox.inbox.partitions.orphaned` | gauges | | The same for the inbox. |
-| `outbox.inbox.window.remaining` | gauge, seconds | | Until the top of this instance's dedup window (database clock); newer ids are accepted without dedup. Every inbox maintenance run refreshes the window. NaN before the inbox starts. Read at scrape time. |
+| `outbox.inbox.window.remaining` | gauge, seconds | | Until the top of this instance's dedup window (database clock); newer ids are accepted without dedup. Every inbox maintenance run refreshes the window. NaN before the inbox starts; with no range left it keeps falling from the last window's top, below 0. Read at scrape time. |
 
 Outbox gauges are refreshed by maintenance every `outbox.partitions.maintenanceInterval` on the instance that runs
 it; another instance keeps its previous values (NaN before its first run). `since_success` is read by every instance.

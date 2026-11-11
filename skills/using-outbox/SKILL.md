@@ -332,7 +332,9 @@ for ops:
 8. **Alerts**: `outbox.shard.lag` growing, `outbox.dead.size > 0`, `outbox.maintenance.since_success > 5 ×
    maintenanceInterval`, `outbox.maintenance.transaction_pooling = 1`, `outbox.partitions.premade < 2`, `overflow = 1`,
    `xids_left` not NaN, `orphaned > 0`, `retained ≥ 2` over 3 runs, `outbox.waiting.oldest > 900`
-   (`relay.waiting.alertAfter`),
+   (`relay.waiting.alertAfter`), `outbox.retry.oldest > N × relay.retry.maxDelay` (e.g. 30 min at the 5 min default),
    `outbox.messages.contract_rejected` or `outbox.messages.route_rejected` growing, `outbox.messages.route_unchecked`
-   growing (morning: the heartbeat fails, operating-outbox); with a dead-letter hook, `outbox.dead.pending.oldest`.
+   growing (morning: the heartbeat fails, operating-outbox); with a dead-letter hook, `outbox.dead.pending.oldest`;
+   with an inbox, `outbox.inbox.window.remaining < (inbox.premake − inbox.partitionInterval) / 2` (41 400 s by
+   default).
    Dead letters: admin API, never SQL.
