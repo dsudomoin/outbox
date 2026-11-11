@@ -128,8 +128,10 @@ class OrderDeliveryTest {
 - **Custom handler without Kafka**: a test `@KoraApp` whose `OutboxHandler` factory returns a handler that records
   what it got; `OutboxTopicHandler` components still get their own topics. The library's own test fixtures are not
   published; write the ten lines.
-- **Retry path**: `drain()` throws `IllegalStateException` after 2 × (`batchTimeout` + 5 s) without progress
-  (a stub answering 500). Lower `batchTimeout` only with a non-Kafka handler; with Kafka it must stay ≥
+- **Retry path**: with one failing key, `drain()` returns after about 3 pauses with a smaller count, and the record
+  waits in `<table>_retry`: assert that count. `drain()` throws `IllegalStateException` only when no shard moves for
+  2 × (`batchTimeout` + 5 s), for example when two or more keys fail and nothing is delivered, or when the relay is
+  halted. Lower `batchTimeout` only with a non-Kafka handler; with Kafka it must stay ≥
   `delivery.timeout.ms + 5 s + max.block.ms`.
 - **Unit tests**: `Outbox` and `Inbox` are interfaces; mock them.
   `new TypedOutbox<>(outbox, serializer, OrderCreated.class)` wraps a mock.

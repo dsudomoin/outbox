@@ -11,8 +11,8 @@ import java.util.UUID;
  * answers, as all act on the shared database.
  *
  * <p>Bulk calls act on the letters dead when they began, none that die meanwhile (a redriven letter dying again
- * included), in chunks of 1 000 letters in id order, one transaction each, so a large redrive never holds more than
- * 1 000 key locks. A failing chunk rolls back alone: the chunks before it stay done, and calling again goes on.
+ * included), except that a letter dying in a relay step begun before the call may be included. They work in chunks of
+ * 1 000 letters in id order, one transaction each, so a large redrive never holds more than 1 000 key locks. A failing chunk rolls back alone: the chunks before it stay done, and calling again goes on.
  * They skip, without waiting and without counting them, the letters a running dead-letter hook call holds and, for a
  * redrive, those whose (topic, key) an open transaction is sending: call again for those. Each mutating call logs its
  * arguments and result in one INFO line, or in one WARN when it fails after it began.
@@ -24,7 +24,8 @@ public interface OutboxAdmin {
 
     /**
      * Up to {@code limit} (1..1000) letters matching {@code filter} with an id above {@code afterId} (null: from the
-     * first), in id order.
+     * first), in id order. A page carries up to {@code limit} full payloads: with large letters (records Kafka refused
+     * as too large) ask for small pages.
      */
     DeadLetterPage findDeadLetters(DeadLetterFilter filter, @Nullable Long afterId, int limit);
 
@@ -101,7 +102,8 @@ public interface OutboxAdmin {
      * its tick, so each of its rows still in the outbox (when its starting tick is left, each that tick does not see)
      * goes back as a new message, with a new id and xid and the same message id, delivered after later messages
      * of its key: consumers get as duplicates the ones delivered before, and only those inside their inbox window are
-     * dropped for them. Rows in the retry, parked and dead tables stay there. Then the shard's cursor moves to the
+     * dropped for them. Letters discarded, abandoned and then discarded, or deleted by dead-letter retention go out again
+     * too: only rows still in the retry, parked and dead tables stay there. Then the shard's cursor moves to the
      * latest tick. A transaction committing meanwhile loses nothing: what the tick does not cover the relay delivers.
      *
      * <p>Under the maintenance lock, for the whole call, so maintenance runs on every instance are skipped meanwhile:
