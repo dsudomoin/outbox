@@ -109,7 +109,10 @@ public final class Maintenance {
     private static final String LOCK_NOT_AVAILABLE = "55P03";
     /** Blocks one statement of an age cleanup ({@link AgedDelete}) reads: 8 MB of 8 kB blocks. */
     static final int CLEANUP_BLOCKS = 1024;
-    /** The {@code statement_timeout} of one such statement: far above what its blocks take. */
+    /**
+     * The {@code statement_timeout} of one such statement: far above what its blocks take, and below
+     * {@code outbox.networkTimeout} by the server's answer margin, so the cleanup never lengthens the socket bound.
+     */
     static final Duration CLEANUP_TIMEOUT = Duration.ofSeconds(30);
 
     private final OutboxTransactions db;
@@ -230,8 +233,9 @@ public final class Maintenance {
         this.buildsDeadIndex = config.schema().bootstrap();
         this.deadRetention = config.deadLetters().retention();
         this.redriveHistory = config.deadLetters().redriveHistory();
-        this.deleteOldKept = new AgedDelete(names.dead(), "status = 'kept' and failed_at");
-        this.deleteOldRedrives = new AgedDelete(names.redriven(), "at");
+        var cleanupTimeout = cleanupTimeout(config.networkTimeout());
+        this.deleteOldKept = new AgedDelete(names.dead(), "status = 'kept' and failed_at", cleanupTimeout);
+        this.deleteOldRedrives = new AgedDelete(names.redriven(), "at", cleanupTimeout);
         this.cleanupBudget = config.partitions().maintenanceInterval();
         // due_at is set on every pending letter: the partial index finds them, not a scan of all the kept ones
         this.deadPending = "select count(*), coalesce(extract(epoch from now() - min(failed_at)), 0)::float8 from "
@@ -833,23 +837,34 @@ public final class Maintenance {
 
     /**
      * The rows of a table older than an age, deleted by ranges of {@link #CLEANUP_BLOCKS} blocks (a TID range scan,
-     * each its own autocommit statement under {@link #CLEANUP_TIMEOUT}, whatever the role's {@code statement_timeout}):
+     * each its own autocommit statement under {@link #cleanupTimeout}, whatever the role's {@code statement_timeout}):
      * a backlog of millions never runs into a timeout, as one statement would on every run, and each row is deleted,
      * and written to the WAL, once. A pass reads the table once, as one statement's scan would, and needs no index.
      * Past the run's budget, after at least one range, it stops, not a failure, and this instance's next run goes on
      * from there; a pass that reached the end starts the next from the first block. Rows that age out behind it
      * meanwhile go in the next pass.
      */
+    static Duration cleanupTimeout(Duration networkTimeout) {
+        if (networkTimeout.isZero()) {
+            return CLEANUP_TIMEOUT;
+        }
+        var under = networkTimeout.minus(SocketBound.ANSWER_MARGIN);
+        return under.compareTo(Duration.ofSeconds(1)) < 0 ? Duration.ofSeconds(1)
+                : under.compareTo(CLEANUP_TIMEOUT) < 0 ? under : CLEANUP_TIMEOUT;
+    }
+
     private static final class AgedDelete {
 
         private final String table;
         private final String delete;
+        private final Duration timeout;
         /** The block this instance's next run starts at. */
         private volatile long next;
 
         /** {@code aged}: the predicate up to the timestamp compared with now() less the age. */
-        AgedDelete(String table, String aged) {
+        AgedDelete(String table, String aged, Duration timeout) {
             this.table = table;
+            this.timeout = timeout;
             this.delete = "delete from " + table + " where ctid >= ('(' || ?::bigint || ',0)')::tid"
                     + " and ctid < ('(' || ?::bigint || ',0)')::tid and " + aged
                     + " < now() - make_interval(secs => ?)";
@@ -867,8 +882,8 @@ public final class Maintenance {
                 }
             }
             long from = next < blocks ? next : 0;
-            var settings = Map.of("statement_timeout", String.valueOf(CLEANUP_TIMEOUT.toMillis()));
-            return SocketBound.atLeast(c, CLEANUP_TIMEOUT, () -> SessionSettings.with(c, settings, () -> {
+            var settings = Map.of("statement_timeout", String.valueOf(timeout.toMillis()));
+            return SocketBound.atLeast(c, timeout, () -> SessionSettings.with(c, settings, () -> {
                 long deleted = 0;
                 try (var ps = c.prepareStatement(delete)) {
                     for (long at = from; at < blocks; ) {

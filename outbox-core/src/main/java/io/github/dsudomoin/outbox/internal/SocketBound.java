@@ -22,7 +22,7 @@ public final class SocketBound {
 
     private static final Logger log = LoggerFactory.getLogger(SocketBound.class);
     /** Past a statement's own {@code statement_timeout}, for the server's answer to come. */
-    private static final Duration ANSWER_MARGIN = Duration.ofSeconds(5);
+    static final Duration ANSWER_MARGIN = Duration.ofSeconds(5);
 
     /** Once per JVM: every component of an instance has a bound of its own, on one source's connections. */
     private static final AtomicBoolean WARNED = new AtomicBoolean();
