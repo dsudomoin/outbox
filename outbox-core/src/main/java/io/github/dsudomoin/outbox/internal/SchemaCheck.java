@@ -7,7 +7,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,11 +35,30 @@ final class SchemaCheck {
     /** {@code table}: the configured name, for the message; {@code render}: the method whose SQL fixes it. */
     static void run(Connection app, Connection ddl, SchemaObjects required, String table, String render)
             throws SQLException {
-        // what it compares is catalog text, which a session with quote_all_identifiers prints otherwise
-        SessionSettings.with(app, Map.of("quote_all_identifiers", "off"), () -> {
+        // what it compares is catalog text, which a session with quote_all_identifiers prints otherwise; one transaction
+        // with SET LOCAL, as a transaction pooler may run each autocommit statement on another backend
+        boolean autoCommit = app.getAutoCommit();
+        app.setAutoCommit(false);
+        try {
+            try (var st = app.createStatement()) {
+                st.execute("set local quote_all_identifiers = off");
+            }
             check(app, ddl, required, table, render);
-            return null;
-        });
+        } catch (Throwable e) {
+            try {
+                end(app, autoCommit);
+            } catch (SQLException | RuntimeException ending) {
+                e.addSuppressed(ending);
+            }
+            throw e;
+        }
+        end(app, autoCommit);
+    }
+
+    /** Ends the check's transaction, which only read, and gives {@code app} its autocommit back. */
+    private static void end(Connection app, boolean autoCommit) throws SQLException {
+        app.rollback();
+        app.setAutoCommit(autoCommit);
     }
 
     private static void check(Connection app, Connection ddl, SchemaObjects required, String table, String render)

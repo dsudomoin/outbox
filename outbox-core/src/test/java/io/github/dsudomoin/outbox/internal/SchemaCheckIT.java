@@ -10,6 +10,8 @@ import io.github.dsudomoin.outbox.OutboxSql;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
@@ -266,6 +268,59 @@ class SchemaCheckIT {
     void noPrimaryKeyFails() throws Exception {
         assertSchemaProblem((c, n) -> TestSql.execute(c, "alter table " + n.redriven() + " drop constraint "
                 + unqualified(n.redriven()) + "_pkey"), n -> n.redriven() + " has no primary key");
+    }
+
+    @Test
+    void behindATransactionPoolerOnBackendsQuotingAllIdentifiersTheSchemaPasses() throws Exception {
+        var schema = "s" + TestSql.uniqueTable();
+        var config = new TestOutboxConfig().table(schema + ".outbox");
+        var n = TableNames.of(config.table());
+        var source = TestDataSources.newDataSource();
+
+        try (var first = source.getConnection(); var second = source.getConnection()) {
+            TestSql.execute(first, "create schema " + schema);
+            TestSql.execute(first, OutboxSql.outbox(config, null));
+            // as a role or database default would have it on every backend the pooler hands out
+            TestSql.execute(first, "set quote_all_identifiers = on");
+            TestSql.execute(second, "set quote_all_identifiers = on");
+            var pooled = transactionPooled(first, second);
+
+            assertThatCode(() -> SchemaCheck.run(pooled, pooled, SchemaObjects.outbox(n), config.table(),
+                    "OutboxSql.outbox")).doesNotThrowAnyException();
+        }
+    }
+
+    /**
+     * One connection as a transaction pooler serves it: each autocommit statement runs on the other backend in turn,
+     * and a transaction stays on one backend until it ends.
+     */
+    private static Connection transactionPooled(Connection first, Connection second) {
+        var backends = new Connection[] {first, second};
+        var state = new Object() {
+            int next;
+            Connection pinned;
+        };
+        return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[] {Connection.class},
+                (proxy, method, args) -> {
+                    var name = method.getName();
+                    Connection target;
+                    if (state.pinned != null) {
+                        target = state.pinned;
+                    } else {
+                        target = backends[state.next];
+                        state.next = 1 - state.next;
+                    }
+                    if (name.equals("setAutoCommit")) {
+                        state.pinned = (Boolean) args[0] ? null : target;
+                    } else if (name.equals("getAutoCommit")) {
+                        return state.pinned == null;
+                    }
+                    try {
+                        return method.invoke(target, args);
+                    } catch (InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
     }
 
     @Test
