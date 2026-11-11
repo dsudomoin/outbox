@@ -217,6 +217,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
             }
             c.setAutoCommit(true);
             PartitionDdl.requireSessionStable(c, "outbox inbox bootstrap of " + names.base());
+            PartitionDdl.warnIfDetachDropUnfixed(c, "outbox inbox bootstrap of " + names.base());
             clock.read(c);
             // statement_timeout: a shorter role or database default would end the lock waits with 57014, not 55P03
             var budget = LOCK_TIMEOUT.plus(PartitionDdl.DDL_MARGIN);

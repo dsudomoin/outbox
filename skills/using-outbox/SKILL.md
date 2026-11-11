@@ -7,7 +7,9 @@ description: Use when adding dsudomoin/outbox (io.github.dsudomoin:outbox-kora, 
 
 ## Quick reference
 
-- **Versions**: Java 17+; Postgres 14+ (13 fails at startup), one primary; kafka-clients 3.9.2 or 4.x; Kora 1.2.23+:
+- **Versions**: Java 17+; Postgres 14.14+, 15.9+, 16.5+ or any 17+ (an older minor can crash a backend on
+  maintenance's detach-and-drop: a startup WARN names the minor to upgrade to; 13 fails at startup), one primary;
+  kafka-clients 3.9.2 or 4.x; Kora 1.2.23+:
   `outbox-kora` brings `platform("ru.tinkoff.kora:kora-parent:1.2.23")`, which raises every Kora module and HikariCP
   (7.1.0) on the runtime classpath, so set the service's own `kora-parent` and its annotation or symbol processors to
   1.2.23 too.
@@ -286,7 +288,7 @@ class OutboxDataSources {
 End your answer with a «Before deploy» list covering every clause below, each marked done, not applicable (why) or
 for ops:
 
-1. **Versions**: Postgres 14+, kafka-clients 3.9.2 or 4.x, Kora 1.2.23+ with the service's `kora-parent` and
+1. **Versions**: Postgres 14.14+/15.9+/16.5+/17+, kafka-clients 3.9.2 or 4.x, Kora 1.2.23+ with the service's `kora-parent` and
    processors aligned to it (Quick reference).
 2. **DB role and schema**, one of two models ([config-reference.md](config-reference.md), `outbox.schema`):
    - *one role owns everything* (default, `outbox.schema.bootstrap = true`): `CREATE` on the schema; owner of the

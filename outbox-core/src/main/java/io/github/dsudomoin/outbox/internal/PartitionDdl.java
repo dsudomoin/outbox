@@ -498,6 +498,36 @@ public final class PartitionDdl {
     }
 
     /**
+     * The first minor of {@code major} with the fix for crashes and "could not open relation" errors of queries
+     * (prepared ones above all) on a partitioned table concurrent with {@code DETACH PARTITION … CONCURRENTLY} and an
+     * immediate drop of the partition, which {@link #detachConcurrentlyAndDrop} does; null when {@code major.minor}
+     * has it. 17.0 shipped with it.
+     */
+    @Nullable
+    static String detachDropFix(int major, int minor) {
+        int fixed = switch (major) {
+            case 14 -> 14;
+            case 15 -> 9;
+            case 16 -> 5;
+            default -> 0;
+        };
+        return minor < fixed ? major + "." + fixed : null;
+    }
+
+    /** One WARN for {@code what} when the server of {@code c} lacks {@link #detachDropFix}; it does not refuse. */
+    static void warnIfDetachDropUnfixed(Connection c, String what) throws SQLException {
+        var meta = c.getMetaData(); // pgjdbc parses server_version: no query
+        var fix = detachDropFix(meta.getDatabaseMajorVersion(), meta.getDatabaseMinorVersion());
+        if (fix != null) {
+            log.warn("{}: Postgres {}.{} can crash a backend (which restarts every session of the server) or fail a"
+                    + " query with \"could not open relation\" when a query on a partitioned table runs concurrently"
+                    + " with DETACH PARTITION CONCURRENTLY and an immediate drop of the partition, which outbox"
+                    + " maintenance does for every expired range; {} fixes it: upgrade to {} or newer", what,
+                    meta.getDatabaseMajorVersion(), meta.getDatabaseMinorVersion(), fix, fix);
+        }
+    }
+
+    /**
      * Runs {@code sql} under the class's per-statement timeouts, then gives the session's own back. On Postgres 17+
      * also with {@code transaction_timeout} off, which a role or database default would otherwise apply to the
      * statement's implicit transaction too (a concurrent index build or detach included). Inside a transaction

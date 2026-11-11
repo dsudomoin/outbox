@@ -410,6 +410,7 @@ public final class OutboxSchema implements AutoCloseable {
             try {
                 // first: behind a transaction-pooling proxy even the settings below would leak
                 PartitionDdl.requireSessionStable(c, "outbox bootstrap of " + spelled.base());
+                PartitionDdl.warnIfDetachDropUnfixed(c, "outbox bootstrap of " + spelled.base());
                 // a statement runs for as long as its timeout: silence only past that says the network dropped it
                 var settings = SessionSettings.noTransactionTimeout(c, BOOTSTRAP_SETTINGS);
                 SocketBound.atLeast(c, STATEMENT_TIMEOUT, () -> SessionSettings.with(c, settings, () -> {

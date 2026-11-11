@@ -112,5 +112,6 @@ Metrics, alerts and procedures are the same. What differs:
   letter («Требования к Kafka»): on kafka-clients ≤ 4.1 an oversized record shared a producer batch, and the sender
   resends its batch-mates unbatched. Nothing is lost; fix the cause with `batch.size` ≤ the topic's
   `max.message.bytes`, or kafka-clients 4.2+.
-- Upgrades: Postgres 14+ (13 fails at startup), Kora 1.2.23+ (using-outbox).
+- Upgrades: Postgres 14.14+, 15.9+, 16.5+ or 17+ (older minors: startup WARN, backend crash risk on partition
+  drops; 13 fails at startup), Kora 1.2.23+ (using-outbox).
 - Writers' timeouts: ≥ 300 ms by day, ≥ `tailConversion.maxStall` + 300 ms at night.
