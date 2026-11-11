@@ -4,6 +4,7 @@ import static io.github.dsudomoin.outbox.DeadLetterDecision.discard;
 import static io.github.dsudomoin.outbox.DeadLetterDecision.keep;
 import static io.github.dsudomoin.outbox.DeadLetterDecision.redrive;
 import static io.github.dsudomoin.outbox.DeadLetterDecision.redriveAt;
+import static io.github.dsudomoin.outbox.DeadLetterDecision.retryLater;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.concurrent.TimeUnit.SECONDS;
@@ -225,6 +226,57 @@ class DeadLetterPassIT {
             execute("update " + names.dead() + " set due_at = now()");
         }
         assertThat(registry.get("outbox.dead.hook.failures").counter().count()).isEqualTo(2);
+    }
+
+    /** A letter the hook cannot act on yet backs off alone: the decisions about its batch-mates commit with it. */
+    @Test
+    void retryLaterBacksOffItsLetterAloneAndCommitsItsBatchMates() throws Exception {
+        long waiting = letter("x", "w", "p", List.of());
+        var mates = new ArrayList<Long>();
+        for (int i = 0; i < 3; i++) {
+            mates.add(letter("t", "k" + i, "p", List.of()));
+        }
+        var calls = new AtomicInteger();
+        var pass = pass(letters -> {
+            calls.incrementAndGet();
+            return letters.stream().map(l -> l.topic().equals("x")
+                    ? retryLater(new IllegalStateException("x.dlq is missing")) : discard()).toList();
+        });
+
+        var before = dbNow();
+        assertThat(pass.runOnce()).isZero();
+        var after = dbNow();
+
+        for (long id : mates) {
+            assertThat(status(id)).as("discarded in the same call").isNull();
+        }
+        assertThat(status(waiting)).isEqualTo("pending");
+        assertThat(handlerAttempts(waiting)).isEqualTo(1);
+        assertThat(lastHandlerError(waiting)).contains("x.dlq is missing");
+        assertThat(dueAt(waiting)).as("the backoff of a failed call")
+                .isBetween(before.plusMillis(50), after.plusMillis(50));
+        assertThat(calls).hasValue(1);
+        assertThat(decisions("discard")).isEqualTo(3);
+        assertThat(decisions("retry_later")).isEqualTo(1);
+        assertThat(registry.find("outbox.dead.hook.failures").counter()).as("no failed call").isNull();
+    }
+
+    /** A call that decided nothing but retryLater holds the hook back as a failed one does: the run ends with it. */
+    @Test
+    void aBatchRetriedWhollyEndsTheRun() throws Exception {
+        config.deadLettersBatchSize(2);
+        for (int i = 0; i < 4; i++) {
+            letter("t", "k" + i, "p", List.of());
+        }
+        var handed = new AtomicInteger();
+        var pass = pass(letters -> {
+            handed.addAndGet(letters.size());
+            return all(letters, retryLater(new IllegalStateException("Kafka is down")));
+        });
+
+        pass.runOnce();
+
+        assertThat(handed).as("one batch").hasValue(2);
     }
 
     @Test

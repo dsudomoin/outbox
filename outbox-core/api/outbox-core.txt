@@ -34,6 +34,7 @@ package io.github.dsudomoin.outbox {
     method public static io.github.dsudomoin.outbox.DeadLetterDecision! keep();
     method public static io.github.dsudomoin.outbox.DeadLetterDecision! redrive();
     method public static io.github.dsudomoin.outbox.DeadLetterDecision! redriveAt(java.time.Instant!);
+    method public static io.github.dsudomoin.outbox.DeadLetterDecision! retryLater(Throwable!);
   }
 
   public static final class DeadLetterDecision.Discard implements io.github.dsudomoin.outbox.DeadLetterDecision {
@@ -51,6 +52,11 @@ package io.github.dsudomoin.outbox {
   public static final class DeadLetterDecision.RedriveAt implements io.github.dsudomoin.outbox.DeadLetterDecision {
     ctor public DeadLetterDecision.RedriveAt(java.time.Instant!);
     method public java.time.Instant! at();
+  }
+
+  public static final class DeadLetterDecision.RetryLater implements io.github.dsudomoin.outbox.DeadLetterDecision {
+    ctor public DeadLetterDecision.RetryLater(Throwable!);
+    method public Throwable! error();
   }
 
   public final class DeadLetterFilter {

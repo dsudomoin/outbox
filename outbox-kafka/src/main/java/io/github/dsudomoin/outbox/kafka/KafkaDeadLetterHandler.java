@@ -37,12 +37,10 @@ import org.slf4j.LoggerFactory;
  * once with no send. A refusal by the broker, after the append, closes the producer and fails the letter's batch-mates
  * too: those are sent again in the same call, once per such refusal. Batch-mates already in flight may have been
  * written all the same, and the new producer's idempotence cannot tell, so they can land twice even in a call that
- * discards them all. Any other failure (not acknowledged in time, a cooling or missing topic) throws a
- * {@link KafkaException} naming how many failed, and the dead-letter pass hands every letter of the call again after a
- * backoff: letters acknowledged in a call that throws repeat on their dead-letter topic, once per failed call for as
- * long as a batch-mate keeps failing. Each kept letter has a WARN, at most one a minute of each kind with a count of
- * those not logged. Where brokers do not create topics on first use, create the dead-letter topics beforehand; until
- * then their letters wait.
+ * discards them all. A letter that fails otherwise (not acknowledged in time, a cooling or missing topic) is
+ * {@link DeadLetterDecision#retryLater retried later} with its Kafka error, alone: its batch-mates' decisions commit.
+ * Each kept letter has a WARN, at most one a minute of each kind with a count of those not logged. Where brokers do
+ * not create topics on first use, create the dead-letter topics beforehand; until then their letters wait.
  *
  * <p>Without a template it is not {@link #active()}: dead letters are written kept, with no call.
  */
@@ -122,38 +120,33 @@ public final class KafkaDeadLetterHandler implements OutboxDeadLetterHandler {
                 unsent.add(i);
             }
         }
-        int published = unsent.size();
-        Throwable cause = null;
         // a refusal after the append closed the producer and failed the records still in flight, so those go again;
         // each such round sets one letter aside at least, so there are at most as many rounds as letters
         while (!unsent.isEmpty()) {
             var sent = sender.sendAndReport(unsent.stream().map(i -> records[i]).toList());
             var failed = new ArrayList<Integer>();
-            cause = null;
             for (int j = 0; j < unsent.size(); j++) {
                 int i = unsent.get(j);
                 var outcome = sent.outcomes().get(j);
                 if (outcome == Outcome.delivered()) {
                     decisions[i] = DeadLetterDecision.discard();
                 } else if (outcome instanceof Outcome.Permanent p) { // as the relay does: retrying cannot help
+                    decisions[i] = DeadLetterDecision.keep(); // a round before may have failed it
                     refusals.put(letters.get(i).messageId(), Boolean.TRUE); // before a cut of this call loses it
                     refused.warn(name(letters.get(i)) + " is kept: Kafka refused it for good on its dead-letter topic "
                             + records[i].topic(), p.error());
-                } else {
+                } else { // alone: the others' decisions stand; a further round of this call decides it anew
                     failed.add(i);
-                    if (cause == null && outcome instanceof Outcome.Retry r) {
-                        cause = r.error();
-                    }
+                    decisions[i] = DeadLetterDecision.retryLater(outcome instanceof Outcome.Retry r ? r.error()
+                            : new KafkaException("not tried on its dead-letter topic " + records[i].topic()
+                                    + " in this call: a cooling topic or partition, a refused record of its key, or"
+                                    + " the call's deadline"));
                 }
             }
             unsent = failed;
             if (!sent.closedByRefusal()) { // the others failed for reasons of their own
                 break;
             }
-        }
-        if (!unsent.isEmpty()) {
-            throw new KafkaException(unsent.size() + " of " + published + " dead letters were not published to their"
-                    + " dead-letter topics; all " + letters.size() + " are handed again after a backoff", cause);
         }
         return List.of(decisions);
     }

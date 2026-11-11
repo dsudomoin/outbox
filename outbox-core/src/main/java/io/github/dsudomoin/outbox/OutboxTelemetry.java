@@ -93,7 +93,10 @@ public interface OutboxTelemetry {
     /** A shard was paused after a failed call. */
     default void shardPaused() {}
 
-    /** The dead-letter hook decided a letter: {@code keep}, {@code discard}, {@code redrive} or {@code redrive_at}. */
+    /**
+     * The dead-letter hook decided a letter: {@code keep}, {@code discard}, {@code redrive}, {@code redrive_at} or
+     * {@code retry_later}.
+     */
     default void deadLetterDecision(String decision) {}
 
     /** A dead-letter hook call failed or timed out. */

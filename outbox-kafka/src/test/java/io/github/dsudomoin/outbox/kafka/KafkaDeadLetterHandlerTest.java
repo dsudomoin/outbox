@@ -26,7 +26,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Function;
 import org.apache.kafka.clients.producer.ProducerRecord;
-import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.errors.NotEnoughReplicasException;
 import org.apache.kafka.common.errors.RecordTooLargeException;
 import org.junit.jupiter.api.AfterEach;
@@ -120,16 +119,17 @@ class KafkaDeadLetterHandlerTest {
                 Map.entry(KafkaOutboxHeaders.MESSAGE_ID, letter.messageId().toString()));
     }
 
+    /** The unacknowledged letter alone is retried later: its batch-mates on Kafka already are discarded. */
     @Test
-    void anUnacknowledgedLetterFailsTheCallNamingHowMany() {
+    void anUnacknowledgedLetterIsRetriedLaterAlone() throws Exception {
         var handler = handler(TEMPLATE, r -> new String(r.value(), UTF_8).equals("down")
                 ? new NotEnoughReplicasException("not enough replicas") : null);
 
-        assertThatThrownBy(() -> handler.handle(List.of(letter(1, "a", "v", null), letter(2, "b", "v", null),
-                letter(3, "c", "down", null))))
-                .isInstanceOf(KafkaException.class)
-                .hasMessageContaining("1 of 3 dead letters")
-                .hasCauseInstanceOf(NotEnoughReplicasException.class);
+        var decisions = handler.handle(List.of(letter(1, "a", "v", null), letter(2, "b", "v", null),
+                letter(3, "c", "down", null)));
+
+        assertThat(decisions).hasSize(3).startsWith(DeadLetterDecision.discard(), DeadLetterDecision.discard());
+        assertRetryLater(decisions.get(2), NotEnoughReplicasException.class);
         assertThat(producers).as("no refusal, no second round").hasSize(1);
     }
 
@@ -165,9 +165,9 @@ class KafkaDeadLetterHandlerTest {
                 .containsExactly(DeadLetterDecision.keep(), DeadLetterDecision.keep(), DeadLetterDecision.discard());
     }
 
-    /** A batch-mate that fails again after the refusal's round fails the call. */
+    /** A batch-mate that fails again after the refusal's round is retried later. */
     @Test
-    void aBatchMateFailingAgainAfterTheRefusalFailsTheCall() throws Exception {
+    void aBatchMateFailingAgainAfterTheRefusalIsRetriedLater() throws Exception {
         var handler = handler(TEMPLATE, false, r -> null);
 
         var letters = List.of(letter(1, "a", "big", null), letter(2, "b", "v", null));
@@ -175,10 +175,9 @@ class KafkaDeadLetterHandlerTest {
         awaitSent(0, 2).errorNext(new RecordTooLargeException("too large"));
         awaitSent(1, 1).errorNext(new NotEnoughReplicasException("not enough replicas"));
 
-        assertThatThrownBy(() -> call.get(5, SECONDS)).cause()
-                .isInstanceOf(KafkaException.class)
-                .hasMessageContaining("1 of 2 dead letters")
-                .hasCauseInstanceOf(NotEnoughReplicasException.class);
+        var decisions = call.get(5, SECONDS);
+        assertThat(decisions.get(0)).isEqualTo(DeadLetterDecision.keep());
+        assertRetryLater(decisions.get(1), NotEnoughReplicasException.class);
         assertThat(producers).hasSize(2);
     }
 
@@ -213,19 +212,20 @@ class KafkaDeadLetterHandlerTest {
 
     /**
      * A refusal on the caller thread leaves the producer open: the batch-mate failed for a reason of its own, so it is
-     * not sent again, and the call fails at once.
+     * not sent again but retried later.
      */
     @Test
-    void aClientSideRefusalSendsNothingAgain() {
+    void aClientSideRefusalSendsNothingAgain() throws Exception {
         var handler = handler(TEMPLATE, r -> switch (new String(r.value(), UTF_8)) {
             case "big" -> new RecordTooLargeException("over max.request.size");
             case "down" -> new NotEnoughReplicasException("not enough replicas");
             default -> null;
         });
 
-        assertThatThrownBy(() -> handler.handle(List.of(letter(1, "a", "big", null), letter(2, "b", "down", null))))
-                .isInstanceOf(KafkaException.class)
-                .hasMessageContaining("1 of 2 dead letters");
+        var decisions = handler.handle(List.of(letter(1, "a", "big", null), letter(2, "b", "down", null)));
+
+        assertThat(decisions.get(0)).isEqualTo(DeadLetterDecision.keep());
+        assertRetryLater(decisions.get(1), NotEnoughReplicasException.class);
         assertThat(producers).as("one round").hasSize(1);
         assertThat(producers.get(0).history()).isEmpty(); // neither record was appended
     }
@@ -279,6 +279,11 @@ class KafkaDeadLetterHandlerTest {
         assertThat(handler.handle(List.of(letter(1, "a", "v", null), letter(2, "b", "v", null))))
                 .containsExactly(DeadLetterDecision.keep(), DeadLetterDecision.keep());
         assertThat(producers).isEmpty();
+    }
+
+    private static void assertRetryLater(DeadLetterDecision decision, Class<? extends Throwable> error) {
+        assertThat(decision).isInstanceOfSatisfying(DeadLetterDecision.RetryLater.class,
+                r -> assertThat(r.error()).isInstanceOf(error));
     }
 
     private KafkaDeadLetterHandler handler(@Nullable String template,

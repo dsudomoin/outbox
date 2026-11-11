@@ -39,7 +39,7 @@ README «Наблюдаемость» → «Контракт по этапам»
 | `outbox.waiting.oldest` | gauge, seconds | | Since the oldest of them first waited; 0 when none. Alert above `outbox.relay.waiting.alertAfter` (15 min). |
 | `outbox.dead.pending` | gauge | | Dead letters waiting for the hook's decision (`pending`); 0 without an active hook. |
 | `outbox.dead.pending.oldest` | gauge, seconds | | Since `failed_at` of the oldest `pending` letter; 0 when there is none. |
-| `outbox.dead.decisions` | counter | `decision` = `keep` / `discard` / `redrive` / `redrive_at` | Committed hook decisions. Admin API calls are not counted. |
+| `outbox.dead.decisions` | counter | `decision` = `keep` / `discard` / `redrive` / `redrive_at` / `retry_later` | Committed hook decisions. Admin API calls are not counted. |
 | `outbox.dead.hook.failures` | counter | | Failed hook calls (exception, invalid answer, `deadLetters.timeout`): one per call, not per letter. |
 | `outbox.partitions.premade` | gauge | | xid ranges above the current xid. |
 | `outbox.partitions.overflow` | gauge | | 1 while the tail partition holds rows: writes go on into it; the next swap turns it into a range (over `maxTailScan`: inside `tailConversion.window`). |
@@ -61,7 +61,8 @@ restart.
 
 Dead letters: `outbox.dead.size` growing while `outbox.dead.pending` does not means kept letters pile up (no hook,
 the hook kept them, or the Kafka DLQ refused them): morning work. `outbox.dead.pending.oldest` above X while
-`outbox.dead.hook.failures` grows means the hook fails: wake someone. Take X above `relay.retry.maxDelay` (5 min),
+`outbox.dead.hook.failures` or `outbox.dead.decisions{decision="retry_later"}` grows means the hook fails or keeps
+putting letters off (Kafka DLQ: a missing DLQ topic, say): wake someone. Take X above `relay.retry.maxDelay` (5 min),
 the hook's backoff ceiling.
 
 Waiting records: `outbox.waiting.oldest` above `outbox.relay.waiting.alertAfter` (Prometheus

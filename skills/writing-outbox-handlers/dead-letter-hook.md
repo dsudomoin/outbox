@@ -30,15 +30,17 @@ letters per call.
 | `discard()` | Deleted. |
 | `redrive()` | Right after the decision commits, back to the outbox as a new message after the later messages of its key: same message id, topic, key, payload and headers, `attempts` from zero, shard computed for the current `outbox.shards`. While a transaction that sends its key is open, it waits `scheduled` and tries again after `relay.retry.initialDelay`. |
 | `redriveAt(at)` | Waits `scheduled` and redrives at `at`, without another hook call; `at` is clamped to [now, now + 7 days]. By the JVM's clock: `Instant.now().plusSeconds(3)` means 3 s on the database's clock, however far off this instance's is. |
+| `retryLater(error)` | Not yet: stays `pending` and comes again after the backoff of a failed call, `handlerAttempts` one higher, `error` as its `last_handler_error`. The other letters' decisions commit. A call that answers `retryLater` for every letter ends the pass, as a failed call does. |
 
 A redrive breaks per-key order: the letter is delivered after the key's later records. Inbox consumers deduplicate
 it by message id within their window.
 
 ## The rules
 
-- **A call is all or nothing.** A call that throws (an `Error` too), returns an invalid list (null, wrong size, a
-  null element) or runs past `outbox.deadLetters.timeout` (30 s; it is interrupted and abandoned) leaves every one of
-  its letters `pending`, decided letters included. Return a decision for each letter, or throw for all of them.
+- **A failed call fails all its letters.** A call that throws (an `Error` too), returns an invalid list (null, wrong
+  size, a null element) or runs past `outbox.deadLetters.timeout` (30 s; it is interrupted and abandoned) leaves every
+  one of its letters `pending`, decided letters included. When one letter cannot be handled now (its target is down,
+  say), return `retryLater(e)` for it and decide the rest: throw only when nothing can be decided.
 - **At least once.** A failed call is repeated after a backoff (`relay.retry.initialDelay` doubling to `maxDelay`)
   with `handlerAttempts` one higher; a crash between the call and the commit repeats it too, and a shutdown
   interrupts it and hands the letters to another instance or the next start. So an alert sent from the hook may go
@@ -94,17 +96,19 @@ module's hook publishes each letter through the relay's producers:
   comes out invalid (over 249 characters), a DLQ topic equal to the original, and letters Kafka refused for good (too
   large). Refusals are remembered by message id (the last 10 000) until restart: such a letter handed again is kept at
   once, without a send.
-- **Duplicates.** Any other failure (no ack in time, topic on cooldown or missing) fails the whole call, so its
-  letters come again: already acknowledged ones repeat in the DLQ topic once per failed round while a batch-mate keeps
-  failing. A broker refusal after the append closes the producer: batch-mates still in flight are sent again in the
-  same call and may land twice. DLQ consumers deduplicate by `outbox-message-id`.
-- Create DLQ topics before deploy when the broker does not auto-create them; until then their letters wait
-  `pending`. Keep `outbox.deadLetters.timeout` ≥ `delivery.timeout.ms + 5 s + max.block.ms` (30 s by default), else
+- A letter that fails otherwise (no ack in time, topic on cooldown or missing) gets `retryLater` with Kafka's error
+  and comes again after a backoff; its acknowledged batch-mates are discarded in the same call (a WARN at most once a
+  minute for the letters retried).
+- **Duplicates.** A broker refusal after the append closes the producer: batch-mates still in flight are sent again in
+  the same call and may land twice. DLQ consumers deduplicate by `outbox-message-id`.
+- Create DLQ topics before deploy when the broker does not auto-create them; until then the letters of those topics
+  wait `pending`, while the others go to their DLQ topics. Keep `outbox.deadLetters.timeout` ≥ `delivery.timeout.ms + 5 s + max.block.ms` (30 s by default), else
   a WARN at startup: a cut call repeats acknowledged letters too.
 
 ## Alerts
 
-`outbox.dead.pending.oldest` above X (> `relay.retry.maxDelay`) while `outbox.dead.hook.failures` grows: the hook
-fails and its alerts do not go out. `outbox.dead.size` growing while `outbox.dead.pending` does not: kept letters
+`outbox.dead.pending.oldest` above X (> `relay.retry.maxDelay`) while `outbox.dead.hook.failures` or
+`outbox.dead.decisions{decision="retry_later"}` grows: the hook fails or keeps putting letters off (for Kafka DLQ, a
+missing DLQ topic, say), and its alerts do not go out. `outbox.dead.size` growing while `outbox.dead.pending` does not: kept letters
 pile up for humans. `outbox.dead.decisions{decision}` counts committed decisions
 ([metrics.md](../operating-outbox/metrics.md)).

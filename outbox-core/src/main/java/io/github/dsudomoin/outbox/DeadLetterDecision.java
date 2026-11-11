@@ -37,6 +37,16 @@ public sealed interface DeadLetterDecision {
         return new RedriveAt(at);
     }
 
+    /**
+     * Not yet: the letter stays {@link DeadLetter.Status#PENDING} and is handed again after the backoff a failed call
+     * gives it, {@link DeadLetter#handlerAttempts()} one higher and {@code error} as its last hook error, while the
+     * decisions about its batch-mates commit. For a letter the hook could not act on now, so it does not fail the call
+     * and hold the whole batch back with it.
+     */
+    static DeadLetterDecision retryLater(Throwable error) {
+        return new RetryLater(error);
+    }
+
     record Keep() implements DeadLetterDecision {}
 
     record Discard() implements DeadLetterDecision {}
@@ -46,6 +56,12 @@ public sealed interface DeadLetterDecision {
     record RedriveAt(Instant at) implements DeadLetterDecision {
         public RedriveAt {
             Objects.requireNonNull(at, "at");
+        }
+    }
+
+    record RetryLater(Throwable error) implements DeadLetterDecision {
+        public RetryLater {
+            Objects.requireNonNull(error, "error");
         }
     }
 }

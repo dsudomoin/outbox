@@ -16,6 +16,7 @@ import java.time.InstantSource;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -38,7 +39,8 @@ import org.slf4j.LoggerFactory;
  * one transaction (read committed, {@code idle_in_transaction_session_timeout} = hook timeout + 30 s): claim up to
  * {@code deadLetters.batchSize} due letters {@code for update skip locked}, so no two passes on any instance hand one
  * letter at once; call the hook, bounded by {@code deadLetters.timeout}, while the claim holds them; commit its
- * decisions, or, after a failed call, a backoff for every letter of it. That transaction takes no key lock: a
+ * decisions, a {@code retryLater} as the backoff of a failed call for its letter alone, or, after a failed call, a
+ * backoff for every letter of it. That transaction takes no key lock: a
  * {@code redrive} commits as {@code redriveAt(now)}, so a decision is never lost and the hook is called once for it.
  * Scheduled letters due are redriven, a batch per transaction ({@link Resender}, the {@code <redriven>} count, the dead
  * rows deleted), one batch after each full hand-over and the rest once those end, so a steady stream of pending letters
@@ -89,6 +91,7 @@ public final class DeadLetterPass {
     /** One {@link #runOnce} at a time; not {@code synchronized}, which pins a virtual thread's carrier (JDK 21+). */
     private final ReentrantLock running = new ReentrantLock();
     private final Warnings hookFailures = new Warnings();
+    private final Warnings retries = new Warnings();
     private final Warnings lockTimeouts = new Warnings();
     /** The last {@link #inTx} could not roll back; under {@link #running}. */
     private boolean rollbackFailed;
@@ -168,7 +171,7 @@ public final class DeadLetterPass {
 
     /**
      * With an active hook, hands due pending letters to it batch after batch, until a batch is not full or a call fails
-     * (its backoff then holds the hook back, not just its letters), with one batch of due scheduled letters after each
+     * or retries all its letters later (its backoff then holds the hook back, not just its letters), with one batch of due scheduled letters after each
      * full one; without one, makes every pending letter kept, unless an instance with an active hook is live: its
      * {@link Heartbeat} row has not expired. Then redrives the due scheduled letters left, those just decided
      * {@code redrive} included. Returns the letters this run redrove: the caller wakes the relay when there are any,
@@ -263,10 +266,21 @@ public final class DeadLetterPass {
                     + "; they stay pending and are handed to it again after a backoff", batch.failure());
             return false;
         }
+        int retried = 0;
+        Throwable retry = null;
         for (var decision : batch.decisions()) {
             telemetry.deadLetterDecision(name(decision));
+            if (decision instanceof DeadLetterDecision.RetryLater r) {
+                retried++;
+                retry = retry == null ? r.error() : retry;
+            }
         }
-        return batch.claimed() == batchSize;
+        if (retry != null) {
+            retries.warn("outbox dead-letter hook retries " + retried + " of " + batch.claimed() + " letters of "
+                    + dead + " later; they stay pending and are handed to it again after a backoff", retry);
+        }
+        // a call that decided nothing holds the hook back as a failed one does
+        return batch.claimed() == batchSize && retried < batch.claimed();
     }
 
     /** {@code ids} gets the claimed letters' ids, for {@link #deferStillDue} should the transaction fail later. */
@@ -294,6 +308,8 @@ public final class DeadLetterPass {
         }
         var kept = new ArrayList<Long>();
         var discarded = new ArrayList<Long>();
+        var retried = new ArrayList<DeadLetters.Claimed>();
+        var retryErrors = new ArrayList<Throwable>();
         int scheduled = 0;
         try (var ps = tx.prepareStatement(schedule)) {
             for (int i = 0; i < claimed.size(); i++) {
@@ -303,6 +319,9 @@ public final class DeadLetterPass {
                     kept.add(letter.letter().id());
                 } else if (decision instanceof DeadLetterDecision.Discard) {
                     discarded.add(letter.letter().id());
+                } else if (decision instanceof DeadLetterDecision.RetryLater r) {
+                    retried.add(letter);
+                    retryErrors.add(r.error());
                 } else {
                     // the database clamps it to [now, now + 7 days], so redrive = redriveAt(EPOCH) = redriveAt(now);
                     // a range make_interval takes first, so Instant.MAX is no failing batch
@@ -322,6 +341,9 @@ public final class DeadLetterPass {
         }
         DeadLetters.byIds(tx, keep, kept);
         rows.delete(tx, discarded);
+        if (!retried.isEmpty()) {
+            backOff(tx, retried, retryErrors);
+        }
         return new Batch(claimed.size(), null, decisions);
     }
 
@@ -464,17 +486,30 @@ public final class DeadLetterPass {
 
     /** Every letter of a failed call stays pending, due after a backoff by its failed calls so far. */
     private Batch failed(Connection tx, List<DeadLetters.Claimed> claimed, Throwable failure) throws SQLException {
-        var error = RetryStore.errorText(RetryStore.describe(failure));
+        backOff(tx, claimed, Collections.nCopies(claimed.size(), failure));
+        return new Batch(claimed.size(), failure, List.of());
+    }
+
+    /** These letters stay pending, due after a backoff by their failed calls so far; {@code errors} in their order. */
+    private void backOff(Connection tx, List<DeadLetters.Claimed> letters, List<Throwable> errors)
+            throws SQLException {
         try (var ps = tx.prepareStatement(fail)) {
-            for (var c : claimed) {
-                ps.setString(1, error);
-                ps.setDouble(2, Backoff.delay(c.letter().handlerAttempts(), initialDelay, maxDelay).toNanos() / 1e9);
-                ps.setLong(3, c.letter().id());
+            String text = null;
+            Throwable last = null;
+            for (int i = 0; i < letters.size(); i++) {
+                var letter = letters.get(i).letter();
+                var e = errors.get(i);
+                if (e != last) { // a failed call's one error is rendered once
+                    text = RetryStore.errorText(RetryStore.describe(e));
+                    last = e;
+                }
+                ps.setString(1, text);
+                ps.setDouble(2, Backoff.delay(letter.handlerAttempts(), initialDelay, maxDelay).toNanos() / 1e9);
+                ps.setLong(3, letter.id());
                 ps.addBatch();
             }
             ps.executeBatch();
         }
-        return new Batch(claimed.size(), failure, List.of());
     }
 
     private List<DeadLetters.Claimed> claim(Connection tx, String status) throws SQLException {
@@ -528,6 +563,8 @@ public final class DeadLetterPass {
             return "discard";
         } else if (decision instanceof DeadLetterDecision.Redrive) {
             return "redrive";
+        } else if (decision instanceof DeadLetterDecision.RetryLater) {
+            return "retry_later";
         }
         return "redrive_at";
     }
