@@ -155,19 +155,23 @@ public final class Heartbeat {
         }
     }
 
-    /** {@link #delete(ConnectionSource, TableNames, String, Duration)}'s work, until {@code deadline} (nano time). */
-    private static void delete(ConnectionSource db, TableNames names, String id, long deadline) {
+    /**
+     * {@link #delete(ConnectionSource, TableNames, String, Duration)}'s work, until {@code deadline} (nano time);
+     * whether it deleted.
+     */
+    private static boolean delete(ConnectionSource db, TableNames names, String id, long deadline) {
         Connection used = null;
         try (var c = db.newConnection()) {
             used = c;
             delete(c, names, id, Duration.ofNanos(Math.max(0, deadline - System.nanoTime())));
+            return true;
         } catch (Exception e) {
             if (db instanceof HeartbeatConnections own && own.cannotWrite(used, e)) {
-                delete(db, names, id, deadline); // once more, on the application's connections: the lane is off now
-                return;
+                return own.retry((SQLException) e, () -> delete(db, names, id, deadline));
             }
             log.warn("outbox instance {} could not delete its row from {}; it expires by itself: {}", id,
                     names.instance(), e.toString());
+            return false;
         }
     }
 
@@ -228,7 +232,8 @@ public final class Heartbeat {
         delete(connections, names, id, Duration.ofNanos(Math.max(0, deadline - System.nanoTime())));
     }
 
-    void beat() { // package-private for a test
+    /** One beat; whether it ended without a failure it logged. Package-private for a test. */
+    boolean beat() {
         boolean refreshed = false;
         Connection used = null;
         try (var c = connections.newConnection(); var bound = socket.on(c)) {
@@ -247,7 +252,7 @@ public final class Heartbeat {
                 }
                 if (stopped) {
                     c.rollback(); // stop() deleted the row, or is about to
-                    return;
+                    return true;
                 }
                 c.commit(); // before the shard count, whose lock a recovery may hold for its run
                 refreshed = true;
@@ -256,7 +261,7 @@ public final class Heartbeat {
                 }
                 if (stopped) { // stop() deleted it before this commit; on c, as its source may hold no second connection
                     delete(c, names, id, STOP_BUDGET);
-                    return;
+                    return true;
                 }
                 lockTimeout(c);
                 try (var st = c.createStatement(); var rs = st.executeQuery(Cursors.shardCount(names))) {
@@ -264,6 +269,7 @@ public final class Heartbeat {
                     guard.observed(rs.getInt(1));
                 }
                 c.commit();
+                return true;
             } finally {
                 giveBack(c);
             }
@@ -272,14 +278,14 @@ public final class Heartbeat {
                 log.warn("outbox heartbeat of instance {} into {} waited {} ms for a lock (a recovery holds {} for its"
                         + " run?); the shard count stands as last read, retrying in {}", id, names.instance(),
                         Maintenance.SHARDS_LOCK_TIMEOUT.toMillis(), names.cursor(), interval);
-                return;
+                return true; // the row is refreshed
             }
             if (connections instanceof HeartbeatConnections own && own.cannotWrite(used, t)) {
-                beat(); // once more, on the application's connections: the lane is off now
-                return;
+                return own.retry((SQLException) t, this::beat);
             }
             log.warn("outbox heartbeat of instance {} into {} failed; retrying in {}", id, names.instance(), interval,
                     t);
+            return false;
         }
     }
 

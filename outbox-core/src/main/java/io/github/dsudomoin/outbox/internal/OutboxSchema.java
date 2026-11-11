@@ -145,7 +145,7 @@ public final class OutboxSchema implements AutoCloseable {
      * {@code heartbeat}: connections for the heartbeat alone, its beats and its row's delete, null for those of
      * {@code db}. One that reaches another database than {@code db}'s fails {@link #start()} when seen there; seen only
      * later, as when it could not connect at start, it is reported by an ERROR, and the heartbeat keeps {@code db}'s
-     * connections until restart.
+     * connections for a few {@code maintenanceInterval}s, then checks it again.
      */
     public OutboxSchema(OutboxTransactions db, OutboxTransactions ddl, OutboxConfig config,
             Map<String, Integer> contracts, Set<String> routes, @Nullable ConnectionSource heartbeat) {
@@ -166,7 +166,8 @@ public final class OutboxSchema implements AutoCloseable {
         this.schemaLockAttempts = schemaLockAttempts;
         this.contracts = new ContractGuard(contracts, routes, config.partitions().maintenanceInterval());
         this.heartbeat = heartbeat == null ? null
-                : new HeartbeatConnections(db, heartbeat, Heartbeat.socketBound(config));
+                : new HeartbeatConnections(db, heartbeat, Heartbeat.socketBound(config),
+                        config.partitions().maintenanceInterval());
         this.socket = new SocketBound(config.networkTimeout());
     }
 

@@ -153,6 +153,103 @@ class HeartbeatConnectionsIT {
         }
     }
 
+    /**
+     * The whole database read-only for a while (a reload of {@code default_transaction_read_only}, a managed server at
+     * its storage limit): the retry on the application's connections fails the same way, so the source is not to blame,
+     * keeps its lane without an ERROR, and serves the beats again once the database writes.
+     */
+    @Test
+    void aDatabaseThatCannotWriteLeavesTheLaneOn() throws Exception {
+        var config = new TestOutboxConfig().relayEnabled(false).maintenanceInterval(Duration.ofMillis(100));
+        var readOnly = new AtomicBoolean();
+        var app = readOnlyWhile(readOnly);
+        var own = new AtomicInteger();
+        ConnectionSource lane = () -> {
+            own.incrementAndGet();
+            return app.getConnection();
+        };
+        try (var log = new CapturedStderr()) {
+            var runtime = OutboxRuntime.builder(config, new JdbcTransactions(app), record -> {})
+                    .heartbeatConnections(lane).build();
+            runtime.start();
+            try {
+                readOnly.set(true);
+                awaitLog(log, "outbox heartbeat of instance");
+                readOnly.set(false);
+                int at = own.get();
+                long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+                while (own.get() < at + 2) {
+                    assertThat(System.nanoTime()).as("the beats are back on the lane").isLessThan(deadline);
+                    Thread.sleep(20);
+                }
+            } finally {
+                runtime.close();
+            }
+            assertThat(log.text()).doesNotContain("cannot write");
+        }
+    }
+
+    /**
+     * A lane that could not write is off for a few maintenance intervals only, then measured again: a standby promoted,
+     * a role fixed, and the beats are back on it without a restart.
+     */
+    @Test
+    void aLaneOffForCannotWriteIsMeasuredAgain() throws Exception {
+        var config = new TestOutboxConfig().relayEnabled(false).maintenanceInterval(Duration.ofMillis(100));
+        var readOnly = new AtomicBoolean();
+        var lanes = readOnlyWhile(readOnly);
+        var own = new AtomicInteger();
+        ConnectionSource lane = () -> {
+            own.incrementAndGet();
+            return lanes.getConnection();
+        };
+        try (var log = new CapturedStderr()) {
+            var runtime = OutboxRuntime.builder(config, new JdbcTransactions(MAIN), record -> {})
+                    .heartbeatConnections(lane).build();
+            runtime.start();
+            try {
+                readOnly.set(true);
+                awaitLog(log, "cannot write");
+                readOnly.set(false);
+                int at = own.get();
+                long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+                while (own.get() < at + 2) {
+                    assertThat(System.nanoTime()).as("the lane is measured again and serves").isLessThan(deadline);
+                    Thread.sleep(20);
+                }
+            } finally {
+                runtime.close();
+            }
+            assertThat(log.text()).containsOnlyOnce("cannot write");
+        }
+    }
+
+    private static void awaitLog(CapturedStderr log, String text) throws InterruptedException {
+        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (!log.text().contains(text)) {
+            assertThat(System.nanoTime()).as("logged: " + text).isLessThan(deadline);
+            Thread.sleep(20);
+        }
+    }
+
+    /** Connections of the main database whose transactions default to read-only while {@code readOnly} is set. */
+    private static DataSource readOnlyWhile(AtomicBoolean readOnly) {
+        var ds = new PGSimpleDataSource() {
+            @Override
+            public Connection getConnection() throws SQLException {
+                var c = super.getConnection();
+                if (readOnly.get()) {
+                    TestSql.execute(c, "set default_transaction_read_only = on");
+                }
+                return c;
+            }
+        };
+        ds.setUrl(TestDataSources.jdbcUrl());
+        ds.setUser(TestDataSources.user());
+        ds.setPassword(TestDataSources.password());
+        return ds;
+    }
+
     @Test
     void matchingSourceAtStartServesTheBeats() throws Exception {
         var app = new Recorded("app", MAIN, n -> false);

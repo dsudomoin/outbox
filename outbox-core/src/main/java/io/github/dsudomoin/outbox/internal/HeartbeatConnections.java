@@ -8,6 +8,7 @@ import java.time.Duration;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -18,18 +19,23 @@ import org.slf4j.LoggerFactory;
  * none. The heartbeat source must reach the application's database, as {@link SchemaCheck#where} tells it on the table
  * name the beats use: {@link #start} fails on a mismatch, and on nothing else. When it cannot check at start, the first
  * beat that gets an answer from a connection of its own measures it against an application connection taken for it,
- * and on a mismatch logs an ERROR and stays on the application's connections until restart. Both sides are always
+ * and on a mismatch logs an ERROR and stays on the application's connections for {@value #RECHECK_INTERVALS}
+ * {@code maintenanceInterval}s, then measures it again; a repeated ERROR logs at most once an hour. Both sides are always
  * measured together, back to back, never against a value recorded earlier: {@code where} includes the server's start
  * time, which changes on every restart and failover. A mismatch is measured once more before it counts, as another
  * instance's first bootstrap may create the table between the two measures, while another database stays another.
  * A source that connects but cannot write (a hot standby after a failover, a read-only role, missing rights) passes
- * that check: the first beat or delete that fails on it for that reason ({@link #cannotWrite}) turns the lane off with
- * an ERROR until restart, and runs once more on the application's connections.
+ * that check: a beat or delete that fails on it for that reason ({@link #cannotWrite}) runs once more on the
+ * application's connections ({@link #retry}). When that one succeeds the lane is off, as above, with an ERROR; when it
+ * fails too, the database cannot write rather than the source, and the lane stays on with the retry's WARN alone.
  */
 final class HeartbeatConnections implements ConnectionSource {
 
     private static final Logger log = LoggerFactory.getLogger(HeartbeatConnections.class);
     private static final long WARN_INTERVAL = TimeUnit.MINUTES.toNanos(1);
+    private static final long ERROR_INTERVAL = TimeUnit.HOURS.toNanos(1);
+    /** How many {@code maintenanceInterval}s the lane stays off before it is measured again. */
+    static final int RECHECK_INTERVALS = 5;
     private static final String SEARCH_PATH = " (and, for an unqualified name, give both roles the same search_path)";
     /** read_only_sql_transaction (a hot standby, a read-only default) and insufficient_privilege. */
     private static final Set<String> CANNOT_WRITE = Set.of("25006", "42501");
@@ -39,7 +45,7 @@ final class HeartbeatConnections implements ConnectionSource {
         UNCHECKED,
         /** Reaches the application's database: the beats take its connections. */
         CHECKED,
-        /** Reaches another database, or cannot write: the beats take the application's connections until restart. */
+        /** Reaches another database, or cannot write: the beats take the application's connections until a recheck. */
         OFF
     }
 
@@ -48,19 +54,27 @@ final class HeartbeatConnections implements ConnectionSource {
     private final SocketBound socket;
     /** When the fallback WARN last logged ({@link System#nanoTime()}). */
     private final AtomicLong warned = new AtomicLong(System.nanoTime() - WARN_INTERVAL);
+    /** When an ERROR that turned the lane off last logged ({@link System#nanoTime()}). */
+    private final AtomicLong erred = new AtomicLong(System.nanoTime() - ERROR_INTERVAL);
+    /** How long the lane stays off before it is measured again, in nanos. */
+    private final long recheck;
     private volatile State state = State.UNCHECKED;
+    /** When the lane went off ({@link System#nanoTime()}). */
+    private volatile long offAt;
     private volatile String table;
     /** The last connection handed out from the heartbeat source, which {@link #cannotWrite} tells from the others. */
     private volatile Connection lastOwn;
 
     HeartbeatConnections(ConnectionSource application, ConnectionSource heartbeat) {
-        this(application, heartbeat, new SocketBound(Duration.ZERO));
+        this(application, heartbeat, new SocketBound(Duration.ZERO), Duration.ofHours(1));
     }
 
-    HeartbeatConnections(ConnectionSource application, ConnectionSource heartbeat, SocketBound socket) {
+    HeartbeatConnections(ConnectionSource application, ConnectionSource heartbeat, SocketBound socket,
+            Duration maintenanceInterval) {
         this.application = application;
         this.heartbeat = heartbeat;
         this.socket = socket;
+        this.recheck = maintenanceInterval.multipliedBy(RECHECK_INTERVALS).toNanos();
     }
 
     /**
@@ -108,7 +122,10 @@ final class HeartbeatConnections implements ConnectionSource {
     public Connection newConnection() throws SQLException {
         var at = state;
         if (at == State.OFF) {
-            return application.newConnection();
+            if (System.nanoTime() - offAt < recheck) {
+                return application.newConnection();
+            }
+            state = at = State.UNCHECKED; // a failover, a fixed role or search_path may have healed it
         }
         Connection own;
         try {
@@ -126,22 +143,40 @@ final class HeartbeatConnections implements ConnectionSource {
 
     /**
      * Whether {@code failure} of work on {@code c}, a connection of the heartbeat source, says it cannot write: the
-     * lane is then off until restart, with an ERROR, and the caller runs that work once more, on the application's
-     * connections. False for any other failure, or for a connection of the application's.
+     * caller then runs that work once more through {@link #retry}. False for any other failure, or for a connection of
+     * the application's.
      */
     boolean cannotWrite(@Nullable Connection c, Throwable failure) {
-        if (c == null || c != lastOwn || !(failure instanceof SQLException e)
-                || !CANNOT_WRITE.contains(e.getSQLState())) {
+        return c != null && c == lastOwn && failure instanceof SQLException e
+                && CANNOT_WRITE.contains(e.getSQLState());
+    }
+
+    /**
+     * Runs {@code work}, which failed on the heartbeat source for {@code failure} ({@link #cannotWrite}), once more on
+     * the application's connections, and returns whether it succeeded. Then the source is to blame: the lane is off,
+     * with an ERROR. Else the application's connections cannot write either, so the database is the cause, which the
+     * work's own WARN reports: the lane stays as it was.
+     */
+    boolean retry(SQLException failure, BooleanSupplier work) {
+        var before = state;
+        off(); // the work's connections come from the application now
+        if (!work.getAsBoolean()) {
+            state = before;
             return false;
         }
-        if (state != State.OFF) {
-            state = State.OFF;
+        if (before != State.OFF && due(erred, ERROR_INTERVAL)) {
             log.error("outbox heartbeat connection source of {} cannot write (SQLSTATE {}: a hot standby, a read-only"
-                    + " role or one without the application's rights on the outbox tables?); the heartbeat uses the"
-                    + " application's connections until restart, point the heartbeat source at the primary with the"
-                    + " application's rights: {}", table, e.getSQLState(), e.toString());
+                    + " role or one without the application's rights on the outbox tables?), while the application's"
+                    + " connections can; the heartbeat uses the application's connections and checks the source again"
+                    + " in {}, point the heartbeat source at the primary with the application's rights: {}", table,
+                    failure.getSQLState(), Duration.ofNanos(recheck), failure.toString());
         }
         return true;
+    }
+
+    private void off() {
+        offAt = System.nanoTime();
+        state = State.OFF;
     }
 
     /**
@@ -159,11 +194,16 @@ final class HeartbeatConnections implements ConnectionSource {
                 return app;
             }
             boolean same = m.same();
-            if (!same) {
-                log.error("{}; the heartbeat of {} uses the application's connections until restart, point the"
-                        + " heartbeat source at its database" + SEARCH_PATH, m.mismatch(), table);
+            if (same) {
+                state = State.CHECKED;
+            } else {
+                if (due(erred, ERROR_INTERVAL)) {
+                    log.error("{}; the heartbeat of {} uses the application's connections and checks the source again"
+                            + " in {}, point the heartbeat source at its database" + SEARCH_PATH, m.mismatch(), table,
+                            Duration.ofNanos(recheck));
+                }
+                off();
             }
-            state = same ? State.CHECKED : State.OFF;
             (same ? app : own).close();
             return same ? own : app;
         } catch (SQLException | RuntimeException e) { // closing one already closed is a no-op
@@ -213,7 +253,7 @@ final class HeartbeatConnections implements ConnectionSource {
 
     /** The heartbeat source failed for this beat, which takes the application's connection instead. */
     private void fallback(Exception e) {
-        if (due()) {
+        if (due(warned, WARN_INTERVAL)) {
             log.warn("outbox heartbeat connection source of {} failed, this beat uses the application's connections;"
                     + " this WARN repeats at most once a minute: {}", table, e.toString());
         }
@@ -224,11 +264,11 @@ final class HeartbeatConnections implements ConnectionSource {
                 + heartbeat + ", application " + application;
     }
 
-    /** Whether the fallback WARN may log now, at most once a {@link #WARN_INTERVAL}. */
-    private boolean due() {
+    /** Whether a log line last logged at {@code at} may log now, at most once an {@code interval} (nanos). */
+    private static boolean due(AtomicLong at, long interval) {
         long now = System.nanoTime();
-        long last = warned.get();
-        return now - last >= WARN_INTERVAL && warned.compareAndSet(last, now);
+        long last = at.get();
+        return now - last >= interval && at.compareAndSet(last, now);
     }
 
     private static void close(Connection c, Throwable cause) {

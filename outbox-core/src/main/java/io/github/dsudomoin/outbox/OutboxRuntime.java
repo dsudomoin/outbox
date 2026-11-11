@@ -271,8 +271,8 @@ public final class OutboxRuntime implements AutoCloseable {
          * {@code maintenanceInterval}, as a beat waits that long for it. A beat that gets no connection from it takes
          * the application's, with a WARN at most once a minute. It must reach the application's database: one that
          * reaches another fails {@link OutboxRuntime#start()} when seen there; seen only later, as when it could not
-         * connect at start, it is reported by an ERROR, and the heartbeat keeps the application's connections until
-         * restart.
+         * connect at start, it is reported by an ERROR, and the heartbeat keeps the application's connections for a
+         * few {@code maintenanceInterval}s, then checks it again.
          */
         public Builder heartbeatConnections(ConnectionSource heartbeat) {
             this.heartbeat = Objects.requireNonNull(heartbeat, "heartbeat");

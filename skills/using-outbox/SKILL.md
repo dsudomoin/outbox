@@ -163,7 +163,9 @@ no route check.
 
   A heartbeat source that hands out no connection makes that beat use the app's, with a WARN at most once a minute;
   one unreachable at start does not fail the start; one on another database fails the start when seen there, else
-  logs an ERROR and the heartbeat keeps the app's connections until restart.
+  logs an ERROR and the heartbeat keeps the app's connections for 5 × `maintenanceInterval`, then checks it again. One
+  that cannot write (a standby, a read-only role, missing rights) while the app's connections can goes off the same way;
+  when the app's cannot write either, the database is to blame and the source stays on.
 
 ## Spring Boot
 
