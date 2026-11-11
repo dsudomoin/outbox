@@ -188,6 +188,7 @@ package io.github.dsudomoin.outbox {
   }
 
   public static interface OutboxConfig.RelayConfig {
+    method public default long batchBytes();
     method public default int batchSize();
     method public default java.time.Duration! batchTimeout();
     method public default java.time.Duration! connectionHold();

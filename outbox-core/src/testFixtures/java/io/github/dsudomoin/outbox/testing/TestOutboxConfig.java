@@ -20,6 +20,7 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     private boolean relayEnabled = true;
     private int workers = 2;
     private int batchSize = 100;
+    private long batchBytes = new RelayConfig() {}.batchBytes();
     private int maxTicksPerBatch = 100;
     private Duration minTickInterval = Duration.ofMillis(5);
     private Duration idlePollInterval = Duration.ofMillis(20);
@@ -198,6 +199,16 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
 
     public TestOutboxConfig batchSize(int batchSize) {
         this.batchSize = batchSize;
+        return this;
+    }
+
+    @Override
+    public long batchBytes() {
+        return batchBytes;
+    }
+
+    public TestOutboxConfig batchBytes(long batchBytes) {
+        this.batchBytes = batchBytes;
         return this;
     }
 

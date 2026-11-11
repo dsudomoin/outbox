@@ -380,6 +380,26 @@ class ParkedStoreIT {
     }
 
     @Test
+    void aDuePassKeepsToItsByteBudgetAndAKeyPastItDoesNotFit() throws SQLException {
+        var fits = new ParkedStore(names, retries, DELAY, 10, 20); // rows of 9 bytes: a key of 3 does not fit
+        var a = List.of(record("t", "a"), record("t", "a"), record("t", "a"));
+        var b = record("t", "b");
+        var parks = new ArrayList<BatchClassifier.Action>();
+        a.forEach(row -> parks.add(new Park(row, 1, NOW)));
+        parks.add(new Park(b, 1, NOW));
+        fits.apply(c, 0, parks, Set.of(), NOW);
+
+        assertThat(fits.dueWithOlder(c, 0, NOW, 10, 20, 20, 40, true)).extracting(OutboxRecord::id)
+                .as("past the budget a key comes only with its due rows, as many as the budget holds")
+                .containsExactly(a.get(0).id(), a.get(1).id());
+        assertThat(fits.dueWithOlder(c, 0, NOW, 10, 20, 5, 40, false)).as("a first row over the budget").isEmpty();
+        assertThat(fits.dueWithOlder(c, 0, NOW, 10, 20, 5, 5, true)).extracting(OutboxRecord::id)
+                .as("unless one at least is asked for: then it goes alone").containsExactly(a.get(0).id());
+        assertThat(fits.dueWithOlder(c, 0, NOW, 10, 20)).extracting(OutboxRecord::id).as("no byte limit")
+                .containsExactly(a.get(0).id(), a.get(1).id(), a.get(2).id(), b.id());
+    }
+
+    @Test
     void aRowAnsweringRequeueInALongKeyComesRoundAfterItsBatches() throws SQLException {
         var fits = new ParkedStore(names, retries, DELAY, 2);
         var rows = new ArrayList<OutboxRecord>();

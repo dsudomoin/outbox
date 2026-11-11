@@ -93,6 +93,27 @@ class RetryStoreIT {
     }
 
     @Test
+    void dueHeadsAndFollowersKeepToTheirByteBudgets() throws SQLException {
+        var a = record("t", "a"); // 9 bytes a row: payload<id> and the key
+        var b = record("t", "b");
+        var d = record("t", "d");
+        var a1 = record("t", "a");
+        var a2 = record("t", "a");
+        var a3 = record("t", "a");
+        store.apply(c, 0, List.of(new Head(a, 1, NOW, "e"), new Head(b, 1, NOW, "e"), new Head(d, 1, NOW, "e"),
+                new Follower(a1), new Follower(a2), new Follower(a3)), NOW);
+
+        assertThat(store.dueHeads(c, 0, NOW, 10, 18, true)).extracting(head -> head.r().id())
+                .containsExactly(a.id(), b.id());
+        assertThat(store.dueHeads(c, 0, NOW, 10, 5, true)).extracting(head -> head.r().id())
+                .as("one at least, alone").containsExactly(a.id());
+        assertThat(store.dueHeads(c, 0, NOW, 10, 5, false)).isEmpty();
+        assertThat(store.followers(c, notWaiting(a), 10, 18).get(a.id())).extracting(OutboxRecord::id)
+                .containsExactly(a1.id(), a2.id());
+        assertThat(store.followers(c, notWaiting(a), 10, 8)).as("not even one: a head goes on without").isEmpty();
+    }
+
+    @Test
     void followersOfEachKeyedHeadInIdOrderUpToPerKey() throws SQLException {
         var a = record("t", "a");
         var b = record("t", "b");

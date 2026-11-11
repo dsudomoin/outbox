@@ -21,6 +21,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Random;
@@ -244,6 +245,7 @@ class BatchReaderIT {
             for (boolean checkBlocked : List.of(true, false)) {
                 var used = partitionsInPlan(conn, checkBlocked, p, c);
                 assertThat(used).as("partitions in the plan (checkBlocked = %s)", checkBlocked).hasSizeBetween(1, 2);
+                assertThat(partitionsInPlan(conn, checkBlocked, p, c, true)).as("budgeted").isEqualTo(used);
             }
             var empty = new PgSnapshot(p.xmin(), p.xmax(), new long[0]);
             assertThat(partitionsInPlan(conn, true, empty, c)).as("empty xip prunes its branch").hasSize(1);
@@ -364,6 +366,104 @@ class BatchReaderIT {
         assertThat(readMany(reads, total).cut()).as("exactly the limit counts as cut").isTrue();
     }
 
+    /** The byte budget cuts the read at the row that crosses it, in the order of the reads, and says so. */
+    @Test
+    void aByteBudgetCutsTheReadAtTheRowThatCrossesIt() throws Exception {
+        config.shards(16);
+        bootstrap();
+        var random = new Random(5);
+        var p = tick();
+        for (int tx = 0; tx < 20; tx++) {
+            var messages = IntStream.range(0, 1 + random.nextInt(10)).mapToObj(i -> {
+                var payload = new byte[1 + random.nextInt(300)];
+                random.nextBytes(payload);
+                var m = OutboxMessage.of("t", "k" + random.nextInt(100), payload);
+                return random.nextBoolean() ? m.withHeader("h", bytes("v" + random.nextInt(1000))) : m;
+            }).toList();
+            db.inTx((SqlFunction0<List<UUID>>) () -> outbox.sendAll(messages));
+        }
+        var c = tick();
+        var group = shuffled(random, 16).stream().map(shard -> new ShardRead(shard, p, c, 0, 1000, true)).toList();
+        int busiest = 0;
+        for (int shard = 1; shard < 16; shard++) {
+            if (read(shard, p, c, 0, 1000, true).size() > read(busiest, p, c, 0, 1000, true).size()) {
+                busiest = shard;
+            }
+        }
+
+        var one = List.of(new ShardRead(busiest, p, c, 0, 1000, true));
+        for (var reads : List.of(group, one)) {
+            var full = readMany(reads, 100_000);
+            var order = inReadOrder(full, reads);
+            long total = order.stream().mapToLong(BatchReaderIT::bytesOf).sum();
+            assertThat(order).as("%s shards", reads.size()).hasSizeGreaterThan(3);
+            assertThat(full.bytesCut()).isFalse();
+            assertThat(full.bytes()).isEqualTo(total);
+            var unlimited = readMany(reads, 100_000, RowBytes.NO_LIMIT, true);
+            assertThat(rowKeys(inReadOrder(unlimited, reads))).as("budgeted without a limit: the plain read")
+                    .isEqualTo(rowKeys(order));
+            assertThat(unlimited.bytesCut()).isFalse();
+
+            for (long budget : List.of(1L, total / 3, total - 1)) {
+                var batch = readMany(reads, 100_000, budget, true);
+                var got = inReadOrder(batch, reads);
+                long bytes = got.stream().mapToLong(BatchReaderIT::bytesOf).sum();
+
+                assertThat(batch.bytesCut()).as("budget %s of %s", budget, total).isTrue();
+                assertThat(rowKeys(got)).as("a prefix in the order of the reads")
+                        .isEqualTo(rowKeys(order.subList(0, got.size())));
+                assertThat(got).extracting(r -> Arrays.toString(r.record().payload()))
+                        .isEqualTo(order.subList(0, got.size()).stream()
+                                .map(r -> Arrays.toString(r.record().payload())).toList());
+                assertThat(batch.bytes()).isEqualTo(bytes);
+                assertThat(bytes <= budget || got.size() == 1).as("within the budget, or one row alone").isTrue();
+                assertThat(bytes + bytesOf(order.get(got.size()))).as("cut at the row that crosses it")
+                        .isGreaterThan(budget);
+            }
+            var exact = readMany(reads, 100_000, total, true);
+            assertThat(exact.bytesCut()).as("exactly the budget is no cut").isFalse();
+            assertThat(rowKeys(inReadOrder(exact, reads))).isEqualTo(rowKeys(order));
+            var none = readMany(reads, 100_000, bytesOf(order.get(0)) - 1, false);
+            assertThat(none.bytesCut()).as("a first row over the budget, none at least asked for").isTrue();
+            assertThat(none.rows().values()).allMatch(List::isEmpty);
+            var rowCut = readMany(reads, 2, total, true);
+            assertThat(rowCut.cut()).as("the row limit still cuts").isTrue();
+            assertThat(rowCut.bytesCut()).isFalse();
+        }
+    }
+
+    /** A row counts its payload, key and headers as stored; a null counts nothing. */
+    @Test
+    void aRowCountsItsPayloadKeyAndHeaders() throws Exception {
+        bootstrap();
+        var p = tick();
+        var withHeader = OutboxMessage.of("t", "ab", bytes("12345")).withHeader("h", bytes("v")); // 2 + 5 + 10
+        sendCommitted(withHeader);
+        sendCommitted(OutboxMessage.of("u", (byte[]) null)); // 0
+        var cId = sendCommitted(OutboxMessage.of("t", "c", bytes("123"))); // 4
+        var c = tick();
+        var reads = List.of(new ShardRead(0, p, c, 0, 100, true));
+        assertThat(HeaderCodec.encode(withHeader.headers())).hasSize(10);
+
+        assertThat(readMany(reads, 100, 100, true).bytes()).isEqualTo(21);
+        var cut = readMany(reads, 100, 17, true);
+        assertThat(cut.rows().get(0)).hasSize(2);
+        assertThat(cut.bytesCut()).isTrue();
+        assertThat(messageIds(readMany(reads, 100, 21, true).rows().get(0))).endsWith(cId);
+    }
+
+    /** The rows of {@code batch} in the order of {@code reads}, id order inside each. */
+    private static List<BatchRow> inReadOrder(BatchReader.Batch batch, List<ShardRead> reads) {
+        return reads.stream().flatMap(r -> batch.rows().get(r.shard()).stream()).toList();
+    }
+
+    private static long bytesOf(BatchRow row) {
+        var r = row.record();
+        var headers = HeaderCodec.encode(r.headers());
+        return (r.payload() == null ? 0 : r.payload().length) + (r.key() == null ? 0 : r.key().length)
+                + (headers == null ? 0 : headers.length);
+    }
+
     @Test
     void readManyPrunesPartitions() throws Exception {
         config.shards(16).xidsPerPartition(1000).premake(20);
@@ -393,6 +493,8 @@ class BatchReaderIT {
             // and at plan time: the statement does not even open the others (run-time pruning opens and locks them
             // all, past the fast-path locks with a few dozen partitions)
             assertThat(partitionsPlanned(conn, reads)).as("partitions planned").isNotEmpty().isSubsetOf(covering);
+            assertThat(partitionsPlanned(conn, reads, true)).as("partitions planned, budgeted").isNotEmpty()
+                    .isSubsetOf(covering);
         }
     }
 
@@ -434,11 +536,22 @@ class BatchReaderIT {
      */
     private TreeSet<String> partitionsInPlan(Connection c, boolean checkBlocked, PgSnapshot prev, PgSnapshot target)
             throws SQLException {
+        return partitionsInPlan(c, checkBlocked, prev, target, false);
+    }
+
+    /** {@link #partitionsInPlan(Connection, boolean, PgSnapshot, PgSnapshot)} of the plain or the budgeted statement. */
+    private TreeSet<String> partitionsInPlan(Connection c, boolean checkBlocked, PgSnapshot prev, PgSnapshot target,
+            boolean budgeted) throws SQLException {
         var used = new TreeSet<String>();
         var partition = Pattern.compile(Pattern.quote(names.unqualified(names.partitionPrefix())) + "\\d+");
         execute(c, "set plan_cache_mode = force_custom_plan");
-        try (var ps = c.prepareStatement("explain " + reader.sql(checkBlocked))) {
-            reader.bind(ps, 0, prev, target, 0, 100);
+        try (var ps = c.prepareStatement("explain " + (budgeted ? reader.budgetedSql(checkBlocked)
+                : reader.sql(checkBlocked)))) {
+            if (budgeted) {
+                reader.bindBudgeted(ps, 0, prev, target, 0, 100, 16L << 20, true);
+            } else {
+                reader.bind(ps, 0, prev, target, 0, 100);
+            }
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
                     var m = partition.matcher(rs.getString(1));
@@ -513,12 +626,22 @@ class BatchReaderIT {
 
     /** {@code EXPLAIN} (no analyze) of the statement {@code readMany} runs, bound as it binds it: the partitions planned. */
     private TreeSet<String> partitionsPlanned(Connection c, List<ShardRead> reads) throws SQLException {
+        return partitionsPlanned(c, reads, false);
+    }
+
+    /** {@link #partitionsPlanned(Connection, List)} of the plain statement, or of the budgeted one. */
+    private TreeSet<String> partitionsPlanned(Connection c, List<ShardRead> reads, boolean budgeted)
+            throws SQLException {
         var planned = new TreeSet<String>();
         var partition = Pattern.compile(Pattern.quote(names.unqualified(names.partitionPrefix())) + "\\d+");
         c.setAutoCommit(false);
-        try (var ps = c.prepareStatement("explain " + reader.manySql())) {
+        try (var ps = c.prepareStatement("explain " + (budgeted ? reader.budgetedManySql(true) : reader.manySql()))) {
             execute(c, "set local plan_cache_mode = force_custom_plan");
-            reader.bindMany(ps, reads, 1000);
+            if (budgeted) {
+                reader.bindBudgetedMany(ps, reads, 1000, 16L << 20, true);
+            } else {
+                reader.bindMany(ps, reads, 1000);
+            }
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
                     var m = partition.matcher(rs.getString(1));
@@ -553,6 +676,17 @@ class BatchReaderIT {
             c.setAutoCommit(false);
             execute(c, "set local plan_cache_mode = force_custom_plan");
             var batch = reader.readMany(c, reads, totalLimit);
+            c.commit();
+            return batch;
+        }
+    }
+
+    private BatchReader.Batch readMany(List<ShardRead> reads, int totalLimit, long totalBytes, boolean oneAtLeast)
+            throws SQLException {
+        try (var c = TestDb.connect()) {
+            c.setAutoCommit(false);
+            execute(c, "set local plan_cache_mode = force_custom_plan");
+            var batch = reader.readMany(c, reads, totalLimit, totalBytes, oneAtLeast);
             c.commit();
             return batch;
         }
