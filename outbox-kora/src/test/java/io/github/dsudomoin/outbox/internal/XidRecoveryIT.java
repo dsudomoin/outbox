@@ -9,6 +9,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxMessage;
+import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.Outcome;
@@ -119,6 +120,62 @@ class XidRecoveryIT {
         assertThat(maintenance.halted()).isFalse();
         await(Duration.ofSeconds(10), () -> handler.delivered().size() >= 20);
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyInAnyOrderElementsOf(sent);
+    }
+
+    @Test
+    void sequencesALogicalCutoverLeftBehindAreRaisedAtBootstrap() throws Exception {
+        bootstrap();
+        try (var c = TestDb.connect()) { // the copied ticks lie above the ids the target's sequence starts from
+            execute(c, "alter table " + names.tick() + " alter column id restart with 1000");
+        }
+        var handler = new RecordingHandler();
+        var relay = relay(handler, maintenance());
+        relay.start();
+        var before = send(outbox(relay), messages("before", 20));
+        await(Duration.ofSeconds(5), () -> delivered(handler).containsAll(before));
+        relay.close();
+        // logical replication or DMS: the rows are copied, the sequences stay at their start, and the target's xid
+        // counter is not behind, so no regression shows
+        try (var c = TestDb.connect()) {
+            execute(c, "alter table " + names.tick() + " alter column id restart with 1");
+            execute(c, "alter table " + names.cursor() + " alter column seq restart with 1");
+            execute(c, "alter table " + names.base() + " alter column id restart with 1");
+        }
+
+        try (var err = new CapturedStderr()) {
+            bootstrap(); // the restart onto the new cluster
+
+            assertThat(err.text()).contains("ERROR").contains(names.tick()).contains(names.cursor())
+                    .contains(names.base()).doesNotContain("xid regression detected");
+        }
+        var relayAfter = relay(handler, maintenance());
+        relayAfter.start();
+        var after = send(outbox(relayAfter), messages("after", 20));
+        await(Duration.ofSeconds(10), () -> delivered(handler).containsAll(after));
+    }
+
+    @Test
+    void maintenanceRaisesARewoundOutboxIdAboveTheDeadLetters() throws Exception {
+        bootstrap();
+        var handler = new RecordingHandler().failAlways(r -> "x".equals(key(r)),
+                () -> new OutboxPermanentException("poison"));
+        var maintenance = maintenance();
+        var relay = relay(handler, maintenance);
+        relay.start();
+        var outbox = outbox(relay);
+        send(outbox, msg("t", "x", "first"));
+        await(Duration.ofSeconds(5), () -> count(names.dead()) == 1);
+        try (var c = TestDb.connect()) { // a live repoint onto a copy whose outbox id sequence was not carried
+            execute(c, "alter table " + names.base() + " alter column id restart with 1");
+        }
+
+        try (var err = new CapturedStderr()) {
+            assertThat(maintenance.runOnce()).isTrue();
+
+            assertThat(err.text()).contains("ERROR").contains(names.base());
+        }
+        send(outbox, msg("t", "x", "second")); // without the raise, its id is the dead letter's: 23505 on every step
+        await(Duration.ofSeconds(10), () -> count(names.dead()) == 2);
     }
 
     @Test

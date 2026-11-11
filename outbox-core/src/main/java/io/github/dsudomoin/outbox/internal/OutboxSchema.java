@@ -458,6 +458,7 @@ public final class OutboxSchema implements AutoCloseable {
             st.execute("insert into " + n.maintenance() + " (succeeded_at) values (now()) on conflict (id) do nothing");
 
             checkSequenceCache(c, n);
+            raiseRewoundSequences(c, n); // before this instance makes a tick or a cursor row
             int present = (int) queryLong(st, Cursors.shardCount(n));
             int shards;
             if (config.shards() == null) {
@@ -1026,6 +1027,47 @@ public final class OutboxSchema implements AutoCloseable {
                             + " assigned in lock order (each session draws from its own block), which breaks the"
                             + " order of a key's messages, of ticks and of cursor rows; set it back with"
                             + " ALTER SEQUENCE ... CACHE 1");
+                }
+            }
+        }
+    }
+
+    /**
+     * Moves an identity sequence that lags the ids its rows already hold past them, with an ERROR: logical replication
+     * and DMS copy rows but not sequence values, and a cutover onto a cluster whose xid counter is ahead shows no xid
+     * regression. A rewound tick id leaves every new tick below the newest one (no shard sees work again), a rewound
+     * cursor seq leaves new cursor rows ignored (the same batch re-sent forever), a rewound outbox id reuses retry,
+     * parked and dead ids (23505 on every step) and breaks key order. Bootstrap and every {@link Maintenance} run;
+     * reads primary keys and the small tick and cursor tables, never the outbox: the outbox id goes by the ids the
+     * ticks recorded ({@code max_id}), the cursors' {@code last_id} and the retry, parked and dead tables. On the
+     * owner's connection: {@code setval} needs UPDATE on the sequence.
+     */
+    static void raiseRewoundSequences(Connection c, TableNames n) throws SQLException {
+        try (var ps = c.prepareStatement("with q as materialized (select t, s, coalesce(pg_sequence_last_value(s), 0)"
+                + " last, held from (values (?::text, pg_get_serial_sequence(?, 'id')::regclass, greatest("
+                + "(select max(max_id) from " + n.tick() + "), (select max(last_id) from " + n.cursor() + "),"
+                + " (select max(id) from " + n.retry() + "), (select max(id) from " + n.parked() + "),"
+                + " (select max(id) from " + n.dead() + "))),"
+                + " (?::text, pg_get_serial_sequence(?, 'id')::regclass, (select max(id) from " + n.tick() + ")),"
+                + " (?::text, pg_get_serial_sequence(?, 'seq')::regclass, (select max(seq) from " + n.cursor() + ")))"
+                + " v(t, s, held)) select string_agg(format('%s of %s from %s to %s', s, t, last, held), ', '),"
+                + " count(setval(s, held)) from q where held > last")) {
+            ps.setString(1, n.base());
+            ps.setString(2, n.base());
+            ps.setString(3, n.tick());
+            ps.setString(4, n.tick());
+            ps.setString(5, n.cursor());
+            ps.setString(6, n.cursor());
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                var raised = rs.getString(1);
+                if (raised != null) {
+                    log.error("outbox identity sequences of {} were behind ids their rows already hold, and were moved"
+                            + " past them: {}. Logical replication and AWS DMS copy rows but not sequence values, so a"
+                            + " cutover onto another cluster leaves them at their start; without the move no new tick"
+                            + " would be seen, new cursor rows would be ignored and new outbox ids would collide with"
+                            + " retry, parked and dead rows. Sync the sequences as part of the cutover (README,"
+                            + " «Восстановление после регрессии xid»)", n.base(), raised);
                 }
             }
         }

@@ -636,6 +636,10 @@ public final class Maintenance {
     /** True when every step succeeded. */
     private boolean run(Connection c) {
         stepFailed = false;
+        step("sequences", () -> { // a live repoint onto a copy, which no restart's bootstrap saw
+            OutboxSchema.raiseRewoundSequences(c, names);
+            return null;
+        });
         step("finish pending detach", () -> {
             partitions.finishPendingDetach(c, detachLockTimeout, quiesceTimeout);
             return null;
