@@ -302,8 +302,8 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
     private static Status status(OutboxStatus s) {
         return new Status(s.halted(), s.lagSeconds(), s.retrySize(), s.parkedSize(), s.waitingSize(),
                 s.waitingOldestSeconds(),
-                s.deadLetters().stream().map(c -> new DeadLetterCount(c.topic(), status(c.status()), c.count()))
-                        .toList(),
+                s.deadLetters() == null ? null : s.deadLetters().stream()
+                        .map(c -> new DeadLetterCount(c.topic(), status(c.status()), c.count())).toList(),
                 s.orphans().stream().map(o -> new Orphan(o.table(), kind(o.kind()))).toList(),
                 s.tailOverflow(), s.premade(), s.xidsLeft(), s.maintenanceSinceSuccessSeconds(), s.shards(),
                 s.instances().stream().map(i -> new Instance(i.id(), i.shards(), utc(i.lastSeen()), i.hookActive(),

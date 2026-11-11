@@ -520,12 +520,20 @@ class OutboxAdminIT {
             });
 
             for (ThrowingCallable read : List.<ThrowingCallable>of(() -> admin.countDeadLetters(DeadLetterFilter.any()),
-                    () -> admin.findDeadLetters(DeadLetterFilter.any(), null, 10), admin::status)) {
+                    () -> admin.findDeadLetters(DeadLetterFilter.any(), null, 10))) {
                 long start = System.nanoTime();
                 assertThatThrownBy(read).isInstanceOfSatisfying(RuntimeSqlException.class,
                         e -> assertThat(((SQLException) e.getCause()).getSQLState()).isEqualTo("57014"));
                 assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(2));
             }
+
+            // the lock stands in for a dead table too large to count within readTimeout: only the counts are lost
+            long start = System.nanoTime();
+            var status = admin.status();
+            assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(2));
+            assertThat(status.deadLetters()).as("unknown").isNull();
+            assertThat(status.halted()).isFalse();
+            assertThat(status.shards()).isEqualTo(config.shards());
         }
     }
 

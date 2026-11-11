@@ -406,8 +406,8 @@ components:
   schemas:
     Status:
       type: object
-      required: [halted, lagSeconds, retrySize, parkedSize, waitingSize, waitingOldestSeconds, deadLetters, orphans,
-        tailOverflow, premade, shards, instances]
+      required: [halted, lagSeconds, retrySize, parkedSize, waitingSize, waitingOldestSeconds, orphans, tailOverflow,
+        premade, shards, instances]
       properties:
         halted:
           type: boolean
@@ -434,7 +434,9 @@ components:
           description: Since the oldest of them began to wait, 0 when none waits
         deadLetters:
           type: array
-          description: Dead letters by topic and status
+          description: >-
+            Dead letters by topic and status; absent when counting them took longer than the read's 60 s limit (a
+            full scan of the dead table), the rest of the status read all the same
           items:
             $ref: '#/components/schemas/DeadLetterCount'
         orphans:

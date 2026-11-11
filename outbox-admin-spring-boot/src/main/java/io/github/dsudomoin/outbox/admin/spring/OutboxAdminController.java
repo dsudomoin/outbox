@@ -343,7 +343,7 @@ class OutboxAdminController implements OutboxAdminApi {
     private static Status status(OutboxStatus s) {
         return new Status().halted(s.halted()).lagSeconds(s.lagSeconds()).retrySize(s.retrySize())
             .parkedSize(s.parkedSize()).waitingSize(s.waitingSize()).waitingOldestSeconds(s.waitingOldestSeconds())
-            .deadLetters(s.deadLetters().stream()
+            .deadLetters(s.deadLetters() == null ? null : s.deadLetters().stream()
                 .map(c -> new DeadLetterCount(c.topic(), status(c.status()), c.count())).toList())
             .orphans(s.orphans().stream().map(o -> new Orphan(o.table(), kind(o.kind()))).toList())
             .tailOverflow(s.tailOverflow()).premade(s.premade()).xidsLeft(s.xidsLeft())

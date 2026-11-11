@@ -375,8 +375,8 @@ package io.github.dsudomoin.outbox {
   }
 
   public final class OutboxStatus {
-    ctor public OutboxStatus(boolean, double, long, long, long, double, java.util.List<io.github.dsudomoin.outbox.OutboxStatus.DeadLetterCount!>!, java.util.List<io.github.dsudomoin.outbox.OutboxStatus.Orphan!>!, boolean, int, Long?, Double?, int, java.util.List<io.github.dsudomoin.outbox.OutboxStatus.Instance!>!);
-    method public java.util.List<io.github.dsudomoin.outbox.OutboxStatus.DeadLetterCount!>! deadLetters();
+    ctor public OutboxStatus(boolean, double, long, long, long, double, java.util.List<io.github.dsudomoin.outbox.OutboxStatus.DeadLetterCount!>?, java.util.List<io.github.dsudomoin.outbox.OutboxStatus.Orphan!>!, boolean, int, Long?, Double?, int, java.util.List<io.github.dsudomoin.outbox.OutboxStatus.Instance!>!);
+    method public java.util.List<io.github.dsudomoin.outbox.OutboxStatus.DeadLetterCount!>? deadLetters();
     method public boolean halted();
     method public java.util.List<io.github.dsudomoin.outbox.OutboxStatus.Instance!>! instances();
     method public double lagSeconds();

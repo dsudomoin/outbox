@@ -50,7 +50,8 @@ import org.slf4j.LoggerFactory;
  * never interpolated; user text is logged with control and format characters escaped ({@link #printable}).
  * {@code restoreOrphan}, {@code recoverXidRegression} and {@code recoverStrandedShards} hold the maintenance lock for
  * their whole run, so maintenance's steps never run beside them. The reads, {@code status} and the dead-letter find
- * and count, give up on a statement after 60 s (57014).
+ * and count, give up on a statement after 60 s (57014); {@code status} counts the dead letters in a read of its own
+ * after the rest and reports them unknown (null) when that count is the one cut.
  * {@code abandonWaiting}, {@code abandonKey} and {@code abandonRecord} move each chunk under its shard's lock, which
  * every relay step holds while it writes the retry and parked tables, so no step adds a record to a key a chunk moves
  * or makes a key it reads wait meanwhile; {@code abandonKey} moves only the rows its first chunk finds, so what a step
@@ -62,6 +63,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     /** Letters, so key locks, per transaction of a bulk call; also the largest page. */
     static final int CHUNK = 1000;
     private static final String LOCK_NOT_AVAILABLE = "55P03";
+    private static final String QUERY_CANCELED = "57014";
 
     private final OutboxTransactions db;
     /**
@@ -154,14 +156,14 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             // most for it, so the reads after it would make a swap running meanwhile miss
             boolean tailOverflow = read(conn, c -> PartitionDdl.attachment(c, names.base(), names.tail())
                     != Attachment.MISSING && PartitionDdl.hasRows(c, names.tail()));
-            return read(conn, c -> new OutboxStatus(
+            var s = read(conn, c -> new OutboxStatus(
                     queryBoolean(c, "select exists (select 1 from " + names.halt() + ")"),
                     maintenance.lagSeconds(c),
                     retries.size(c),
                     parked.size(c),
                     RetryStore.count(c, "select count(*) from " + names.retry() + " where waiting_since is not null"),
                     queryDouble(c, waitingOldest),
-                    deadLetterCounts(c),
+                    null,
                     partitions.orphans(c).stream().map(o -> new OutboxStatus.Orphan(o.table(), o.setAside()
                             ? OrphanKind.SET_ASIDE : o.ours() ? OrphanKind.DETACHED_BY_LIBRARY : OrphanKind.FOREIGN))
                             .toList(),
@@ -171,6 +173,23 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                     maintenance.secondsSinceSuccess(c),
                     shards,
                     instances(c)));
+            // a full scan of the dead table, kept forever by default: on its own, so a count cut by readTimeout
+            // leaves the rest of the status standing
+            List<DeadLetterCount> deadLetters;
+            try {
+                deadLetters = read(conn, this::deadLetterCounts);
+            } catch (SQLException e) {
+                if (!QUERY_CANCELED.equals(e.getSQLState())) {
+                    throw e;
+                }
+                log.warn("outbox admin status: the dead-letter counts took longer than {}, reported unknown; a"
+                        + " retention (outbox.deadLetters.retention) or a discard keeps the dead table small",
+                        readTimeout);
+                deadLetters = null;
+            }
+            return new OutboxStatus(s.halted(), s.lagSeconds(), s.retrySize(), s.parkedSize(), s.waitingSize(),
+                    s.waitingOldestSeconds(), deadLetters, s.orphans(), s.tailOverflow(), s.premade(), s.xidsLeft(),
+                    s.maintenanceSinceSuccessSeconds(), s.shards(), s.instances());
         } catch (SQLException e) {
             throw db.translate(e);
         }
