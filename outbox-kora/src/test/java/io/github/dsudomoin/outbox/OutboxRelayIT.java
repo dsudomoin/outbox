@@ -608,6 +608,78 @@ class OutboxRelayIT {
         assertThat(parked()).isEqualTo("k#4,k#5");
     }
 
+    /** A batch another instance started at or after the drain's tick holds only rows committed after it. */
+    @Test
+    void drainDoesNotWaitForABatchStartedAtOrAfterItsTick() throws Exception {
+        config.relayEnabled(false).shards(2).batchSize(2);
+        bootstrap();
+        var early = keyOnShard(0, "early");
+        var late = keyOnShard(1, "late");
+        var draining = new CountDownLatch(1);
+        var releaseDrain = new CountDownLatch(1);
+        var drainer = relay(new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {
+            }
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                if (records.stream().anyMatch(r -> early.equals(key(r)))) {
+                    draining.countDown();
+                    try {
+                        releaseDrain.await();
+                    } catch (InterruptedException e) {
+                        throw new IllegalStateException(e);
+                    }
+                }
+                return records.stream().map(r -> (Outcome) Outcome.delivered()).toList();
+            }
+        });
+        drainer.start();
+        send(outbox(() -> {}), msg("t", early, "e"));
+        var drained = CompletableFuture.supplyAsync(drainer::drain);
+        var otherHolds = new CountDownLatch(1);
+        try {
+            assertThat(draining.await(10, TimeUnit.SECONDS)).isTrue();
+            long d = ticksMade(); // the drain's tick: no other instance makes ticks yet
+
+            // another instance: its start's maintenance moves shard 1 to a tick at or after D, then it starts a batch
+            // there, steps it once and holds its second step, and the shard's lock with it
+            config.relayEnabled(true);
+            var calls = new AtomicInteger();
+            var other = start(new OutboxHandler() {
+                @Override
+                public void handle(OutboxRecord record) {
+                }
+
+                @Override
+                public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                    if (calls.incrementAndGet() > 1) {
+                        try {
+                            otherHolds.await();
+                        } catch (InterruptedException e) {
+                            throw new IllegalStateException(e);
+                        }
+                    }
+                    return records.stream().map(r -> (Outcome) Outcome.delivered()).toList();
+                }
+            });
+            await(Duration.ofSeconds(10), () -> checkpointTick() >= d);
+            send(outbox(other::wake), IntStream.range(0, 6).mapToObj(i -> msg("t", late, "l" + i))
+                    .toArray(OutboxMessage[]::new));
+            await(Duration.ofSeconds(10), () -> calls.get() > 1);
+            assertThat(cursor(1).targetTickId()).as("a batch in progress").isNotNull();
+
+            releaseDrain.countDown();
+
+            assertThat(drained.get(10, TimeUnit.SECONDS)).isOne();
+            assertThat(cursor(1).targetTickId()).as("still the other instance's").isNotNull();
+        } finally {
+            releaseDrain.countDown();
+            otherHolds.countDown();
+        }
+    }
+
     @Test
     void drainFailsOnAStuckShardWhileOtherShardsMove() throws Exception {
         config.batchTimeout(Duration.ofMillis(500)).headFailuresBeforeDivert(1000);

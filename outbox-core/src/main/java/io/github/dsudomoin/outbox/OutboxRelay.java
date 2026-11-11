@@ -344,8 +344,10 @@ public final class OutboxRelay implements AutoCloseable {
 
     /**
      * Makes a tick D, then processes shards until none is {@link Position#behind() behind} D (a shard without rows up
-     * to D is not, so it is not stepped), none has a batch in progress, no retry head is due and no parked row was due
-     * when this call started (one due later does not hold it up); returns the number of messages this call delivered.
+     * to D is not, so it is not stepped), none has a batch in progress started below D (one started at or after D, by
+     * another instance under live traffic, holds only rows committed after D and is left to it), no retry head is due
+     * and no parked row was due when this call started (one due later does not hold it up); returns the number of
+     * messages this call delivered.
      * A parked row that answers requeue stays parked with a due time past that start, so a call offers it once and
      * ends, however long the handler takes and however often it requeues; so do the rows behind those that left, which
      * the next call offers, and of a row answering NotAttempted. Under sustained overload another instance parking rows
@@ -429,7 +431,7 @@ public final class OutboxRelay implements AutoCloseable {
         while (true) {
             requireNotHalted();
             var now = clock.now();
-            var pending = cursors.positions(c, target).stream().filter(p -> !drained(p, now, parkedUntil))
+            var pending = cursors.positions(c, target).stream().filter(p -> !drained(p, target, now, parkedUntil))
                     .map(Position::cursor).toList();
             if (pending.isEmpty()) {
                 return delivered;
@@ -472,9 +474,14 @@ public final class OutboxRelay implements AutoCloseable {
         }
     }
 
-    private static boolean drained(Position p, Instant now, Instant parkedUntil) {
+    /**
+     * Neither behind {@code target} nor in a batch started below it: a batch from an effective tick at or above it
+     * (another instance's, under live traffic) holds only rows committed after it, so it is not this call's work.
+     */
+    private static boolean drained(Position p, long target, Instant now, Instant parkedUntil) {
         var c = p.cursor();
-        return !p.behind() && c.targetTickId() == null && !due(c.retryDueAt(), now) && !due(c.parkedDueAt(), parkedUntil);
+        return !p.behind() && (c.targetTickId() == null || p.effectiveTickId() >= target)
+                && !due(c.retryDueAt(), now) && !due(c.parkedDueAt(), parkedUntil);
     }
 
     private static boolean due(@Nullable Instant at, Instant now) {
