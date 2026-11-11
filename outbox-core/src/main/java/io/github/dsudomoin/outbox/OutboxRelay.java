@@ -448,7 +448,9 @@ public final class OutboxRelay implements AutoCloseable {
             }
             boolean worked = false;
             for (var group : groups(pending.stream().map(Cursor::shard).toList())) {
-                var results = processInOwnTransaction(c, group, target, now, parkedUntil);
+                // a fresh clock per step, as stepHeld reads: busy shards step one by one, and a later one must not be
+                // paused or have its retries scheduled from the round's start
+                var results = processInOwnTransaction(c, group, target, clock.now(), parkedUntil);
                 learn(group, results);
                 for (var result : results) {
                     delivered += result.delivered();

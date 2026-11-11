@@ -925,6 +925,52 @@ class OutboxRelayIT {
         assertThat(retryRows("w")).isOne();
     }
 
+    /** Busy shards step one by one in a drain round: a later one pauses from its own step, not from the round's start. */
+    @Test
+    void drainPausesAShardFromItsOwnStepNotFromTheStartOfTheRound() throws Exception {
+        config.relayEnabled(false).shards(2).batchSize(1).headFailuresBeforeDivert(1) // a failure diverts at once
+                .retry(Duration.ofSeconds(2), Duration.ofMinutes(1), 0);
+        bootstrap();
+        var slow = keyOnShard(0, "slow");
+        var failing = keyOnShard(1, "failing");
+        var offers = new CopyOnWriteArrayList<Long>();
+        var relay = relay(new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {
+            }
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                return records.stream().map(r -> {
+                    if (slow.equals(key(r))) {
+                        try {
+                            Thread.sleep(3000); // longer than the pause, within batchTimeout
+                        } catch (InterruptedException e) {
+                            throw new IllegalStateException(e);
+                        }
+                    }
+                    if (!failing.equals(key(r))) {
+                        return Outcome.delivered();
+                    }
+                    offers.add(System.nanoTime());
+                    return (Outcome) Outcome.retry(new RuntimeException("target down"));
+                }).toList();
+            }
+        });
+        var outbox = outbox(relay::wake);
+        // a row on each shard: each delivers a full batchSize read, so each is busy and steps alone, shard 0 first
+        send(outbox, msg("t", keyOnShard(0, "warm"), "w0"), msg("t", keyOnShard(1, "warm"), "w1"));
+        assertThat(relay.drain()).isEqualTo(2);
+        send(outbox, msg("t", slow, "s"), msg("t", failing, "f"));
+
+        assertThat(relay.drain()).isOne();
+
+        // the pause and the retry are 2 s from shard 1's step; from the round's start they were due before it ended
+        assertThat(offers).hasSizeGreaterThanOrEqualTo(2);
+        assertThat(Duration.ofNanos(offers.get(1) - offers.get(0))).as("from the first offer to the next")
+                .isGreaterThanOrEqualTo(Duration.ofMillis(1500));
+    }
+
     @Test
     void aShardWhoseParkedRowIsDueIsSteppedWithoutNewRows() throws Exception {
         bootstrap();
