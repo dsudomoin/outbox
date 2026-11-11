@@ -33,7 +33,7 @@ outbox {
 | `maxTicksPerBatch` | `100` | ≥ 1. |
 | `minTickInterval` | `50ms` | ≥ 0. Under load, at most one tick per interval. |
 | `idlePollInterval` | `200ms` | > 0. Idle tick rate; how fast a commit on another instance is noticed. |
-| `batchTimeout` | `30s` | > 0, ≤ 24 days. Bound of one handler call: wind-down at 80 %, abandoned (all records retried) at 100 %. With Kafka ≥ `delivery.timeout.ms + 5 s + max.block.ms`. `drain()` gives up after 2 × this without progress. |
+| `batchTimeout` | `30s` | > 0, ≤ 24 days. Bound of one handler call: wind-down at 80 %, abandoned (all records retried) at 100 %. With Kafka ≥ `delivery.timeout.ms + 5 s + max.block.ms`. `drain()` gives up after 3 × this + 10 s without progress (longer than a relay step runs). |
 | `shutdownTimeout` | `30s` | ≥ 0. Grace for in-flight batches at shutdown; then they are interrupted and redelivered later. `close()` spends up to about 8 s more: interrupted workers and the instance row's delete (a locked row or an exhausted pool is left to expire). |
 | `headFailuresBeforeDivert` | `3` | ≥ 1. Consecutive failures before a shard isolates a single failing key. |
 | `cursorAnchorInterval` | `1h` | > 0 and ≥ `partitions.maintenanceInterval`. Maintenance writes an idle shard one cursor row this often; ticks are kept about this long (at most about 10 000: a shard that far behind is anchored at the next run), so a rollback to the previous release resumes from these anchors. |

@@ -361,10 +361,10 @@ public final class OutboxRelay implements AutoCloseable {
      * at a time: the pass runs once the shards' is closed, after the dead-letter thread's run in progress, if any.
      *
      * @throws IllegalStateException when no shard advanced and this call moved no row, delivered or answering requeue,
-     *     for {@code 2 × (batchTimeout + 5 s)}, twice the longest a tail swap waits for relay steps in flight, while
-     *     work remains (e.g. a shard paused by a down target), or
-     *     while maintenance has halted the relay (xid regression), or when a lock on the halt table kept the first
-     *     xid check from reading for that long
+     *     for {@code 3 × batchTimeout + 10 s}, longer than a relay step runs (its retry pass about 2 × batchTimeout,
+     *     its main pass's call another) and at least twice a tail swap's wait for steps in flight, while work remains (e.g.
+     *     a shard paused by a down target), or while maintenance has halted the relay (xid regression), or when a lock
+     *     on the halt table kept the first xid check from reading for that long
      */
     public int drain() {
         int delivered = drainShards();
@@ -376,8 +376,8 @@ public final class OutboxRelay implements AutoCloseable {
 
     /** {@link #drain()} but its dead-letter run, on one connection of its own. */
     private int drainShards() {
-        // a swap keeps every step out while it waits for those in flight: no progress for that long is no stall
-        var stallAfter = Maintenance.quiesceTimeout(config).multipliedBy(2);
+        // a step in flight, or a swap keeping every step out while it waits for those, moves no cursor for that long
+        var stallAfter = Maintenance.stallTimeout(config);
         try {
             checkHaltWaiting(stallAfter);
         } catch (InterruptedException e) {

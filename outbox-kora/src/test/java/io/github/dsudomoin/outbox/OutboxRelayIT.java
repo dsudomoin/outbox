@@ -1043,6 +1043,76 @@ class OutboxRelayIT {
                 .isGreaterThanOrEqualTo(Duration.ofMillis(1500));
     }
 
+    /**
+     * A worker's step that legitimately runs about 3 × batchTimeout: the retry pass's call of two heads is cut at
+     * batchTimeout, its single-record call runs almost as long again, and so does the main pass's call. A drain on
+     * another instance sees no position change all that while and must not give up before the step commits.
+     */
+    @Test
+    @Tag("timing") // about 45 s of handler calls
+    void drainOutlastsAWorkersStepOfThreeBatchTimeouts() throws Exception {
+        var batchTimeout = Duration.ofSeconds(15); // above 10 s: 3 × batchTimeout outgrows 2 × (batchTimeout + 5 s)
+        config.relayEnabled(false).shards(1).workers(1).batchTimeout(batchTimeout)
+                .retry(Duration.ofHours(1), Duration.ofHours(1), 0);
+        bootstrap();
+        var slow = new AtomicBoolean();
+        var stepping = new CountDownLatch(1);
+        var singles = new AtomicInteger();
+        OutboxHandler handler = new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {
+            }
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                if (!slow.get()) { // the setup: k and j fail beside a delivered row, so both are diverted
+                    return records.stream().map(r -> "w".equals(key(r)) ? Outcome.delivered()
+                            : (Outcome) Outcome.retry(new RuntimeException("target down"))).toList();
+                }
+                // a call blocked where the wind-down at 80 % does not reach it, as a slow target's I/O
+                if (records.size() > 1) { // the retry pass's call of both heads: cut at batchTimeout
+                    stepping.countDown();
+                    sleepThrough(batchTimeout.plusSeconds(1));
+                } else if (singles.incrementAndGet() <= 2) { // a head's single call, then the main call of m
+                    sleepThrough(batchTimeout.minusSeconds(1));
+                }
+                return records.stream().map(r -> (Outcome) Outcome.delivered()).toList();
+            }
+
+            private static void sleepThrough(Duration duration) {
+                long until = System.nanoTime() + duration.toNanos();
+                for (long left; (left = until - System.nanoTime()) > 0; ) {
+                    try {
+                        TimeUnit.NANOSECONDS.sleep(left);
+                    } catch (InterruptedException e) {
+                        // the wind-down's interrupt: this call does not notice it
+                    }
+                }
+            }
+        };
+        var drainer = relay(handler);
+        var outbox = outbox(() -> {});
+        send(outbox, msg("t", "w", "w"), msg("t", "k", "k"), msg("t", "j", "j"));
+        assertThat(drainer.drain()).isOne(); // the heads are due in an hour: the drain does not wait for them
+        assertThat(rows(schema.names().retry())).isEqualTo(2);
+        try (var c = TestDb.connect(); var st = c.createStatement()) {
+            st.execute("update " + schema.names().retry() + " set next_attempt_at = now() - interval '1 minute'"
+                    + " where next_attempt_at is not null");
+            st.execute("update " + schema.names().cursor() + " set retry_due_at = now() - interval '1 minute'"
+                    + " where retry_due_at is not null");
+        }
+        send(outbox, msg("t", "m", "m"));
+        slow.set(true);
+
+        config.relayEnabled(true);
+        start(handler); // its worker steps the shard: both due heads, then m in its main pass
+        assertThat(stepping.await(10, TimeUnit.SECONDS)).isTrue();
+        var drained = CompletableFuture.supplyAsync(drainer::drain);
+
+        drained.get(2, TimeUnit.MINUTES); // throws "made no progress" if the drain gives up on the step
+        assertThat(rows(schema.names().retry())).isZero();
+    }
+
     @Test
     void aShardWhoseParkedRowIsDueIsSteppedWithoutNewRows() throws Exception {
         bootstrap();

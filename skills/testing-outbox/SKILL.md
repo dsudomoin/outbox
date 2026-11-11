@@ -130,7 +130,7 @@ class OrderDeliveryTest {
   published; write the ten lines.
 - **Retry path**: with one failing key, `drain()` returns after about 3 pauses with a smaller count, and the record
   waits in `<table>_retry`: assert that count. `drain()` throws `IllegalStateException` only when no shard moves for
-  2 × (`batchTimeout` + 5 s), for example when two or more keys fail and nothing is delivered, or when the relay is
+  3 × `batchTimeout` + 10 s, for example when two or more keys fail and nothing is delivered, or when the relay is
   halted. Lower `batchTimeout` only with a non-Kafka handler; with Kafka it must stay ≥
   `delivery.timeout.ms + 5 s + max.block.ms`.
 - **Unit tests**: `Outbox` and `Inbox` are interfaces; mock them.

@@ -289,6 +289,15 @@ public final class Maintenance {
     }
 
     /**
+     * How long {@code drain()} waits for a pending shard to move before it gives up: 3 × batchTimeout + 10 s, the
+     * longest a relay step legitimately runs without moving a cursor (its retry pass about 2 × batchTimeout, its main
+     * pass's call another batchTimeout, plus statements), and never under twice the tail swap's quiesce wait.
+     */
+    public static Duration stallTimeout(OutboxConfig config) {
+        return config.relay().batchTimeout().multipliedBy(3).plusSeconds(10);
+    }
+
+    /**
      * As of the last check: true while the xid-regression halt is recorded in {@code <base>_halt}. A check that finds
      * the counter below a tick's xmax (dump/restore or logical migration: relaying would skip new rows) records it with
      * the highest tick xmax; relay workers then take no shards and {@code drain()} fails, on every instance and across
