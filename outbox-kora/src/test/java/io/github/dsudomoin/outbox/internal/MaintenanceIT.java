@@ -1201,6 +1201,7 @@ class MaintenanceIT {
 
             assertThat(log).contains("ERROR").contains("is not attached").contains("server cut")
                     .contains(" MB to check its bounds")
+                    .contains("This instance's next attempt gives its scan twice that time") // not another's
                     .contains("alter table " + names.base() + " attach partition " + names.tail()
                             + " for values from ('" + lower + "') to (maxvalue)")
                     .doesNotContain("a long transaction or snapshot");

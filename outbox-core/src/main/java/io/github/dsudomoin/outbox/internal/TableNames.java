@@ -37,8 +37,10 @@ public record TableNames(
             Pattern.compile("(?:[A-Za-z_][A-Za-z0-9_]{0,40}\\.)?[A-Za-z_][A-Za-z0-9_]{0,40}");
 
     /**
-     * The reserved (R) and type/function-name (T) keywords of {@code pg_get_keywords()} on Postgres 14 to 18, so the
-     * SQL rendered without a server ({@code OutboxSql}) refuses them too; {@link #resolve} asks the server itself.
+     * The reserved (R) and type/function-name (T) keywords of {@code pg_get_keywords()} on every Postgres from 14 to
+     * 18, so the SQL rendered without a server ({@code OutboxSql}) refuses them too; {@link #resolve} asks the server
+     * itself. A word that is one only on some of these versions ({@code system_user}, reserved since 16) stays out:
+     * the older servers take it as a name, and the server's own list refuses it where it is a keyword.
      */
     private static final Set<String> KEYWORDS = Set.of(
             "all", "analyse", "analyze", "and", "any", "array", "as", "asc", "asymmetric",
@@ -51,7 +53,7 @@ public record TableNames(
             "leading", "left", "like", "limit", "localtime", "localtimestamp", "natural", "not",
             "notnull", "null", "offset", "on", "only", "or", "order", "outer", "overlaps", "placing",
             "primary", "references", "returning", "right", "select", "session_user", "similar", "some",
-            "symmetric", "system_user", "table", "tablesample", "then", "to", "trailing", "true",
+            "symmetric", "table", "tablesample", "then", "to", "trailing", "true",
             "union", "unique", "user", "using", "variadic", "verbose", "when", "where", "window", "with");
 
     public TableNames {

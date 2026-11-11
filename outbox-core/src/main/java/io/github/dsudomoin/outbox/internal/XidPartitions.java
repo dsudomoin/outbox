@@ -1343,7 +1343,7 @@ public final class XidPartitions {
                     : "attaching it back scans all its " + mb(bytes) + " MB to check its bounds, and the server cut"
                             + " that at the " + bound.toMillis() / 1000.0 + " s it was given ("
                             + firstLine(e.getMessage()) + "). " + (slowdown < ATTACH_SLOWDOWN_CAP
-                                    ? "The next run gives its scan twice that time, up to " + ATTACH_SLOWDOWN_CAP
+                                    ? "This instance's next attempt gives its scan twice that time, up to " + ATTACH_SLOWDOWN_CAP
                                             + " times the first; or run it"
                                     : "Its scan already gets " + ATTACH_SLOWDOWN_CAP + " times the first time; run it")
                             + " by hand in a session without a statement_timeout;"

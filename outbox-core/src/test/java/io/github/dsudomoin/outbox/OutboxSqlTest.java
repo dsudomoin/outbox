@@ -38,7 +38,7 @@ class OutboxSqlTest {
 
     @Test
     void aKeywordTheUnquotedSqlCannotTakeIsRefusedBeforeRendering() {
-        for (var table : new String[] {"order.outbox", "user", "Left", "system_user"}) {
+        for (var table : new String[] {"order.outbox", "user", "Left"}) {
             assertThatThrownBy(() -> OutboxSql.outbox(new TestOutboxConfig().table(table), null)).as(table)
                     .isInstanceOf(IllegalArgumentException.class)
                     .hasMessageContaining("is a reserved Postgres keyword");
@@ -50,5 +50,8 @@ class OutboxSqlTest {
         assertThat(OutboxSql.outbox(new TestOutboxConfig().table("public.user"), null))
                 .contains("create table public.user (");
         assertThat(OutboxSql.inbox(new TestOutboxConfig().inboxTable("between"), null)).contains("between");
+        // a keyword only since Postgres 16 is left to the server's own list, as 14 and 15 take it as a name
+        assertThat(OutboxSql.outbox(new TestOutboxConfig().table("system_user"), null))
+                .contains("create table system_user (");
     }
 }
