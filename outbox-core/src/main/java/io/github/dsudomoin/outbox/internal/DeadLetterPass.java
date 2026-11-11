@@ -80,6 +80,7 @@ public final class DeadLetterPass {
     private final Duration timeout;
     private final Duration initialDelay;
     private final Duration maxDelay;
+    private final boolean asciiText;
     private final String claim;
     private final String claimScheduled;
     private final String keep;
@@ -132,6 +133,7 @@ public final class DeadLetterPass {
         this.timeout = config.deadLetters().timeout();
         this.initialDelay = config.relay().retry().initialDelay();
         this.maxDelay = config.relay().retry().maxDelay();
+        this.asciiText = OutboxSchema.asciiText(config);
         claim = "select " + DeadLetters.COLUMNS + " from " + dead + " where status = ? and due_at <= now()"
                 + " order by due_at, id limit ? for update skip locked";
         // a redrive copies payloads and headers inside the database: they stay out of the heap
@@ -501,7 +503,7 @@ public final class DeadLetterPass {
                 var letter = letters.get(i).letter();
                 var e = errors.get(i);
                 if (e != last) { // a failed call's one error is rendered once
-                    text = RetryStore.errorText(RetryStore.describe(e));
+                    text = RetryStore.errorText(RetryStore.describe(e), asciiText);
                     last = e;
                 }
                 ps.setString(1, text);

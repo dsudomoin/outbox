@@ -275,6 +275,65 @@ class DatabaseSettingsIT {
         assertThat(runtime.relay().running()).isTrue();
     }
 
+    /**
+     * A database in LATIN1, which has no Cyrillic: the error texts of a handler and of a dead-letter hook are stored
+     * with every non-ASCII character escaped, so the step that writes them commits, the bad key goes dead once and the
+     * keys sent with it are delivered once. On UTF8 the same texts are stored as they are.
+     */
+    @Test
+    void errorTextsOutsideTheServerEncodingAreStoredEscaped() throws Exception {
+        assertThat(deadErrors("encoding 'LATIN1' lc_collate 'C' lc_ctype 'C' template template0")).containsOnly(
+                "io.github.dsudomoin.outbox.OutboxPermanentException: \\u0441\\u0447\\u0451\\u0442 \\u0437\\u0430"
+                        + "\\u0431\\u043b\\u043e\\u043a\\u0438\\u0440\\u043e\\u0432\\u0430\\u043d | "
+                        + "java.lang.IllegalStateException: \\u0445\\u0443\\u043a \\u0443\\u043f\\u0430\\u043b");
+        assertThat(deadErrors("encoding 'UTF8' template template0")).containsOnly(
+                "io.github.dsudomoin.outbox.OutboxPermanentException: счёт заблокирован | "
+                        + "java.lang.IllegalStateException: хук упал");
+    }
+
+    /**
+     * Sends keys g1..g5 and {@code bad}, which the handler fails permanently, into a new database made with
+     * {@code options}, the hook failing every call; the dead row's error and last hook error once both are written.
+     */
+    private List<String> deadErrors(String options) throws Exception {
+        var database = "enc_" + UUID.randomUUID().toString().substring(0, 8);
+        try (var c = superuser("test")) {
+            TestSql.execute(c, "create database " + database + " " + options);
+        }
+        var ds = pool(database, Pg.INSTANCE.getUsername(), Pg.INSTANCE.getPassword(), 8);
+        var transactions = new JdbcTransactions(ds);
+        var config = new TestOutboxConfig().shards(1).retry(Duration.ofMillis(100), Duration.ofMillis(200), 0);
+        Map<String, AtomicInteger> calls = new ConcurrentHashMap<>();
+        var runtime = OutboxRuntime.builder(config, transactions, record -> {
+            calls.computeIfAbsent(record.keyAsString(), k -> new AtomicInteger()).incrementAndGet();
+            if (record.keyAsString().equals("bad")) {
+                throw new OutboxPermanentException("счёт заблокирован");
+            }
+        }).deadLetterHandler(letters -> {
+            throw new IllegalStateException("хук упал");
+        }).build();
+        closing.add(runtime);
+        runtime.start();
+        transactions.inTx(c -> runtime.outbox().sendAll(List.of("g1", "g2", "bad", "g3", "g4", "g5").stream()
+                .map(key -> OutboxMessage.of("t", key, new byte[1])).toList()));
+
+        var dead = TableNames.of(config.table()).dead();
+        var errors = new ArrayList<String>();
+        await(Duration.ofSeconds(20), () -> {
+            errors.clear();
+            try (var c = ds.getConnection(); var st = c.createStatement(); var rs = st.executeQuery(
+                    "select error || ' | ' || last_handler_error from " + dead + " where handler_attempts > 0")) {
+                while (rs.next()) {
+                    errors.add(rs.getString(1));
+                }
+            }
+            return !errors.isEmpty();
+        });
+        assertThat(calls).as("each key handled once").allSatisfy((key, n) -> assertThat(n).as(key).hasValue(1))
+                .containsOnlyKeys("g1", "g2", "bad", "g3", "g4", "g5");
+        return errors;
+    }
+
     /** As a promoted-then-demoted node: the setting for new sessions, every current session of the database cut. */
     private static void readOnly(String database, boolean on) throws SQLException {
         try (var c = superuser("postgres")) {

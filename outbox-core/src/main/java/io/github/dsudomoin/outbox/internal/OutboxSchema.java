@@ -107,6 +107,8 @@ public final class OutboxSchema implements AutoCloseable {
     private final int schemaLockAttempts;
     private final String instanceId = Heartbeat.newId();
     private final ShardGuard guard = new ShardGuard();
+    /** {@link #asciiText(Connection, TableNames)} as the bootstrap read it. */
+    private boolean asciiText;
     private final ContractGuard contracts;
     /** The heartbeat's own connections, which fall back on {@link #db}; null without a source of its own. */
     @Nullable
@@ -352,9 +354,10 @@ public final class OutboxSchema implements AutoCloseable {
 
     /**
      * {@code config} with the shard count resolved at bootstrap, and this instance's {@link ShardGuard}, which the
-     * writes of every component built from it check ({@link ShardGuard#of}).
+     * writes of every component built from it check ({@link ShardGuard#of}); {@code asciiText}: see
+     * {@link #asciiText(OutboxConfig)}.
      */
-    record Resolved(OutboxConfig config, Integer shards, ShardGuard guard) implements OutboxConfig {
+    record Resolved(OutboxConfig config, Integer shards, ShardGuard guard, boolean asciiText) implements OutboxConfig {
 
         @Override
         public String table() {
@@ -467,6 +470,7 @@ public final class OutboxSchema implements AutoCloseable {
 
             checkSequenceCache(c, n);
             raiseRewoundSequences(c, n); // before this instance makes a tick or a cursor row
+            asciiText = asciiText(c, n);
             int present = (int) queryLong(st, Cursors.shardCount(n));
             int shards;
             if (config.shards() == null) {
@@ -481,7 +485,7 @@ public final class OutboxSchema implements AutoCloseable {
                     reshard(c, n, present, shards);
                 }
             }
-            var r = new Resolved(config, shards, guard);
+            var r = new Resolved(config, shards, guard, asciiText);
             checkXidCounter(c, n, r);
 
             ensurePartitions(c, n);
@@ -922,7 +926,7 @@ public final class OutboxSchema implements AutoCloseable {
             failed.add(standalone.size() + " standalone ranges (" + standalone + "), whose rows lie outside the outbox:"
                     + " restore or drop them first (OutboxAdmin.status() lists them)");
         }
-        if (new XidRecovery(n, new Resolved(config, from, guard)).check(c).halted()) {
+        if (new XidRecovery(n, new Resolved(config, from, guard, asciiText)).check(c).halted()) {
             failed.add("1 xid regression (the xid counter is below a tick's xmax): start with the current count, so"
                     + " the relay recovers it first");
         }
@@ -1023,6 +1027,33 @@ public final class OutboxSchema implements AutoCloseable {
                 return rs.getBoolean(1);
             }
         }
+    }
+
+    /**
+     * Whether the error texts the components built from {@code config} store must be ASCII: true when the bootstrap
+     * found a server encoding other than UTF8 or SQL_ASCII ({@link RetryStore}).
+     */
+    static boolean asciiText(OutboxConfig config) {
+        return config instanceof Resolved r && r.asciiText();
+    }
+
+    /**
+     * The server encoding, read once: pgjdbc sends text in UTF8, which only UTF8 and SQL_ASCII (no conversion) take
+     * whole; any other rejects a character it lacks with 22P05, so the error texts are then stored escaped.
+     */
+    private static boolean asciiText(Connection c, TableNames n) throws SQLException {
+        String encoding;
+        try (var st = c.createStatement(); var rs = st.executeQuery("show server_encoding")) {
+            rs.next();
+            encoding = rs.getString(1);
+        }
+        if (encoding.equals("UTF8") || encoding.equals("SQL_ASCII")) {
+            return false;
+        }
+        log.warn("outbox {} is in a database with server_encoding {}, which lacks most of Unicode: the error texts it"
+                + " stores (last_error, error, last_handler_error) have every non-ASCII character escaped as \\uXXXX;"
+                + " a UTF8 database stores them as they are", n.base(), encoding);
+        return true;
     }
 
     /**

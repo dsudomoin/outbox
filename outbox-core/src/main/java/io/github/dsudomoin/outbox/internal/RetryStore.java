@@ -17,6 +17,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -25,7 +26,9 @@ import java.util.UUID;
  * The rare path: blocked (topic, key) streams in {@code <base>_retry} (a head with
  * {@code next_attempt_at}, followers with null) and permanently failed rows in {@code <base>_dead}. A head that waits
  * for an instance able to handle it has {@code waiting_since}, the caller's {@code now} of its first wait; every other
- * row has null. Error texts are cut to 2000 chars, NUL characters (rejected by Postgres text) replaced by {@code ?}.
+ * row has null. Error texts are cut to 2000 chars, NUL characters (rejected by Postgres text) replaced by {@code ?},
+ * and with {@code asciiText} every non-ASCII character escaped as {@code \\uXXXX}: a server encoding other than UTF8
+ * or SQL_ASCII rejects a character it lacks (22P05), and the step writing the text would fail on every pass.
  * Every dead row, here and in {@link ParkedStore}, is written by {@link #toDead} or {@link #apply}: pending and due at
  * once while a dead-letter hook is active, kept otherwise, with the redrives {@code <base>_redriven} counts for its
  * message.
@@ -41,6 +44,7 @@ public final class RetryStore {
     private final String deadTable;
     private final String redriven;
     private final boolean hookActive;
+    private final boolean asciiText;
     private final String insertRetry;
     private final String insertDead;
     private final String selectDue;
@@ -56,6 +60,12 @@ public final class RetryStore {
     private final String deadSize;
 
     public RetryStore(TableNames names, boolean hookActive) {
+        this(names, hookActive, false);
+    }
+
+    /** {@code asciiText}: {@link OutboxSchema#asciiText} of the config. */
+    public RetryStore(TableNames names, boolean hookActive, boolean asciiText) {
+        this.asciiText = asciiText;
         var retry = names.retry();
         this.deadTable = names.dead();
         this.redriven = names.redriven();
@@ -382,12 +392,31 @@ public final class RetryStore {
         }
     }
 
+    /** {@code error} as this store writes it. */
     @Nullable
-    static String errorText(@Nullable String error) {
+    String errorText(@Nullable String error) {
+        return errorText(error, asciiText);
+    }
+
+    /** {@code error} as stored: cut, NUL-free, and with {@code ascii} its non-ASCII characters as {@code \\uXXXX}. */
+    @Nullable
+    static String errorText(@Nullable String error, boolean ascii) {
         if (error == null) {
             return null;
         }
         var text = error.replace('\0', '?');
+        if (ascii) {
+            var escaped = new StringBuilder(Math.min(text.length(), MAX_ERROR_LENGTH));
+            for (int i = 0; i < text.length() && escaped.length() < MAX_ERROR_LENGTH; i++) {
+                char ch = text.charAt(i);
+                if (ch < 0x80) {
+                    escaped.append(ch);
+                } else {
+                    escaped.append("\\u").append(HexFormat.of().toHexDigits(ch));
+                }
+            }
+            text = escaped.toString();
+        }
         return text.length() <= MAX_ERROR_LENGTH ? text : text.substring(0, MAX_ERROR_LENGTH);
     }
 }

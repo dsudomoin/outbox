@@ -2,7 +2,6 @@ package io.github.dsudomoin.outbox.internal;
 
 import static io.github.dsudomoin.outbox.internal.RetryStore.COLUMNS;
 import static io.github.dsudomoin.outbox.internal.RetryStore.RECORD_COLUMNS;
-import static io.github.dsudomoin.outbox.internal.RetryStore.errorText;
 import static io.github.dsudomoin.outbox.internal.RetryStore.requireOneRow;
 import static io.github.dsudomoin.outbox.internal.RetryStore.timestamp;
 
@@ -49,6 +48,7 @@ public final class ParkedStore {
      */
     private static final int CARRIED = 1000;
 
+    private final RetryStore retries; // its error texts
     private final Duration delay;
     private final int batch;
     private final String insert;
@@ -86,6 +86,7 @@ public final class ParkedStore {
 
     /** {@code delay}, {@code batch}: {@code relay.requeue.delay} and {@code relay.batchSize}. */
     public ParkedStore(TableNames names, RetryStore retries, Duration delay, int batch) {
+        this.retries = retries;
         this.delay = delay;
         this.batch = batch;
         var parked = names.parked();
@@ -313,7 +314,7 @@ public final class ParkedStore {
             bindNewerOfKey(ps, 6, shard, row); // retry heads
             ps.setInt(10, attempts);
             ps.setObject(11, timestamp(nextAttemptAt));
-            ps.setString(12, errorText(error));
+            ps.setString(12, retries.errorText(error));
             ps.setObject(13, waitingSince == null ? null : timestamp(waitingSince));
             ps.setLong(14, row.id());
             ps.setLong(15, row.id());
@@ -348,7 +349,7 @@ public final class ParkedStore {
         try (var ps = c.prepareStatement(toDead)) {
             ps.setLong(1, row.id());
             ps.setInt(2, attempts);
-            ps.setString(3, errorText(error));
+            ps.setString(3, retries.errorText(error));
             requireOneRow(ps.executeUpdate(), "parked", row);
         }
     }

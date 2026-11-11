@@ -114,4 +114,6 @@ Metrics, alerts and procedures are the same. What differs:
   `max.message.bytes`, or kafka-clients 4.2+.
 - Upgrades: Postgres 14.14+, 15.9+, 16.5+ or 17+ (older minors: startup WARN, backend crash risk on partition
   drops; 13 fails at startup), Kora 1.2.23+ (using-outbox).
+- A database encoding other than UTF8 or SQL_ASCII: a startup WARN names it, and `last_error`, `error` and
+  `last_handler_error` hold non-ASCII as `\uXXXX` (Postgres would reject the characters it lacks).
 - Writers' timeouts: ≥ 300 ms by day, ≥ `tailConversion.maxStall` + 300 ms at night.

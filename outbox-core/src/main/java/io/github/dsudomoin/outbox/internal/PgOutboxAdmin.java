@@ -126,7 +126,8 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         this.wakeRelay = wakeRelay;
         this.rows = new DeadLetters(names, config);
         this.partitions = new XidPartitions(names, config.partitions());
-        this.retries = new RetryStore(names, false); // its dead rows are kept: the abandoned ones
+        // its dead rows are kept: the abandoned ones
+        this.retries = new RetryStore(names, false, OutboxSchema.asciiText(config));
         this.parked = new ParkedStore(names, retries);
         this.recovery = new XidRecovery(names, config);
         this.socket = new SocketBound(config.networkTimeout());
@@ -881,7 +882,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                 ps.setObject(3, value);
                 ps.setLong(4, bound.get());
                 ps.setInt(5, CHUNK - moved);
-                ps.setString(6, RetryStore.errorText(error));
+                ps.setString(6, retries.errorText(error));
                 moved += ps.executeUpdate();
             }
         }
@@ -974,7 +975,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                         rows += rs.getLong(1);
                     }
                 } else {
-                    ps.setString(5, RetryStore.errorText(error));
+                    ps.setString(5, retries.errorText(error));
                     rows += ps.executeUpdate();
                 }
             }

@@ -9,6 +9,8 @@ description: Use when adding dsudomoin/outbox (io.github.dsudomoin:outbox-kora, 
 
 - **Versions**: Java 17+; Postgres 14.14+, 15.9+, 16.5+ or any 17+ (an older minor can crash a backend on
   maintenance's detach-and-drop: a startup WARN names the minor to upgrade to; 13 fails at startup), one primary;
+  a UTF8 or SQL_ASCII database (any other encoding: a startup WARN, and stored error texts escape non-ASCII as
+  `\uXXXX`);
   kafka-clients 3.9.2 or 4.x; Kora 1.2.23+:
   `outbox-kora` brings `platform("ru.tinkoff.kora:kora-parent:1.2.23")`, which raises every Kora module and HikariCP
   (7.1.0) on the runtime classpath, so set the service's own `kora-parent` and its annotation or symbol processors to
