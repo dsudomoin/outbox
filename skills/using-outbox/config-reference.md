@@ -129,7 +129,8 @@ own role has DML only: `OutboxRuntime.builder(...).ownerConnections(ownerDataSou
 maintenance (partitions, orphans, xid-regression recovery), `OutboxAdmin.status()`, `recoverStrandedShards`, `restoreOrphan` and
 `recoverXidRegression`; through the app's role `send`, `tryAccept`, relay steps, the dead-letter pass, the other admin
 calls. An owner source with `bootstrap = true` fails at build; one reaching another database fails startup before
-any DDL. Render the grants with `OutboxSql.outbox(config, "app_role")`; the role also needs `USAGE` on the schema, and
+any DDL (one database where an unqualified name finds another table, mostly the app role lacking `USAGE` on the
+schema, gets its own message with the `GRANT`). Render the grants with `OutboxSql.outbox(config, "app_role")`; the role also needs `USAGE` on the schema, and
 must not have `CREATE` on any schema of the owner's `search_path` (startup WARNs with the `REVOKE`). Every partition
 is given to the parent table's owner: an owner source that is only a member of that role needs the `SET` option on
 PG 16+, and the owner role needs `CREATE` on the schema, or startup fails naming the `GRANT`.

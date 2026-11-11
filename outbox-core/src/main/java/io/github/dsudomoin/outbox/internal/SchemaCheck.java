@@ -90,15 +90,66 @@ final class SchemaCheck {
     /**
      * Fails unless {@code app} and {@code owner} reach one database of one server, where {@code table} names the same
      * table (or none on both): an owner source pointed elsewhere would make partitions where the application never
-     * writes.
+     * writes. When only the table differs, the message names why (a missing {@code USAGE}, another search_path).
      */
     static void requireSameDatabase(Connection app, Connection owner, String table) throws SQLException {
-        var a = where(app, table);
-        var o = where(owner, table);
-        if (!a.equals(o)) {
-            throw new IllegalStateException("outbox owner connection source reaches another database than the"
-                    + " application's: owner " + o + ", application " + a + "; point both at the database of " + table
-                    + " (and, for an unqualified name, give both roles the same search_path)");
+        var a = locate(app, table);
+        var o = locate(owner, table);
+        if (a.equals(o)) {
+            return;
+        }
+        if (a.database().equals(o.database()) && a.started().equals(o.started())) {
+            throw new IllegalStateException("outbox table " + table + " resolves to another table for the application"
+                    + " connection than for the owner connection source in database " + a.database() + ": "
+                    + resolution(app, owner, a.oid(), o.oid()));
+        }
+        throw new IllegalStateException("outbox owner connection source reaches another database than the"
+                + " application's: owner " + o.text(table) + ", application " + a.text(table)
+                + "; point both at the database of " + table
+                + " (and, for an unqualified name, give both roles the same search_path)");
+    }
+
+    /** Why one database resolves a name to {@code appOid} for {@code app} and to {@code ownerOid} for {@code owner}. */
+    private static String resolution(Connection app, Connection owner, @Nullable String appOid,
+            @Nullable String ownerOid) throws SQLException {
+        if (appOid == null || ownerOid == null) {
+            return appOid == null ? unresolved(app, "the application", ownerOid, "the owner's")
+                    : unresolved(owner, "the owner connection source", appOid, "the application's");
+        }
+        return "application " + relation(app, appOid) + ", owner " + relation(owner, ownerOid)
+                + "; give both roles the same search_path, or name the table with its schema";
+    }
+
+    /** {@code side} on {@code c} resolves no table where {@code other}'s session resolves {@code oid}. */
+    private static String unresolved(Connection c, String side, String oid, String other) throws SQLException {
+        try (var ps = c.prepareStatement("select pg_catalog.quote_ident(n.nspname), pg_catalog.quote_ident("
+                + "r.relname), pg_catalog.has_schema_privilege(n.oid, 'USAGE'), pg_catalog.quote_ident(current_user)"
+                + " from pg_catalog.pg_class r join pg_catalog.pg_namespace n on n.oid = r.relnamespace"
+                + " where r.oid = ?::oid")) {
+            ps.setString(1, oid);
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                var schema = rs.getString(1);
+                var role = rs.getString(4);
+                var where = side + " resolves no table, " + other + " resolves " + schema + "." + rs.getString(2);
+                return rs.getBoolean(3)
+                        ? where + "; schema " + schema + " is not in the search_path of role " + role + ": give both"
+                                + " roles the same search_path, or name the table with its schema"
+                        : where + "; role " + role + " lacks USAGE on schema " + schema + ", so its search_path skips"
+                                + " it: GRANT USAGE ON SCHEMA " + schema + " TO " + role;
+            }
+        }
+    }
+
+    private static String relation(Connection c, String oid) throws SQLException {
+        try (var ps = c.prepareStatement("select pg_catalog.quote_ident(n.nspname) || '.' ||"
+                + " pg_catalog.quote_ident(r.relname) from pg_catalog.pg_class r join pg_catalog.pg_namespace n"
+                + " on n.oid = r.relnamespace where r.oid = ?::oid")) {
+            ps.setString(1, oid);
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getString(1) + " (oid " + oid + ")";
+            }
         }
     }
 
@@ -150,14 +201,25 @@ final class SchemaCheck {
      * so the start is written in UTC: in the session's {@code TimeZone} one server would read as two.
      */
     static String where(Connection c, String table) throws SQLException {
+        return locate(c, table).text(table);
+    }
+
+    /** {@link #where} in parts; {@code oid} is null when the name resolves to no table. */
+    private record Location(String database, String started, @Nullable String oid) {
+
+        String text(String table) {
+            return "database " + database + " of the server started " + started + " UTC, "
+                    + (oid == null ? "no table " + table : "table " + table + " oid " + oid);
+        }
+    }
+
+    private static Location locate(Connection c, String table) throws SQLException {
         try (var ps = c.prepareStatement("select current_database(), to_char(pg_postmaster_start_time()"
                 + " at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US'), to_regclass(?)::oid")) {
             ps.setString(1, table);
             try (var rs = ps.executeQuery()) {
                 rs.next();
-                var oid = rs.getString(3);
-                return "database " + rs.getString(1) + " of the server started " + rs.getString(2) + " UTC, "
-                        + (oid == null ? "no table " + table : "table " + table + " oid " + oid);
+                return new Location(rs.getString(1), rs.getString(2), rs.getString(3));
             }
         }
     }

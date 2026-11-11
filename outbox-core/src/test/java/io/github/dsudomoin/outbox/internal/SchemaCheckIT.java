@@ -122,7 +122,10 @@ class SchemaCheckIT {
 
             assertThatThrownBy(() -> SchemaCheck.requireSameDatabase(utc, moscow, table))
                     .isInstanceOf(IllegalStateException.class)
-                    .hasMessageContaining("reaches another database than the application's");
+                    .hasMessageContaining("outbox table " + table + " resolves to another table for the application")
+                    .hasMessageContaining("application public." + table)
+                    .hasMessageContaining("owner " + schema + "." + table)
+                    .hasMessageContaining("give both roles the same search_path");
         }
     }
 

@@ -89,6 +89,34 @@ class OwnerSourceIT {
         }
     }
 
+    /**
+     * Postgres skips a search_path schema the role has no USAGE on, so an unqualified name resolves to no table for
+     * the application role: one database, and the start names the missing right instead of another database.
+     */
+    @Test
+    void appRoleWithoutUsageOnTheSchemaIsNamed() throws Exception {
+        sql("alter role " + owner + " set search_path = " + schema);
+        sql("alter role " + app + " set search_path = " + schema);
+        sql("revoke usage on schema " + schema + " from " + app);
+        var unqualified = new TestOutboxConfig().table("outbox").inboxTable("inbox").schemaBootstrap(false);
+        try (var c = as(owner).getConnection()) {
+            TestSql.execute(c, OutboxSql.outbox(unqualified, app));
+            TestSql.execute(c, OutboxSql.inbox(unqualified, app));
+        }
+        var outbox = runtime(OutboxRuntime.builder(unqualified, new JdbcTransactions(as(app)), record -> {})
+                .ownerConnections(as(owner)::getConnection).build());
+        var inbox = runtime(InboxRuntime.builder(unqualified, new JdbcTransactions(as(app)))
+                .ownerConnections(as(owner)::getConnection).build());
+
+        assertThatThrownBy(outbox::start).isInstanceOf(IllegalStateException.class)
+                .hasMessageNotContaining("reaches another database")
+                .hasMessageContaining("role " + app + " lacks USAGE on schema " + schema)
+                .hasMessageContaining("GRANT USAGE ON SCHEMA " + schema + " TO " + app);
+        assertThatThrownBy(inbox::start).isInstanceOf(IllegalStateException.class)
+                .hasMessageNotContaining("reaches another database")
+                .hasMessageContaining("role " + app + " lacks USAGE on schema " + schema);
+    }
+
     @Test
     void ownerWithoutDdlRightsFails() throws Exception {
         migrate();
