@@ -191,6 +191,117 @@ class OutboxAdminInterceptorTest {
         }
     }
 
+    /**
+     * Over plain HTTP to an address other than localhost a browser sends no {@code Sec-Fetch-Site}, but it names the
+     * page's origin: one that is not this server's own host and port is another site.
+     */
+    @ParameterizedTest
+    @CsvSource({"http://evil.example,app:8080", "null,app:8080", "http://app:8081,app:8080", "http://app,app:8080",
+            "http://app:8080,app", "http://app:8080,"})
+    void aPostWhoseOriginIsAnotherHostIsRefusedBeforeTheAuthorizer(String origin, String host) {
+        var interceptor = new OutboxAdminInterceptor(request -> {
+            throw new AssertionError("the authorizer must not run");
+        }, deferred(new AtomicReference<>()), new $ModelError_JsonWriter());
+
+        var response = interceptor.intercept(Context.current(), request("POST",
+                "/kora-outbox/admin/v1/recovery/xid-regression", host == null ? HttpHeaders.of("origin", origin)
+                        : HttpHeaders.of("origin", origin, "host", host)),
+                (context, request) -> {
+                    throw new AssertionError("the route must not run");
+                }).toCompletableFuture();
+
+        assertThat(response).as("answered without the authorizer").isDone();
+        var answered = response.join();
+        assertThat(answered.code()).isEqualTo(403);
+        assertThat(body(answered)).isEqualTo("{\"message\":\"cross-site request refused\"}");
+    }
+
+    /** The scheme is not compared: behind a proxy ending TLS the server sees http where the page had https. */
+    @ParameterizedTest
+    @CsvSource({"http://app:8080,app:8080", "http://APP:8080,app:8080", "http://app,app", "http://app:80,app",
+            "https://app,app:443", "https://app:8443,app:8443", "http://[::1]:8080,[::1]:8080",
+            "http://admin.internal,admin.internal"})
+    void aPostFromTheServersOwnOriginReachesTheAuthorizer(String origin, String host) {
+        var authorization = new AtomicReference<Runnable>();
+        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.allow("ops"),
+                deferred(authorization), new $ModelError_JsonWriter());
+
+        var response = interceptor.intercept(Context.current(), request("POST",
+                "/kora-outbox/admin/v1/recovery/xid-regression", HttpHeaders.of("origin", origin, "host", host)),
+                (context, request) -> CompletableFuture.completedFuture(HttpServerResponse.of(200)));
+        authorization.get().run();
+
+        assertThat(response.toCompletableFuture().join().code()).isEqualTo(200);
+    }
+
+    /** {@code Sec-Fetch-Site} decides when a browser sends it; a GET with another origin changes nothing. */
+    @ParameterizedTest
+    @CsvSource({"POST,same-origin", "GET,"})
+    void anOriginIsNotLookedAtWithSecFetchSiteOrOnAGet(String method, String site) {
+        var authorization = new AtomicReference<Runnable>();
+        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.allow("ops"),
+                deferred(authorization), new $ModelError_JsonWriter());
+
+        var headers = HttpHeaders.of("origin", "http://proxy.example", "host", "app:8080");
+        if (site != null) {
+            headers.set("sec-fetch-site", site);
+        }
+        var response = interceptor.intercept(Context.current(), request(method, "/kora-outbox/admin/v1/status",
+                headers), (context, request) -> CompletableFuture.completedFuture(HttpServerResponse.of(200)));
+        authorization.get().run();
+
+        assertThat(response.toCompletableFuture().join().code()).isEqualTo(200);
+    }
+
+    /**
+     * Kora reads a JSON body whatever its {@code Content-Type}, and a page elsewhere can post {@code text/plain}
+     * without asking the server first: a body route takes {@code application/json} only, as Spring MVC's does.
+     */
+    @ParameterizedTest
+    @CsvSource({"text/plain,415", "application/x-www-form-urlencoded,415", "multipart/form-data; boundary=x,415",
+            "application/jsonx,415", ",400"})
+    void aBodyRouteRefusesAnotherContentTypeBeforeTheRoute(String type, int status) {
+        var authorization = new AtomicReference<Runnable>();
+        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.allow("ops"),
+                deferred(authorization), new $ModelError_JsonWriter());
+
+        try (var stderr = new CapturedStderr()) {
+            for (var path : List.of("dead-letters/discard", "dead-letters/redrive", "keys/abandon",
+                    "waiting/abandon")) {
+                var response = interceptor.intercept(Context.current(), request("POST",
+                        "/kora-outbox/admin/v1/" + path, type == null ? HttpHeaders.of()
+                                : HttpHeaders.of("content-type", type)), (context, request) -> {
+                            throw new AssertionError("the route must not run");
+                        });
+                authorization.get().run();
+
+                var answered = response.toCompletableFuture().join();
+                assertThat(answered.code()).as(path).isEqualTo(status);
+                assertThat(body(answered)).isEqualTo(type == null
+                        ? "{\"message\":\"a JSON body is required, with Content-Type application/json\"}"
+                        : "{\"message\":\"Content-Type " + type + " is not supported: application/json only\"}");
+                assertThat(stderr.text()).contains("outbox admin POST \"/kora-outbox/admin/v1/" + path
+                        + "\" by \"ops\": " + status);
+            }
+            assertThat(stderr.text()).doesNotContain("WARN");
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"application/json", "application/json; charset=utf-8", "Application/JSON;charset=UTF-8"})
+    void aBodyRouteTakesJson(String type) {
+        var authorization = new AtomicReference<Runnable>();
+        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.allow("ops"),
+                deferred(authorization), new $ModelError_JsonWriter());
+
+        var response = interceptor.intercept(Context.current(), request("POST",
+                "/kora-outbox/admin/v1/dead-letters/discard", HttpHeaders.of("content-type", type)),
+                (context, request) -> CompletableFuture.completedFuture(HttpServerResponse.of(200)));
+        authorization.get().run();
+
+        assertThat(response.toCompletableFuture().join().code()).isEqualTo(200);
+    }
+
     /** Clients other than browsers send no such header; a GET changes nothing, so a link from another site works. */
     @ParameterizedTest
     @CsvSource({"POST,", "POST,same-origin", "POST,none", "GET,cross-site"})

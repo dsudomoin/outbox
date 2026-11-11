@@ -559,6 +559,44 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
     }
 
     /**
+     * A page elsewhere can post {@code text/plain} or a form without asking the server first, and Kora would read the
+     * JSON in it: the body routes take {@code application/json} only, as Spring MVC's do.
+     */
+    @Test
+    void anotherContentTypeIs415() throws Exception {
+        long id = letter(1, "t", "k", "boom", T0, KEPT);
+
+        for (var type : List.of("text/plain", "application/x-www-form-urlencoded")) {
+            var response = send(HttpRequest.newBuilder(URI.create("http://localhost:" + port + API
+                    + "/dead-letters/discard")).header("Content-Type", type)
+                    .POST(BodyPublishers.ofString("{\"ids\":[" + id + "]}")));
+
+            assertJson(response, 415);
+            assertThat(response.body()).isEqualTo("{\"message\":\"Content-Type " + type
+                    + " is not supported: application/json only\"}");
+        }
+        assertThat(deadIds()).containsExactly(id);
+    }
+
+    /**
+     * Over plain HTTP to an address other than localhost a browser sends no {@code Sec-Fetch-Site}; its
+     * {@code Origin} still tells another site's page from the server's own, by the {@code Host} the server got.
+     */
+    @Test
+    void aPostFromAnotherOriginIs403() throws Exception {
+        var foreign = send(HttpRequest.newBuilder(URI.create("http://localhost:" + port + API
+                + "/recovery/xid-regression")).header("Origin", "http://evil.example")
+                .POST(BodyPublishers.noBody()));
+        var own = send(HttpRequest.newBuilder(URI.create("http://localhost:" + port + API
+                + "/recovery/xid-regression")).header("Origin", "http://localhost:" + port)
+                .POST(BodyPublishers.noBody()));
+
+        assertJson(foreign, 403);
+        assertThat(foreign.body()).isEqualTo("{\"message\":\"cross-site request refused\"}");
+        assertJson(own, 409); // reached the route: there is no regression to recover
+    }
+
+    /**
      * Neither bad input nor a refusal of the outbox's state: a 500 whose {@code Error} has the failure's message, for
      * the authenticated operator; one WARN with the exception; the audit line says 500.
      */
@@ -721,6 +759,12 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
             request.header("Content-Type", "application/json");
         }
         return client.send(request.build(), BodyHandlers.ofString());
+    }
+
+    /** {@code request} with the test's key, sent as it is otherwise. */
+    private HttpResponse<String> send(HttpRequest.Builder request) throws Exception {
+        return client.send(request.timeout(Duration.ofSeconds(60)).header("X-Api-Key", "secret").build(),
+                BodyHandlers.ofString());
     }
 
     private static void assertJson(HttpResponse<String> response, int status) {

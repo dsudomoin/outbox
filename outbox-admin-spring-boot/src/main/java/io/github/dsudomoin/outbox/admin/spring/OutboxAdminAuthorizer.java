@@ -18,8 +18,9 @@ import java.util.Objects;
  * <p>Base the decision on a credential the client sends on purpose (a header such as an API key or a bearer token), not
  * on one a browser adds by itself (a cookie, Basic or SSO credentials it remembers, a client certificate, the caller's
  * address): a page on another site can make the operator's browser send those. The admin API refuses state changes a
- * browser marks as cross-site before this runs, but a browser too old to mark them gets through, and so does one on
- * plain HTTP to an address other than localhost, where browsers do not send {@code Sec-Fetch-Site} at all.
+ * browser marks as cross-site before this runs: by {@code Sec-Fetch-Site}, or, where a browser sends none (plain HTTP
+ * to an address other than localhost), by an {@code Origin} that is not the request's server name and port. A browser
+ * too old to send either gets through.
  */
 public interface OutboxAdminAuthorizer {
 

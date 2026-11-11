@@ -3,6 +3,9 @@ package io.github.dsudomoin.outbox.admin.spring;
 import jakarta.annotation.Nullable;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.StringJoiner;
@@ -26,9 +29,13 @@ import org.springframework.web.servlet.HandlerInterceptor;
  *
  * <p>A denied call gets a JSON {@code Error} with the decision's status and never reaches the route; an authorizer that
  * fails gets a WARN with its exception and the caller a 500 {@code Error} "authorization failed", nothing of why. A
- * call other than a {@code GET} or {@code HEAD} that a browser marks as sent by another site ({@code Sec-Fetch-Site}
- * other than {@code same-origin} or {@code none}) gets a 403 {@code Error} "cross-site request refused" without the
- * authorizer: a page elsewhere cannot change state with what the operator's browser adds by itself. Each is a
+ * call other than a {@code GET} or {@code HEAD} that a browser marks as sent by another site gets a 403 {@code Error}
+ * "cross-site request refused" without the authorizer: a page elsewhere cannot change state with what the operator's
+ * browser adds by itself. The browser's mark is {@code Sec-Fetch-Site} other than {@code same-origin} or {@code none};
+ * without that header (a browser sends none over plain HTTP to an address other than localhost) it is an
+ * {@code Origin} of {@code null} or of another host and port than the request's server name and port, the scheme
+ * aside: those the container took from {@code Host}, or from forwarded headers where the app takes them
+ * ({@code server.forward-headers-strategy}). Curl and service clients send neither header. Each is a
  * {@link Refused} that the controller's own handler answers, so neither an app's advice nor the app's JSON library is
  * this class's concern.
  *
@@ -142,11 +149,33 @@ final class OutboxAdminGuard implements HandlerInterceptor {
     /**
      * Whether a browser says another site made it send {@code request} ({@code Sec-Fetch-Site}): such a request may
      * carry what the browser adds by itself (a cookie, an SSO session, the operator's network address), which an
-     * authorizer cannot tell from the operator's own call. Clients other than browsers send no such header.
+     * authorizer cannot tell from the operator's own call. Without that header, which a browser sends only to a
+     * trustworthy origin (HTTPS or localhost), an {@code Origin} that is not this server's host and port says so.
+     * Clients other than browsers send neither header.
      */
     private static boolean sentByAnotherSite(HttpServletRequest request) {
         var site = request.getHeader("Sec-Fetch-Site");
-        return site != null && !site.equals("same-origin") && !site.equals("none");
+        if (site != null) {
+            return !site.equals("same-origin") && !site.equals("none");
+        }
+        var origin = request.getHeader("Origin");
+        return origin != null && !sameHost(origin, request.getServerName(), request.getServerPort());
+    }
+
+    /**
+     * Whether {@code origin} names {@code host} and {@code port} (below 0 when the {@code Host} header had none: the
+     * default of the browser's scheme). Not the scheme: behind a proxy ending TLS the page had https, the server http.
+     */
+    private static boolean sameHost(String origin, String host, int port) {
+        try {
+            var page = new URI(origin);
+            var defaultPort = "https".equalsIgnoreCase(page.getScheme()) ? 443 : 80;
+            return page.getHost() != null
+                && page.getHost().toLowerCase(Locale.ROOT).equals(host.toLowerCase(Locale.ROOT))
+                && (page.getPort() < 0 ? defaultPort : page.getPort()) == (port < 0 ? defaultPort : port);
+        } catch (URISyntaxException e) {
+            return false;
+        }
     }
 
     /** {@code  with <name> "<value>", ...} of the operation's detail, each value {@link #printable}; else empty. */

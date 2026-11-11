@@ -284,6 +284,49 @@ class OutboxAdminGuardIT {
         }
     }
 
+    /**
+     * Over plain HTTP to an address other than localhost a browser sends no {@code Sec-Fetch-Site}, but it names the
+     * page's origin: one that is not this server's own host and port is another site.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"http://evil.example", "null", "http://localhost", "http://localhost:1"})
+    void aPostWhoseOriginIsAnotherHostIsRefusedBeforeTheAuthorizer(String origin) throws Exception {
+        try (var server = AdminServer.start(WithKeys.class, WithSpy.class); var stderr = new CapturedStderr()) {
+            var refused = server.send("POST", API + "/recovery/xid-regression", null, KEY, "secret", "Origin",
+                origin);
+
+            assertError(refused, 403, "cross-site request refused");
+            assertThat(server.bean(Keys.class).threads).as("the authorizer never ran").isEmpty();
+            assertThat(server.bean(Spy.class).ran).isEmpty();
+            assertThat(server.settledAudit(stderr, 1))
+                .containsExactly("outbox admin POST \"" + API + "/recovery/xid-regression\" denied: 403");
+        }
+    }
+
+    /**
+     * The server's own origin passes, the scheme aside (behind a proxy ending TLS the page had https); and where the
+     * app takes forwarded headers, the host it takes from them is the one compared.
+     */
+    @Test
+    void aPostFromTheServersOwnOriginReachesTheAuthorizer() throws Exception {
+        try (var server = AdminServer.start(WithKeys.class, WithSpy.class)) {
+            for (var origin : List.of("http://localhost:" + server.port, "https://LOCALHOST:" + server.port)) {
+                assertThat(server.send("POST", API + "/recovery/xid-regression", null, KEY, "wrong", "Origin",
+                    origin).statusCode()).as(origin).isEqualTo(403);
+            }
+            assertThat(server.bean(Keys.class).threads).hasSize(2);
+        }
+        try (var server = AdminServer.start(List.of("server.forward-headers-strategy=framework"), WithKeys.class,
+            WithSpy.class)) {
+            assertThat(server.send("POST", API + "/recovery/xid-regression", null, KEY, "wrong", "Origin",
+                "http://admin.example", "X-Forwarded-Host", "admin.example").statusCode()).isEqualTo(403);
+            assertThat(server.bean(Keys.class).threads).hasSize(1);
+            assertError(server.send("POST", API + "/recovery/xid-regression", null, KEY, "secret", "Origin",
+                "http://localhost:" + server.port, "X-Forwarded-Host", "admin.example"), 403,
+                "cross-site request refused");
+        }
+    }
+
     /** Clients other than browsers send no such header; a GET changes nothing, so a link from another site works. */
     @ParameterizedTest
     @CsvSource({"POST,", "POST,same-origin", "POST,none", "GET,cross-site", "GET,same-site", "HEAD,cross-site"})

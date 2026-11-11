@@ -3,8 +3,12 @@ package io.github.dsudomoin.outbox.admin.kora;
 import io.github.dsudomoin.outbox.InternalApi;
 import io.github.dsudomoin.outbox.admin.kora.model.ModelError;
 import jakarta.annotation.Nullable;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.StringJoiner;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -31,9 +35,15 @@ import ru.tinkoff.kora.json.common.JsonWriter;
  * is answered as an {@code Error} of its status too, as is any response exception of the server (a 503), and any
  * other failure as a 500 {@code Error} with the failure's message (its class name when it has none), for the
  * authenticated operator; a 5xx after one WARN with the exception. A call other than a {@code GET} or {@code HEAD}
- * that a browser marks as sent by another site ({@code Sec-Fetch-Site} other than {@code same-origin} or {@code none})
- * gets a 403 {@code Error} "cross-site request refused" without the authorizer: a page elsewhere cannot change state
- * with what the operator's browser adds by itself.
+ * that a browser marks as sent by another site gets a 403 {@code Error} "cross-site request refused" without the
+ * authorizer: a page elsewhere cannot change state with what the operator's browser adds by itself. The browser's mark
+ * is {@code Sec-Fetch-Site} other than {@code same-origin} or {@code none}; without that header (a browser sends none
+ * over plain HTTP to an address other than localhost) it is an {@code Origin} of {@code null} or of another host and
+ * port than the request's {@code Host}, the scheme aside. Kora takes no forwarded headers, so a proxy in front must
+ * pass the browser's {@code Host} on. Curl and service clients send neither header. An allowed call to a route with a
+ * body ({@code redrive}, {@code discard}, {@code keys/abandon}, {@code waiting/abandon}) gets a 415 {@code Error} for a
+ * {@code Content-Type} other than {@code application/json}, a 400 for none, before its body is read: Kora's JSON
+ * reader looks at no {@code Content-Type}, and a page elsewhere may post {@code text/plain} without a preflight.
  *
  * <p>Every call leaves one INFO audit line, written before its response completes:
  * {@code outbox admin <method> "<path>" by "<identity>": <status>} when allowed, {@code outbox admin <method>
@@ -55,6 +65,10 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
      * completes reads them.
      */
     static final Context.KeyImmutable<Map<String, String>> DETAIL = new Context.KeyImmutable<>() {};
+    /** The routes that read a JSON body; none has a path parameter, so the path is the route. */
+    private static final Set<String> BODY_ROUTES = Set.of("/kora-outbox/admin/v1/dead-letters/redrive",
+            "/kora-outbox/admin/v1/dead-letters/discard", "/kora-outbox/admin/v1/keys/abandon",
+            "/kora-outbox/admin/v1/waiting/abandon");
 
     private final OutboxAdminAuthorizer authorizer;
     private final BlockingRequestExecutor executor;
@@ -121,11 +135,38 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
     /**
      * Whether a browser says another site made it send {@code request} ({@code Sec-Fetch-Site}): such a request may
      * carry what the browser adds by itself (a cookie, an SSO session, the operator's network address), which an
-     * authorizer cannot tell from the operator's own call. Clients other than browsers send no such header.
+     * authorizer cannot tell from the operator's own call. Without that header, which a browser sends only to a
+     * trustworthy origin (HTTPS or localhost), an {@code Origin} that is not this server's host and port says so.
+     * Clients other than browsers send neither header.
      */
     private static boolean sentByAnotherSite(HttpServerRequest request) {
         var site = request.headers().getFirst("sec-fetch-site");
-        return site != null && !site.equals("same-origin") && !site.equals("none");
+        if (site != null) {
+            return !site.equals("same-origin") && !site.equals("none");
+        }
+        var origin = request.headers().getFirst("origin");
+        return origin != null && !sameHost(origin, request.headers().getFirst("host"));
+    }
+
+    /**
+     * Whether {@code origin} names the host and port of {@code host} (a {@code Host} header, its port omitted for the
+     * default of the browser's scheme). Not the scheme: behind a proxy ending TLS the page had https, the server http.
+     */
+    private static boolean sameHost(String origin, @Nullable String host) {
+        if (host == null) {
+            return false;
+        }
+        try {
+            var page = new URI(origin);
+            var server = new URI("http://" + host);
+            var defaultPort = "https".equalsIgnoreCase(page.getScheme()) ? 443 : 80;
+            return page.getHost() != null && server.getHost() != null
+                    && page.getHost().toLowerCase(Locale.ROOT).equals(server.getHost().toLowerCase(Locale.ROOT))
+                    && (page.getPort() < 0 ? defaultPort : page.getPort())
+                    == (server.getPort() < 0 ? defaultPort : server.getPort());
+        } catch (URISyntaxException e) {
+            return false;
+        }
     }
 
     private HttpServerResponse error(Context context, int code, @Nullable MutableHttpHeaders headers,
@@ -136,6 +177,18 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
 
     private static CompletionStage<HttpServerResponse> process(Context context, HttpServerRequest request,
             InterceptChain chain) {
+        if (BODY_ROUTES.contains(request.path())) {
+            var type = request.headers().getFirst("content-type");
+            if (type == null) {
+                return CompletableFuture.failedFuture(HttpServerResponseException.of(400,
+                        "a JSON body is required, with Content-Type application/json"));
+            }
+            var semicolon = type.indexOf(';');
+            if (!(semicolon < 0 ? type : type.substring(0, semicolon)).strip().equalsIgnoreCase("application/json")) {
+                return CompletableFuture.failedFuture(HttpServerResponseException.of(415,
+                        "Content-Type " + type + " is not supported: application/json only"));
+            }
+        }
         try {
             return chain.process(context, request);
         } catch (Exception e) {

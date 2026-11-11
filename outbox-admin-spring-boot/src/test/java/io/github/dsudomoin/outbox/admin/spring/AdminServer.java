@@ -83,7 +83,7 @@ final class AdminServer implements AutoCloseable {
 
     final ConfigurableApplicationContext context;
     final TableNames names;
-    private final int port;
+    final int port;
     private final HttpClient client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build();
 
     private AdminServer(ConfigurableApplicationContext context) {

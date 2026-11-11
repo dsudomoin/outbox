@@ -57,8 +57,13 @@ curl -s -H "$KEY" -H "$JSON" -d '{"topic":"orders","key":"order-42","reason":"ha
 
 - 200 with JSON (changing calls: `{"count": N}`; `waiting/abandon`, `keys/abandon`: `{"keys": N, "records": M}`); 400 rejected input
   (unknown field, so a mistyped `key` never widens an abandon; over 1 000 `ids`, empty filter, not an orphan, blank
-  `topic` or `reason`; in `keys/abandon` not exactly one of `key` and `messageId`, or the `messageId` of a keyed record); 401 / 403 from the authorizer; 409 not now (maintenance running, or a relay step holding the
+  `topic` or `reason`; in `keys/abandon` not exactly one of `key` and `messageId`, or the `messageId` of a keyed record, or a body with no `Content-Type`); 401 / 403 from the authorizer; 415 a body that is not `application/json`; 409 not now (maintenance running, or a relay step holding the
   shard past `batchTimeout` + 5 s: retry; no xid regression); 500 otherwise. Every error body is `{"message": "..."}`.
+- Decide by a credential sent on purpose (a header), not a cookie. A non-GET/HEAD call gets 403 before the authorizer
+  when `Sec-Fetch-Site` is other than `same-origin`/`none`, or, with no `Sec-Fetch-Site` (browsers send none on plain
+  HTTP to a non-localhost address), when `Origin` is `null` or another host:port than the request's `Host` (the scheme
+  aside). Kora reads no forwarded headers: a proxy in front must pass the browser's `Host` on (nginx
+  `proxy_set_header Host $http_host`). curl and services send neither header.
 - Reads (`/status`, find, count) wait at most 5 s for a lock and 60 s per statement: during an xid regression
   recovery, which holds its tables, `/status` answers 500 (55P03) after 5 s; retry once it is done.
 - A body holds exactly one of `ids` (up to 1 000) and `filter`. `status` is `pending`, `kept` or `scheduled`. A filter
@@ -100,12 +105,14 @@ class ApiKeyAuthorizer implements OutboxAdminAuthorizer {
 
 - It runs on the request's thread and may block; it must not read the body. Deny with `unauthorized` (401) or
   `forbidden` (403), never by throwing: any throw or null is a 500 «authorization failed».
-- Decide by a credential sent on purpose (a header), not a cookie. A non-GET/HEAD call with `Sec-Fetch-Site` other than
-  `same-origin`/`none` gets 403 before the authorizer; browsers send no such header on plain HTTP to a non-localhost
-  address.
+- Decide by a credential sent on purpose (a header), not a cookie. A non-GET/HEAD call gets 403 before the authorizer
+  when `Sec-Fetch-Site` is other than `same-origin`/`none`, or, with no `Sec-Fetch-Site` (browsers send none on plain
+  HTTP to a non-localhost address), when `Origin` is `null` or another host:port than the server name and port the
+  container took from `Host`, or from proxy headers under `server.forward-headers-strategy` (the scheme aside). curl
+  and services send neither header.
 - Audit: logger `io.github.dsudomoin.outbox.admin.spring.OutboxAdminGuard` at INFO; keep it on. An allowed call's line
   comes just after its response is flushed.
-- Differs from Kora: a JSON body with no `Content-Type` gets 400; a body over 1 MiB gets 400; blank `?limit=` and
+- Differs from Kora: a body over 1 MiB gets 400; blank `?limit=` and
   `?afterId=` read as absent; unmatched 404/405/406 and OPTIONS go to the app's default handling, no route run. A
   multipart request is parsed ahead of authorization on every path.
 - Request bodies are read with the library's own mapper, so the app's Jackson settings and deserializers cannot change
