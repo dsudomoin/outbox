@@ -49,9 +49,10 @@ import org.slf4j.LoggerFactory;
  * others of its batch go on, and the phase ends with that batch. Right after the claim the batch's
  * {@code lock_timeout} becomes {@link XidPartitions#lockWait}: it bounds each lock wait of the batch, not their
  * sum, and while one lasts the writers of the keys the batch holds wait too, so a batch that meets several held
- * table locks stalls them for that many waits. A batch that fails after its claim rolls back, and those of its
- * letters still due are then due again after {@code initialDelay} (none another pass decided meanwhile), so they hold
- * back no letter behind them. In the redrive phase a lock timeout (55P03) is a WARN, at most once a minute, and ends
+ * table locks stalls them for that many waits. Its {@code idle_in_transaction_session_timeout} becomes 5 s then
+ * too, as no hook runs in it: a session cut while it holds key locks frees them that soon. A batch that fails after
+ * its claim rolls back, and those of its letters still due are then due again after {@code initialDelay} (none
+ * another pass decided meanwhile), so they hold back no letter behind them. In the redrive phase a lock timeout (55P03) is a WARN, at most once a minute, and ends
  * the phase until the next pass; any other failure, and any failure of a hand-over (a lock timeout writing the hook's
  * decisions included: the hook is called again for them), propagates. Hook failures have a WARN of their own, at
  * most once a minute too. Until {@code <dead>_due} exists (an upgraded dead table with rows gets it from

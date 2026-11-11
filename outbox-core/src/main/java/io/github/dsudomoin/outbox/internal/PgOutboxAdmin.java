@@ -1105,6 +1105,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                 }
             }
         }
+        rows.limitLockWaits(tx); // before the key locks: from them on, writers of those keys wait with this chunk
         var ready = rows.tryKeyLocks(tx, claimed, held).ready();
         rows.redrive(tx, ready);
         return new Chunk(claimed.size(), claimed.isEmpty() ? after : claimed.get(claimed.size() - 1).id(),

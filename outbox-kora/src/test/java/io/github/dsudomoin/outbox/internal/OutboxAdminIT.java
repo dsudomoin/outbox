@@ -392,6 +392,24 @@ class OutboxAdminIT {
                 messageIds.get(busy));
     }
 
+    /** A chunk holding key locks idles at most 5 s: a cut session does not keep writers of its keys waiting 30 s. */
+    @Test
+    void aRedriveChunkHoldsItsKeyLocksUnderAShortIdleBound() throws Exception {
+        long id = letter("t", "k");
+        var seen = TestDb.uniqueTable(); // what each chunk's delete saw, its key locks taken
+        execute("create table " + seen + " (setting text)");
+        execute("create function " + seen + "_f() returns trigger language plpgsql as $$ begin insert into " + seen
+                + " values (current_setting('idle_in_transaction_session_timeout')); return null; end $$");
+        execute("create trigger " + seen + "_t after delete on " + names.dead() + " for each statement execute"
+                + " function " + seen + "_f()");
+
+        assertThat(admin.redriveDeadLetters(List.of(id))).isOne();
+
+        try (var c = TestDb.connect()) {
+            assertThat(queryString(c, "select string_agg(setting, ',') from " + seen)).isEqualTo("5s");
+        }
+    }
+
     @Test
     void aKeyHeldInOneChunkIsSkippedInTheLaterChunksOfAFilterCall() throws Exception {
         aKeyHeldInOneChunkIsSkippedInTheLaterChunks(

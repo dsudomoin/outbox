@@ -46,7 +46,7 @@ final class DeadLetters {
         this.resender = new Resender(names, config);
         this.dead = names.dead();
         this.lockTimeout = "set local lock_timeout = '" + XidPartitions.lockWait(config.partitions()).toMillis()
-                + "ms'";
+                + "ms'; set local idle_in_transaction_session_timeout = '5s'";
         // one row per message, should two of its letters be redriven together
         this.remember = "insert into " + names.redriven() + " (message_id, redrives)"
                 + " select m, max(r) from unnest(?::uuid[], ?::int[]) u(m, r) group by m"
@@ -125,7 +125,11 @@ final class DeadLetters {
         delete(tx, letters.stream().map(Ref::id).toList());
     }
 
-    /** Each lock wait of the rest of {@code tx} at most {@link XidPartitions#lockWait}, past a swap's hold. */
+    /**
+     * Each lock wait of the rest of {@code tx} at most {@link XidPartitions#lockWait}, past a swap's hold, and its
+     * idle time at most 5 s: no hook runs inside a redrive, so a session cut while it holds key locks keeps the
+     * writers of those keys waiting no longer than that.
+     */
     void limitLockWaits(Connection tx) throws SQLException {
         try (var st = tx.createStatement()) {
             st.execute(lockTimeout);

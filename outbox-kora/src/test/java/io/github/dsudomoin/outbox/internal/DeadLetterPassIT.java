@@ -636,6 +636,58 @@ class DeadLetterPassIT {
         assertThat(Duration.ofNanos(heldFor)).isLessThan(Duration.ofSeconds(3));
     }
 
+    /**
+     * A redrive batch calls no hook, so a session cut while it holds key locks must not keep writers of those keys
+     * waiting for the hand-over's idle bound (hook timeout + 30 s).
+     */
+    @Test
+    void aRedriveBatchTakesItsKeyLocksUnderAShortIdleBound() throws Exception {
+        letter("t", "k", "p", List.of());
+        execute("update " + names.dead() + " set status = 'scheduled'");
+        var seen = new CopyOnWriteArrayList<String>(); // the idle bound in effect as each key-lock try is sent
+        var factory = new JdbcConnectionFactory() {
+            @Override
+            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
+                return db.withConnection(callback);
+            }
+
+            @Override
+            public Connection currentConnection() {
+                return db.currentConnection();
+            }
+
+            @Override
+            public Connection newConnection() {
+                var c = db.newConnection();
+                return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
+                        new Class<?>[] {Connection.class}, (proxy, method, args) -> {
+                            if (method.getName().equals("prepareStatement")
+                                    && args[0].toString().contains("pg_try_advisory_xact_lock")) {
+                                seen.add(TestSql.queryString(c,
+                                        "select current_setting('idle_in_transaction_session_timeout')"));
+                            }
+                            try {
+                                return method.invoke(c, args);
+                            } catch (InvocationTargetException e) {
+                                throw e.getCause();
+                            }
+                        });
+            }
+
+            @Override
+            public DataBaseTelemetry telemetry() {
+                return db.telemetry();
+            }
+        };
+        var pass = new DeadLetterPass(new KoraOutboxTransactions(factory), names, config, null,
+                new OutboxMetrics(registry));
+        passes.add(pass);
+
+        assertThat(pass.runOnce()).isOne();
+
+        assertThat(seen).as("the 5 s of ticks and heartbeats, not hook timeout + 30 s").containsExactly("5s");
+    }
+
     @Test
     void closeInterruptsTheHookWithoutCostingAnAttempt() throws Exception {
         long id = letter("t", "k", "p", List.of());
