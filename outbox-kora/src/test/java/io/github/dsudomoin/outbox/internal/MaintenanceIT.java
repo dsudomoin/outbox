@@ -1521,6 +1521,86 @@ class MaintenanceIT {
         assertThat(gauge(registry, "outbox.partitions.orphaned")).as("the foreign one").isEqualTo(1);
     }
 
+    /** Orphans of ours are restored by their lower bound, not by name: {@code _x99993} before {@code _x100007}. */
+    @Test
+    void oursOrphansAreRestoredInXidOrderAcrossADigitBoundary() throws Exception {
+        bootstrap();
+        var orphans = keyedOrphans(relay(new RecordingHandler(), maintenance()));
+
+        assertThat(maintenance().runOnce()).isTrue();
+
+        assertThat(keyedPayloads()).as("the key's rows in their order").containsExactly("a", "b", "c", "d");
+        for (var orphan : orphans) {
+            assertThat(exists(orphan)).as(orphan).isFalse();
+        }
+    }
+
+    /** A restore that fails leaves the later orphans of ours for the next run, so a key's later rows don't pass it. */
+    @Test
+    void aFailedRestoreHoldsBackTheLaterOursOrphans() throws Exception {
+        bootstrap();
+        var orphans = keyedOrphans(relay(new RecordingHandler(), maintenance()));
+        var registry = new SimpleMeterRegistry();
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry), Duration.ofMillis(300));
+        try (var dump = TestDb.connect()) {
+            dump.setAutoCommit(false); // a pg_dump of the first orphan: its chunk's ACCESS EXCLUSIVE times out
+            queryLong(dump, "select count(*) from " + orphans.get(0));
+
+            assertThat(maintenance.runOnce()).isTrue();
+
+            assertThat(gauge(registry, "outbox.partitions.orphaned")).as("both kept").isEqualTo(2);
+            assertThat(keyedPayloads()).as("none passed the failed one").isEmpty();
+            dump.commit();
+        }
+
+        assertThat(maintenance.runOnce()).isTrue();
+
+        assertThat(keyedPayloads()).containsExactly("a", "b", "c", "d");
+        assertThat(gauge(registry, "outbox.partitions.orphaned")).isZero();
+    }
+
+    /**
+     * Two orphans of ours below the tail, a digit apart in their names ({@code _x99993} and {@code _x100007}, as a
+     * name sort puts them the other way round): the first with key K's rows a, b, the second with its later rows c, d,
+     * all at the slowest shard's horizon. Returns the two tables.
+     */
+    private List<String> keyedOrphans(OutboxRelay relay) throws Exception {
+        send(msg("t", "k", "a"));
+        relay.drain();
+        long horizon = horizonXmin();
+        long tailLower = ranges().stream().filter(b -> b.to() == null).mapToLong(b -> Long.parseLong(b.from()))
+                .findFirst().orElseThrow();
+        long power = (long) Math.pow(10, Long.toString(tailLower).length() - 1);
+        assertThat(power + 7).as("both below the tail").isLessThan(tailLower);
+        var tables = List.of(names.partitionPrefix() + (power - 7), names.partitionPrefix() + (power + 7));
+        try (var c = TestDb.connect()) {
+            long id = 1;
+            for (var table : tables) {
+                execute(c, "create table " + table + " (like " + names.base() + " including defaults)");
+                markDropping(c, table);
+                for (int i = 0; i < 2; i++, id++) {
+                    execute(c, "insert into " + table + " (id, shard, xid, message_id, topic, key, payload) values ("
+                            + id + ", 0, '" + horizon + "', gen_random_uuid(), 't', convert_to('K', 'UTF8'),"
+                            + " convert_to('" + (char) ('a' + id - 1) + "', 'UTF8'))");
+                }
+            }
+        }
+        return tables;
+    }
+
+    /** The payloads of key K's rows in the outbox, in id order. */
+    private List<String> keyedPayloads() throws SQLException {
+        var payloads = new ArrayList<String>();
+        try (var c = TestDb.connect(); var st = c.createStatement(); var rs = st.executeQuery("select"
+                + " convert_from(payload, 'UTF8') from " + names.base() + " where key = convert_to('K', 'UTF8')"
+                + " order by id")) {
+            while (rs.next()) {
+                payloads.add(rs.getString(1));
+            }
+        }
+        return payloads;
+    }
+
     /**
      * A key held by an open send: its rows stay, in every chunk, without a wait, so they go back behind that send; the
      * other keys' rows go on, then the held key is waited for once, at most swapLockTimeout, and the call fails with

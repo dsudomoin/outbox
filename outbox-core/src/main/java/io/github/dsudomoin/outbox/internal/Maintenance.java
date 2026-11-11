@@ -710,9 +710,12 @@ public final class Maintenance {
             var kept = step("orphan drop", () -> {
                 long horizon = slowest.snapshot().xmin();
                 int left = 0;
+                boolean failed = false;
                 for (var orphan : partitions.dropOrphans(c, horizon, detachLockTimeout)) {
                     if (orphan.ours() && restoreOrphans) {
-                        if (!restored(c, orphan.table(), horizon)) {
+                        // in xid order: after a failure, a later one may hold the left rows' keys' later rows
+                        if (failed || !restored(c, orphan.table(), horizon)) {
+                            failed = true;
                             left++;
                         }
                     } else if (orphan.ours()) {
@@ -770,7 +773,8 @@ public final class Maintenance {
 
     /**
      * Moves the rows of an orphan of ours back from {@code horizon} ({@link OrphanRestore}); false when that failed,
-     * which is logged and fails the step, but not the other orphans': the table is kept, and the next run resumes.
+     * which is logged and fails the step, but not the other orphans': the table is kept, and the next run resumes. The
+     * later orphans of ours wait for that run too, as they may hold later rows of the keys left behind.
      */
     private boolean restored(Connection c, String table, long horizon) {
         try {

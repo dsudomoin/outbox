@@ -1132,8 +1132,10 @@ public final class XidPartitions {
     /**
      * The standalone ranges {@link #dropOrphans} looks at, read only: {@code <base>_x<lower>} in no partition tree but
      * those at or above the tail's lower bound, which the extension makes for its next swap, and set-aside
-     * {@code <base>_o<digits>}; {@code ours} when recorded in {@code <base>_dropping}. A name whose digits fit no long
-     * is no table of the library's: left out (so never dropped or restored), with a WARN at most once a minute.
+     * {@code <base>_o<digits>}; {@code ours} when recorded in {@code <base>_dropping}. Sorted by their digits as a
+     * number, not by name ({@code _x900} before {@code _x1000}), so orphans of ours are restored in xid order. A name
+     * whose digits fit no long is no table of the library's: left out (so never dropped or restored), with a WARN at
+     * most once a minute.
      */
     List<Orphan> orphans(Connection c) throws SQLException {
         var marked = new HashSet<String>();
@@ -1169,6 +1171,7 @@ public final class XidPartitions {
                     + " library's: left alone, neither dropped nor restorable. This WARN repeats at most once a minute",
                     strangers, names.base());
         }
+        orphans.sort(Comparator.comparingLong(o -> xidOf(names.unqualified(o.table()).substring(prefix))));
         return orphans;
     }
 
