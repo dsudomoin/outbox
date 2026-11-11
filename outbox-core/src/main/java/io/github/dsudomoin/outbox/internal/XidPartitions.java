@@ -73,6 +73,8 @@ public final class XidPartitions {
      * is only there to tell a dead socket from a long statement.
      */
     static final long ATTACH_SCAN_RATE = 20L * 1024 * 1024;
+    /** How many times its {@link #ATTACH_SCAN_RATE} time an attach back gets at most after cuts of the ones before. */
+    static final int ATTACH_SLOWDOWN_CAP = 16;
     /** Ranges a swap attaches at most besides the former and the new tail: each attach adds to its hold. */
     static final int RANGES_PER_SWAP = 4;
     /** Where a swap statement leaves what it did, for the next statement of the session to read. */
@@ -261,6 +263,8 @@ public final class XidPartitions {
     /** Why the server cut this instance's last attach back of the tail (57014), else null. */
     @Nullable
     private volatile String attachBackCut;
+    /** Times its {@link #ATTACH_SCAN_RATE} time the next attach back gets: doubled by each cut, 1 after a success. */
+    private volatile int attachSlowdown = 1;
 
     public XidPartitions(TableNames names, OutboxConfig.PartitionsConfig cfg) {
         this(names, cfg, LONG_TRANSACTION, false);
@@ -1307,20 +1311,31 @@ public final class XidPartitions {
         if (bootstrap && rows && bytes > maxTailScan) { // its scan would hold the schema lock and others' startup
             return false;
         }
-        // the attach scans the whole tail to check its bounds: time for that at ATTACH_SCAN_RATE, blocking no writer
-        var bound = lockTimeout.plus(attachMargin).plusMillis(bytes * 1000 / attachScanRate);
+        // the attach scans the whole tail to check its bounds: time for that at ATTACH_SCAN_RATE, blocking no writer,
+        // times the slowdown earlier cuts showed, so a disk slower than the rate still gets it back
+        int slowdown = attachSlowdown;
+        var bound = lockTimeout.plus(attachMargin).plusMillis(bytes * 1000 / attachScanRate * slowdown);
         try {
             boolean dropped = PartitionDdl.dropIfEmptyElseAttach(
                     c, names.base(), tail, Long.toString(lower), null, lockTimeout, bound);
             attachBackCut = null;
+            attachSlowdown = 1;
             if (dropped) {
                 return true;
             }
         } catch (SQLException e) {
-            attachBackCut = !QUERY_CANCELED.equals(e.getSQLState()) ? null
+            boolean cut = QUERY_CANCELED.equals(e.getSQLState());
+            if (cut) {
+                attachSlowdown = Math.min(ATTACH_SLOWDOWN_CAP, slowdown * 2);
+            }
+            attachBackCut = !cut ? null
                     : "attaching it back scans all its " + mb(bytes) + " MB to check its bounds, and the server cut"
                             + " that at the " + bound.toMillis() / 1000.0 + " s it was given ("
-                            + firstLine(e.getMessage()) + "). Run it by hand in a session without a statement_timeout;"
+                            + firstLine(e.getMessage()) + "). " + (slowdown < ATTACH_SLOWDOWN_CAP
+                                    ? "The next run gives its scan twice that time, up to " + ATTACH_SLOWDOWN_CAP
+                                            + " times the first; or run it"
+                                    : "Its scan already gets " + ATTACH_SLOWDOWN_CAP + " times the first time; run it")
+                            + " by hand in a session without a statement_timeout;"
                             + " it blocks no writer: alter table " + names.base() + " attach partition " + tail + " "
                             + PartitionDdl.bounds(Long.toString(lower), null);
             throw e;

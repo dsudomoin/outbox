@@ -1207,6 +1207,46 @@ class MaintenanceIT {
         }
     }
 
+    /**
+     * Each cut of the attach back doubles the scan time the next attempt gets, so a disk slower than the assumed rate
+     * still gets the tail back without a human; a success starts again from the assumed rate.
+     */
+    @Test
+    void anAttachBackCutDoublesTheNextScanTimeUntilOneSucceeds() throws Exception {
+        bootstrap();
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null), Duration.ofMillis(1));
+        maintenance.partitions.attachMargin = Duration.ZERO; // the bound is the 1 ms lock wait and the scan time
+        try (var c = TestDb.connect()) {
+            long lower = ranges().stream().filter(b -> b.to() == null).mapToLong(b -> Long.parseLong(b.from()))
+                    .findFirst().orElseThrow();
+            XidPartitionsIT.fillTail(c, names, lower, 300_000);
+            execute(c, "alter table " + names.base() + " detach partition " + names.tail());
+            long bytes = queryLong(c, "select pg_relation_size('" + names.tail() + "')");
+            long oneMs = bytes * 1000; // a scan rate that gives this tail 1 ms
+            maintenance.partitions.attachScanRate = oneMs;
+
+            assertThat(cutLog(maintenance)).contains("at the 0.002 s it was given");
+            assertThat(cutLog(maintenance)).contains("at the 0.003 s it was given");
+            assertThat(cutLog(maintenance)).contains("at the 0.005 s it was given");
+
+            maintenance.partitions.attachScanRate = bytes / 60; // a minute, times the slowdown: time enough
+            assertThat(maintenance.runOnce()).isTrue();
+            assertThat(PartitionDdl.attachment(c, names.base(), names.tail())).isEqualTo(Attachment.ATTACHED);
+
+            execute(c, "alter table " + names.base() + " detach partition " + names.tail());
+            maintenance.partitions.attachScanRate = oneMs;
+            assertThat(cutLog(maintenance)).as("a success resets the scan time")
+                    .contains("at the 0.002 s it was given");
+        }
+    }
+
+    private static String cutLog(Maintenance maintenance) throws Exception {
+        try (var err = new CapturedStderr()) {
+            assertThat(maintenance.runOnce()).isTrue();
+            return err.text();
+        }
+    }
+
     @Test
     void rangeOrphanedBetweenDetachAndDropIsDroppedOnceRelayed() throws Exception {
         bootstrap();
