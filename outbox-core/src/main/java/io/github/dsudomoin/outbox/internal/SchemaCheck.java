@@ -231,7 +231,7 @@ final class SchemaCheck {
                 if (rs.getBoolean(3)) {
                     problems.add("index " + index.name() + " is unique, and this version needs it not to be");
                 }
-                if (!rs.getBoolean(4) && !index.rebuilt()) {
+                if (!rs.getBoolean(4)) {
                     problems.add("index " + index.name() + " is INVALID, as an interrupted build leaves it: drop it"
                             + " and build it again");
                 }

@@ -27,11 +27,8 @@ public record SchemaObjects(List<Table> tables) {
     public record Column(String name, String type, boolean notNull, @Nullable String defaultValue, boolean identity,
             int since) {}
 
-    /**
-     * {@code definition}: after {@code on <table>}; {@code rebuilt}: the library rebuilds it when INVALID
-     * ({@link DeadIndexBuilder}), so the startup check lets that pass.
-     */
-    public record Index(String name, String definition, int since, boolean rebuilt) {}
+    /** {@code definition}: after {@code on <table>}. */
+    public record Index(String name, String definition, int since) {}
 
     /** {@code name}: unqualified. */
     public record Check(String name, String definition, int since) {}
@@ -113,7 +110,7 @@ public record SchemaObjects(List<Table> tables) {
                         List.of("primary key (id)"),
                         List.of(new Check(n.unqualified(n.dead()) + "_status",
                                 "check (status in ('pending', 'kept', 'scheduled'))", 1)),
-                        List.of(new Index(n.dead() + "_due", "(due_at) where due_at is not null", 1, true))),
+                        List.of(new Index(n.dead() + "_due", "(due_at) where due_at is not null", 1))),
                 plain(n.redriven(), List.of(
                         column("message_id", "uuid", true),
                         column("redrives", "integer", true),
@@ -172,7 +169,7 @@ public record SchemaObjects(List<Table> tables) {
     }
 
     private static Index index(String name, String definition) {
-        return new Index(name, definition, 1, false);
+        return new Index(name, definition, 1);
     }
 
     @SafeVarargs

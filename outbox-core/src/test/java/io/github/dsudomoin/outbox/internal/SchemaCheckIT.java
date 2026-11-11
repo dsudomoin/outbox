@@ -192,21 +192,17 @@ class SchemaCheckIT {
     }
 
     @Test
-    void anInvalidIndexFailsButTheDeadDueOneThatMaintenanceRebuilds() throws Exception {
-        assertSchemaProblem((c, n) -> TestSql.execute(c, "update pg_index set indisvalid = false where indexrelid in"
-                + " (to_regclass('" + n.retry() + "_key'), to_regclass('" + n.dead() + "_due'))"),
-                n -> "index " + n.retry() + "_key is INVALID");
-        var schema = "s" + TestSql.uniqueTable();
-        var config = new TestOutboxConfig().table(schema + ".outbox");
-        var n = TableNames.of(config.table());
-        try (var c = TestDataSources.newDataSource().getConnection()) {
-            TestSql.execute(c, "create schema " + schema);
-            TestSql.execute(c, OutboxSql.outbox(config, null));
-            TestSql.execute(c, "update pg_index set indisvalid = false where indexrelid = to_regclass('" + n.dead()
-                    + "_due')");
+    void anInvalidIndexFails() throws Exception {
+        assertSchemaProblem((c, n) -> TestSql.execute(c, "update pg_index set indisvalid = false where indexrelid ="
+                + " to_regclass('" + n.retry() + "_key')"), n -> "index " + n.retry() + "_key is INVALID");
+    }
 
-            SchemaCheck.run(c, c, SchemaObjects.outbox(n), config.table(), "OutboxSql.outbox");
-        }
+    /** Maintenance builds {@code <dead>_due} only with bootstrap, so the check, which runs without it, owns it too. */
+    @Test
+    void anInvalidDeadDueIndexFails() throws Exception {
+        assertSchemaProblem((c, n) -> TestSql.execute(c, "update pg_index set indisvalid = false where indexrelid ="
+                + " to_regclass('" + n.dead() + "_due')"), n -> "index " + n.dead() + "_due is INVALID, as an"
+                + " interrupted build leaves it: drop it and build it again");
     }
 
     @Test
