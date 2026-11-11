@@ -1320,6 +1320,40 @@ class OutboxRelayIT {
         assertThat(retryRows("k1") + retryRows("k2")).isZero();
     }
 
+    @Test
+    void byTopicRouteReturningAnInvalidListForTheWholeCallHasItsRecordsCalledAlone() throws Exception {
+        config.shards(1).retry(Duration.ofMillis(100), Duration.ofMillis(100), 0);
+        bootstrap();
+        var audit = new RecordingHandler();
+        OutboxHandler shortOfOutcomes = new OutboxHandler() { // one outcome whatever the call's size
+            @Override
+            public void handle(OutboxRecord record) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                return records.size() == 1 ? audit.handleBatch(records) : List.of(Outcome.delivered());
+            }
+        };
+        var fallback = new RecordingHandler();
+        var relay = start(OutboxHandler.byTopic(Map.of("audit", shortOfOutcomes), fallback));
+
+        try (var err = new CapturedStderr()) {
+            var ids = send(outbox(relay::wake), msg("audit", "k1", "a"), msg("audit", "k2", "b"), msg("t", "k3", "c"));
+            // beside k3 the route's two records get Retry and go to the retry table together; the retry pass then
+            // calls them as its whole call, a failed call as with a plain handler: each key is called alone, not
+            // both together for ever
+            await(Duration.ofSeconds(10), () -> audit.delivered().size() == 2);
+
+            assertThat(audit.delivered()).extracting(OutboxRecord::messageId)
+                    .containsExactlyInAnyOrder(ids.get(0), ids.get(1));
+            assertThat(fallback.delivered()).extracting(OutboxRecord::messageId).containsExactly(ids.get(2));
+            assertThat(retryRows("k1") + retryRows("k2")).isZero();
+            assertThat(err.text()).contains("invalid outcome list for 2 records");
+        }
+    }
+
     /** A route whose handleBatch throws OutboxPermanentException for a call with a {@code poison} payload. */
     private static OutboxHandler throwingOnPoison(RecordingHandler delivering) {
         return new OutboxHandler() {

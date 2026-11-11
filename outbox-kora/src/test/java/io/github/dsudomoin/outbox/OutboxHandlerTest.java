@@ -341,6 +341,28 @@ class OutboxHandlerTest {
     }
 
     @Test
+    void byTopicRouteGivenTheWholeCallThrowsForAnInvalidList() {
+        OutboxHandler broken = new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {}
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                return List.of(Outcome.delivered());
+            }
+        };
+        var handler = OutboxHandler.byTopic(Map.of("a", broken), new RecordingHandler());
+
+        try (var err = new CapturedStderr()) {
+            assertThatThrownBy(() -> handler.handleBatch(List.of(record("a", "k1"), record("a", "k2"))))
+                    .as("the relay's own failed call: it calls each record alone")
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("invalid outcome list for 2 records");
+            assertThat(err.text()).contains("ERROR " + OutboxHandler.class.getName());
+        }
+    }
+
+    @Test
     void byTopicPassesRequeueThrough() {
         OutboxHandler requeueing = new OutboxHandler() {
             @Override

@@ -29,10 +29,10 @@ final class RouteCalls {
      * {@code route}'s outcomes for {@code records}, one per record. A route that throws {@link OutboxWaitException}
      * gives {@code Waiting} (its kind and message) for all of them; one that throws another exception, or returns an
      * invalid list (null, wrong size, a null element; logged at ERROR, at most once per 10 s), gives {@code Retry} for
-     * all of them. An {@link Error} propagates, and so does any exception but a wait when {@code records} is the
-     * {@code whole} call: the relay then treats it as the failed call it is (a lone record's
-     * {@link OutboxPermanentException} goes to dead letters, a call of several is halved until the failing one is
-     * alone), which per-record {@code Retry} would hide.
+     * all of them. An {@link Error} propagates, and when {@code records} is the {@code whole} call so does any
+     * exception but a wait, and an invalid list is thrown as an {@link IllegalStateException}: the relay then treats
+     * it as the failed call it is (a lone record's {@link OutboxPermanentException} goes to dead letters, a call of
+     * several is halved until the failing one is alone), which per-record {@code Retry} would hide.
      */
     List<Outcome> handleBatch(OutboxHandler route, List<OutboxRecord> records, boolean whole) {
         List<Outcome> outcomes;
@@ -52,6 +52,9 @@ final class RouteCalls {
             var error = new IllegalStateException(route + " returned an invalid outcome list for " + records.size()
                     + " records: " + outcomes);
             report(error);
+            if (whole) {
+                throw error;
+            }
             outcomes = records.stream().map(r -> Outcome.retry(error)).toList();
         }
         return outcomes;

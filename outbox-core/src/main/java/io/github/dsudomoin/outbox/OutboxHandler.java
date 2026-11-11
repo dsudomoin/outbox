@@ -128,7 +128,8 @@ public interface OutboxHandler {
      * element; logged at ERROR, at most once per 10 s), gets {@code Retry} for all its records; one that throws
      * {@link OutboxWaitException} gets {@code Waiting} (its kind and message) for all of them; an {@link Error}
      * propagates and fails the whole call. A route given every record of the call is the call: any exception it
-     * throws but a wait propagates, and the relay isolates the failing record as for any handler (a call of that
+     * throws but a wait propagates, an invalid list it returns is thrown as an {@link IllegalStateException}, and the
+     * relay isolates the failing record as for any handler (a call of that
      * record alone that throws {@link OutboxPermanentException} moves it to the dead table). Routes run one after
      * another on one thread: once the soft deadline asks the call to wind down, the routes that follow return
      * {@code NotAttempted} (default {@code handleBatch}). A route
