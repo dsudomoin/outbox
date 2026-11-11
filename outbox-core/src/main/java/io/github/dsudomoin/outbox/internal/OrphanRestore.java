@@ -72,10 +72,11 @@ public final class OrphanRestore {
      * drops {@code table} and deletes its {@code <base>_dropping} marker, unless rows stayed. Then, so that a key held
      * almost all the time still gets through, the first {@link #HELD_KEYS_WAITED} keys that stayed are waited for,
      * one transaction each: its key lock waited for at most {@code keyLockTimeout} (only that key's writers wait
-     * meanwhile, at most one such wait), then up to {@link #CHUNK} of its rows moved, and the table dropped with the
-     * last of them. Rows still left fail the call with SQLState 55P03, and the next run or call moves them. A lock
-     * timeout (55P03) on the table or on another lock rolls back the chunk it hits, rows and locks. Returns the rows
-     * moved.
+     * meanwhile, at most one such wait), then up to {@link #CHUNK} of its rows moved by the ids the chunks kept,
+     * through {@code <table>_id}, so the key is held for its rows alone, not for a scan of the table; the table
+     * dropped with the last of them. Rows still left fail the call with SQLState 55P03, and the next run or call
+     * moves them. A lock timeout (55P03) on the table or on another lock rolls back the chunk it hits, rows and locks.
+     * Returns the rows moved.
      *
      * @throws IllegalArgumentException before any SQL that names it, unless {@code table} is {@code <base>_x<digits>}
      *     or {@code <base>_o<digits>}, unqualified or qualified as the outbox is named, and a table in the outbox's
@@ -131,7 +132,8 @@ public final class OrphanRestore {
         long after = Long.MIN_VALUE;
         boolean last = false;
         var busy = new HashSet<Integer>(); // key hashes another transaction held: theirs stay, in every later chunk
-        var held = new LinkedHashMap<Integer, Resender.Source>(); // a row of each busy hash, in the order first met
+        // the first HELD_KEYS_WAITED busy hashes, in the order first met: the ids of up to CHUNK of their rows, by id
+        var held = new LinkedHashMap<Integer, ArrayList<Long>>();
         long left = 0;
         var c = autocommit;
         while (!last) {
@@ -172,8 +174,15 @@ public final class OrphanRestore {
                 busy.addAll(resender.tryKeyLocks(c,
                         hashes.stream().filter(h -> h != null && !busy.contains(h)).toList()));
                 for (int i = 0; i < rows.size(); i++) {
-                    if (hashes.get(i) != null && busy.contains(hashes.get(i))) {
-                        held.putIfAbsent(hashes.get(i), rows.get(i));
+                    var hash = hashes.get(i);
+                    if (hash != null && busy.contains(hash)) {
+                        var kept = held.get(hash);
+                        if (kept == null && held.size() < HELD_KEYS_WAITED) {
+                            held.put(hash, kept = new ArrayList<>());
+                        }
+                        if (kept != null && kept.size() < CHUNK) {
+                            kept.add(ids.get(i));
+                        }
                     }
                 }
                 for (int i = rows.size() - 1; i >= 0; i--) {
@@ -213,16 +222,15 @@ public final class OrphanRestore {
                 afterChunk.accept(c);
             }
         }
-        int waited = 0;
         boolean dropped = left == 0;
-        for (var row : held.values()) {
-            if (dropped || waited++ == HELD_KEYS_WAITED) {
+        for (var e : held.entrySet()) {
+            if (dropped) {
                 break;
             }
-            var m = moveHeld(c, table, fromXid, lockTimeout, row);
-            moved += m.rows();
-            left -= m.rows();
-            dropped = m.dropped();
+            long m = moveHeld(c, table, lockTimeout, e.getKey(), e.getValue(), left);
+            moved += m;
+            left -= m;
+            dropped = left == 0;
         }
         if (!dropped) {
             throw new SQLException("moved " + moved + " rows of " + table + " back into the outbox; "
@@ -233,15 +241,13 @@ public final class OrphanRestore {
         return moved;
     }
 
-    /** What {@link #moveHeld} did: the rows it moved, and whether it dropped the table, none being left. */
-    private record Moved(long rows, boolean dropped) {}
-
     /**
-     * Up to {@link #CHUNK} rows of {@code row}'s key from {@code fromXid}, in id order, in one transaction as a
-     * chunk's, once its key lock is had within {@code keyLockTimeout}; none when it is not. Drops the table when no row at or
-     * above {@code fromXid} is left.
+     * The rows {@code ids} of the key hash {@code hash}, which the chunks left, in id order, in one transaction as a
+     * chunk's, once its key lock is had within {@code keyLockTimeout}; none when it is not. Read by id through
+     * {@code <table>_id}, so the key is held for its rows alone, not for a scan of the table. Drops the table when they
+     * are the {@code left} rows the chunks left. Returns the rows moved.
      */
-    private Moved moveHeld(Connection c, String table, long fromXid, Duration lockTimeout, Resender.Source row)
+    private long moveHeld(Connection c, String table, Duration lockTimeout, int hash, ArrayList<Long> ids, long left)
             throws SQLException {
         c.setAutoCommit(false);
         try (var st = c.createStatement()) {
@@ -253,7 +259,7 @@ public final class OrphanRestore {
             st.execute("set local lock_timeout = " + keyLockTimeout.toMillis());
             try (var ps = c.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {
                 ps.setInt(1, names.keyNamespace());
-                ps.setInt(2, Hashing.keyHash(row.topic(), row.key()));
+                ps.setInt(2, hash);
                 ps.execute();
             } catch (SQLException e) {
                 if (!"55P03".equals(e.getSQLState())) {
@@ -261,18 +267,14 @@ public final class OrphanRestore {
                 }
                 c.rollback();
                 c.setAutoCommit(true);
-                return new Moved(0, false);
+                return 0;
             }
-            var ids = new ArrayList<Long>();
             var rows = new ArrayList<Resender.Source>();
             try (var ps = c.prepareStatement("select id, topic, key from " + table
-                    + " where xid >= ?::text::xid8 and topic = ? and key = ? order by id limit " + CHUNK)) {
-                ps.setString(1, Long.toString(fromXid));
-                ps.setString(2, row.topic());
-                ps.setBytes(3, row.key());
+                    + " where id = any(?) order by id")) {
+                ps.setArray(1, c.createArrayOf("int8", ids.toArray()));
                 try (var rs = ps.executeQuery()) {
                     while (rs.next()) {
-                        ids.add(rs.getLong(1));
                         rows.add(new Resender.Source(rs.getLong(1), rs.getString(2), rs.getBytes(3)));
                     }
                 }
@@ -282,15 +284,9 @@ public final class OrphanRestore {
                 ps.setArray(1, c.createArrayOf("int8", ids.toArray()));
                 ps.executeUpdate();
             }
-            boolean empty;
-            try (var ps = c.prepareStatement("select not exists (select 1 from " + table
-                    + " where xid >= ?::text::xid8)")) {
-                ps.setString(1, Long.toString(fromXid));
-                try (var rs = ps.executeQuery()) {
-                    rs.next();
-                    empty = rs.getBoolean(1);
-                }
-            }
+            // nothing writes into a standalone range: the chunks counted every row they left, as the last chunk's drop
+            // relies on, so no scan of the table under the key lock
+            boolean empty = rows.size() == left;
             if (empty) {
                 st.execute("drop table " + table);
                 try (var ps = c.prepareStatement(unmarkDropping)) {
@@ -300,7 +296,7 @@ public final class OrphanRestore {
             }
             c.commit();
             c.setAutoCommit(true);
-            return new Moved(rows.size(), empty);
+            return rows.size();
         } catch (Throwable e) { // an Error too: setAutoCommit(true) would commit the work so far
             try {
                 c.rollback();

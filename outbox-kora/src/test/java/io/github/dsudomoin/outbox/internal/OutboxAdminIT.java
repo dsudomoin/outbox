@@ -31,6 +31,7 @@ import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import jakarta.annotation.Nullable;
+import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
@@ -574,6 +575,57 @@ class OutboxAdminIT {
 
         assertThat(count(orphan)).isEqualTo(LARGE_ROWS);
         assertThat(outboxMessageIds()).isEmpty();
+    }
+
+    /**
+     * Moving a held key's rows once its lock is had holds that lock, so its writers wait: it reads them by the ids the
+     * chunks kept through the id index, not by a scan of the whole orphan, which grows with the orphan.
+     */
+    @Test
+    void restoreOrphanMovesAHeldKeyByItsIdsWithoutScanningTheOrphan() throws Exception {
+        var orphan = foreignOrphan();
+        // 6 chunks, the last of 500 rows; k1 and k2 have 6 rows each
+        execute("insert into " + orphan + " (id, shard, xid, message_id, topic, key) overriding system value"
+                + " select g, 0, '10', gen_random_uuid(), 't', convert_to('k' || (g % 1000), 'UTF8')"
+                + " from generate_series(1, 5500) g");
+        execute("analyze " + orphan); // the statistics a range keeps from its time in the outbox
+        execute("alter table " + orphan + " set (autovacuum_enabled = off)"); // no other reader of it meanwhile
+        String scans = "select (select seq_scan from pg_stat_user_tables where relid = '" + orphan + "'::regclass)"
+                + " || '/' || (select coalesce(sum(idx_scan), 0) from pg_stat_user_indexes where relid = '" + orphan
+                + "'::regclass and indexrelname <> '" + names.unqualified(orphan) + "_id')";
+        String k1 = "select string_agg(message_id::text, ',' order by id) from %s where key = convert_to('k1', 'UTF8')";
+        String k1Rows;
+        try (var c = TestDb.connect()) {
+            k1Rows = queryString(c, k1.formatted(orphan));
+        }
+        try (var a = TestDb.connect(); var b = TestDb.connect(); var c = TestDb.connect()) {
+            for (var holder : List.of(Map.entry(a, "k1"), Map.entry(b, "k2"))) { // b holds k2 through the call
+                holder.getKey().setAutoCommit(false);
+                TestSql.execute(holder.getKey(), "select pg_advisory_xact_lock(" + names.keyNamespace() + ", "
+                        + Hashing.keyHash("t", bytes(holder.getValue())) + ")");
+            }
+            var before = new AtomicReference<String>();
+            var chunks = new AtomicInteger();
+            admin.orphanRestore.afterChunk = s -> {
+                if (chunks.incrementAndGet() == 6) {
+                    flushStats(s);
+                    before.set(queryString(s, scans));
+                    a.commit(); // k1 free for its wait
+                }
+            };
+
+            assertThatThrownBy(() -> admin.orphanRestore.restore(c, orphan, 0, Duration.ofSeconds(5)))
+                    .isInstanceOfSatisfying(SQLException.class, e -> assertThat(e.getSQLState()).isEqualTo("55P03"))
+                    .hasMessageContaining("6 rows of keys another transaction held");
+
+            flushStats(c);
+            assertThat(queryString(c, scans)).as("seq scans / other index scans of the orphan").isEqualTo(
+                    before.get());
+            assertThat(queryLong(c, "select count(*) from " + orphan + " where key = convert_to('k2', 'UTF8')"))
+                    .as("only the held one's rows stay").isEqualTo(count(orphan)).isEqualTo(6);
+            assertThat(queryString(c, k1.formatted(names.base()))).as("k1's, in id order").isEqualTo(k1Rows);
+            b.commit();
+        }
     }
 
     /** Postgres reads a negative xid8 as one above every real xid: such a cut would move nothing and drop every row. */
@@ -1421,6 +1473,12 @@ class OutboxAdminIT {
         try (var c = TestDb.connect()) {
             return queryString(c, "select to_regclass(?)::text", table) != null;
         }
+    }
+
+    /** Makes this session's table and index statistics so far visible to every session (Postgres 15+). */
+    private static void flushStats(Connection c) throws SQLException {
+        TestSql.execute(c, "do $$ begin if to_regproc('pg_stat_force_next_flush') is not null then"
+                + " perform pg_stat_force_next_flush(); end if; end $$");
     }
 
     private void execute(String sql) throws SQLException {
