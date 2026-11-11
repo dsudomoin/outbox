@@ -94,6 +94,65 @@ class HeartbeatConnectionsIT {
         }
     }
 
+    /** A hot standby after a failover, or a role whose transactions default to read-only: 25006 on the upsert. */
+    @Test
+    void aReadOnlySourceLeavesTheBeatsAndTheDeleteToTheApplication() throws Exception {
+        beatsAndDeleteGoToTheApplication("set default_transaction_read_only = on", "25006");
+    }
+
+    /** A role without the rights on {@code <base>_instance}: 42501. */
+    @Test
+    void aSourceWithoutTheRightsLeavesTheBeatsAndTheDeleteToTheApplication() throws Exception {
+        var role = "r" + TestSql.uniqueTable();
+        try (var c = MAIN.getConnection()) {
+            TestSql.execute(c, "create role " + role + " nologin");
+        }
+        try {
+            beatsAndDeleteGoToTheApplication("set role " + role, "42501");
+        } finally {
+            try (var c = MAIN.getConnection()) {
+                TestSql.execute(c, "drop role " + role);
+            }
+        }
+    }
+
+    /**
+     * A heartbeat source whose sessions run {@code setup} connects and passes the start check, then cannot write: the
+     * beats keep the row live on the application's connections, the lane goes off with one ERROR naming
+     * {@code sqlState}, and the close deletes the row.
+     */
+    private static void beatsAndDeleteGoToTheApplication(String setup, String sqlState) throws Exception {
+        var config = new TestOutboxConfig().relayEnabled(false).maintenanceInterval(Duration.ofMillis(100));
+        ConnectionSource cannotWrite = () -> {
+            var c = MAIN.getConnection();
+            TestSql.execute(c, setup);
+            return c;
+        };
+        try (var log = new CapturedStderr()) {
+            var runtime = OutboxRuntime.builder(config, new JdbcTransactions(MAIN), record -> {})
+                    .heartbeatConnections(cannotWrite).build();
+            runtime.start();
+            var row = runtime.schema().names().instance() + " where instance_id = '" + runtime.schema().instanceId()
+                    + "'";
+            try (var holder = MAIN.getConnection()) {
+                try {
+                    var lastSeen = "select (extract(epoch from last_seen) * 1000000)::bigint from " + row;
+                    long seen = TestSql.queryLong(holder, lastSeen);
+                    long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+                    while (TestSql.queryLong(holder, lastSeen) <= seen) {
+                        assertThat(System.nanoTime()).as("a beat refreshes the row").isLessThan(deadline);
+                        Thread.sleep(20);
+                    }
+                } finally {
+                    runtime.close();
+                }
+                assertThat(TestSql.queryLong(holder, "select count(*) from " + row)).as("deleted at close").isZero();
+            }
+            assertThat(log.text()).containsOnlyOnce("heartbeat connection source of").contains(sqlState)
+                    .doesNotContain("could not delete its row");
+        }
+    }
+
     @Test
     void matchingSourceAtStartServesTheBeats() throws Exception {
         var app = new Recorded("app", MAIN, n -> false);

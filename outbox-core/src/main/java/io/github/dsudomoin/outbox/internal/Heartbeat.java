@@ -146,17 +146,28 @@ public final class Heartbeat {
      * on, is a WARN, as the row expires anyway.
      */
     static void delete(ConnectionSource db, TableNames names, String id, Duration budget) {
-        boolean ended = Bounded.run("outbox-heartbeat-delete", budget.plus(CANCEL_GRACE), () -> {
-            try (var c = db.newConnection()) {
-                delete(c, names, id, budget);
-            } catch (Exception e) {
-                log.warn("outbox instance {} could not delete its row from {}; it expires by itself: {}", id,
-                        names.instance(), e.toString());
-            }
-        });
+        long deadline = System.nanoTime() + budget.toNanos();
+        boolean ended = Bounded.run("outbox-heartbeat-delete", budget.plus(CANCEL_GRACE),
+                () -> delete(db, names, id, deadline));
         if (!ended) {
             log.warn("outbox instance {} stopped waiting for the delete of its row from {}, budget {}: no connection, no"
                     + " answer or an interrupt; the row expires by itself", id, names.instance(), budget);
+        }
+    }
+
+    /** {@link #delete(ConnectionSource, TableNames, String, Duration)}'s work, until {@code deadline} (nano time). */
+    private static void delete(ConnectionSource db, TableNames names, String id, long deadline) {
+        Connection used = null;
+        try (var c = db.newConnection()) {
+            used = c;
+            delete(c, names, id, Duration.ofNanos(Math.max(0, deadline - System.nanoTime())));
+        } catch (Exception e) {
+            if (db instanceof HeartbeatConnections own && own.cannotWrite(used, e)) {
+                delete(db, names, id, deadline); // once more, on the application's connections: the lane is off now
+                return;
+            }
+            log.warn("outbox instance {} could not delete its row from {}; it expires by itself: {}", id,
+                    names.instance(), e.toString());
         }
     }
 
@@ -219,7 +230,9 @@ public final class Heartbeat {
 
     void beat() { // package-private for a test
         boolean refreshed = false;
+        Connection used = null;
         try (var c = connections.newConnection(); var bound = socket.on(c)) {
+            used = c;
             try {
                 c.setAutoCommit(false);
                 lockTimeout(c);
@@ -259,6 +272,10 @@ public final class Heartbeat {
                 log.warn("outbox heartbeat of instance {} into {} waited {} ms for a lock (a recovery holds {} for its"
                         + " run?); the shard count stands as last read, retrying in {}", id, names.instance(),
                         Maintenance.SHARDS_LOCK_TIMEOUT.toMillis(), names.cursor(), interval);
+                return;
+            }
+            if (connections instanceof HeartbeatConnections own && own.cannotWrite(used, t)) {
+                beat(); // once more, on the application's connections: the lane is off now
                 return;
             }
             log.warn("outbox heartbeat of instance {} into {} failed; retrying in {}", id, names.instance(), interval,

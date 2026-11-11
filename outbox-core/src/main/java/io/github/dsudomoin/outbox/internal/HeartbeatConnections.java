@@ -5,6 +5,7 @@ import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
@@ -21,19 +22,24 @@ import org.slf4j.LoggerFactory;
  * measured together, back to back, never against a value recorded earlier: {@code where} includes the server's start
  * time, which changes on every restart and failover. A mismatch is measured once more before it counts, as another
  * instance's first bootstrap may create the table between the two measures, while another database stays another.
+ * A source that connects but cannot write (a hot standby after a failover, a read-only role, missing rights) passes
+ * that check: the first beat or delete that fails on it for that reason ({@link #cannotWrite}) turns the lane off with
+ * an ERROR until restart, and runs once more on the application's connections.
  */
 final class HeartbeatConnections implements ConnectionSource {
 
     private static final Logger log = LoggerFactory.getLogger(HeartbeatConnections.class);
     private static final long WARN_INTERVAL = TimeUnit.MINUTES.toNanos(1);
     private static final String SEARCH_PATH = " (and, for an unqualified name, give both roles the same search_path)";
+    /** read_only_sql_transaction (a hot standby, a read-only default) and insufficient_privilege. */
+    private static final Set<String> CANNOT_WRITE = Set.of("25006", "42501");
 
     private enum State {
         /** Not measured yet: the start could not reach the heartbeat source. */
         UNCHECKED,
         /** Reaches the application's database: the beats take its connections. */
         CHECKED,
-        /** Reaches another database: the beats take the application's connections until restart. */
+        /** Reaches another database, or cannot write: the beats take the application's connections until restart. */
         OFF
     }
 
@@ -44,6 +50,8 @@ final class HeartbeatConnections implements ConnectionSource {
     private final AtomicLong warned = new AtomicLong(System.nanoTime() - WARN_INTERVAL);
     private volatile State state = State.UNCHECKED;
     private volatile String table;
+    /** The last connection handed out from the heartbeat source, which {@link #cannotWrite} tells from the others. */
+    private volatile Connection lastOwn;
 
     HeartbeatConnections(ConnectionSource application, ConnectionSource heartbeat) {
         this(application, heartbeat, new SocketBound(Duration.ZERO));
@@ -109,7 +117,31 @@ final class HeartbeatConnections implements ConnectionSource {
             fallback(e);
             return application.newConnection();
         }
-        return at == State.CHECKED ? own : checked(own);
+        var c = at == State.CHECKED ? own : checked(own);
+        if (c == own) {
+            lastOwn = own;
+        }
+        return c;
+    }
+
+    /**
+     * Whether {@code failure} of work on {@code c}, a connection of the heartbeat source, says it cannot write: the
+     * lane is then off until restart, with an ERROR, and the caller runs that work once more, on the application's
+     * connections. False for any other failure, or for a connection of the application's.
+     */
+    boolean cannotWrite(@Nullable Connection c, Throwable failure) {
+        if (c == null || c != lastOwn || !(failure instanceof SQLException e)
+                || !CANNOT_WRITE.contains(e.getSQLState())) {
+            return false;
+        }
+        if (state != State.OFF) {
+            state = State.OFF;
+            log.error("outbox heartbeat connection source of {} cannot write (SQLSTATE {}: a hot standby, a read-only"
+                    + " role or one without the application's rights on the outbox tables?); the heartbeat uses the"
+                    + " application's connections until restart, point the heartbeat source at the primary with the"
+                    + " application's rights: {}", table, e.getSQLState(), e.toString());
+        }
+        return true;
     }
 
     /**
