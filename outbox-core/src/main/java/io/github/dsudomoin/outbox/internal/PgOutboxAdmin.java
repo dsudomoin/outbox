@@ -737,9 +737,10 @@ public final class PgOutboxAdmin implements OutboxAdmin {
      * ({@link #lockShard}), so after any relay step that held it. The retry table first and its newest rows first: a
      * call that stops between chunks leaves the key's retry rows with their head, and its parked rows, which block
      * nothing. Only rows up to {@code bound}, the highest id of such rows the first chunk finds: a relay step between
-     * chunks reads the key's new records as followers of its head, and they stay. The last chunk makes the lowest one
-     * the key's head, due now, or nothing would ever send them. A writer's transaction committing a record of the key
-     * with an id below the bound during the call still sees it go.
+     * chunks reads the key's new records as followers of its head, and they stay. The chunk that leaves the key no
+     * retry row up to the bound, and the last chunk, make the lowest one the key's head, due now on the cursor too, or
+     * nothing would ever send them. A writer's transaction committing a record of the key with an id below the bound
+     * during the call still sees it go.
      */
     private int abandonRowsChunk(Connection tx, int shard, String topic, String condition, Object value,
             AtomicReference<Long> bound, String error) throws SQLException {
@@ -778,16 +779,22 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                 moved += ps.executeUpdate();
             }
         }
-        if (moved < CHUNK && value instanceof byte[]) {
-            // coalesce: a record failing in such a step, with no retry row of the key before it, is a head already
-            try (var ps = tx.prepareStatement("update " + names.retry() + " set next_attempt_at ="
-                    + " coalesce(next_attempt_at, ?) where id = (select id from " + names.retry() + " where shard = ?"
-                    + " and topic = ?" + condition + " order by id limit 1)")) {
+        if (value instanceof byte[]) {
+            // in the chunk that took the key's last retry row up to the bound, short or full, or a call cut before the
+            // next one leaves the followers a relay step added without a head; "is null": a record failing in such a
+            // step, with no retry row of the key before it, is a head already
+            try (var ps = tx.prepareStatement("update " + names.retry() + " set next_attempt_at = ? where id ="
+                    + " (select id from " + names.retry() + " where shard = ? and topic = ?" + condition + " order by id"
+                    + " limit 1) and (? or id > ?) and next_attempt_at is null")) {
                 ps.setObject(1, RetryStore.timestamp(Instant.now()));
                 ps.setShort(2, (short) shard);
                 ps.setString(3, topic);
                 ps.setObject(4, value);
-                ps.executeUpdate();
+                ps.setBoolean(5, moved < CHUNK);
+                ps.setLong(6, bound.get());
+                if (ps.executeUpdate() > 0) {
+                    refreshDueTimes(tx, shard);
+                }
             }
         }
         return moved;

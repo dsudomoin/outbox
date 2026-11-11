@@ -898,6 +898,55 @@ class OutboxAdminIT {
         }
     }
 
+    /**
+     * The head goes in a full chunk, after a relay step added a follower above the bound, and the call is cut before
+     * its next chunk: the chunk that took the key's last row up to the bound made the follower its head, due now on
+     * the cursor too, and the relay delivers it.
+     */
+    @Test
+    void abandonKeyCutRightAfterItsHeadWentInAFullChunkLeavesTheFollowerItsHead() throws Exception {
+        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
+        var ticks = new Ticks(names, config.shards());
+        int shard = Hashing.shard(Hashing.keyHash("t", bytes("k")), config.shards());
+        var handed = new CopyOnWriteArrayList<String>();
+        var processor = new ShardProcessor(names, config, record -> handed.add(new String(record.payload(), UTF_8)),
+                TestTelemetry.kora(), false);
+        try {
+            // two full chunks; the lowest the head, due in an hour
+            execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, payload, created_at,"
+                    + " attempts, next_attempt_at) select -i, " + shard + ", gen_random_uuid(), 't', 'k', 'old', now(),"
+                    + " case when i = 2000 then 3 else 0 end, case when i = 2000 then now() + interval '1 hour' end"
+                    + " from generate_series(1, 2000) i");
+            execute("update " + names.cursor() + " set retry_due_at = now() + interval '1 hour' where shard = "
+                    + shard);
+            db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("t", "k", bytes("fresh"))));
+            var chunks = new AtomicInteger();
+            admin.afterChunk = c -> {
+                if (chunks.incrementAndGet() == 1) {
+                    try {
+                        step(processor, ticks, shard, Instant.now());
+                    } catch (Exception e) {
+                        throw new IllegalStateException(e);
+                    }
+                } else {
+                    throw new IllegalStateException("cut");
+                }
+            };
+
+            assertThatThrownBy(() -> admin.abandonKey("t", bytes("k"), "gone", false)).hasMessageContaining("cut");
+
+            assertThat(payloads(names.retry())).containsExactly("fresh");
+            assertThat(count(names.retry() + " where next_attempt_at is not null")).as("its head").isOne();
+            assertThat(queryText("select (retry_due_at <= now())::text from " + names.cursor() + " where shard = "
+                    + shard + " order by seq desc limit 1")).as("due now on the cursor").isEqualTo("true");
+            step(processor, ticks, shard, Instant.now().plusSeconds(1));
+            assertThat(handed).containsExactly("fresh");
+            assertThat(count(names.retry())).isZero();
+        } finally {
+            processor.close();
+        }
+    }
+
     /** The letters redrive as any: new messages of the key, and a record sent after the abandon needs no call of it. */
     @Test
     void anAbandonedKeyFlowsAgainAndItsLettersRedrive() throws Exception {
