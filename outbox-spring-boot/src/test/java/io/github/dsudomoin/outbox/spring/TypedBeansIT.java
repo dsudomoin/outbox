@@ -15,6 +15,7 @@ import io.github.dsudomoin.outbox.Outbox;
 import io.github.dsudomoin.outbox.OutboxContract;
 import io.github.dsudomoin.outbox.OutboxDeserializer;
 import io.github.dsudomoin.outbox.OutboxHeader;
+import io.github.dsudomoin.outbox.OutboxIncompatibleContractException;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxSerializer;
 import io.github.dsudomoin.outbox.OutboxTopicHandler;
@@ -372,6 +373,17 @@ class TypedBeansIT {
             assertThat(delivered.contractVersion()).isEqualTo(2);
             assertThat(delivered.headers()).contains(new OutboxHeader("outbox-contract", "2".getBytes(UTF_8)));
         });
+    }
+
+    /** The Outbox bean stands in for the lifecycle's outbox; a refusal still names the class the payload was. */
+    @Test
+    void contractRefusalNamesTheType() {
+        app().withUserConfiguration(OrdersApp.class, V2Sender.class).run(context ->
+            assertThatThrownBy(() -> new TransactionTemplate(context.getBean(PlatformTransactionManager.class))
+                .executeWithoutResult(status ->
+                    context.getBean(V2Sender.class).events.send("orders", "k", new OrderCreatedV2(1))))
+                .isInstanceOfSatisfying(OutboxIncompatibleContractException.class,
+                    e -> assertThat(e.type()).isEqualTo(OrderCreatedV2.class.getName())));
     }
 
     static class RawOrders {

@@ -76,8 +76,15 @@ public final class Contracts {
         return stamped;
     }
 
+    /** An outbox that names the type a message was written as to its writer guard. */
+    public interface TypedSend {
+
+        /** {@code send(message)} of a message written as {@code type}, the class name a refusal names. */
+        UUID send(OutboxMessage message, String type);
+    }
+
     /** {@code outbox.send(message)}, naming {@code type}, the class the payload was written as, to its writer guard. */
     public static UUID send(Outbox outbox, OutboxMessage message, String type) {
-        return outbox instanceof PgOutbox pg ? pg.send(message, type) : outbox.send(message);
+        return outbox instanceof TypedSend typed ? typed.send(message, type) : outbox.send(message);
     }
 }

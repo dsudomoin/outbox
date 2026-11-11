@@ -27,7 +27,7 @@ import org.slf4j.LoggerFactory;
  * claims is written with the {@code outbox-local} header, which marks its record for a route, after the telemetry's
  * headers and in place of any such header given; any other message is written without one.
  */
-public final class PgOutbox implements Outbox {
+public final class PgOutbox implements Outbox, Contracts.TypedSend {
 
     /** The header, null-valued, that marks a record for a route: one of any other value marks nothing. */
     public static final String LOCAL_HEADER = "outbox-local";
@@ -98,7 +98,8 @@ public final class PgOutbox implements Outbox {
     }
 
     /** {@link #send(OutboxMessage)} of a message written as {@code type}, the class name a refusal names. */
-    UUID send(OutboxMessage message, String type) {
+    @Override
+    public UUID send(OutboxMessage message, String type) {
         var c = currentTransaction();
         var id = insert(c, message, type);
         wakeUpAfterCommit();
