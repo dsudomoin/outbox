@@ -51,7 +51,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 import java.util.stream.IntStream;
+import java.util.stream.LongStream;
 import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -388,6 +390,50 @@ class OutboxAdminIT {
         assertThat(admin.redriveDeadLetters(List.of(busy))).as("once the send committed").isOne();
         assertThat(outboxMessageIds()).as("behind the send").containsExactly(live, messageIds.get(free),
                 messageIds.get(busy));
+    }
+
+    @Test
+    void aKeyHeldInOneChunkIsSkippedInTheLaterChunksOfAFilterCall() throws Exception {
+        aKeyHeldInOneChunkIsSkippedInTheLaterChunks(
+                () -> admin.redriveDeadLetters(filter("t", null, null, null, null, null)));
+    }
+
+    @Test
+    void aKeyHeldInOneChunkIsSkippedInTheLaterChunksOfAnIdsCall() throws Exception {
+        var all = LongStream.rangeClosed(1, 1001).boxed().toList();
+        aKeyHeldInOneChunkIsSkippedInTheLaterChunks(() -> admin.redriveDeadLetters(all));
+    }
+
+    /** Letter 1 of key busy in the first chunk, letter 1001 of it in the second; the key free from the second on. */
+    private void aKeyHeldInOneChunkIsSkippedInTheLaterChunks(LongSupplier redrive) throws Exception {
+        deadLetters(1000);
+        execute("update " + names.dead() + " set key = convert_to('busy', 'UTF8') where id = 1");
+        execute("insert into " + names.dead() + " (id, shard, message_id, topic, key, created_at, attempts, error)"
+                + " values (1001, 0, gen_random_uuid(), 't', convert_to('busy', 'UTF8'), now(), 3, 'boom')");
+        UUID first;
+        UUID later;
+        try (var c = TestDb.connect()) {
+            first = UUID.fromString(queryString(c, "select message_id from " + names.dead() + " where id = 1"));
+            later = UUID.fromString(queryString(c, "select message_id from " + names.dead() + " where id = 1001"));
+        }
+        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
+        try (var business = TestDb.connect()) {
+            business.setAutoCommit(false); // holds busy's key lock through the first chunk only
+            outbox.send(business, OutboxMessage.of("t", "busy", bytes("live")));
+            var committed = new AtomicBoolean();
+            admin.afterChunk = c -> {
+                if (committed.compareAndSet(false, true)) {
+                    business.commit();
+                }
+            };
+
+            assertThat(redrive.getAsLong()).as("busy skipped in both chunks").isEqualTo(999);
+        }
+        admin.afterChunk = null;
+        assertThat(deadIds()).containsExactly(1L, 1001L);
+        assertThat(redrive.getAsLong()).as("busy whole, on the next call").isEqualTo(2);
+        var order = outboxMessageIds();
+        assertThat(order.indexOf(first)).as("the key's letters in id order").isLessThan(order.indexOf(later));
     }
 
     @Test

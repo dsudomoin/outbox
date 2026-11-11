@@ -8,8 +8,10 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.UUID;
 
 /** Dead rows as {@link DeadLetter}s and their redrive: what {@link DeadLetterPass} and {@link PgOutboxAdmin} share. */
@@ -84,8 +86,17 @@ final class DeadLetters {
      * another transaction holds, an open {@code send} of it, are held.
      */
     Split tryKeyLocks(Connection tx, List<Ref> letters) throws SQLException {
+        return tryKeyLocks(tx, letters, new HashSet<>());
+    }
+
+    /**
+     * {@link #tryKeyLocks(Connection, List)} across the chunks of one call: the letters of a key in {@code held},
+     * found held in an earlier chunk, are held without trying the lock again, and the keys found held now join it.
+     * So a key skipped once is skipped for the whole call and comes back whole, in id order, on a later one.
+     */
+    Split tryKeyLocks(Connection tx, List<Ref> letters, Set<Integer> held) throws SQLException {
         var hashes = letters.stream().map(r -> r.key() == null ? null : Hashing.keyHash(r.topic(), r.key())).toList();
-        var held = resender.tryKeyLocks(tx, hashes);
+        held.addAll(resender.tryKeyLocks(tx, hashes.stream().filter(h -> h != null && !held.contains(h)).toList()));
         var ready = new ArrayList<Ref>();
         var waiting = new ArrayList<Ref>();
         for (int i = 0; i < letters.size(); i++) {

@@ -23,6 +23,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -44,8 +45,9 @@ import org.slf4j.LoggerFactory;
  * dying meanwhile, with a later {@code failed_at}), in id order, each above the last chunk's,
  * {@code for update skip locked}, in a read-committed transaction of its own. A redrive chunk then tries their key
  * locks without waiting ({@link DeadLetters#tryKeyLocks}) and redrives the ready ones as the dead-letter pass does
- * ({@link DeadLetters#redrive}), so no writer waits for one of its key locks. Filters are bound parameters, never
- * interpolated; user text is logged with control and format characters escaped ({@link #printable}).
+ * ({@link DeadLetters#redrive}), so no writer waits for one of its key locks; a key found held stays skipped in the
+ * call's later chunks, so its letters go back whole and in id order on a later call. Filters are bound parameters,
+ * never interpolated; user text is logged with control and format characters escaped ({@link #printable}).
  * {@code restoreOrphan}, {@code recoverXidRegression} and {@code recoverStrandedShards} hold the maintenance lock for
  * their whole run, so maintenance's steps never run beside them. The reads, {@code status} and the dead-letter find
  * and count, give up on a statement after 60 s (57014).
@@ -239,13 +241,13 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     @Override
     public long redriveDeadLetters(Collection<Long> ids) {
         requireOwnTransactions();
-        return bulk("redriveDeadLetters(" + logged(ids) + ")", Where.ids(ids), true, this::redrive);
+        return bulk("redriveDeadLetters(" + logged(ids) + ")", Where.ids(ids), true, redrive(new HashSet<>()));
     }
 
     @Override
     public long redriveDeadLetters(DeadLetterFilter filter) {
         requireOwnTransactions();
-        return bulk("redriveDeadLetters(" + filter + ")", Where.of(nonEmpty(filter)), true, this::redrive);
+        return bulk("redriveDeadLetters(" + filter + ")", Where.of(nonEmpty(filter)), true, redrive(new HashSet<>()));
     }
 
     @Override
@@ -1023,8 +1025,16 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         return done;
     }
 
-    /** Redrives the claimed letters but those whose key another transaction holds, skipped without waiting. */
-    private Chunk redrive(Connection tx, Where where, long after) throws SQLException {
+    /**
+     * Redrives the claimed letters but those whose key another transaction holds, skipped without waiting; a key
+     * found held goes in {@code held}, the call's, and its letters in the call's later chunks are skipped too, so a
+     * later letter of the key never goes back ahead of an earlier one.
+     */
+    private Step redrive(Set<Integer> held) {
+        return (tx, where, after) -> redrive(tx, where, after, held);
+    }
+
+    private Chunk redrive(Connection tx, Where where, long after, Set<Integer> held) throws SQLException {
         var claimed = new ArrayList<DeadLetters.Ref>();
         try (var ps = tx.prepareStatement("select " + DeadLetters.REF_COLUMNS + " from " + dead + " where "
                 + where.sql() + " and id > ? order by id limit " + CHUNK + " for update skip locked")) {
@@ -1035,7 +1045,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                 }
             }
         }
-        var ready = rows.tryKeyLocks(tx, claimed).ready();
+        var ready = rows.tryKeyLocks(tx, claimed, held).ready();
         rows.redrive(tx, ready);
         return new Chunk(claimed.size(), claimed.isEmpty() ? after : claimed.get(claimed.size() - 1).id(),
                 ready.size());
