@@ -132,12 +132,12 @@ class SchemaCheckIT {
     }
 
     @Test
-    void aKeywordTheGrammarRefusesAsAnUnquotedNameFailsTheResolve() throws Exception {
+    void aKeywordTheGrammarRefusesAsAnUnquotedNameFailsBeforeTheResolve() throws Exception {
         try (var c = TestDataSources.newDataSource().getConnection()) {
             for (var name : new String[] {"user", "Left", "order.outbox"}) {
                 var keyword = name.contains(".") ? "order" : name.toLowerCase(Locale.ROOT);
                 assertThatThrownBy(() -> TableNames.of(name).resolve(c))
-                        .isInstanceOf(IllegalStateException.class)
+                        .isInstanceOf(IllegalArgumentException.class)
                         .hasMessageContaining("\"" + keyword + "\" is a reserved Postgres keyword")
                         .hasMessageContaining("outbox.table or outbox.inbox.table");
             }

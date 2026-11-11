@@ -35,4 +35,20 @@ class OutboxSqlTest {
         assertThat(OutboxSql.inbox(config, "app"))
                 .contains("grant select, insert, update, delete on table app.inbox to app;");
     }
+
+    @Test
+    void aKeywordTheUnquotedSqlCannotTakeIsRefusedBeforeRendering() {
+        for (var table : new String[] {"order.outbox", "user", "Left", "system_user"}) {
+            assertThatThrownBy(() -> OutboxSql.outbox(new TestOutboxConfig().table(table), null)).as(table)
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("is a reserved Postgres keyword");
+            assertThatThrownBy(() -> OutboxSql.inbox(new TestOutboxConfig().inboxTable(table), null)).as(table)
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("is a reserved Postgres keyword");
+        }
+        // a keyword after the schema, and one the grammar takes as a table name, stay accepted
+        assertThat(OutboxSql.outbox(new TestOutboxConfig().table("public.user"), null))
+                .contains("create table public.user (");
+        assertThat(OutboxSql.inbox(new TestOutboxConfig().inboxTable("between"), null)).contains("between");
+    }
 }

@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox.internal;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.Locale;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
@@ -35,6 +36,24 @@ public record TableNames(
     private static final Pattern NAME =
             Pattern.compile("(?:[A-Za-z_][A-Za-z0-9_]{0,40}\\.)?[A-Za-z_][A-Za-z0-9_]{0,40}");
 
+    /**
+     * The reserved (R) and type/function-name (T) keywords of {@code pg_get_keywords()} on Postgres 14 to 18, so the
+     * SQL rendered without a server ({@code OutboxSql}) refuses them too; {@link #resolve} asks the server itself.
+     */
+    private static final Set<String> KEYWORDS = Set.of(
+            "all", "analyse", "analyze", "and", "any", "array", "as", "asc", "asymmetric",
+            "authorization", "binary", "both", "case", "cast", "check", "collate", "collation",
+            "column", "concurrently", "constraint", "create", "cross", "current_catalog",
+            "current_date", "current_role", "current_schema", "current_time", "current_timestamp",
+            "current_user", "default", "deferrable", "desc", "distinct", "do", "else", "end", "except",
+            "false", "fetch", "for", "foreign", "freeze", "from", "full", "grant", "group", "having",
+            "ilike", "in", "initially", "inner", "intersect", "into", "is", "isnull", "join", "lateral",
+            "leading", "left", "like", "limit", "localtime", "localtimestamp", "natural", "not",
+            "notnull", "null", "offset", "on", "only", "or", "order", "outer", "overlaps", "placing",
+            "primary", "references", "returning", "right", "select", "session_user", "similar", "some",
+            "symmetric", "system_user", "table", "tablesample", "then", "to", "trailing", "true",
+            "union", "unique", "user", "using", "variadic", "verbose", "when", "where", "window", "with");
+
     public TableNames {
         requireValid(base);
     }
@@ -64,9 +83,7 @@ public record TableNames(
                 String schema = rs.getString(1);
                 String existing = rs.getString(2);
                 if (rs.getBoolean(3)) {
-                    throw new IllegalStateException("table " + base + ": \"" + head + "\" is a reserved Postgres"
-                            + " keyword, which the library's unquoted SQL cannot take as a schema or an unqualified"
-                            + " table name; rename it in outbox.table or outbox.inbox.table");
+                    throw new IllegalStateException(keywordMessage(base, head));
                 }
                 if (base.indexOf('.') < 0 && schema == null) {
                     throw new IllegalStateException("table " + base + " is unqualified, but the search_path names"
@@ -163,6 +180,16 @@ public record TableNames(
             throw new IllegalArgumentException(
                     "table name must match [schema.]name with parts [A-Za-z_][A-Za-z0-9_]{0,40}: " + base);
         }
+        String head = base.substring(0, base.indexOf('.') < 0 ? base.length() : base.indexOf('.'));
+        if (KEYWORDS.contains(head.toLowerCase(Locale.ROOT))) {
+            throw new IllegalArgumentException(keywordMessage(base, head.toLowerCase(Locale.ROOT)));
+        }
         return base;
+    }
+
+    private static String keywordMessage(String base, String head) {
+        return "table " + base + ": \"" + head + "\" is a reserved Postgres keyword, which the library's unquoted SQL"
+                + " cannot take as a schema or an unqualified table name; rename it in outbox.table or"
+                + " outbox.inbox.table";
     }
 }
