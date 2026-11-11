@@ -467,9 +467,12 @@ public final class Maintenance {
         lastSuccess = System.nanoTime() - (long) (age * 1e9);
         if (!halted && age > staleAfter.toMillis() / 1e3 && due(staleLogged)) {
             log.warn("outbox maintenance of {} has not completed a run on any instance for {} s, over {} ×"
-                    + " outbox.partitions.maintenanceInterval: partitions are not extended or dropped and ticks pile"
-                    + " up meanwhile. Earlier WARN or ERROR lines name failing steps; if runs never start, a session"
-                    + " holds the maintenance lock: select pid from pg_locks where locktype = 'advisory' and classid"
+                    + " outbox.partitions.maintenanceInterval: a step failed in every run, and its WARN \"outbox"
+                    + " maintenance step '<name>' failed\" names it. Partitions stall only behind 'finish pending"
+                    + " detach', 'partition extension', 'cursor read', 'checkpoint' or 'partition drop', and ticks pile"
+                    + " up behind the last three or 'tick cleanup'; any other step leaves both going. If runs never"
+                    + " start, a session holds the maintenance lock: select pid from pg_locks where locktype ="
+                    + " 'advisory' and classid"
                     + " = {} and objid = {} and objsubid = 2", names.base(), Math.round(age), STALE_INTERVALS,
                     Integer.toUnsignedLong(names.internalNamespace()), TableNames.LOCK_MAINTENANCE);
         }
@@ -952,19 +955,7 @@ public final class Maintenance {
 
     private void refreshGauges(Connection c, @Nullable Read read) throws SQLException {
         lag = read == null ? Double.NaN : read.lagSeconds();
-        retrySize = retries.size(c);
-        try (var st = c.createStatement(); var rs = st.executeQuery(oldestRetried)) {
-            rs.next();
-            retryOldest = rs.getDouble(1);
-        }
-        refreshWaiting(c);
-        deadSize = retries.deadSize(c);
-        try (var st = c.createStatement(); var rs = st.executeQuery(deadPending)) {
-            rs.next();
-            deadPendingCount = rs.getLong(1);
-            deadPendingOldest = rs.getDouble(2);
-        }
-        parkedSize = parked.size(c);
+        // first: a size count that fails every run must not keep the tail ERROR and the partition gauges stale
         var state = partitions.state(c);
         int ahead = state.ahead();
         premade = ahead;
@@ -1000,6 +991,19 @@ public final class Maintenance {
             log.warn("only {} premade xid partitions of {} left; inserts reach the tail soon, see README \"tail"
                     + " overflow\"; this WARN repeats at most once a minute", ahead, names.base());
         }
+        retrySize = retries.size(c);
+        try (var st = c.createStatement(); var rs = st.executeQuery(oldestRetried)) {
+            rs.next();
+            retryOldest = rs.getDouble(1);
+        }
+        refreshWaiting(c);
+        deadSize = retries.deadSize(c);
+        try (var st = c.createStatement(); var rs = st.executeQuery(deadPending)) {
+            rs.next();
+            deadPendingCount = rs.getLong(1);
+            deadPendingOldest = rs.getDouble(2);
+        }
+        parkedSize = parked.size(c);
     }
 
     /**

@@ -1072,6 +1072,41 @@ class MaintenanceIT {
     }
 
     /**
+     * A size gauge that fails every run (here the dead table is gone) leaves the partition gauges and the tail ERROR
+     * in place, and the stale WARN points at the failing step instead of claiming partitions stalled.
+     */
+    @Test
+    void aFailingSizeGaugeStillReportsTheTail() throws Exception {
+        bootstrap();
+        var registry = new SimpleMeterRegistry();
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry), Duration.ofMillis(300));
+        assertThat(maintenance.runOnce()).isTrue();
+        assertThat(gauge(registry, "outbox.partitions.xids_left")).as("tail attached").isNaN();
+
+        String dead = names.dead().substring(names.dead().lastIndexOf('.') + 1);
+        try (var holder = TestDb.connect(); var c = TestDb.connect(); var err = new CapturedStderr()) {
+            execute(c, "alter table " + names.dead() + " rename to " + dead + "_moved");
+            execute(c, "update " + names.maintenance() + " set succeeded_at = now() - interval '1 day'");
+            holder.setAutoCommit(false); // a pg_dump
+            execute(holder, "set transaction isolation level repeatable read");
+            queryLong(holder, "select count(*) from " + names.base());
+            execute(c, "set lock_timeout = '300ms'"); // the tail is left detach-pending, as above
+            assertThatThrownBy(() -> execute(c, "alter table " + names.base() + " detach partition " + names.tail()
+                            + " concurrently"))
+                    .isInstanceOf(SQLException.class);
+            execute(c, "reset lock_timeout");
+
+            assertThat(maintenance.runOnce()).isTrue();
+
+            assertThat(gauge(registry, "outbox.partitions.xids_left")).isNotNaN().isPositive();
+            assertThat(err.text()).contains("is not attached").contains("more xids")
+                    .contains("has not completed").doesNotContain("partitions are not extended or dropped");
+            holder.commit();
+            execute(c, "alter table " + names.dead() + "_moved rename to " + dead);
+        }
+    }
+
+    /**
      * A hot tail over maxTailScan that cannot be converted (here no tailConversion window) fails the run: no success is
      * recorded, so {@code outbox.maintenance.since_success} grows and pages, while the other steps still run.
      */
