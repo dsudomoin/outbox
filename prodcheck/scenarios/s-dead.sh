@@ -56,7 +56,8 @@ s_admin() { # each admin operation over HTTP on a live instance while the others
   local i
   for i in 1001 1002 1003; do pc_load "$i" 'rate=100&writers=4&keys=30&topics=payments'; done
   redrive_until_empty 1002 '{"filter":{"topic":"payments","status":"kept"}}' 'topic=payments&status=kept'
-  check "$(passes logs_have 'outbox admin POST .* by \"admin-key\": 200')" "аудит-строка каждого вызова"
+  # a destructive call's line also names what it selected: by "admin-key" with count "3", ids "[...]": 200
+  check "$(passes logs_have 'outbox admin POST .* by \"admin-key\"( with .*)?: 200')" "аудит-строка каждого вызова"
   check "$(passes logs_have 'denied: 401')" "аудит отказа"
   REPAIRED="POST dead-letters/redrive и discard на живом инстансе"
   # the refused first arrival of each letter and its redrive are two arrivals: no bound on duplicates here
