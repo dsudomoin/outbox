@@ -524,6 +524,25 @@ class OutboxAdminIT {
         assertThat(wakes).hasValue(1);
     }
 
+    /** Postgres reads a negative xid8 as one above every real xid: such a cut would move nothing and drop every row. */
+    @Test
+    void restoreOrphanRefusesANegativeFromXid() throws Exception {
+        var orphan = foreignOrphan();
+        orphanRow(orphan, 1, 10, "a");
+        orphanRow(orphan, 2, 20, "b");
+
+        for (long fromXid : new long[] {-1, Long.MIN_VALUE}) {
+            assertThatThrownBy(() -> admin.restoreOrphan(orphan, fromXid)).as("fromXid %d", fromXid)
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+
+        assertThat(exists(orphan)).isTrue();
+        assertThat(count(orphan)).isEqualTo(2);
+        assertThat(admin.status().orphans()).containsExactly(new Orphan(orphan, OrphanKind.FOREIGN));
+        assertThat(outboxMessageIds()).isEmpty();
+        assertThat(wakes).hasValue(0);
+    }
+
     /** A read stuck behind a lock (or a slow scan) gives its pool connection back after readTimeout. */
     @Test
     void readsGiveUpAfterTheirTimeout() throws Exception {

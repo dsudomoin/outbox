@@ -72,9 +72,14 @@ public final class OrphanRestore {
      *
      * @throws IllegalArgumentException before any SQL that names it, unless {@code table} is {@code <base>_x<digits>}
      *     or {@code <base>_o<digits>}, unqualified or qualified as the outbox is named, and a table in the outbox's
-     *     schema that is no partition
+     *     schema that is no partition, or before any SQL at all for a negative {@code fromXid}
      */
     public long restore(Connection autocommit, String table, long fromXid, Duration lockTimeout) throws SQLException {
+        if (fromXid < 0) {
+            // xid8 parses a negative number as one above every real xid: the cut would move nothing and drop every row
+            throw new IllegalArgumentException("fromXid " + fromXid + " is below 0: xids are never negative, and 0"
+                    + " moves every row");
+        }
         return SocketBound.atLeast(autocommit, lockTimeout.plus(PartitionDdl.DDL_MARGIN),
                 () -> restoreBounded(autocommit, table, fromXid, lockTimeout));
     }

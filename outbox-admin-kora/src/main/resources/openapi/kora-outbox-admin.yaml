@@ -184,10 +184,11 @@ paths:
         - name: fromXid
           in: query
           required: true
-          description: Rows with an xid at or above this one are moved
+          description: Rows with an xid at or above this one are moved; 0 moves every row, a negative value gets 400
           schema:
             type: integer
             format: int64
+            minimum: 0
       responses:
         '200':
           description: How many rows were moved

@@ -352,6 +352,19 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
     }
 
     @Test
+    void aNegativeFromXidIs400AndKeepsTheOrphan() throws Exception {
+        var orphan = foreignOrphan();
+        orphanRow(orphan, 1, 10);
+
+        var response = call("POST", "/orphans/" + orphan + "/restore?fromXid=-1", null);
+
+        assertJson(response, 400);
+        assertThat(response.body()).startsWith("{\"message\":\"");
+        assertThat(exists(orphan)).isTrue();
+        assertThat(outboxMessageIds()).isEmpty();
+    }
+
+    @Test
     void tableNameIsNeverInterpolated() throws Exception {
         var victim = TestDb.uniqueTable();
         execute("create table " + victim + " (id bigint)");

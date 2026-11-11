@@ -577,6 +577,21 @@ class AdminHttpIT {
     }
 
     @Test
+    void aNegativeFromXidIs400AndKeepsTheOrphan() {
+        app(() -> {
+            var orphan = foreignOrphan();
+            orphanRow(orphan, 1, 10);
+
+            var response = call("POST", "/orphans/" + orphan + "/restore?fromXid=-1", null);
+
+            assertJson(response, 400);
+            assertThat(response.body).startsWith("{\"message\":\"fromXid -1 is below 0");
+            assertThat(exists(orphan)).isTrue();
+            assertThat(outboxMessageIds()).isEmpty();
+        });
+    }
+
+    @Test
     void tableNameIsNeverInterpolated() {
         app(() -> {
             var victim = TestSql.uniqueTable();

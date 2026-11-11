@@ -67,7 +67,8 @@ public interface OutboxAdmin {
      *
      * @throws IllegalArgumentException before any SQL that names it, unless {@code table} is {@code <base>_x<digits>}
      *     or {@code <base>_o<digits>}, unqualified or qualified as the outbox is named, a table in the outbox's schema
-     *     in no partition tree, and not one the partition extension made ahead of the tail for its next swap
+     *     in no partition tree, and not one the partition extension made ahead of the tail for its next swap; and for
+     *     a negative {@code fromXid} ({@code 0} moves every row)
      */
     long restoreOrphan(String table, long fromXid);
 
