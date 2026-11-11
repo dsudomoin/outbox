@@ -613,7 +613,7 @@ public final class Maintenance {
     private boolean run(Connection c) {
         stepFailed = false;
         step("finish pending detach", () -> {
-            partitions.finishPendingDetach(c, detachLockTimeout);
+            partitions.finishPendingDetach(c, detachLockTimeout, quiesceTimeout);
             return null;
         });
         step("partition extension", () -> {

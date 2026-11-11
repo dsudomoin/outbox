@@ -38,6 +38,19 @@ public final class PartitionDdl {
     static final String SESSION_POOLING_REQUIRED =
             "needs a direct or session-pooled connection (transaction-pooling proxy detected)";
 
+    /**
+     * The sessions of this database holding a snapshot, oldest first: how many, and the first five with their
+     * transaction's age; a session of another role shows none to a role without {@code pg_read_all_stats}.
+     */
+    private static final String OLDEST_SNAPSHOTS = """
+            with s as (select pid, application_name, state, xact_start, backend_xmin from pg_stat_activity
+                        where datname = current_database() and backend_xmin is not null and pid <> pg_backend_pid())
+            select (select count(*) from s),
+                   (select string_agg(format('pid %s (%s, %s) in a transaction open %s', pid, application_name, state,
+                                             coalesce(round(extract(epoch from now() - xact_start)::numeric, 1)
+                                                      || ' s', 'for a time hidden from this role')), ', ')
+                      from (select * from s order by age(backend_xmin) desc limit 5) o)""";
+
     private static final Logger log = LoggerFactory.getLogger(PartitionDdl.class);
     private static final Pattern NAME = Pattern.compile("(?:[A-Za-z_][A-Za-z0-9_]*\\.)?[A-Za-z_][A-Za-z0-9_]*");
     private static final Pattern VALUE = Pattern.compile("[0-9A-Za-z:.+ -]+");
@@ -238,14 +251,33 @@ public final class PartitionDdl {
 
     /**
      * {@code DETACH ... CONCURRENTLY}, or {@code FINALIZE} when an earlier detach was interrupted (lock timeout,
-     * crash) and left the partition pending; no-op when the partition is not attached.
+     * crash) and left the partition pending; no-op when the partition is not attached. A {@code FINALIZE} that timed
+     * out (55P03) waited for the sessions of this database holding an older snapshot, whatever they read: the 55P03
+     * again, naming the oldest of them ({@link #OLDEST_SNAPSHOTS}).
      */
     static void detach(Connection c, String parent, String partition, Duration lockTimeout) throws SQLException {
         var attachment = attachment(c, parent, partition);
         if (attachment == Attachment.ATTACHED || attachment == Attachment.DETACH_PENDING) {
-            execute(c, lockTimeout, "alter table " + name(parent) + " detach partition " + name(partition)
-                    + (attachment == Attachment.DETACH_PENDING ? " finalize" : " concurrently"));
+            try {
+                execute(c, lockTimeout, "alter table " + name(parent) + " detach partition " + name(partition)
+                        + (attachment == Attachment.DETACH_PENDING ? " finalize" : " concurrently"));
+            } catch (SQLException e) {
+                if (attachment != Attachment.DETACH_PENDING || !"55P03".equals(e.getSQLState())) {
+                    throw e;
+                }
+                throw new SQLException(e.getMessage() + "; FINALIZE of " + partition + " waits for every older"
+                        + " snapshot in this database, of any table: " + oldestSnapshots(c), e.getSQLState(), e);
+            }
             log.info("detached partition {} from {}", partition, parent);
+        }
+    }
+
+    private static String oldestSnapshots(Connection c) {
+        try (var st = c.createStatement(); var rs = st.executeQuery(OLDEST_SNAPSHOTS)) {
+            rs.next();
+            return rs.getLong(1) + " sessions hold one right after, the oldest: " + rs.getString(2);
+        } catch (SQLException | RuntimeException read) {
+            return "who holds them could not be read: " + read;
         }
     }
 

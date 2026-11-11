@@ -292,7 +292,7 @@ public final class XidRecovery {
     private long recoverBounded(Connection autocommit) throws SQLException {
         var c = autocommit;
         outboxLocked = false;
-        partitions.finishPendingDetach(c, LOCK_TIMEOUT);
+        partitions.finishPendingDetach(c, LOCK_TIMEOUT, LOCK_TIMEOUT);
         if (beforeTransaction != null) {
             beforeTransaction.accept(c);
         }

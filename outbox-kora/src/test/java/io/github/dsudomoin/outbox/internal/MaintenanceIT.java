@@ -913,6 +913,103 @@ class MaintenanceIT {
     }
 
     @Test
+    void relayedRangeLeftPendingIsDroppedPastAnUnrelatedSnapshot() throws Exception {
+        bootstrap();
+        var relay = relay(new RecordingHandler(), maintenance());
+        send(msg("t", "k", "a"));
+        TestDb.burnXids(3000);
+        relay.drain();
+        long xmin = horizonXmin();
+        var pending = ranges().stream()
+                .filter(b -> b.to() != null && Long.parseLong(b.to()) <= xmin)
+                .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
+                .orElseThrow();
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null), Duration.ofMillis(300));
+        try (var reader = TestDb.connect()) {
+            reader.setAutoCommit(false);
+            queryLong(reader, "select count(*) from " + names.base()); // the drop's detach times out waiting for it
+            assertThat(maintenance.runOnce()).isTrue();
+            reader.commit();
+        }
+        var unrelated = TestDb.uniqueTable();
+        try (var c = TestDb.connect(); var report = TestDb.connect(); var err = new CapturedStderr()) {
+            assertThat(queryString(c, "select inhdetachpending::text from pg_inherits where inhrelid = to_regclass(?)",
+                            pending.name()))
+                    .isEqualTo("true");
+            execute(c, "create table " + unrelated + " (a int)");
+            // a report on another table: read only, so it holds no xid back, but its snapshot is older than a FINALIZE
+            report.setAutoCommit(false);
+            execute(report, "set transaction isolation level repeatable read");
+            queryLong(report, "select count(*) from " + unrelated);
+            TestDb.burnXids(3000);
+            relay.drain();
+            long horizon = horizonXmin();
+            var next = ranges().stream()
+                    .filter(b -> b.to() != null && Long.parseLong(b.to()) <= horizon && !b.equals(pending))
+                    .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
+                    .orElseThrow();
+
+            assertThat(maintenance.runOnce()).isTrue();
+            assertThat(maintenance.runOnce()).isTrue();
+
+            assertThat(exists(pending.name())).as(err.text()).isFalse();
+            assertThat(exists(next.name())).as(err.text()).isFalse();
+            assertThat(droppingMarkers()).doesNotContain(names.unqualified(pending.name()));
+            report.commit();
+        } finally {
+            try (var c = TestDb.connect()) {
+                execute(c, "drop table if exists " + unrelated);
+            }
+        }
+    }
+
+    @Test
+    void someoneElsesPendingRangeIsFinalizedAndItsWaitNamesTheOldestSnapshots() throws Exception {
+        bootstrap();
+        var range = ranges().stream()
+                .filter(b -> b.to() != null)
+                .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
+                .orElseThrow();
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null), Duration.ofMillis(300));
+        var unrelated = TestDb.uniqueTable();
+        try (var c = TestDb.connect(); var reader = TestDb.connect(); var report = TestDb.connect()) {
+            // an operator's detach that timed out: not recorded as relayed, so its rows may be undelivered
+            reader.setAutoCommit(false);
+            queryLong(reader, "select count(*) from " + names.base());
+            execute(c, "set lock_timeout = '300ms'");
+            assertThatThrownBy(() -> execute(c, "alter table " + names.base() + " detach partition " + range.name()
+                            + " concurrently"))
+                    .isInstanceOf(SQLException.class);
+            execute(c, "reset lock_timeout");
+            reader.commit();
+            execute(c, "create table " + unrelated + " (a int)");
+            report.setAutoCommit(false);
+            execute(report, "set transaction isolation level repeatable read");
+            long pid = queryLong(report, "select pg_backend_pid()");
+            queryLong(report, "select count(*) from " + unrelated);
+
+            try (var err = new CapturedStderr()) {
+                assertThat(maintenance.runOnce()).isTrue();
+
+                assertThat(err.text()).contains("'finish pending detach'").contains("FINALIZE of " + range.name())
+                        .contains("pid " + pid + " ");
+            }
+            assertThat(queryString(c, "select inhdetachpending::text from pg_inherits where inhrelid = to_regclass(?)",
+                            range.name()))
+                    .isEqualTo("true");
+            report.commit();
+        } finally {
+            try (var c = TestDb.connect()) {
+                execute(c, "drop table if exists " + unrelated);
+            }
+        }
+
+        assertThat(maintenance.runOnce()).isTrue(); // the snapshot is gone: FINALIZE, then the empty range is dropped
+
+        assertThat(exists(range.name())).isFalse();
+    }
+
+    @Test
     void tailNotAttachedReportsTheXidsLeft() throws Exception {
         bootstrap();
         var registry = new SimpleMeterRegistry();

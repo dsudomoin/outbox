@@ -544,6 +544,41 @@ class PgInboxIT {
     }
 
     @Test
+    void expiredRangeLeftPendingIsDroppedPastAnUnrelatedSnapshot() throws Exception {
+        start();
+        long hour = lowest() + 2 * HOUR;
+        var expired = List.of(table() + "_old1", table() + "_old2");
+        var unrelated = TestDb.uniqueTable();
+        try (var c = TestDb.connect(); var reader = TestDb.connect(); var report = TestDb.connect()) {
+            attach(c, expired.get(0), hour - 6 * HOUR);
+            attach(c, expired.get(1), hour - 5 * HOUR);
+            reader.setAutoCommit(false);
+            queryLong(reader, "select count(*) from " + table());
+            assertThatThrownBy(() -> PartitionDdl.detach(c, table(), expired.get(1), Duration.ofMillis(300)))
+                    .isInstanceOf(SQLException.class);
+            reader.commit();
+            assertThat(PartitionDdl.pendingDetach(c, table())).isEqualTo(expired.get(1));
+            // a report on another table, its snapshot older than a FINALIZE would be
+            execute(c, "create table " + unrelated + " (a int)");
+            report.setAutoCommit(false);
+            execute(report, "set transaction isolation level repeatable read");
+            queryLong(report, "select count(*) from " + unrelated);
+
+            inbox.runMaintenance();
+
+            assertThat(ranges()).noneMatch(b -> expired.contains(b.name()));
+            for (var t : expired) {
+                assertThat(queryLong(c, "select count(*) from pg_class where relname = '" + t + "'")).as(t).isZero();
+            }
+            report.commit();
+        } finally {
+            try (var c = TestDb.connect()) {
+                execute(c, "drop table if exists " + unrelated);
+            }
+        }
+    }
+
+    @Test
     void rangeOrphanedBetweenDetachAndDropIsDroppedOnceExpired() throws Exception {
         start();
         long hour = lowest() + 2 * HOUR; // the hour init saw, wherever the clock is now

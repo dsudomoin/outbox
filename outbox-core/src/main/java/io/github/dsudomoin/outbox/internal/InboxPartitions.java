@@ -220,8 +220,10 @@ final class InboxPartitions {
     }
 
     /**
-     * Finalizes a range whose detach was left pending, and drops it when its whole range is past retention, as
-     * {@link #dropExpired} would; one inside the dedup window (an operator's detach) is only finalized, and
+     * Drops a range whose detach was left pending when its whole range is past retention, as {@link #dropExpired}
+     * would: without {@code FINALIZE}, which waits for every older snapshot in the database, by
+     * {@link XidPartitions#dropPending} (consumer transactions are its only lock holders), else finalized and dropped.
+     * One inside the dedup window (an operator's detach) is only finalized, and
      * {@link #dropOrphans} reports it ({@link #attachBack} may attach it back). The pending detach must be finished
      * either way: Postgres allows one per parent and fails every other {@code DETACH ... CONCURRENTLY} meanwhile
      * (SQLState 55000).
@@ -234,7 +236,9 @@ final class InboxPartitions {
         boolean expired = PartitionDdl.listRanges(c, table).stream()
                 .anyMatch(b -> b.name().equals(pending) && b.to() != null && millis(b.to()) < now - retention);
         if (expired) {
-            PartitionDdl.detachConcurrentlyAndDrop(c, table, pending, lockTimeout);
+            if (!XidPartitions.dropPending(c, table, pending)) {
+                PartitionDdl.detachConcurrentlyAndDrop(c, table, pending, lockTimeout);
+            }
         } else { // an operator's detach inside the window: its dedup records are kept, dropOrphans reports them
             PartitionDdl.detach(c, table, pending, lockTimeout);
         }

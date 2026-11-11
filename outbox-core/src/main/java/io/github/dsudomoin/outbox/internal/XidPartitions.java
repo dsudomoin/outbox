@@ -65,6 +65,8 @@ public final class XidPartitions {
     static final int RANGES_PER_SWAP = 4;
     /** Where a swap statement leaves what it did, for the next statement of the session to read. */
     private static final String SWAP_RESULT = "kora_outbox.swap";
+    /** Where {@link #dropPending}'s statement leaves what it did. */
+    private static final String DROP_RESULT = "kora_outbox.drop_pending";
     /** {@link #lockWait} when {@code swapLockTimeout} is 0: past the swap's hold, which writers wait for. */
     private static final Duration DEFAULT_LOCK_WAIT = Duration.ofMillis(200);
     /**
@@ -661,21 +663,8 @@ public final class XidPartitions {
         String result;
         try {
             var tries = holdSql(false, lower, bound, first, top, maxBytes);
-            result = PartitionDdl.withTimeouts(c, HOLD_LOCK_TIMEOUT, holdBound.plus(TRY_MARGIN), () -> {
-                String r;
-                while (true) { // a statement a try, a millisecond apart: one that missed returns at once, did nothing
-                    r = hold(c, tries);
-                    if (!r.equals("busy") || System.nanoTime() - start >= NOWAIT_WINDOW.toNanos()) {
-                        return r;
-                    }
-                    try {
-                        Thread.sleep(1);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        return r;
-                    }
-                }
-            });
+            result = PartitionDdl.withTimeouts(c, HOLD_LOCK_TIMEOUT, holdBound.plus(TRY_MARGIN), () ->
+                    nowaitTries(start, () -> hold(c, tries)));
             if (result.equals("busy") && !swapLockTimeout.isZero()) {
                 var queued = holdSql(true, lower, bound, first, top, maxBytes);
                 result = PartitionDdl.withTimeouts(c, swapLockTimeout, swapLockTimeout.plus(holdBound), () ->
@@ -709,6 +698,68 @@ public final class XidPartitions {
                 bound == null ? "" : "attached it with its rows as " + former + " [" + lower + ", " + bound + "), ",
                 (top - first) / size, first, top, top, base, held, Math.round(tried * 10) / 10.0);
         return null;
+    }
+
+    /**
+     * {@code attempt}, one statement whose NOWAIT try missed when it returns "busy", again every millisecond while it
+     * does, until {@link #NOWAIT_WINDOW} from {@code start}; its last result. A miss returns at once, having done
+     * nothing, so no writer ever waits behind a try.
+     */
+    private static String nowaitTries(long start, SqlFunction0<String> attempt) throws SQLException {
+        while (true) {
+            var r = attempt.apply();
+            if (!r.equals("busy") || System.nanoTime() - start >= NOWAIT_WINDOW.toNanos()) {
+                return r;
+            }
+            try {
+                Thread.sleep(1);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return r;
+            }
+        }
+    }
+
+    /**
+     * Drops {@code partition}, detach-pending, of {@code parent} without {@code FINALIZE}, which waits for every
+     * snapshot in the database older than its own, a report on another table included: one autocommit {@code DO}
+     * statement takes ACCESS EXCLUSIVE on the parent {@code NOWAIT}, as the swap does, and drops the partition. Any
+     * query that could still see the partition holds a lock on the parent, so a try that gets it waits for no snapshot,
+     * and one that misses leaves nothing behind. Tried every millisecond for {@link #NOWAIT_WINDOW}; the drop's own
+     * lock waits are cut at {@link #HOLD_LOCK_TIMEOUT} and the hold at {@link #DAY_HOLD}. False when no try got the
+     * lock, or a session holding the partition itself timed the drop out (55P03): nothing done, the caller finalizes.
+     * Only for a partition whose rows may go: the caller has proven that.
+     */
+    static boolean dropPending(Connection c, String parent, String partition) throws SQLException {
+        // a local commit, as the swap's: a wait for a synchronous standby ignores cancels and would hold the lock
+        var sql = "do $$ begin perform set_config('synchronous_commit', 'local', true); begin lock table only " + parent
+                + " in access exclusive mode nowait; exception when lock_not_available then perform set_config('"
+                + DROP_RESULT + "', 'busy', false); return; end; drop table if exists " + partition + "; perform"
+                + " set_config('" + DROP_RESULT + "', 'dropped', false); end $$";
+        long start = System.nanoTime();
+        String result;
+        try {
+            result = PartitionDdl.withTimeouts(c, HOLD_LOCK_TIMEOUT, DAY_HOLD.plus(TRY_MARGIN), () ->
+                    nowaitTries(start, () -> {
+                        execute(c, sql);
+                        try (var st = c.createStatement();
+                                var rs = st.executeQuery("select current_setting('" + DROP_RESULT + "', true)")) {
+                            rs.next();
+                            return rs.getString(1);
+                        }
+                    }));
+        } catch (SQLException e) {
+            if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
+                throw e;
+            }
+            return false;
+        }
+        if (!result.equals("dropped")) {
+            return false;
+        }
+        log.info("dropped partition {} of {}, left detach-pending, under ACCESS EXCLUSIVE on {} instead of finalizing"
+                + " its detach", partition, parent, parent);
+        return true;
     }
 
     /** The swap's one statement; {@code queued}: its parent lock waits in the queue instead of trying NOWAIT. */
@@ -974,19 +1025,49 @@ public final class XidPartitions {
     /**
      * Finishes a detach that an interrupted run left pending. Postgres allows one pending detach per parent and fails
      * every other {@code DETACH ... CONCURRENTLY} meanwhile (SQLState 55000), so this goes before any other partition
-     * DDL. A pending range is finalized, which leaves it standalone, and {@link #dropOrphans} decides on its drop: one
-     * {@link #dropProcessed} detached is recorded as relayed, anyone else's is kept unless empty. A pending tail takes
-     * the extension's path: dropped when empty, attached back when it holds rows.
+     * DDL. A pending range recorded in {@code <base>_dropping} is one {@link #dropProcessed} detached as relayed (its
+     * phase 2 timed out waiting for a lock holder, a relay step or a writer): no row can reach it since, so it is
+     * dropped as that run would have, by {@link #dropPending} under the quiesce ({@code quiesceTimeout}, relay steps
+     * in flight hold a lock on the parent too). When that misses, and for anyone else's pending range, it is
+     * finalized, which leaves it standalone, and {@link #dropOrphans} decides on its drop: one recorded as relayed
+     * goes, anyone else's is kept unless empty. A pending tail takes the extension's path: dropped when empty,
+     * attached back when it holds rows.
      */
-    void finishPendingDetach(Connection c, Duration lockTimeout) throws SQLException {
+    void finishPendingDetach(Connection c, Duration lockTimeout, Duration quiesceTimeout) throws SQLException {
         var pending = PartitionDdl.pendingDetach(c, names.base());
         if (pending == null) {
             return;
         }
         if (PartitionDdl.attachment(c, names.base(), names.tail()) == Attachment.DETACH_PENDING) {
             dropOrAttachBack(c, state(c), lockTimeout);
-        } else {
-            PartitionDdl.detach(c, names.base(), pending, lockTimeout); // FINALIZE; dropOrphans decides on the drop
+            return;
+        }
+        var range = names.unqualified(pending);
+        if (marked(c, range) && droppedQuiesced(c, pending, quiesceTimeout)) {
+            marker(c, unmarkDropping, range);
+            return;
+        }
+        PartitionDdl.detach(c, names.base(), pending, lockTimeout); // FINALIZE; dropOrphans decides on the drop
+    }
+
+    private boolean marked(Connection c, String range) throws SQLException {
+        try (var ps = c.prepareStatement("select 1 from " + names.dropping() + " where table_name = ?")) {
+            ps.setString(1, range);
+            try (var rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
+    }
+
+    /** {@link #dropPending} under the quiesce; false when a relay step in flight outlasted {@code quiesceTimeout}. */
+    private boolean droppedQuiesced(Connection c, String pending, Duration quiesceTimeout) throws SQLException {
+        try {
+            return quiesced(c, quiesceTimeout, () -> dropPending(c, names.base(), pending));
+        } catch (SQLException e) {
+            if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
+                throw e;
+            }
+            return false;
         }
     }
 

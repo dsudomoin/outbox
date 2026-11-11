@@ -937,7 +937,7 @@ public final class OutboxSchema implements AutoCloseable {
         try {
             advisory(c, "pg_advisory_lock", n, TableNames.LOCK_MAINTENANCE); // bounded by the session lock_timeout
             try {
-                partitions.finishPendingDetach(c, LOCK_TIMEOUT);
+                partitions.finishPendingDetach(c, LOCK_TIMEOUT, LOCK_TIMEOUT);
                 partitions.ensurePremade(c, LOCK_TIMEOUT, LOCK_TIMEOUT);
             } finally {
                 advisory(c, "pg_advisory_unlock", n, TableNames.LOCK_MAINTENANCE);
