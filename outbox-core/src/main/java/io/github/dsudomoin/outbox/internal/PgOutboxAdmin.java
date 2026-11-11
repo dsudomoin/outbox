@@ -512,11 +512,10 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             }
         }
         var xids = tx.createArrayOf("text", chunk.stream().map(r -> Long.toString(r.xid())).distinct().toArray());
-        var rows = new ArrayList<Resender.Row>(chunk.size());
-        var ids = new ArrayList<Long>(chunk.size());
+        var rows = new ArrayList<Resender.Source>(chunk.size());
         var xidsOf = new ArrayList<Long>(chunk.size());
-        try (var ps = tx.prepareStatement("select o.id, o.xid::text, o.message_id, o.topic, o.key, o.payload, o.headers"
-                + " from " + names.base() + " o where o.shard = ? and o.xid = any(?::text[]::xid8[]) and o.id = any(?)"
+        try (var ps = tx.prepareStatement("select o.id, o.xid::text, o.topic, o.key from " + names.base() + " o"
+                + " where o.shard = ? and o.xid = any(?::text[]::xid8[]) and o.id = any(?)"
                 + " and not exists (select 1 from " + names.retry() + " r where r.id = o.id"
                 + " and r.message_id = o.message_id)"
                 + " and not exists (select 1 from " + names.parked() + " p where p.id = o.id"
@@ -527,29 +526,30 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             ps.setArray(2, xids);
             ps.setArray(3, tx.createArrayOf("int8", chunk.stream().map(CoveredRow::id).toArray()));
             try (var rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    ids.add(rs.getLong(1));
+                while (rs.next()) { // the payloads and headers stay in the database: insertFrom copies them
+                    rows.add(new Resender.Source(rs.getLong(1), rs.getString(3), rs.getBytes(4)));
                     xidsOf.add(Long.parseLong(rs.getString(2)));
-                    rows.add(new Resender.Row(rs.getObject(3, UUID.class), rs.getString(4), rs.getBytes(5),
-                            rs.getBytes(6), rs.getBytes(7)));
                 }
             }
         }
         var hashes = rows.stream().map(r -> r.key() == null ? null : Hashing.keyHash(r.topic(), r.key())).toList();
         held.addAll(resender.tryKeyLocks(tx, hashes.stream().filter(h -> h != null && !held.contains(h)).toList()));
-        var ready = new ArrayList<Resender.Row>(rows.size());
+        var ready = new ArrayList<Resender.Source>(rows.size());
         var readyIds = new ArrayList<Long>(rows.size());
         var readyXids = new ArrayList<String>(rows.size());
         for (int i = 0; i < rows.size(); i++) {
             if (hashes.get(i) != null && held.contains(hashes.get(i))) {
-                left.add(new CoveredRow(ids.get(i), xidsOf.get(i)));
+                left.add(new CoveredRow(rows.get(i).id(), xidsOf.get(i)));
             } else {
                 ready.add(rows.get(i));
-                readyIds.add(ids.get(i));
+                readyIds.add(rows.get(i).id());
                 readyXids.add(Long.toString(xidsOf.get(i)));
             }
         }
-        resender.insertAll(tx, ready);
+        var xidList = String.join(",", readyXids.stream().distinct().toList());
+        // the shard and xids find the rows by the (shard, xid) index: the outbox has none on id. Numbers only, inlined
+        resender.insertFrom(tx, "(select id, message_id, topic, key, payload, headers from " + names.base()
+                + " where shard = " + shard + " and xid = any('{" + xidList + "}'::xid8[]))", ready);
         try (var ps = tx.prepareStatement("delete from " + names.base() + " where shard = ?"
                 + " and xid = any(?::text[]::xid8[]) and id = any(?)")) {
             ps.setShort(1, (short) shard);
@@ -977,20 +977,20 @@ public final class PgOutboxAdmin implements OutboxAdmin {
 
     /** Redrives the claimed letters but those whose key another transaction holds, skipped without waiting. */
     private Chunk redrive(Connection tx, Where where, long after) throws SQLException {
-        var claimed = new ArrayList<DeadLetters.Claimed>();
-        try (var ps = tx.prepareStatement("select " + DeadLetters.COLUMNS + " from " + dead + " where " + where.sql()
-                + " and id > ? order by id limit " + CHUNK + " for update skip locked")) {
+        var claimed = new ArrayList<DeadLetters.Ref>();
+        try (var ps = tx.prepareStatement("select " + DeadLetters.REF_COLUMNS + " from " + dead + " where "
+                + where.sql() + " and id > ? order by id limit " + CHUNK + " for update skip locked")) {
             ps.setLong(where.bind(ps), after);
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    claimed.add(DeadLetters.read(rs));
+                    claimed.add(DeadLetters.readRef(rs));
                 }
             }
         }
         var ready = rows.tryKeyLocks(tx, claimed).ready();
         rows.redrive(tx, ready);
-        return new Chunk(claimed.size(),
-                claimed.isEmpty() ? after : claimed.get(claimed.size() - 1).letter().id(), ready.size());
+        return new Chunk(claimed.size(), claimed.isEmpty() ? after : claimed.get(claimed.size() - 1).id(),
+                ready.size());
     }
 
     private Chunk discard(Connection tx, Where where, long after) throws SQLException {

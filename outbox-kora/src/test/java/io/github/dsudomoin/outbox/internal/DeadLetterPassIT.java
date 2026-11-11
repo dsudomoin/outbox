@@ -19,6 +19,7 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.testing.ByteReads;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
@@ -696,6 +697,25 @@ class DeadLetterPassIT {
         }
     }
 
+    /** Scheduled letters go back into the outbox inside the database: a batch of large ones stays out of the heap. */
+    @Test
+    void redrivesScheduledLettersWithoutReadingPayloadsOrHeaders() throws Exception {
+        var headers = List.of(new OutboxHeader("h", bytes("v")));
+        for (int i = 0; i < 10; i++) {
+            letter("t", "k" + i, "p", headers);
+        }
+        execute("update " + names.dead() + " set status = 'scheduled',"
+                + " payload = decode(repeat(md5(id::text), 4096), 'hex')"); // 64 KB each
+        var stored = contents(names.dead());
+        var pass = new DeadLetterPass(ByteReads.of(db), names, config, null, new OutboxMetrics(registry));
+        passes.add(pass);
+
+        long read = ByteReads.during(() -> assertThat(pass.runOnce()).isEqualTo(10));
+
+        assertThat(read).as("bytes read into Java: the keys at most").isLessThan(1024);
+        assertThat(contents(names.base())).as("in id order, byte for byte").isEqualTo(stored);
+    }
+
     @Test
     void withoutAHookPendingLettersBecomeKept() throws Exception {
         long pending = letter("t", "a", "p", List.of());
@@ -998,6 +1018,19 @@ class DeadLetterPassIT {
             ps.executeUpdate();
         }
         return id;
+    }
+
+    /** Each row's message id, topic, key and the md5 of its payload and headers, by id. */
+    private static List<String> contents(String table) throws SQLException {
+        var all = new ArrayList<String>();
+        try (var c = TestDb.connect(); var st = c.createStatement(); var rs = st.executeQuery("select concat_ws(' ',"
+                + " message_id, topic, encode(key, 'hex'), md5(payload), md5(headers)) from " + table
+                + " order by id")) {
+            while (rs.next()) {
+                all.add(rs.getString(1));
+            }
+        }
+        return all;
     }
 
     private static List<DeadLetterDecision> all(List<DeadLetter> letters, DeadLetterDecision decision) {

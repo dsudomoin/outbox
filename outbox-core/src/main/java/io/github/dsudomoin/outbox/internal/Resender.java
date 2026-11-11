@@ -12,11 +12,12 @@ import java.util.Set;
 import java.util.UUID;
 
 /**
- * The one bulk insert into the outbox: {@code sendAll}, and every path that puts rows back into it (orphan restore,
- * redrive). A row gets a new id and the inserting transaction's xid; it keeps its {@code message_id} and stored
- * headers, and its shard is recomputed for the current {@code outbox.shards}. Keyed rows take
- * {@code pg_advisory_xact_lock(keyNamespace, keyHash)}, the lock {@code send} takes, before the identity assigns their
- * ids, so a row cannot interleave with a concurrent {@code send} of its (topic, key).
+ * The bulk inserts into the outbox: {@code sendAll} ({@link #insertAll}), and every path that puts rows back into it
+ * (orphan restore, redrive, stranded-shard repair: {@link #insertFrom}). A row gets a new id and the inserting
+ * transaction's xid; it keeps its {@code message_id} and stored headers, and its shard is recomputed for the current
+ * {@code outbox.shards}. Keyed rows take {@code pg_advisory_xact_lock(keyNamespace, keyHash)}, the lock {@code send}
+ * takes, before the identity assigns their ids, so a row cannot interleave with a concurrent {@code send} of its
+ * (topic, key).
  */
 public final class Resender {
 
@@ -35,6 +36,9 @@ public final class Resender {
     /** A row to insert; {@code headers} in the stored encoding ({@link HeaderCodec}). */
     public record Row(
             UUID messageId, String topic, @Nullable byte[] key, @Nullable byte[] payload, @Nullable byte[] headers) {}
+
+    /** A row of another table to copy ({@link #insertFrom}): its id there, and the topic and key it has there. */
+    public record Source(long id, String topic, @Nullable byte[] key) {}
 
     private final int keyNamespace;
     private final TableNames names;
@@ -99,36 +103,20 @@ public final class Resender {
         if (n == 0) {
             return 0;
         }
-        var rowShards = new Short[n];
         var ids = new UUID[n];
         var topics = new String[n];
         var keys = new byte[n][];
         var payloads = new byte[n][];
         var headers = new byte[n][];
-        var hashes = new Integer[n];
-        int keyed = 0;
         for (int i = 0; i < n; i++) {
             var r = rows.get(i);
-            if (r.key() == null) {
-                rowShards[i] = (short) Hashing.randomShard(shards);
-            } else {
-                int hash = Hashing.keyHash(r.topic(), r.key());
-                hashes[keyed++] = hash;
-                rowShards[i] = (short) Hashing.shard(hash, shards);
-            }
             ids[i] = r.messageId();
             topics[i] = r.topic();
             keys[i] = r.key();
             payloads[i] = r.payload();
             headers[i] = r.headers();
         }
-        if (keyed > 0) {
-            try (var ps = inTx.prepareStatement(LOCK_ALL)) { // distinct and sorted: no deadlock between bulk writers
-                ps.setInt(1, keyNamespace);
-                ps.setArray(2, inTx.createArrayOf("int4", Arrays.copyOf(hashes, keyed)));
-                ps.execute();
-            }
-        }
+        var rowShards = lockKeys(inTx, topics, keys);
         try (var ps = inTx.prepareStatement(insertAll)) {
             ps.setArray(1, inTx.createArrayOf("int2", rowShards));
             ps.setArray(2, inTx.createArrayOf("uuid", ids));
@@ -138,5 +126,67 @@ public final class Resender {
             ps.setArray(6, inTx.createArrayOf("bytea", headers));
             return ps.executeUpdate();
         }
+    }
+
+    /**
+     * As {@link #insertAll}, but each row copied from its row in {@code from} inside the database: message id, topic,
+     * key, payload and headers, so no payload comes into Java, however large a chunk's. {@code from} is a table, or a
+     * parenthesised select, with those columns and an {@code id} unique in it; the rows' topics and keys are those it
+     * holds, as their key locks and shards are computed from them here. A source row no longer there is skipped.
+     * Returns the rows inserted.
+     */
+    public int insertFrom(Connection inTx, String from, List<Source> rows) throws SQLException {
+        guard.require(names, shards);
+        int n = rows.size();
+        if (n == 0) {
+            return 0;
+        }
+        var ids = new Long[n];
+        var topics = new String[n];
+        var keys = new byte[n][];
+        for (int i = 0; i < n; i++) {
+            var r = rows.get(i);
+            ids[i] = r.id();
+            topics[i] = r.topic();
+            keys[i] = r.key();
+        }
+        var rowShards = lockKeys(inTx, topics, keys);
+        try (var ps = inTx.prepareStatement("insert into " + names.base()
+                + " (shard, message_id, topic, key, payload, headers)"
+                + " select u.shard, s.message_id, s.topic, s.key, s.payload, s.headers"
+                + " from unnest(?::bigint[], ?::smallint[]) with ordinality u(id, shard, ord)"
+                + " join " + from + " s on s.id = u.id order by u.ord")) {
+            ps.setArray(1, inTx.createArrayOf("int8", ids));
+            ps.setArray(2, inTx.createArrayOf("int2", rowShards));
+            return ps.executeUpdate();
+        }
+    }
+
+    /**
+     * The shard of each row, recomputed for the current {@code outbox.shards}, a random one when it has no key; the
+     * keyed rows' distinct key hashes locked in one statement, until {@code inTx} ends.
+     */
+    private Short[] lockKeys(Connection inTx, String[] topics, byte[][] keys) throws SQLException {
+        int n = topics.length;
+        var rowShards = new Short[n];
+        var hashes = new Integer[n];
+        int keyed = 0;
+        for (int i = 0; i < n; i++) {
+            if (keys[i] == null) {
+                rowShards[i] = (short) Hashing.randomShard(shards);
+            } else {
+                int hash = Hashing.keyHash(topics[i], keys[i]);
+                hashes[keyed++] = hash;
+                rowShards[i] = (short) Hashing.shard(hash, shards);
+            }
+        }
+        if (keyed > 0) {
+            try (var ps = inTx.prepareStatement(LOCK_ALL)) { // distinct and sorted: no deadlock between bulk writers
+                ps.setInt(1, keyNamespace);
+                ps.setArray(2, inTx.createArrayOf("int4", Arrays.copyOf(hashes, keyed)));
+                ps.execute();
+            }
+        }
+        return rowShards;
     }
 }

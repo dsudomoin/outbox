@@ -78,6 +78,7 @@ public final class DeadLetterPass {
     private final Duration initialDelay;
     private final Duration maxDelay;
     private final String claim;
+    private final String claimScheduled;
     private final String keep;
     private final String schedule;
     private final String fail;
@@ -129,6 +130,9 @@ public final class DeadLetterPass {
         this.maxDelay = config.relay().retry().maxDelay();
         claim = "select " + DeadLetters.COLUMNS + " from " + dead + " where status = ? and due_at <= now()"
                 + " order by due_at, id limit ? for update skip locked";
+        // a redrive copies payloads and headers inside the database: they stay out of the heap
+        claimScheduled = "select " + DeadLetters.REF_COLUMNS + " from " + dead + " where status = 'scheduled'"
+                + " and due_at <= now() order by due_at, id limit ? for update skip locked";
         keep = "update " + dead + " set status = 'kept', due_at = null where id = any(?)";
         // from the hook's time as a delay, the hook's clock being the JVM's: a redriveAt(Instant.now().plusSeconds(3))
         // is 3 s by the database's clock, every due_at's; clock_timestamp(): the hook's call may have outlasted now()
@@ -355,14 +359,22 @@ public final class DeadLetterPass {
      * those keys wait with it.
      */
     private DeadLetters.Split redriveBatch(Connection tx, List<Long> ids) throws SQLException {
-        var claimed = claim(tx, "scheduled");
-        claimed.forEach(c -> ids.add(c.letter().id()));
+        var claimed = new ArrayList<DeadLetters.Ref>();
+        try (var ps = tx.prepareStatement(claimScheduled)) {
+            ps.setInt(1, batchSize);
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    claimed.add(DeadLetters.readRef(rs));
+                }
+            }
+        }
+        claimed.forEach(r -> ids.add(r.id()));
         if (claimed.isEmpty()) {
             return new DeadLetters.Split(List.of(), List.of());
         }
         rows.limitLockWaits(tx);
         var split = rows.tryKeyLocks(tx, claimed);
-        defer(tx, split.held().stream().map(c -> c.letter().id()).toList());
+        defer(tx, split.held().stream().map(DeadLetters.Ref::id).toList());
         rows.redrive(tx, split.ready()); // its key locks are ours already: Resender takes them again without waiting
         return split;
     }

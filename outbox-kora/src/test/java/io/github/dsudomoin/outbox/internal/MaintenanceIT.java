@@ -20,6 +20,7 @@ import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.testing.ByteReads;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
@@ -33,6 +34,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -1250,6 +1252,27 @@ class MaintenanceIT {
         }
     }
 
+    /** The rows go back into the outbox inside the database: a chunk of large ones never comes into the heap. */
+    @Test
+    void restoreMovesRowsWithoutReadingPayloadsOrHeaders() throws Exception {
+        bootstrap();
+        var orphan = oursOrphan(relay(new RecordingHandler(), maintenance()), 20);
+        try (var c = TestDb.connect()) {
+            execute(c, "update " + orphan.table() + " set headers = decode(md5(id::text), 'hex'),"
+                    + " payload = decode(repeat(md5(id::text), 4096), 'hex')"); // 64 KB each
+        }
+        var stored = contents(orphan.table(), orphan.above());
+
+        try (var c = ByteReads.of(TestDb.connect())) {
+            long read = ByteReads.during(() -> assertThat(maintenance().orphanRestore
+                    .restore(c, orphan.table(), orphan.horizon(), Duration.ofSeconds(30))).isEqualTo(20));
+
+            assertThat(read).as("bytes read into Java: the keys at most").isLessThan(1024);
+        }
+        assertThat(exists(orphan.table())).isFalse();
+        assertThat(contents(names.base(), orphan.above())).as("byte for byte").isEqualTo(stored);
+    }
+
     @Test
     void oneFailingRestoreDoesNotHideTheOtherOrphans() throws Exception {
         bootstrap();
@@ -2385,6 +2408,21 @@ class MaintenanceIT {
         }
         assertThat(above).hasSize(rows);
         return new Detached(range.name(), horizon, sent, above);
+    }
+
+    /** The message id, topic, key and the md5 of the payload and headers of each row of {@code messageIds}. */
+    private static Set<String> contents(String table, List<UUID> messageIds) throws SQLException {
+        var all = new HashSet<String>();
+        try (var c = TestDb.connect(); var ps = c.prepareStatement("select concat_ws(' ', message_id, topic,"
+                + " encode(key, 'hex'), md5(payload), md5(headers)) from " + table + " where message_id = any(?)")) {
+            ps.setArray(1, c.createArrayOf("uuid", messageIds.toArray()));
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    all.add(rs.getString(1));
+                }
+            }
+        }
+        return all;
     }
 
     private static long count(String table, List<UUID> messageIds) throws SQLException {

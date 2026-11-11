@@ -12,6 +12,7 @@ import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
+import io.github.dsudomoin.outbox.testing.ByteReads;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -174,6 +175,27 @@ class StrandedShardsIT {
             assertThat(queryLong(c, "select count(*) from " + names.base() + " where shard = 1"))
                     .as("moved, not copied: a call that fails midway repeats none of them").isEqualTo(5);
         }
+    }
+
+    /** The rows go back into the outbox inside the database: a chunk of large ones never comes into the heap. */
+    @Test
+    void largeRowsMoveWithoutTheirPayloadsOrHeadersComingIntoJava() throws Exception {
+        leaveTheOtherShardsOnANewerTick();
+        var rows = sendMany(1, 10);
+        try (var c = direct.getConnection()) {
+            execute(c, "update " + names.base() + " set headers = decode(md5(id::text), 'hex'),"
+                    + " payload = decode(repeat(md5(id::text), 4096), 'hex') where shard = 1"); // 64 KB each
+        }
+        var stored = contents(rows);
+        makeATick();
+        deleteTheirTick();
+        relay = OutboxRuntime.builder(config, new JdbcTransactions(ByteReads.of(direct)), this::deliver).build();
+        relay.start();
+
+        long read = ByteReads.during(() -> assertThat(admin().recoverStrandedShards()).isEqualTo(10));
+
+        assertThat(read).as("bytes read into Java: the keys at most").isLessThan(1024);
+        assertThat(contents(rows)).as("byte for byte").isEqualTo(stored);
     }
 
     @Test
@@ -569,6 +591,22 @@ class StrandedShardsIT {
             assertThat(err.text()).contains("outbox admin recoverStrandedShards() on " + names.base()
                     + " returned 2, the rows re-sent, for shards [1, 2]");
         }
+    }
+
+    /** The message id, topic, key and the md5 of the payload and headers of each row of {@code messageIds}. */
+    private Set<String> contents(List<UUID> messageIds) throws Exception {
+        var all = new HashSet<String>();
+        try (var c = direct.getConnection(); var ps = c.prepareStatement("select concat_ws(' ', message_id, topic,"
+                + " encode(key, 'hex'), md5(payload), md5(headers)) from " + names.base()
+                + " where message_id = any(?)")) {
+            ps.setArray(1, c.createArrayOf("uuid", messageIds.toArray()));
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    all.add(rs.getString(1));
+                }
+            }
+        }
+        return all;
     }
 
     private long idOf(UUID messageId) throws Exception {

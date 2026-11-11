@@ -14,6 +14,7 @@ import io.github.dsudomoin.outbox.DeadLetter;
 import io.github.dsudomoin.outbox.DeadLetterDecision;
 import io.github.dsudomoin.outbox.DeadLetterFilter;
 import io.github.dsudomoin.outbox.OutboxAdmin.Abandoned;
+import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxStatus;
 import io.github.dsudomoin.outbox.OutboxStatus.DeadLetterCount;
@@ -22,6 +23,7 @@ import io.github.dsudomoin.outbox.OutboxStatus.OrphanKind;
 import io.github.dsudomoin.outbox.OutboxWaitException;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.testing.ByteReads;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
@@ -184,6 +186,39 @@ class OutboxAdminIT {
         assertThat(deadIds()).containsExactly(c);
         assertThat(outboxMessageIds()).containsExactly(messageIds.get(a), messageIds.get(b));
         assertThat(wakes).hasValue(1);
+    }
+
+    /**
+     * The dead table collects the records Kafka found too large, so a chunk of them must not come into the heap: the
+     * payloads and headers go back into the outbox inside the database, byte for byte.
+     */
+    @Test
+    void redrivesWithoutReadingPayloadsOrHeaders() throws Exception {
+        var byIds = new ArrayList<Long>();
+        for (int i = 0; i < 10; i++) {
+            long id = letter(i < 5 ? "t1" : "t2", "k" + i);
+            if (i >= 5) {
+                byIds.add(id);
+            }
+        }
+        var headers = HeaderCodec.encode(List.of(new OutboxHeader("h", bytes("v"))));
+        try (var c = TestDb.connect(); var ps = c.prepareStatement("update " + names.dead()
+                + " set payload = decode(repeat(md5(id::text), 4096), 'hex'), headers = ?")) { // 64 KB each
+            ps.setBytes(1, headers);
+            ps.executeUpdate();
+        }
+        var stored = contents(names.dead());
+        var counted = new PgOutboxAdmin(ByteReads.of(db), names, config,
+                new Maintenance(db, names, config, new OutboxMetrics(null)), wakes::incrementAndGet);
+
+        long read = ByteReads.during(() -> {
+            assertThat(counted.redriveDeadLetters(filter("t1", null, null, null, null, null))).isEqualTo(5);
+            assertThat(counted.redriveDeadLetters(byIds)).isEqualTo(5);
+        });
+
+        assertThat(read).as("bytes read into Java: the keys at most").isLessThan(1024);
+        assertThat(deadIds()).isEmpty();
+        assertThat(contents(names.base())).as("in id order, byte for byte").isEqualTo(stored);
     }
 
     @Test
@@ -1144,6 +1179,19 @@ class OutboxAdminIT {
                 var rs = st.executeQuery("select message_id from " + names.base() + " order by id")) {
             while (rs.next()) {
                 all.add(rs.getObject(1, UUID.class));
+            }
+        }
+        return all;
+    }
+
+    /** Each row's message id, topic, key and the md5 of its payload and headers, by id. */
+    private static List<String> contents(String table) throws SQLException {
+        var all = new ArrayList<String>();
+        try (var c = TestDb.connect(); var st = c.createStatement(); var rs = st.executeQuery("select concat_ws(' ',"
+                + " message_id, topic, encode(key, 'hex'), md5(payload), md5(headers)) from " + table
+                + " order by id")) {
+            while (rs.next()) {
+                all.add(rs.getString(1));
             }
         }
         return all;

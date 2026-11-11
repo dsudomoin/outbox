@@ -7,14 +7,14 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
-import java.util.UUID;
 import java.util.regex.Pattern;
 import io.github.dsudomoin.outbox.internal.Sql.SqlConsumer;
 
 /**
  * Moves the rows of a standalone outbox range back into the outbox, then drops the range. Moved rows are new messages
- * ({@link Resender}: new id and xid, the same {@code message_id} and headers, the shard recomputed, through the key
- * locks {@code send} takes), so they are delivered after later messages of their keys.
+ * ({@link Resender#insertFrom}: new id and xid, the same {@code message_id} and headers, the shard recomputed, through
+ * the key locks {@code send} takes), so they are delivered after later messages of their keys. Their payloads and
+ * headers are copied inside the database and never come into Java.
  */
 public final class OrphanRestore {
 
@@ -88,18 +88,18 @@ public final class OrphanRestore {
         }
         PartitionDdl.execute(autocommit, lockTimeout,
                 "create index if not exists " + names.unqualified(table) + "_id on " + table + " (id)");
-        String chunk = "select id, message_id, topic, key, payload, headers from " + table
+        String chunk = "select id, topic, key from " + table
                 + " where xid >= ?::text::xid8 and id > ? order by id limit " + CHUNK;
         long moved = 0;
         long after = Long.MIN_VALUE;
         boolean last = false;
         var busy = new HashSet<Integer>(); // key hashes another transaction held: theirs stay, in every later chunk
-        var held = new LinkedHashMap<Integer, Resender.Row>(); // a row of each busy hash, in the order first met
+        var held = new LinkedHashMap<Integer, Resender.Source>(); // a row of each busy hash, in the order first met
         long left = 0;
         var c = autocommit;
         while (!last) {
             var ids = new ArrayList<Long>(CHUNK);
-            var rows = new ArrayList<Resender.Row>(CHUNK);
+            var rows = new ArrayList<Resender.Source>(CHUNK);
             int read;
             c.setAutoCommit(false);
             try (var st = c.createStatement()) {
@@ -118,8 +118,7 @@ public final class OrphanRestore {
                     try (var rs = ps.executeQuery()) {
                         while (rs.next()) {
                             ids.add(rs.getLong(1));
-                            rows.add(new Resender.Row(rs.getObject(2, UUID.class), rs.getString(3), rs.getBytes(4),
-                                    rs.getBytes(5), rs.getBytes(6)));
+                            rows.add(new Resender.Source(rs.getLong(1), rs.getString(2), rs.getBytes(3)));
                         }
                     }
                 }
@@ -145,7 +144,7 @@ public final class OrphanRestore {
                         left++;
                     }
                 }
-                resender.insertAll(c, rows);
+                resender.insertFrom(c, table, rows);
                 try (var ps = c.prepareStatement("delete from " + table + " where id = any(?)")) {
                     ps.setArray(1, c.createArrayOf("int8", ids.toArray()));
                     ps.executeUpdate();
@@ -203,7 +202,7 @@ public final class OrphanRestore {
      * chunk's, once its key lock is had within {@code keyLockTimeout}; none when it is not. Drops the table when no row at or
      * above {@code fromXid} is left.
      */
-    private Moved moveHeld(Connection c, String table, long fromXid, Duration lockTimeout, Resender.Row row)
+    private Moved moveHeld(Connection c, String table, long fromXid, Duration lockTimeout, Resender.Source row)
             throws SQLException {
         c.setAutoCommit(false);
         try (var st = c.createStatement()) {
@@ -226,8 +225,8 @@ public final class OrphanRestore {
                 return new Moved(0, false);
             }
             var ids = new ArrayList<Long>();
-            var rows = new ArrayList<Resender.Row>();
-            try (var ps = c.prepareStatement("select id, message_id, topic, key, payload, headers from " + table
+            var rows = new ArrayList<Resender.Source>();
+            try (var ps = c.prepareStatement("select id, topic, key from " + table
                     + " where xid >= ?::text::xid8 and topic = ? and key = ? order by id limit " + CHUNK)) {
                 ps.setString(1, Long.toString(fromXid));
                 ps.setString(2, row.topic());
@@ -235,12 +234,11 @@ public final class OrphanRestore {
                 try (var rs = ps.executeQuery()) {
                     while (rs.next()) {
                         ids.add(rs.getLong(1));
-                        rows.add(new Resender.Row(rs.getObject(2, UUID.class), rs.getString(3), rs.getBytes(4),
-                                rs.getBytes(5), rs.getBytes(6)));
+                        rows.add(new Resender.Source(rs.getLong(1), rs.getString(2), rs.getBytes(3)));
                     }
                 }
             }
-            resender.insertAll(c, rows); // the key's lock is ours: taken again without waiting
+            resender.insertFrom(c, table, rows); // the key's lock is ours: taken again without waiting
             try (var ps = c.prepareStatement("delete from " + table + " where id = any(?)")) {
                 ps.setArray(1, c.createArrayOf("int8", ids.toArray()));
                 ps.executeUpdate();

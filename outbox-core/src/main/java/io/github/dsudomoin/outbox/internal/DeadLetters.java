@@ -19,19 +19,30 @@ final class DeadLetters {
     static final String COLUMNS = "id, message_id, topic, key, payload, headers, created_at, attempts,"
             + " failed_at, error, status, redrives, handler_attempts, due_at";
 
-    /** A letter with its headers in the stored encoding, as a redrive inserts them. */
+    /** The columns {@link #readRef} maps, in its order: what a redrive needs, the payload and headers left out. */
+    static final String REF_COLUMNS = "id, message_id, topic, key, redrives";
+
+    /** A letter with its headers in the stored encoding. */
     record Claimed(DeadLetter letter, @Nullable byte[] headers) {}
 
+    /**
+     * A letter as a redrive claims it: its payload and headers stay in the database, copied from there
+     * ({@link Resender#insertFrom}), so a chunk of large letters never comes into the heap.
+     */
+    record Ref(long id, UUID messageId, String topic, @Nullable byte[] key, int redrives) {}
+
     /** Letters by their key lock ({@link #tryKeyLocks}): ready to redrive, or held by another transaction. */
-    record Split(List<Claimed> ready, List<Claimed> held) {}
+    record Split(List<Ref> ready, List<Ref> held) {}
 
     private final Resender resender;
+    private final String dead;
     private final String lockTimeout;
     private final String remember;
     private final String delete;
 
     DeadLetters(TableNames names, OutboxConfig config) {
         this.resender = new Resender(names, config);
+        this.dead = names.dead();
         this.lockTimeout = "set local lock_timeout = '" + XidPartitions.lockWait(config.partitions()).toMillis()
                 + "ms'";
         // one row per message, should two of its letters be redriven together
@@ -62,18 +73,21 @@ final class DeadLetters {
                 dueAt == null ? null : dueAt.toInstant()), headers);
     }
 
+    /** The row at {@code rs}, selected as {@link #REF_COLUMNS}. */
+    static Ref readRef(ResultSet rs) throws SQLException {
+        return new Ref(rs.getLong(1), rs.getObject(2, UUID.class), rs.getString(3), rs.getBytes(4), rs.getInt(5));
+    }
+
     /**
      * Tries the key lock of each distinct key without waiting ({@code pg_try_advisory_xact_lock}, held until
      * {@code tx} ends): the unkeyed letters and those whose lock {@code tx} now holds are ready, those whose key
      * another transaction holds, an open {@code send} of it, are held.
      */
-    Split tryKeyLocks(Connection tx, List<Claimed> letters) throws SQLException {
-        var hashes = letters.stream()
-                .map(c -> c.letter().key() == null ? null : Hashing.keyHash(c.letter().topic(), c.letter().key()))
-                .toList();
+    Split tryKeyLocks(Connection tx, List<Ref> letters) throws SQLException {
+        var hashes = letters.stream().map(r -> r.key() == null ? null : Hashing.keyHash(r.topic(), r.key())).toList();
         var held = resender.tryKeyLocks(tx, hashes);
-        var ready = new ArrayList<Claimed>();
-        var waiting = new ArrayList<Claimed>();
+        var ready = new ArrayList<Ref>();
+        var waiting = new ArrayList<Ref>();
         for (int i = 0; i < letters.size(); i++) {
             (hashes.get(i) != null && held.contains(hashes.get(i)) ? waiting : ready).add(letters.get(i));
         }
@@ -81,23 +95,23 @@ final class DeadLetters {
     }
 
     /**
-     * Back into the outbox ({@link Resender}), the redrive counted in {@code <redriven>}, the dead rows deleted. Their
+     * Back into the outbox, copied from the dead table ({@link Resender#insertFrom}), the redrive counted in {@code <redriven>}, the dead rows deleted. Their
      * key locks are {@code tx}'s already ({@link #tryKeyLocks}), so taken again without waiting; any other lock the
      * insert waits for is waited for at most {@link XidPartitions#lockWait} each.
      */
-    void redrive(Connection tx, List<Claimed> letters) throws SQLException {
+    void redrive(Connection tx, List<Ref> letters) throws SQLException {
         if (letters.isEmpty()) {
             return;
         }
         limitLockWaits(tx); // after the claim: the insert waits for a lock no longer than the swap
-        resender.insertAll(tx, letters.stream().map(c -> new Resender.Row(c.letter().messageId(),
-                c.letter().topic(), c.letter().key(), c.letter().payload(), c.headers())).toList());
+        resender.insertFrom(tx, dead, letters.stream().map(r -> new Resender.Source(r.id(), r.topic(), r.key()))
+                .toList());
         try (var ps = tx.prepareStatement(remember)) {
-            ps.setArray(1, tx.createArrayOf("uuid", letters.stream().map(c -> c.letter().messageId()).toArray()));
-            ps.setArray(2, tx.createArrayOf("int4", letters.stream().map(c -> c.letter().redrives() + 1).toArray()));
+            ps.setArray(1, tx.createArrayOf("uuid", letters.stream().map(Ref::messageId).toArray()));
+            ps.setArray(2, tx.createArrayOf("int4", letters.stream().map(r -> r.redrives() + 1).toArray()));
             ps.executeUpdate();
         }
-        delete(tx, letters.stream().map(c -> c.letter().id()).toList());
+        delete(tx, letters.stream().map(Ref::id).toList());
     }
 
     /** Each lock wait of the rest of {@code tx} at most {@link XidPartitions#lockWait}, past a swap's hold. */
