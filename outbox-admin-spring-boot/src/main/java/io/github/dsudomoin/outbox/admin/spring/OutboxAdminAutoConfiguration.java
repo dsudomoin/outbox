@@ -10,6 +10,7 @@ import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.util.function.SingletonSupplier;
@@ -26,6 +27,7 @@ import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandl
 @ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
 @ConditionalOnClass(RequestMappingHandlerAdapter.class)
 @ConditionalOnBean(OutboxAdmin.class)
+@EnableConfigurationProperties(OutboxAdminProperties.class)
 public final class OutboxAdminAutoConfiguration {
 
     @Bean
@@ -46,13 +48,16 @@ public final class OutboxAdminAutoConfiguration {
      * which still maps the controller, and that would leave the routes open. No path patterns: the guard goes by the
      * handler.
      *
-     * <p>Needs nothing to be made, this configuration included, and takes the authorizer at its first call: the mapping
-     * makes this bean during its own start and drops it, silently, if making it comes back to a bean in creation, which
-     * an authorizer with the mapping or {@code HandlerMappingIntrospector} among its dependencies would.
+     * <p>Needs nothing to be made but its properties, which need nothing themselves (not this configuration either),
+     * and takes the authorizer at its first call: the mapping makes this bean during its own start and drops it,
+     * silently, if making it comes back to a bean in creation, which an authorizer with the mapping or
+     * {@code HandlerMappingIntrospector} among its dependencies would.
      */
     @Bean
-    static MappedInterceptor outboxAdminGuard(ObjectProvider<OutboxAdminAuthorizer> authorizers) {
-        return new MappedInterceptor(null, new OutboxAdminGuard(SingletonSupplier.of(() -> authorizer(authorizers))));
+    static MappedInterceptor outboxAdminGuard(ObjectProvider<OutboxAdminAuthorizer> authorizers,
+        OutboxAdminProperties properties) {
+        return new MappedInterceptor(null, new OutboxAdminGuard(SingletonSupplier.of(() -> authorizer(authorizers)),
+            properties.checkOrigin()));
     }
 
     /**

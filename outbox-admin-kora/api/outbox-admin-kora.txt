@@ -22,7 +22,12 @@ package io.github.dsudomoin.outbox.admin.kora {
     method public int status();
   }
 
+  @ru.tinkoff.kora.config.common.annotation.ConfigValueExtractor public interface OutboxAdminConfig {
+    method public default boolean checkOrigin();
+  }
+
   public interface OutboxAdminHttpModule {
+    method public default io.github.dsudomoin.outbox.admin.kora.OutboxAdminConfig! outboxAdminConfig(ru.tinkoff.kora.config.common.Config!, ru.tinkoff.kora.config.common.extractor.ConfigValueExtractor<io.github.dsudomoin.outbox.admin.kora.OutboxAdminConfig!>!);
   }
 
 }

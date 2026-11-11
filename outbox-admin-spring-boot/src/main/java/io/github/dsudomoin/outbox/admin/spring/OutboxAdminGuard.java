@@ -35,7 +35,8 @@ import org.springframework.web.servlet.HandlerInterceptor;
  * without that header (a browser sends none over plain HTTP to an address other than localhost) it is an
  * {@code Origin} of {@code null} or of another host and port than the request's server name and port, the scheme
  * aside: those the container took from {@code Host}, or from forwarded headers where the app takes them
- * ({@code server.forward-headers-strategy}). Curl and service clients send neither header. Each is a
+ * ({@code server.forward-headers-strategy}); {@code outbox.admin.check-origin=false} turns this {@code Origin} check
+ * off ({@code Sec-Fetch-Site} still counts). Curl and service clients send neither header. Each is a
  * {@link Refused} that the controller's own handler answers, so neither an app's advice nor the app's JSON library is
  * this class's concern.
  *
@@ -63,10 +64,15 @@ final class OutboxAdminGuard implements HandlerInterceptor {
     private record Allowed(String identity) {}
 
     private final Supplier<OutboxAdminAuthorizer> authorizer;
+    private final boolean checkOrigin;
 
-    /** A supplier, so that making this guard, which a handler mapping's start does, needs nothing of the app's. */
-    OutboxAdminGuard(Supplier<OutboxAdminAuthorizer> authorizer) {
+    /**
+     * A supplier, so that making this guard, which a handler mapping's start does, needs nothing of the app's.
+     * {@code checkOrigin}: {@link OutboxAdminProperties#checkOrigin}.
+     */
+    OutboxAdminGuard(Supplier<OutboxAdminAuthorizer> authorizer, boolean checkOrigin) {
         this.authorizer = authorizer;
+        this.checkOrigin = checkOrigin;
     }
 
     @Override
@@ -151,12 +157,15 @@ final class OutboxAdminGuard implements HandlerInterceptor {
      * carry what the browser adds by itself (a cookie, an SSO session, the operator's network address), which an
      * authorizer cannot tell from the operator's own call. Without that header, which a browser sends only to a
      * trustworthy origin (HTTPS or localhost), an {@code Origin} that is not this server's host and port says so.
-     * Clients other than browsers send neither header.
+     * Clients other than browsers send neither header. {@link #checkOrigin} off leaves {@code Origin} unread.
      */
-    private static boolean sentByAnotherSite(HttpServletRequest request) {
+    private boolean sentByAnotherSite(HttpServletRequest request) {
         var site = request.getHeader("Sec-Fetch-Site");
         if (site != null) {
             return !site.equals("same-origin") && !site.equals("none");
+        }
+        if (!checkOrigin) {
+            return false;
         }
         var origin = request.getHeader("Origin");
         return origin != null && !sameHost(origin, request.getServerName(), port(request));

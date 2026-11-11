@@ -353,6 +353,22 @@ class OutboxAdminGuardIT {
         }
     }
 
+    /**
+     * {@code outbox.admin.check-origin=false} turns the {@code Origin} fallback off, for a proxy that rewrites
+     * {@code Host} over plain HTTP; a browser's {@code Sec-Fetch-Site} is still refused.
+     */
+    @Test
+    void checkOriginOffLetsAnotherOriginReachTheAuthorizerButNotAnotherSite() throws Exception {
+        try (var server = AdminServer.start(List.of("outbox.admin.check-origin=false"), WithKeys.class,
+            WithSpy.class)) {
+            assertThat(rawPost(server, "Host: app:8080", "Origin: http://ops.internal")).contains("unknown key");
+            assertThat(server.bean(Keys.class).threads).hasSize(1);
+            assertThat(rawPost(server, "Host: app:8080", "Origin: http://ops.internal", "Sec-Fetch-Site: cross-site"))
+                .contains("cross-site request refused");
+            assertThat(server.bean(Keys.class).threads).as("the authorizer did not run").hasSize(1);
+        }
+    }
+
     /** A POST to the xid-regression route with key "wrong" and {@code headers} as given; the whole response. */
     private static String rawPost(AdminServer server, String... headers) throws IOException {
         try (var socket = new java.net.Socket("localhost", server.port)) {
@@ -524,7 +540,7 @@ class OutboxAdminGuardIT {
     /** A container refuses these raw, so no HTTP call gets them here. */
     @Test
     void anAuditLinePathIsOneQuotedToken() throws Exception {
-        var guard = new OutboxAdminGuard(() -> request -> OutboxAdminAuthorizer.unauthorized("who?"));
+        var guard = new OutboxAdminGuard(() -> request -> OutboxAdminAuthorizer.unauthorized("who?"), true);
         var handler = new HandlerMethod(new OutboxAdminController(null),
             OutboxAdminController.class.getMethod("getStatus"));
         try (var stderr = new CapturedStderr()) {
@@ -543,7 +559,7 @@ class OutboxAdminGuardIT {
     void anAuthorizerThatCannotBeHadIsAFixed500() throws Exception {
         OutboxAdminGuard guard = new OutboxAdminGuard(() -> {
             throw new IllegalStateException("no bean");
-        });
+        }, true);
         var handler = new HandlerMethod(new OutboxAdminController(null),
             OutboxAdminController.class.getMethod("getStatus"));
 

@@ -22,8 +22,13 @@ package io.github.dsudomoin.outbox.admin.spring {
     method public int status();
   }
 
-  @org.springframework.boot.autoconfigure.AutoConfiguration(after=OutboxAutoConfiguration.class) @org.springframework.boot.autoconfigure.condition.ConditionalOnBean(OutboxAdmin.class) @org.springframework.boot.autoconfigure.condition.ConditionalOnClass(RequestMappingHandlerAdapter.class) @org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication(type=org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication.Type.SERVLET) public final class OutboxAdminAutoConfiguration {
+  @org.springframework.boot.autoconfigure.AutoConfiguration(after=OutboxAutoConfiguration.class) @org.springframework.boot.autoconfigure.condition.ConditionalOnBean(OutboxAdmin.class) @org.springframework.boot.autoconfigure.condition.ConditionalOnClass(RequestMappingHandlerAdapter.class) @org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication(type=org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication.Type.SERVLET) @org.springframework.boot.context.properties.EnableConfigurationProperties(OutboxAdminProperties.class) public final class OutboxAdminAutoConfiguration {
     ctor public OutboxAdminAutoConfiguration();
+  }
+
+  @org.springframework.boot.context.properties.ConfigurationProperties("outbox.admin") public final class OutboxAdminProperties {
+    ctor public OutboxAdminProperties(@org.springframework.boot.context.properties.bind.DefaultValue("true") boolean);
+    method public boolean checkOrigin();
   }
 
 }

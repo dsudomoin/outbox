@@ -1486,7 +1486,8 @@ kebab-case (`outbox.relay.batch-timeout`), camelCase тоже привязыва
 стартует.
 
 `outbox.heartbeat.dedicated-connection` работает как `dedicatedConnection` в Kora ([Соединения
-heartbeat](#соединения-heartbeat)).
+heartbeat](#соединения-heartbeat)), `outbox.admin.check-origin` — как `checkOrigin` в Kora
+([`outbox.admin`](#outboxadmin-outboxadminhttpmodule)).
 
 Бин приложения заменяет бин адаптера:
 
@@ -2070,8 +2071,9 @@ letters, написанные одним мажором, читает друго
   получает `null` и любой хост с портом, кроме имени и порта сервера из запроса (схема не сравнивается). Имя и порт
   контейнер берёт из `Host`, а с `server.forward-headers-strategy` — из заголовков прокси. Если порта нет ни в `Host`,
   ни в заголовках прокси, порт `Origin` сверяется с портом по умолчанию его же схемы: за прокси, снимающим TLS,
-  страница `https://app` проходит, хотя сервер видит http и порт 80. curl и сервисы не шлют ни
-  того, ни другого и проходят как раньше. Старые браузеры без этих заголовков проходят тоже: ещё одна причина не
+  страница `https://app` проходит, хотя сервер видит http и порт 80. Если прокси подменяет `Host`, а браузеры ходят по
+  обычному HTTP, проверку `Origin` выключает `outbox.admin.check-origin=false`; `Sec-Fetch-Site` проверяется всегда.
+  curl и сервисы не шлют ни того, ни другого и проходят как раньше. Старые браузеры без этих заголовков проходят тоже: ещё одна причина не
   опираться на cookie. Открывайте API только во внутренней сети или за TLS.
 - Проверка следует за контроллером, а не за путём: она держится при `addPathPrefix`, `WebMvcConfigurationSupport` и
   `@EnableWebMvc`. Если что-то её всё же теряет (свой `HandlerMapping` без интерцепторов, контроллер, найденный
@@ -2798,6 +2800,15 @@ xid](#восстановление-после-регрессии-xid-xid-regress
   `JdbcConnectionFactory`), копировать нечего: heartbeat делит соединения приложения, а INFO при старте называет тег
   `@Tag(OutboxHeartbeat.class)`.
 
+### `outbox.admin` (`OutboxAdminHttpModule`)
+
+Защита админ-API от вызовов с чужих страниц ([Админ-API и HTTP](#админ-api-и-http)). В Spring Boot это
+`outbox.admin.check-origin` ([Админ-API в Spring Boot](#админ-api-в-spring-boot)).
+
+| Ключ | По умолчанию | Значение |
+|---|---|---|
+| `checkOrigin` | `true` | `true`: вызов не `GET` и не `HEAD` без `Sec-Fetch-Site` получает 403 «cross-site request refused», если его `Origin` равен `null` или называет другой хост и порт, чем `Host` запроса (схема не сравнивается). `false`: на `Origin` не смотрим. Нужно, когда браузеры ходят по обычному HTTP через прокси, который подменяет `Host`, и передать `Host` браузера нельзя. `Sec-Fetch-Site` проверяется при любом значении. |
+
 ### `outbox.kafka` (`KafkaOutboxModule`)
 
 | Ключ | По умолчанию | Значение |
@@ -3382,7 +3393,9 @@ public final class ApiKeyAuthorizer implements OutboxAdminAuthorizer {
   Пометка — `Sec-Fetch-Site` не `same-origin` и не `none`. По обычному HTTP на адрес не localhost браузеры его не шлют,
   и тогда пометкой считается `Origin`, равный `null` или с другим хостом и портом, чем в `Host` запроса (схема не
   сравнивается). Заголовки прокси Kora не читает, поэтому прокси перед сервисом должен передавать `Host` браузера как
-  есть (в nginx — `proxy_set_header Host $http_host`). curl и другие клиенты не браузеры не шлют ни того, ни другого.
+  есть (в nginx — `proxy_set_header Host $http_host`). Если прокси настроить так нельзя, проверку `Origin` выключает
+  `outbox.admin.checkOrigin = false`; `Sec-Fetch-Site` проверяется всегда. curl и другие клиенты не браузеры не шлют
+  ни того, ни другого.
 - Маршруты с телом (`redrive`, `discard`, `keys/abandon`, `waiting/abandon`) принимают только `Content-Type:
   application/json`: с другим отвечают 415, без него — 400, и тело не читают. Kora на `Content-Type` не смотрит, а
   `text/plain` страница с другого сайта может отправить без предварительного запроса.

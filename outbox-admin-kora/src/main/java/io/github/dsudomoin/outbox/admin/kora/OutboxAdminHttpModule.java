@@ -28,6 +28,8 @@ import io.github.dsudomoin.outbox.admin.kora.model.Selection;
 import io.github.dsudomoin.outbox.admin.kora.model.Status;
 import java.time.OffsetDateTime;
 import java.util.List;
+import ru.tinkoff.kora.config.common.Config;
+import ru.tinkoff.kora.config.common.extractor.ConfigValueExtractor;
 import ru.tinkoff.kora.http.server.common.handler.BlockingRequestExecutor;
 import ru.tinkoff.kora.http.server.common.handler.HttpServerResponseMapper;
 import ru.tinkoff.kora.http.server.common.handler.StringParameterReader;
@@ -38,7 +40,7 @@ import ru.tinkoff.kora.json.common.JsonWriter;
 /**
  * The admin HTTP API on the app's public HTTP server, routes under {@code /kora-outbox/admin/v1}; contract at
  * {@code openapi/kora-outbox-admin.yaml} on the classpath. Needs {@code OutboxModule}, an HTTP server module, a JSON
- * module and one {@link OutboxAdminAuthorizer} component.
+ * module and one {@link OutboxAdminAuthorizer} component. Config at {@code outbox.admin} ({@link OutboxAdminConfig}).
  * <pre>{@code
  * @KoraApp
  * interface App extends HoconConfigModule, JdbcDatabaseModule, OutboxModule, UndertowHttpServerModule, JsonModule,
@@ -47,11 +49,15 @@ import ru.tinkoff.kora.json.common.JsonWriter;
  */
 public interface OutboxAdminHttpModule extends OutboxAdminApiControllerModule {
 
+    default OutboxAdminConfig outboxAdminConfig(Config config, ConfigValueExtractor<OutboxAdminConfig> extractor) {
+        return extractor.extract(config.get("outbox.admin"));
+    }
+
     /** Internal type, unstable: for the adapters of this repository. */
     @InternalApi
     default OutboxAdminInterceptor outboxAdminInterceptor(OutboxAdminAuthorizer authorizer,
-            BlockingRequestExecutor executor, JsonWriter<ModelError> errorWriter) {
-        return new OutboxAdminInterceptor(authorizer, executor, errorWriter);
+            BlockingRequestExecutor executor, JsonWriter<ModelError> errorWriter, OutboxAdminConfig config) {
+        return new OutboxAdminInterceptor(authorizer, executor, errorWriter, config.checkOrigin());
     }
 
     /** Internal type, unstable: for the adapters of this repository. */

@@ -68,7 +68,8 @@ curl -s -H "$KEY" -H "$JSON" -d '{"topic":"orders","key":"order-42","reason":"ha
   when `Sec-Fetch-Site` is other than `same-origin`/`none`, or, with no `Sec-Fetch-Site` (browsers send none on plain
   HTTP to a non-localhost address), when `Origin` is `null` or another host:port than the request's `Host` (the scheme
   aside). Kora reads no forwarded headers: a proxy in front must pass the browser's `Host` on (nginx
-  `proxy_set_header Host $http_host`). curl and services send neither header.
+  `proxy_set_header Host $http_host`), or `outbox.admin.checkOrigin = false` turns the `Origin` check off
+  (`Sec-Fetch-Site` is checked always). curl and services send neither header.
 - Reads (`/status`, find, count) wait at most 5 s for a lock and 60 s per statement: during an xid regression
   recovery, which holds its tables, `/status` answers 500 (55P03) after 5 s; retry once it is done.
 - A body holds exactly one of `ids` (up to 1 000) and `filter`. `status` is `pending`, `kept` or `scheduled`. A filter
@@ -115,7 +116,8 @@ class ApiKeyAuthorizer implements OutboxAdminAuthorizer {
   HTTP to a non-localhost address), when `Origin` is `null` or another host:port than the server name and port the
   container took from `Host`, or from proxy headers under `server.forward-headers-strategy` (the scheme aside). With
   no port in either, the `Origin` port is checked against its own scheme's default, so `https://app` passes behind a
-  TLS-ending proxy although the server sees http on 80. curl and services send neither header.
+  TLS-ending proxy although the server sees http on 80. `outbox.admin.check-origin=false` turns the `Origin` check off
+  (`Sec-Fetch-Site` is checked always). curl and services send neither header.
 - Audit: logger `io.github.dsudomoin.outbox.admin.spring.OutboxAdminGuard` at INFO; keep it on. An allowed call's line
   comes just after its response is flushed.
 - Differs from Kora: a body over 1 MiB gets 400; blank `?limit=` and

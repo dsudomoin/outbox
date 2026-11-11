@@ -194,6 +194,14 @@ end); without a framework, `OutboxRuntime.builder(...).heartbeatConnections(hear
   This pool takes the first slot freed within 5 s, while an app pool connects only when a connection is wanted, so
   the outcome tends to settle on the second: the app pool one connection short at peak.
 
+## `outbox.admin` (`OutboxAdminHttpModule`)
+
+In Kora as below; in Spring Boot `outbox.admin.check-origin`.
+
+| Key | Default | Rule and meaning |
+|---|---|---|
+| `checkOrigin` | `true` | `true`: a call other than `GET`/`HEAD` without `Sec-Fetch-Site` gets 403 «cross-site request refused» when its `Origin` is `null` or another host:port than the request's `Host` (the scheme aside). `false`: `Origin` is not looked at, for browsers on plain HTTP behind a proxy that rewrites `Host` and cannot pass the browser's on. `Sec-Fetch-Site` is checked either way. |
+
 ## `outbox.kafka` (`KafkaOutboxModule`)
 
 `deadLetterTopic` (default unset: Kafka DLQ off, letters stay `kept` in the dead table): topic template, `{topic}` is
@@ -242,6 +250,9 @@ with or without brackets: `outbox.kafka.driver-properties.max.block.ms=3000`. Th
 
 `outbox.enabled` and `outbox.kafka.fallback` take every boolean Spring binds: `false`, `off`, `no`, `0` turn them off,
 `true`, `on`, `yes`, `1` on, in any case; any other value fails the start.
+
+`outbox.admin.check-origin` is `checkOrigin` above, compared with the server name and port the container took
+(from `Host`, or from proxy headers under `server.forward-headers-strategy`).
 
 `outbox.heartbeat.dedicated-connection` is `dedicatedConnection` above: a copy of the `HikariDataSource` behind the
 outbox, named `<pool>-outbox-heartbeat`, or `outbox-heartbeat` while the app's pool has no name, so set

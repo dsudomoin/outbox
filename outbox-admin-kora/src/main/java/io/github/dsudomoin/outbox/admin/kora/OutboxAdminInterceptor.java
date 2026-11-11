@@ -40,7 +40,8 @@ import ru.tinkoff.kora.json.common.JsonWriter;
  * is {@code Sec-Fetch-Site} other than {@code same-origin} or {@code none}; without that header (a browser sends none
  * over plain HTTP to an address other than localhost) it is an {@code Origin} of {@code null} or of another host and
  * port than the request's {@code Host}, the scheme aside. Kora takes no forwarded headers, so a proxy in front must
- * pass the browser's {@code Host} on. Curl and service clients send neither header. An allowed call to a route with a
+ * pass the browser's {@code Host} on, or {@code outbox.admin.checkOrigin = false} turns this {@code Origin} check off
+ * ({@code Sec-Fetch-Site} still counts). Curl and service clients send neither header. An allowed call to a route with a
  * body ({@code redrive}, {@code discard}, {@code keys/abandon}, {@code waiting/abandon}) gets a 415 {@code Error} for a
  * {@code Content-Type} other than {@code application/json}, a 400 for none, before its body is read: Kora's JSON
  * reader looks at no {@code Content-Type}, and a page elsewhere may post {@code text/plain} without a preflight.
@@ -73,12 +74,15 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
     private final OutboxAdminAuthorizer authorizer;
     private final BlockingRequestExecutor executor;
     private final JsonWriter<ModelError> errorWriter;
+    private final boolean checkOrigin;
 
+    /** {@code checkOrigin}: {@link OutboxAdminConfig#checkOrigin}. */
     public OutboxAdminInterceptor(OutboxAdminAuthorizer authorizer, BlockingRequestExecutor executor,
-            JsonWriter<ModelError> errorWriter) {
+            JsonWriter<ModelError> errorWriter, boolean checkOrigin) {
         this.authorizer = authorizer;
         this.executor = executor;
         this.errorWriter = errorWriter;
+        this.checkOrigin = checkOrigin;
     }
 
     @Override
@@ -137,12 +141,15 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
      * carry what the browser adds by itself (a cookie, an SSO session, the operator's network address), which an
      * authorizer cannot tell from the operator's own call. Without that header, which a browser sends only to a
      * trustworthy origin (HTTPS or localhost), an {@code Origin} that is not this server's host and port says so.
-     * Clients other than browsers send neither header.
+     * Clients other than browsers send neither header. {@link #checkOrigin} off leaves {@code Origin} unread.
      */
-    private static boolean sentByAnotherSite(HttpServerRequest request) {
+    private boolean sentByAnotherSite(HttpServerRequest request) {
         var site = request.headers().getFirst("sec-fetch-site");
         if (site != null) {
             return !site.equals("same-origin") && !site.equals("none");
+        }
+        if (!checkOrigin) {
+            return false;
         }
         var origin = request.headers().getFirst("origin");
         return origin != null && !sameHost(origin, request.headers().getFirst("host"));
