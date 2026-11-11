@@ -229,8 +229,9 @@ public final class KafkaOutboxSender implements AutoCloseable {
     /**
      * One outcome per record, in list order. Records never handed to Kafka (after a failure closed the
      * producer, after an interrupt or past the deadline) are {@code NotAttempted}, and so are records that failed only
-     * because the broker refused another record of the call for good: they spend no attempt. Honours interrupts:
-     * returns early and keeps the flag.
+     * because the broker refused another record of the call for good: they spend no attempt. An
+     * {@link InvalidTopicException} is the topic's: every record of that topic not otherwise settled shares its
+     * {@code Permanent}. Honours interrupts: returns early and keeps the flag.
      */
     public List<Outcome> send(List<OutboxRecord> records) {
         return sendAndReport(records).outcomes();
@@ -438,11 +439,12 @@ public final class KafkaOutboxSender implements AutoCloseable {
     /**
      * C1: Kafka refused record {@code i} before appending it, so the producer has nothing to abort and stays open.
      * The rest of the call skips the record's topic after a metadata failure (cooling the topic after a metadata
-     * timeout or a {@link #topicFault}), otherwise its (topic, key); a client-side {@link RecordTooLargeException} is
-     * {@code Permanent} and skips nothing. Before the append a {@link TimeoutException} is a metadata wait, unless it
-     * is a {@link BufferExhaustedException}; after one, the call looks up no topic its producer has not resolved before,
-     * so it waits {@code max.block.ms} for metadata once, plus once per topic wrongly taken as resolved
-     * ({@link Pooled}).
+     * timeout or a {@link #topicFault}) or an {@link InvalidTopicException}, whose {@code Permanent} the skipped
+     * records of the topic then share ({@link #outcomes}), otherwise its (topic, key); a client-side
+     * {@link RecordTooLargeException} is {@code Permanent} and skips nothing. Before the append a
+     * {@link TimeoutException} is a metadata wait, unless it is a {@link BufferExhaustedException}; after one, the call
+     * looks up no topic its producer has not resolved before, so it waits {@code max.block.ms} for metadata once, plus
+     * once per topic wrongly taken as resolved ({@link Pooled}).
      */
     private void refuse(Call call, int i, OutboxRecord record, Exception e, boolean metadata,
             Map<Object, Optional<Instant>> coolingUntil, Set<Object> refused) {
@@ -480,6 +482,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
         var failedTopics = new HashSet<String>();
         var notSent = Outcome.notAttempted();
         Outcome unfinished = null;
+        Map<String, Outcome> invalidTopics = null; // a refused topic name: the topic's records unsent die with it
         synchronized (call) {
             boolean refusal = call.closedByRefusal();
             for (int i = 0; i < partitions.length; i++) {
@@ -500,6 +503,12 @@ public final class KafkaOutboxSender implements AutoCloseable {
                     outcome = notSent;
                 }
                 result.add(outcome);
+                if (outcome instanceof Outcome.Permanent p && p.error() instanceof InvalidTopicException) {
+                    if (invalidTopics == null) {
+                        invalidTopics = new HashMap<>();
+                    }
+                    invalidTopics.putIfAbsent(records.get(i).topic(), outcome);
+                }
                 var partition = partitions[i] != null ? partitions[i] : call.partitionChosenByKafka(i);
                 if (call.stalled[i] && outcome != Outcome.delivered()) {
                     if (expired.size() < EXPIRED_REMEMBERED) {
@@ -522,6 +531,14 @@ public final class KafkaOutboxSender implements AutoCloseable {
                         failedTopics.add(records.get(i).topic());
                     }
                 }
+            }
+        }
+        // the name is invalid for every record of the topic: all of them go dead now, not one per call while the rest
+        // come back NotAttempted
+        for (int i = 0; invalidTopics != null && i < result.size(); i++) {
+            var dead = invalidTopics.get(records.get(i).topic());
+            if (dead != null && result.get(i) instanceof Outcome.NotAttempted) {
+                result.set(i, dead);
             }
         }
         failed.forEach(p -> cooldown.failed(p, now));

@@ -318,12 +318,32 @@ class KafkaOutboxSenderTest {
             }
         }, DELIVERY_TIMEOUT);
 
-        var outcomes = sender.send(List.of(recordTo("bad/topic", 1, "k"), recordTo("bad/topic", 2, null), recordTo(TOPIC, 3, "k")));
+        var outcomes = sender.send(List.of(recordTo("bad/topic", 1, "k"), recordTo("bad/topic", 2, null),
+                recordTo("bad/topic", 3, "k2"), recordTo(TOPIC, 4, "k")));
 
-        assertThat(outcomes.get(0)).isInstanceOfSatisfying(Outcome.Permanent.class,
-                p -> assertThat(p.error()).isInstanceOf(InvalidTopicException.class));
-        assertThat(outcomes.get(1)).isEqualTo(Outcome.notAttempted());
+        // the name is invalid for every record of the topic: all of them go dead in this call, not one per call
+        assertThat(outcomes.subList(0, 3)).allSatisfy(o -> assertThat(o).isInstanceOfSatisfying(
+                Outcome.Permanent.class, p -> assertThat(p.error()).isInstanceOf(InvalidTopicException.class)));
+        assertThat(outcomes.get(3)).isEqualTo(Outcome.delivered());
+        assertThat(producers.get(0).closed()).isFalse();
+    }
+
+    /** The same refusal reported through the callback inside {@code send()}: the whole topic, never appended. */
+    @Test
+    void invalidTopicInsideSendIsPermanentForItsWholeTopic() {
+        var refusals = new AtomicInteger();
+        var sender = sender(() -> new TestProducer(true, r -> r.topic().equals(OTHER) && refusals.incrementAndGet() > 0
+                ? new InvalidTopicException(Set.of(OTHER))
+                : null), DELIVERY_TIMEOUT);
+
+        var outcomes = sender.send(List.of(recordTo(OTHER, 1, "a"), recordTo(OTHER, 2, "b"), recordTo(TOPIC, 3, "a"),
+                recordTo(OTHER, 4, null)));
+
+        assertThat(List.of(outcomes.get(0), outcomes.get(1), outcomes.get(3))).allSatisfy(o -> assertThat(o)
+                .isInstanceOfSatisfying(Outcome.Permanent.class,
+                        p -> assertThat(p.error()).isInstanceOf(InvalidTopicException.class)));
         assertThat(outcomes.get(2)).isEqualTo(Outcome.delivered());
+        assertThat(refusals).as("nothing more is sent to the topic").hasValue(1);
         assertThat(producers.get(0).closed()).isFalse();
     }
 
@@ -727,6 +747,24 @@ class KafkaOutboxSenderTest {
         awaitSent(1, 1).errorNext(new InvalidTopicException("bad topic"));
         assertThat(second.get(5, SECONDS).get(0)).isInstanceOfSatisfying(Outcome.Permanent.class,
                 p -> assertThat(p.error()).isInstanceOf(InvalidTopicException.class));
+    }
+
+    /**
+     * The broker refuses the topic (an append to an internal one): the refusal closes the call, and the topic's other
+     * records, aborted or never sent, take the same {@code Permanent}; another topic's record costs no attempt.
+     */
+    @Test
+    void brokerInvalidTopicIsPermanentForItsWholeTopic() throws Exception {
+        var sender = sender(DELIVERY_TIMEOUT);
+        var result = sendAsync(sender, List.of(record(1, "a"), record(2, "b"), recordTo(OTHER, 3, "c")));
+        awaitSent(0, 3).errorNext(new InvalidTopicException("internal topic"));
+
+        assertThat(result.get(5, SECONDS)).satisfiesExactly(
+                o -> assertThat(o).isInstanceOfSatisfying(Outcome.Permanent.class,
+                        p -> assertThat(p.error()).isInstanceOf(InvalidTopicException.class)),
+                o -> assertThat(o).isInstanceOfSatisfying(Outcome.Permanent.class,
+                        p -> assertThat(p.error()).isInstanceOf(InvalidTopicException.class)),
+                o -> assertThat(o).isEqualTo(Outcome.notAttempted()));
     }
 
     @Test

@@ -217,7 +217,8 @@ not `{topic}` alone. Behaviour and duplicates: writing-outbox-handlers, `dead-le
 | Defaults when unset | `delivery.timeout.ms=20000`, then (only if that was unset) `request.timeout.ms=15000`; `max.block.ms=5000`; `enable.metrics.push=false` |
 
 **Outcomes.** `RecordTooLargeException`, `InvalidRecordException` (a null key on a compacted topic among them) and
-`InvalidTopicException` are permanent (dead letters); everything else, authorization errors included, retries.
+`InvalidTopicException` are permanent (dead letters); an `InvalidTopicException` sends every record of its topic in
+the call to dead letters at once. Everything else, authorization errors included, retries.
 
 **Oversized records.** The broker refuses a whole producer batch that holds a record over the topic's
 `max.message.bytes`. kafka-clients 4.2+ split it until that record is alone and refused: permanent. kafka-clients
