@@ -42,10 +42,10 @@ import org.slf4j.LoggerFactory;
  * {@code for update skip locked}, in a read-committed transaction of its own. A redrive chunk then tries their key
  * locks without waiting ({@link DeadLetters#tryKeyLocks}) and redrives the ready ones as the dead-letter pass does
  * ({@link DeadLetters#redrive}), so no writer waits for one of its key locks. Filters are bound parameters, never
- * interpolated; user text is logged with control characters escaped ({@link #printable}). {@code restoreOrphan},
- * {@code recoverXidRegression} and {@code recoverStrandedShards} hold the maintenance lock for their whole run, so
- * maintenance's steps never run beside them. The reads, {@code status} and the dead-letter find and count, give up on
- * a statement after 60 s (57014).
+ * interpolated; user text is logged with control and format characters escaped ({@link #printable}).
+ * {@code restoreOrphan}, {@code recoverXidRegression} and {@code recoverStrandedShards} hold the maintenance lock for
+ * their whole run, so maintenance's steps never run beside them. The reads, {@code status} and the dead-letter find
+ * and count, give up on a statement after 60 s (57014).
  * {@code abandonWaiting}, {@code abandonKey} and {@code abandonRecord} move each chunk under its shard's lock, which
  * every relay step holds while it writes the retry and parked tables, so no step adds a record to a key it moves or
  * makes a key it reads wait meanwhile.
@@ -991,25 +991,28 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     }
 
     /**
-     * {@code text} with control characters (CR, LF, tab, any other C0 or C1 one) and the Unicode line and paragraph
-     * separators escaped, so text a caller supplied cannot forge log lines.
+     * {@code text} with control characters (CR, LF, tab, any other C0 or C1 one), the Unicode line and paragraph
+     * separators and format characters (a bidi override reorders a line on screen) escaped, so text a caller supplied
+     * cannot forge log lines.
      */
     static String printable(String text) {
         var out = new StringBuilder(text.length());
-        for (int i = 0; i < text.length(); i++) {
-            char ch = text.charAt(i);
+        text.codePoints().forEach(ch -> {
             if (ch == '\n') {
                 out.append("\\n");
             } else if (ch == '\r') {
                 out.append("\\r");
             } else if (ch == '\t') {
                 out.append("\\t");
-            } else if (Character.isISOControl(ch) || ch == '\u2028' || ch == '\u2029') {
-                out.append(String.format("\\u%04x", (int) ch));
+            } else if (Character.isISOControl(ch) || ch == '\u2028' || ch == '\u2029'
+                    || Character.getType(ch) == Character.FORMAT) {
+                for (var unit : Character.toChars(ch)) { // beyond U+FFFF, Java's escape is two of them
+                    out.append(String.format("\\u%04x", (int) unit));
+                }
             } else {
-                out.append(ch);
+                out.appendCodePoint(ch);
             }
-        }
+        });
         return out.toString();
     }
 

@@ -50,8 +50,8 @@ import ru.tinkoff.kora.json.common.JsonWriter;
  * "<path>" denied: <status>} when denied or when the authorizer fails. An allowed call whose operation put its
  * arguments under {@link #DETAIL} has them before the status: {@code by "<identity>" with <name> "<value>", ...}, a
  * null value as {@code null}. The path (its {@code {table}} is caller text, logged before any authorization), the
- * identity (perhaps a token's subject) and each value are quoted, with their quotes, backslashes and control characters
- * escaped, so no caller can forge a line or a part of one.
+ * identity (perhaps a token's subject) and each value are quoted, with their quotes, backslashes, control and format
+ * characters escaped, so no caller can forge a line or a part of one, nor reorder one on screen.
  *
  * <p>Internal type, unstable: for the adapters of this repository.
  */
@@ -209,12 +209,12 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
     }
 
     /**
-     * {@code text} with quotes and backslashes escaped and each control character as its Java escape, so it stays one
-     * quoted token on one log line.
+     * {@code text} with quotes and backslashes escaped and each control or format character (a bidi override reorders
+     * a line on screen) as its Java escape, so it stays one quoted token on one log line.
      */
     private static String printable(String text) {
         var out = new StringBuilder(text.length());
-        text.chars().forEach(ch -> {
+        text.codePoints().forEach(ch -> {
             switch (ch) {
                 case '"' -> out.append("\\\"");
                 case '\\' -> out.append("\\\\");
@@ -222,10 +222,13 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
                 case '\r' -> out.append("\\r");
                 case '\t' -> out.append("\\t");
                 default -> {
-                    if (Character.isISOControl(ch) || ch == '\u2028' || ch == '\u2029') {
-                        out.append(String.format("\\u%04x", ch));
+                    if (Character.isISOControl(ch) || ch == '\u2028' || ch == '\u2029'
+                            || Character.getType(ch) == Character.FORMAT) {
+                        for (var unit : Character.toChars(ch)) { // beyond U+FFFF, Java's escape is two of them
+                            out.append(String.format("\\u%04x", (int) unit));
+                        }
                     } else {
-                        out.append((char) ch);
+                        out.appendCodePoint(ch);
                     }
                 }
             }

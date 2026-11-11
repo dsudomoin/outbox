@@ -145,6 +145,28 @@ class OutboxAdminInterceptorTest {
         }
     }
 
+    /** A bidi override or a zero-width character in the path would reorder or hide part of the line on screen. */
+    @Test
+    void auditLineEscapesFormatCharacters() {
+        var authorization = new AtomicReference<Runnable>();
+        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.unauthorized("who?"),
+                deferred(authorization), new $ModelError_JsonWriter());
+
+        try (var stderr = new CapturedStderr()) {
+            var response = interceptor.intercept(Context.current(),
+                    request("/kora-outbox/admin/v1/orphans/x\u202ey\u200bz\uDB40\uDC01/restore"),
+                    (context, request) -> {
+                        throw new AssertionError("the route must not run");
+                    });
+            authorization.get().run();
+
+            assertThat(response.toCompletableFuture().join().code()).isEqualTo(401);
+            assertThat(stderr.text())
+                    .contains("orphans/x\\u202ey\\u200bz\\udb40\\udc01/restore\" denied: 401")
+                    .doesNotContain("\u202e").doesNotContain("\u200b");
+        }
+    }
+
     /** The identity may be caller text (a token's subject): quoted, it cannot pass for the status that follows. */
     @Test
     void auditLineQuotesTheIdentity() {
