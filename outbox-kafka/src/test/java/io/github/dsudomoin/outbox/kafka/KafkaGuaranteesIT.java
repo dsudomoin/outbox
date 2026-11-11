@@ -14,14 +14,11 @@ import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
-import java.io.IOException;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -35,7 +32,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
-import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -117,29 +113,42 @@ class KafkaGuaranteesIT {
                 .containsOnly("x");
     }
 
+    /**
+     * Key {@code bad} goes to a topic the broker does not have yet, so {@link KafkaOutboxSender} itself answers Retry
+     * for it (a metadata timeout) while the other keys of its one shard are delivered. Its rows are diverted to the
+     * retry table, and messages committed after it started failing get past it while it still fails.
+     */
     @Test
     void aFailingKeyIsRetriedWhileOtherKeysFlow() throws Exception {
-        var topic = TestKafka.createTopic(1); // one partition: offsets order every arrival
-        var handler = new Handler();
-        var badAttempts = new AtomicInteger();
-        handler.fail = r -> key(r).equals("bad") && badAttempts.getAndIncrement() < 2
-                ? Outcome.retry(new IOException("bad is down"))
-                : null;
+        var topic = TestKafka.createTopic(1);
+        var missing = "t-" + UUID.randomUUID(); // created below: the broker creates no topic on first use
+        var sender = sender(Map.of(ProducerConfig.MAX_BLOCK_MS_CONFIG, "1000")); // each metadata wait: 1 s
         // one shard: the other keys come after bad on its cursor, so they get past it, not merely beside it
-        var runtime = start(config().shards(1), handler);
+        var runtime = start(config().shards(1), new Handler(sender));
+        var retryRows = "select count(*) from " + runtime.schema().names().retry();
 
-        var ids = sendAll(runtime, List.of(
-                OutboxMessage.of(topic, "bad", bytes("bad#1")),
-                OutboxMessage.of(topic, "bad", bytes("bad#2")),
-                OutboxMessage.of(topic, "bad", bytes("bad#3")),
-                OutboxMessage.of(topic, "a", bytes("a#1")),
+        sendAll(runtime, List.of(
+                OutboxMessage.of(topic, "a", bytes("a#1")), // resolves topic before bad's metadata wait
+                OutboxMessage.of(missing, "bad", bytes("bad#1")),
+                OutboxMessage.of(missing, "bad", bytes("bad#2")),
+                OutboxMessage.of(missing, "bad", bytes("bad#3")),
                 OutboxMessage.of(topic, "b", bytes("b#1")),
                 OutboxMessage.of(topic, "a", bytes("a#2"))));
+        var bad = committed.remove("bad"); // checked on its own topic
+        await(CONSUME_TIMEOUT, () -> count(retryRows) == bad.size()); // its head and two followers
+        sendAll(runtime, List.of(
+                OutboxMessage.of(topic, "c", bytes("c#1")),
+                OutboxMessage.of(topic, "a", bytes("a#3"))));
 
-        var received = byMessageId(consumeCommitted(topic, r -> true));
-        var bad = ids.subList(0, 3).stream().map(id -> received.get(id).offset()).toList();
-        var others = ids.subList(3, ids.size()).stream().map(id -> received.get(id).offset()).toList();
-        assertThat(Collections.min(bad)).as("bad arrives after the others").isGreaterThan(Collections.max(others));
+        var records = consumeCommitted(topic, r -> true);
+        assertThat(records).as("each message once: no replay of the call").hasSize(5);
+        assertThat(count(retryRows)).as("bad, still failing").isEqualTo(bad.size());
+
+        TestKafka.createTopic(missing, 1, Map.of());
+        var arrived = TestKafka.consumeUntil(missing, CONSUME_TIMEOUT,
+                r -> byMessageId(r).keySet().containsAll(bad));
+        assertThat(firstOccurrenceOrderPerKey(arrived)).isEqualTo(Map.of("bad", bad));
+        await(Duration.ofSeconds(10), () -> count(retryRows) == 0);
     }
 
     @Test
@@ -299,14 +308,12 @@ class KafkaGuaranteesIT {
     }
 
     /**
-     * {@link KafkaOutboxSender#handler()} for the relay: a record {@link #fail} answers for gets that outcome instead
-     * of being sent, and the records of its key after it in the call are not attempted, as the handler contract asks;
-     * {@link #afterSend} runs once the sender returned, before the relay sees the outcomes.
+     * {@link KafkaOutboxSender#handler()} for the relay, counting what Kafka acknowledged; {@link #afterSend} runs once
+     * the sender returned, before the relay sees the outcomes.
      */
     private final class Handler implements OutboxHandler {
 
         private final KafkaOutboxHandler kafka;
-        volatile Function<OutboxRecord, Outcome> fail = r -> null; // null: send it
         volatile Consumer<List<OutboxRecord>> afterSend = records -> {};
         /** Records Kafka acknowledged, and the calls in which it acknowledged any. */
         final AtomicInteger delivered = new AtomicInteger();
@@ -327,31 +334,14 @@ class KafkaGuaranteesIT {
 
         @Override
         public List<Outcome> handleBatch(List<OutboxRecord> records) {
-            var outcomes = new Outcome[records.size()];
-            var failedKeys = new HashSet<String>();
-            var toSend = new ArrayList<Integer>();
-            for (int i = 0; i < records.size(); i++) {
-                var record = records.get(i);
-                var outcome = failedKeys.contains(key(record)) ? Outcome.notAttempted() : fail.apply(record);
-                if (outcome == null) {
-                    toSend.add(i);
-                } else {
-                    outcomes[i] = outcome;
-                    failedKeys.add(key(record));
-                }
-            }
-            var sending = toSend.stream().map(records::get).toList();
-            var sent = sending.isEmpty() ? List.<Outcome>of() : kafka.handleBatch(sending);
-            for (int j = 0; j < sent.size(); j++) {
-                outcomes[toSend.get(j)] = sent.get(j);
-            }
+            var sent = kafka.handleBatch(records);
             int acknowledged = (int) sent.stream().filter(o -> o == Outcome.delivered()).count();
             delivered.addAndGet(acknowledged);
             if (acknowledged > 0) {
                 deliveringCalls.incrementAndGet();
             }
             afterSend.accept(records);
-            return Arrays.asList(outcomes);
+            return sent;
         }
     }
 
@@ -435,6 +425,15 @@ class KafkaGuaranteesIT {
         }
     }
 
+    private long count(String sql) {
+        try (var c = transactions.newConnection(); var ps = c.prepareStatement(sql); var rs = ps.executeQuery()) {
+            rs.next();
+            return rs.getLong(1);
+        } catch (SQLException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     /** The first occurrence of each message id. */
     private static Map<UUID, ConsumerRecord<byte[], byte[]>> byMessageId(List<ConsumerRecord<byte[], byte[]>> records) {
         var result = new HashMap<UUID, ConsumerRecord<byte[], byte[]>>();
@@ -450,10 +449,6 @@ class KafkaGuaranteesIT {
                     .add(KafkaOutboxHeaders.messageId(r));
         }
         return result.entrySet().stream().collect(Collectors.toMap(Map.Entry::getKey, e -> List.copyOf(e.getValue())));
-    }
-
-    private static String key(OutboxRecord record) {
-        return new String(record.key(), UTF_8);
     }
 
     private static byte[] bytes(String s) {
