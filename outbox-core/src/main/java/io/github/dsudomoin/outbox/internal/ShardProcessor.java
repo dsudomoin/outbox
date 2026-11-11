@@ -231,16 +231,20 @@ public final class ShardProcessor implements AutoCloseable {
     /**
      * Opens the shard transaction: autocommit off, then read committed as its first statement, so
      * the cursor re-read after the shard lock sees the previous holder's commit even under a repeatable-read session
-     * default; the idle timeout frees the lock of a frozen worker. No {@code transaction_timeout} (PG 17+): a role's
-     * default would end a step waiting on a slow handler and lose the pause it writes. A step runs a statement between
+     * default; the idle timeout frees the lock of a frozen worker. A backend blocked sending a batch to a client the
+     * network lost is not idle, and no statement or transaction timeout ends it: {@code tcp_user_timeout}, at the same
+     * bound, does, instead of the server's TCP retransmission giving up after about 15 min. It acts on TCP connections
+     * only, and a server whose OS lacks it logs one LOG line per step. No {@code transaction_timeout} (PG 17+): a
+     * role's default would end a step waiting on a slow handler and lose the pause it writes. A step runs a statement between
      * any two handler calls, so the idle timeout never ends one waiting on a call that keeps to {@code batchTimeout}.
      */
     public static void prepareTransaction(Connection c, Duration batchTimeout) throws SQLException {
         c.setAutoCommit(false);
         try (var st = c.createStatement()) {
+            long bound = batchTimeout.plusSeconds(30).toMillis();
             st.execute("set transaction isolation level read committed;"
-                    + " set local idle_in_transaction_session_timeout = '"
-                    + batchTimeout.plusSeconds(30).toMillis() + "ms';"
+                    + " set local idle_in_transaction_session_timeout = '" + bound + "ms';"
+                    + " set local tcp_user_timeout = '" + bound + "ms';"
                     + " set local lock_timeout = '5s'; set local plan_cache_mode = force_custom_plan"
                     + Ticks.noTransactionTimeout(c));
         }

@@ -23,6 +23,7 @@ import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Queue;
@@ -734,6 +735,53 @@ class NetworkBlackholeIT {
         assertThatThrownBy(() -> draining(relay).get(20, TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class);
     }
 
+    /**
+     * A batch larger than the socket buffers, its reader gone silent mid-stream: the backend is not idle but blocked
+     * sending, which no idle or statement timeout ends, so only the step's TCP bound frees its shard's lock.
+     */
+    @Test
+    void aBatchStreamedIntoASilentNetworkFreesItsShard() throws Exception {
+        var config = new TestOutboxConfig().batchTimeout(Duration.ofSeconds(1)).batchSize(1000)
+                .maintenanceInterval(Duration.ofMillis(500));
+        var writerTransactions = new JdbcTransactions(DIRECT);
+        var writer = OutboxRuntime.builder(new TestOutboxConfig().table(config.table()).relayEnabled(false),
+                writerTransactions, record -> {}).build();
+        closing.add(writer);
+        writer.start();
+        var payload = new byte[20_000];
+        Arrays.fill(payload, (byte) 'p');
+        var sent = new HashSet<UUID>();
+        for (int t = 0; t < 15; t++) { // ~60 MB on the wire as hex: past any buffer between the backend and the relay
+            sent.addAll(writerTransactions.inTx(c -> {
+                var ids = new ArrayList<UUID>();
+                for (int i = 0; i < 100; i++) {
+                    ids.add(writer.outbox().send(OutboxMessage.of("t", "one-shard", payload)));
+                }
+                return ids;
+            }));
+        }
+        var held = new AtomicBoolean();
+        var source = intercepting(pool(throughTheHole(3, 3)), (c, call, args) -> {
+            if (call.getName().equals("prepareStatement") && Thread.currentThread().getName().startsWith("outbox-relay")
+                    && args[0].toString().contains("o.payload") && held.compareAndSet(false, true)) {
+                hole.holdReplies(); // the batch is sent into a network that takes no more
+            }
+        });
+        Set<UUID> delivered = ConcurrentHashMap.newKeySet();
+        var relay = OutboxRuntime.builder(config, new JdbcTransactions(source),
+                record -> delivered.add(record.messageId())).build();
+        closing.add(relay);
+        relay.start();
+        await(() -> {
+            try (var c = DIRECT.getConnection()) {
+                return TestSql.queryLong(c, "select count(*) from pg_stat_activity where wait_event = 'ClientWrite'")
+                        > 0;
+            }
+        });
+
+        await(Duration.ofSeconds(120), () -> delivered.containsAll(sent)); // batchTimeout + 30 s, then the rest
+    }
+
     private static FutureTask<Integer> draining(OutboxRuntime relay) {
         var drain = new FutureTask<>(relay.relay()::drain);
         var thread = new Thread(drain, "test-drain");
@@ -1084,6 +1132,8 @@ class NetworkBlackholeIT {
         private final ServerSocket server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
         private final Set<Socket> sockets = ConcurrentHashMap.newKeySet();
         private final Set<Socket> forgotten = ConcurrentHashMap.newKeySet();
+        private final Set<Socket> targets = ConcurrentHashMap.newKeySet();
+        private final Set<Socket> held = ConcurrentHashMap.newKeySet();
         private volatile boolean shut;
 
         Blackhole() throws IOException {
@@ -1108,6 +1158,14 @@ class NetworkBlackholeIT {
             shut = false;
         }
 
+        /**
+         * Every connection's server side is read no more and stays open, its client gone or not, as a network that
+         * lost the client keeps the server's sends unacknowledged; requests still go through, and new connections too.
+         */
+        void holdReplies() {
+            held.addAll(targets);
+        }
+
         @Override
         public void close() throws IOException {
             server.close();
@@ -1123,6 +1181,7 @@ class NetworkBlackholeIT {
                     var target = new Socket(TARGET.getHost(), TARGET.getPort());
                     sockets.add(client);
                     sockets.add(target);
+                    targets.add(target);
                     daemon(() -> pump(client, target));
                     daemon(() -> pump(target, client));
                 }
@@ -1132,18 +1191,25 @@ class NetworkBlackholeIT {
 
         private void pump(Socket from, Socket to) {
             var buffer = new byte[8192];
-            try (from; to) {
+            try (from) {
                 var in = from.getInputStream();
                 var out = to.getOutputStream();
                 int read;
                 while ((read = in.read(buffer)) >= 0) {
-                    while (shut || forgotten.contains(from)) {
+                    while (shut || forgotten.contains(from) || held.contains(from)) {
                         Thread.sleep(10);
                     }
                     out.write(buffer, 0, read);
                     out.flush();
                 }
             } catch (IOException | InterruptedException e) { // one side went away, and the other goes with it
+            } finally {
+                if (!held.contains(to)) {
+                    try {
+                        to.close();
+                    } catch (IOException e) { // closed already
+                    }
+                }
             }
         }
 
