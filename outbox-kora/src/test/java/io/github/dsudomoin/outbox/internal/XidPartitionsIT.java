@@ -2056,6 +2056,40 @@ class XidPartitionsIT {
     }
 
     @Test
+    void theEmptyRangeOfTheCurrentXidDetachedByHandIsMadeAgain() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions());
+
+        try (var c = TestDb.connect()) {
+            if (currentXid(c) % 1000 > 500) { // room for the xids the DDL below takes, within the one range
+                TestDb.burnXids((int) (1000 - currentXid(c) % 1000) + 10);
+            }
+            long floor = Math.floorDiv(currentXid(c), 1000) * 1000;
+            var current = names.partitionPrefix() + floor;
+            execute(c, "alter table " + names.base() + " detach partition " + current);
+
+            partitions.dropOrphans(c, 0, Duration.ofSeconds(5)); // empty and not above the current xid: dropped
+            try (var err = new CapturedStderr()) {
+                partitions.ensurePremade(c);
+
+                assertThat(err.text()).contains("ERROR").contains(current);
+            }
+            assertThat(Math.floorDiv(currentXid(c), 1000) * 1000).as("still in that range").isEqualTo(floor);
+            assertThat(PartitionDdl.listRanges(c, names.base()))
+                    .contains(new Bound(current, Long.toString(floor), Long.toString(floor + 1000)));
+            execute(c, "insert into " + names.base()
+                    + " (shard, message_id, topic) values (0, gen_random_uuid(), 't')");
+
+            execute(c, "alter table " + names.base() + " detach partition " + current);
+            execute(c, "insert into " + names.halt() + " (max_tick_xmax) values ('0')");
+            assertThat(partitions.state(c).holeLower()).as("an xid regression: the recovery makes the ranges").isNull();
+            execute(c, "delete from " + names.halt());
+            assertThat(partitions.state(c).holeLower()).isEqualTo(floor);
+        }
+    }
+
+    @Test
     void missingTailIsAttachedAboveLastRange() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);

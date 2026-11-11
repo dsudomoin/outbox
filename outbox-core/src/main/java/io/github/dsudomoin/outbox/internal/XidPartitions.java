@@ -209,6 +209,7 @@ public final class XidPartitions {
     private final String deleteStaleMarkers;
     private final String markOversized;
     private final String clearOversized;
+    private final String regressed;
     private final long size;
     private final int premake;
     private final Duration swapLockTimeout;
@@ -294,6 +295,10 @@ public final class XidPartitions {
         this.names = names;
         this.markDropping = "insert into " + names.dropping() + " (table_name) values (?) on conflict do nothing";
         this.unmarkDropping = "delete from " + names.dropping() + " where table_name = ?";
+        // as XidRecovery's check: a recorded halt, or a tick above the current xid
+        this.regressed = "select exists (select 1 from " + names.halt() + ") or coalesce((select"
+                + " pg_snapshot_xmax(snapshot)::text::bigint from " + names.tick()
+                + " order by pg_snapshot_xmax(snapshot) desc limit 1), 0) > ?";
         this.deleteStaleMarkers = "delete from " + names.dropping() + " d where not exists (select 1 from pg_class c"
                 + " where c.relname = d.table_name"
                 + " and c.relnamespace = (select p.relnamespace from pg_class p where p.oid = to_regclass(?)))";
@@ -363,8 +368,9 @@ public final class XidPartitions {
      * not swap, deferred or without its lock, counts towards the hourly ERROR ({@link #missed}). A tail left detached,
      * detach-pending (an operator's {@code DETACH CONCURRENTLY}) or missing is finished first: dropped when empty,
      * attached back when it holds rows; ranges and a new tail are then attached without a swap, nothing being attached
-     * above the last range. With the tail attached, a hole first: ranges between the current xid's and the tail's
-     * lower bound that are missing, detached or dropped by hand, are attached back or made anew ({@link #fillHole}).
+     * above the last range. With the tail attached, a hole first: ranges from the current xid's (that one too) until
+     * the tail's lower bound that are missing, detached or dropped by hand, are attached back or made anew
+     * ({@link #fillHole}), but not after an xid regression, where the recovery makes them.
      * Lock timeouts surface as {@link SQLException} (SQLState 55P03), the tail still attached; the next run retries.
      */
     public void ensurePremade(Connection autocommit) throws SQLException {
@@ -465,9 +471,9 @@ public final class XidPartitions {
                 lower = upper;
             }
         } finally {
-            log.error("outbox partitions of {} had a hole at xids [{}, {}), above the range of the current xid {} and"
-                    + " below the tail: a range detached or dropped by hand (never do either). Inserts there fail with"
-                    + " SQLState 23514 once the xid counter reaches it; attached again: {}{}", names.base(),
+            log.error("outbox partitions of {} had a hole at xids [{}, {}), in or above the range of the current xid"
+                    + " {} and below the tail: a range detached or dropped by hand (never do either). Inserts there"
+                    + " fail with SQLState 23514 once the xid counter reaches it; attached again: {}{}", names.base(),
                     s.holeLower, s.holeUpper, s.current, attached, kept.isEmpty() ? ""
                             : "; kept standalone, as they hold rows: " + kept + ", restore or drop them"
                                     + " (OutboxAdmin.restoreOrphan), and the next run fills the hole");
@@ -1505,8 +1511,9 @@ public final class XidPartitions {
             bounded.add(new long[] {Long.parseLong(b.from()), to});
         }
         // the first xids above the current one that no range covers below the tail: a range detached or dropped by
-        // hand, as the library leaves none. Not when no range covers the current xid (its rows a foreign orphan, or
-        // an xid regression): inserts fail at once then, and the recovery or the orphan's restore has to come first
+        // hand, as the library leaves none. When no range covers the current xid either, the hole starts at the
+        // lower bound of the range that held it (or the top of the highest range below), as a range detached empty is
+        // dropped and leaves no other trace; but not after an xid regression, where the recovery makes the ranges
         bounded.sort(Comparator.comparingLong(r -> r[0]));
         long reach = current;
         boolean covered = false;
@@ -1516,19 +1523,36 @@ public final class XidPartitions {
                 continue;
             }
             if (r[0] > reach) {
-                hole = covered ? new long[] {reach, r[0]} : null;
+                hole = new long[] {reach, r[0]};
                 break;
             }
             reach = r[1];
             covered = true;
         }
-        if (hole == null && covered && tailLower != null && reach < tailLower) {
+        if (hole == null && tailLower != null && reach < tailLower) {
             hole = new long[] {reach, tailLower};
+        }
+        if (hole != null && !covered) { // a read only when the current xid's range is gone
+            long from = Math.floorDiv(current, size) * size;
+            for (long to : retainedTo) {
+                from = Math.max(from, to);
+            }
+            hole = regressed(c, current) ? null : new long[] {from, hole[1]};
         }
         return new State(current, oldest, upper, ahead, retainedTo.size(),
                 retainedTo.stream().mapToLong(Long::longValue).toArray(),
                 PartitionDdl.attachment(c, names.base(), names.tail()), tailLower,
                 hole == null ? null : hole[0], hole == null ? null : hole[1]);
+    }
+
+    private boolean regressed(Connection c, long current) throws SQLException {
+        try (var ps = c.prepareStatement(regressed)) {
+            ps.setLong(1, current);
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getBoolean(1);
+            }
+        }
     }
 
     /** {@code tailConversion.window}: from (inclusive) to (exclusive), across midnight when to comes first. */
@@ -1574,7 +1598,8 @@ public final class XidPartitions {
      * {@code ahead}: ranges above the current xid ({@link #premadeAhead}); {@code retained}: attached ranges lying
      * entirely below the range holding it, which {@link #dropProcessed} has not dropped yet, and {@code retainedTo}
      * their upper bounds; {@code [holeLower, holeUpper)}: the first xids above the current one that no range covers
-     * below the tail, null when none.
+     * below the tail, from the lower bound of the current xid's range when that one is gone too, null when none or
+     * after an xid regression.
      */
     record State(long current, long oldest, @Nullable Long upper, int ahead, int retained, long[] retainedTo,
             Attachment tail, @Nullable Long tailLower, @Nullable Long holeLower, @Nullable Long holeUpper) {

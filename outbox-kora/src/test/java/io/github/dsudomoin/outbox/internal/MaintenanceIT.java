@@ -1044,6 +1044,7 @@ class MaintenanceIT {
     @Test
     void someoneElsesPendingRangeIsFinalizedAndItsWaitNamesTheOldestSnapshots() throws Exception {
         bootstrap();
+        TestDb.burnXids(1100); // the lowest range below the current xid's: one holding it would be attached back
         var range = ranges().stream()
                 .filter(b -> b.to() != null)
                 .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
