@@ -22,10 +22,29 @@ public record OutboxMessage(String topic, @Nullable byte[] key, @Nullable byte[]
         if (topic.length() > MAX_TOPIC_LENGTH) {
             throw new IllegalArgumentException("topic longer than " + MAX_TOPIC_LENGTH + " chars: " + topic.length());
         }
+        requireStorable(topic);
         if (key != null && key.length > MAX_KEY_BYTES) {
             throw new IllegalArgumentException("key longer than " + MAX_KEY_BYTES + " bytes: " + key.length);
         }
         headers = List.copyOf(headers);
+    }
+
+    /**
+     * Postgres text cannot hold NUL, and the driver writes an unpaired surrogate as '?', so the row would carry another
+     * topic than the one the shard and the key lock were hashed from. A char loop: no allocation per message.
+     */
+    private static void requireStorable(String topic) {
+        for (int i = 0, n = topic.length(); i < n; i++) {
+            char c = topic.charAt(i);
+            if (c == 0) {
+                throw new IllegalArgumentException("topic contains NUL at index " + i);
+            }
+            if (Character.isHighSurrogate(c) && i + 1 < n && Character.isLowSurrogate(topic.charAt(i + 1))) {
+                i++;
+            } else if (Character.isSurrogate(c)) {
+                throw new IllegalArgumentException("topic contains an unpaired UTF-16 surrogate at index " + i);
+            }
+        }
     }
 
     /** Unkeyed message: no ordering relative to other messages. */

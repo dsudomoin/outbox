@@ -29,6 +29,20 @@ class OutboxMessageTest {
     }
 
     @Test
+    void topicPostgresCannotStoreRejected() {
+        // NUL does not fit Postgres text; an unpaired surrogate would be stored as '?' under another name
+        for (var topic : List.of("t\u0000x", "a\uD800b", "a\uDC00", "\uDC00a", "tenant-\uD83D", "a\uD800\uD800b")) {
+            assertThatThrownBy(() -> OutboxMessage.of(topic, null))
+                    .as(topic)
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+        assertThatThrownBy(() -> new OutboxMessage("a\uD800b", null, null, List.of()))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatCode(() -> OutboxMessage.of("t\uD83D\uDE00", null)).doesNotThrowAnyException();
+        assertThatCode(() -> OutboxMessage.of("t", null).withHeader("h\u0000", null)).doesNotThrowAnyException();
+    }
+
+    @Test
     void blankTopicRejected() {
         assertThatThrownBy(() -> OutboxMessage.of("", null)).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> OutboxMessage.of(" \t", null)).isInstanceOf(IllegalArgumentException.class);

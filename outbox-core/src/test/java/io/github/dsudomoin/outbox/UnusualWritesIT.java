@@ -207,15 +207,21 @@ class UnusualWritesIT {
         assertThat(Arrays.equals(received.get(bigId).payload(), big)).isTrue();
     }
 
-    /** A topic with NUL, which Postgres text cannot hold, fails the send before the commit; the next send works. */
+    /**
+     * A topic with NUL, which Postgres text cannot hold, is refused before any SQL: the caller's transaction stays
+     * usable and commits the next send.
+     */
     @Test
     void aTopicPostgresCannotStoreFailsTheSend() {
         var transactions = new JdbcTransactions(TestDataSources.newDataSource());
         var runtime = start(new TestOutboxConfig(), transactions);
 
-        assertThatThrownBy(() -> transactions.inTx(c -> runtime.outbox().send(
-                OutboxMessage.of("t\u0000x", "k", bytes("nul"))))).isInstanceOf(RuntimeException.class);
-        var ok = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", "k", bytes("ok"))));
+        var ok = transactions.inTx(c -> {
+            assertThatThrownBy(() -> runtime.outbox().send(OutboxMessage.of("t\u0000x", "k", bytes("nul"))))
+                    .isInstanceOf(IllegalArgumentException.class);
+            TestSql.execute(c, "select 1");
+            return runtime.outbox().send(OutboxMessage.of("t", "k", bytes("ok")));
+        });
 
         assertThat(order).isEmpty();
         assertThatAwait(() -> delivered.containsKey(ok));
