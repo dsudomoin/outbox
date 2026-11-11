@@ -5,6 +5,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.micrometer.observation.Observation;
+import io.micrometer.observation.ObservationRegistry;
 import io.micrometer.tracing.Tracer;
 import io.micrometer.tracing.propagation.Propagator;
 import java.util.ArrayList;
@@ -32,8 +33,9 @@ final class TraceInjector {
      * makes no span of its own (an {@code ObservationPredicate} rejected it, no tracing handler, a noop registry): its
      * scope then leaves the span current before it, such as the relay step's, which is not the record's trace.
      */
-    OutboxRecord inject(Observation observation, OutboxRecord record) {
+    OutboxRecord inject(ObservationRegistry observations, Observation observation, OutboxRecord record) {
         var outer = tracer.currentSpan();
+        var previous = observations.getCurrentObservationScope(); // a handler throwing on the scope leaves it current
         try (var scope = observation.openScope()) {
             var span = tracer.currentSpan();
             if (span == null || outer != null && outer.context().spanId().equals(span.context().spanId())) {
@@ -47,6 +49,8 @@ final class TraceInjector {
             }
             propagator.inject(span.context(), headers, SETTER);
             return record.withHeaders(headers);
+        } finally {
+            ObservationOutboxTelemetry.restoreScope(observations, previous);
         }
     }
 }

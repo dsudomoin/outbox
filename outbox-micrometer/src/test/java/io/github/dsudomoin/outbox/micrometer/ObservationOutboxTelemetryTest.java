@@ -72,12 +72,17 @@ class ObservationOutboxTelemetryTest {
 
     @BeforeEach
     void handlers() {
-        observations.observationConfig()
+        traced(observations).observationConfig().observationHandler(new DefaultMeterObservationHandler(meters));
+    }
+
+    /** The tracing handlers, registered first as Spring Boot groups them. */
+    private ObservationRegistry traced(ObservationRegistry registry) {
+        registry.observationConfig()
                 .observationHandler(new ObservationHandler.FirstMatchingCompositeObservationHandler(
                         new PropagatingSenderTracingObservationHandler<>(tracer, propagator),
                         new PropagatingReceiverTracingObservationHandler<>(tracer, propagator),
-                        new DefaultTracingObservationHandler(tracer)))
-                .observationHandler(new DefaultMeterObservationHandler(meters));
+                        new DefaultTracingObservationHandler(tracer)));
+        return registry;
     }
 
     @AfterEach
@@ -542,27 +547,31 @@ class ObservationOutboxTelemetryTest {
     @Test
     void aHandlerFailingToOpenOrCloseTheStepScopeLeavesNoStepCurrentOrRunning() {
         for (boolean onOpen : new boolean[] {true, false}) {
-            var registry = ObservationRegistry.create(); // no tracing handlers: their thread-local is not the subject
+            var registry = traced(ObservationRegistry.create()); // the tracer's thread-local must be left clean too
             throwingOnScope(registry, OutboxStepContext.class, onOpen);
             var stopped = stoppedSteps(registry);
-            var telemetry = GuardedTelemetry.of(
-                    ObservationOutboxTelemetry.builder(registry, new OutboxMetrics(meters)).build());
+            var telemetry = GuardedTelemetry.of(ObservationOutboxTelemetry.builder(registry, new OutboxMetrics(meters))
+                    .tracing(tracer, propagator).build());
+            spans.reset();
 
             telemetry.stepStarted(List.of(1)).finished();
             telemetry.stepStarted(List.of(2)).failed(new SQLException("x"));
 
             assertThat(registry.getCurrentObservation()).as("onOpen=" + onOpen).isNull();
+            assertThat(tracer.currentSpan()).as("onOpen=" + onOpen).isNull();
             assertThat(stopped).as("onOpen=" + onOpen).hasSize(2);
+            assertThat(spans.getFinishedSpanItems()).as("onOpen=" + onOpen).hasSize(2)
+                    .allSatisfy(span -> assertThat(span.getParentSpanContext().isValid()).isFalse());
         }
     }
 
     @Test
     void aHandlerFailingToOpenOrCloseTheRecordScopeLeavesNoDeliveryCurrent() throws Exception {
         for (boolean onOpen : new boolean[] {true, false}) {
-            var registry = ObservationRegistry.create();
+            var registry = traced(ObservationRegistry.create());
             throwingOnScope(registry, OutboxDeliveryContext.class, onOpen);
-            var telemetry = GuardedTelemetry.of(
-                    ObservationOutboxTelemetry.builder(registry, new OutboxMetrics(meters)).build());
+            var telemetry = GuardedTelemetry.of(ObservationOutboxTelemetry.builder(registry, new OutboxMetrics(meters))
+                    .tracing(tracer, propagator).build());
             var records = List.of(record(List.of()), record(List.of()));
             var delivery = telemetry.deliveryStarted(records, NOW);
             var handed = delivery.handed(records);
@@ -570,6 +579,7 @@ class ObservationOutboxTelemetryTest {
             for (var record : handed) {
                 assertThat(delivery.inRecordScope(record, () -> 1)).isEqualTo(1);
                 assertThat(registry.getCurrentObservation()).as("onOpen=" + onOpen).isNull();
+                assertThat(tracer.currentSpan()).as("onOpen=" + onOpen).isNull();
             }
             delivery.finished(List.of(Outcome.delivered(), Outcome.delivered()));
         }

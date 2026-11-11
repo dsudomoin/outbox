@@ -201,7 +201,7 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
      * Opens the step observation's scope on the thread that steps; the step closes it there before it stops. A
      * Micrometer scope makes itself current before it notifies the handlers and restores the previous one only after
      * they are notified on close, so a handler that throws there would leave it current: the thread's previous scope is
-     * restored either way.
+     * restored either way, see {@link #restoreScope}.
      */
     @Override
     public RelayStep stepStarted(List<Integer> shards) {
@@ -214,11 +214,31 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
         try {
             scope = observation.openScope();
         } catch (Throwable e) {
-            observations.setCurrentObservationScope(previous);
-            end(observation, null, e); // the caller gets no RelayStep to stop it with
+            try {
+                restoreScope(observations, previous);
+            } finally {
+                end(observation, null, e); // the caller gets no RelayStep to stop it with
+            }
             throw e;
         }
         return new ObservedStep(observations, observation, scope, previous);
+    }
+
+    /**
+     * Makes {@code previous} the thread's scope again. A scope that a handler left current, by throwing while it opened
+     * or closed, is reset first: the tracing handler then closes the tracer's scope as well, which would otherwise keep
+     * that span current and parent whatever the thread observes next. A reset leaves no span current in the tracer,
+     * so a {@code previous} scope's span is not current there again until that scope closes.
+     */
+    static void restoreScope(ObservationRegistry observations, @Nullable Observation.Scope previous) {
+        var left = observations.getCurrentObservationScope();
+        try {
+            if (left != null && left != previous) {
+                left.reset();
+            }
+        } finally {
+            observations.setCurrentObservationScope(previous);
+        }
     }
 
     /** On a handler or dead-letter hook thread, which the library owns: no observation stays current there. */
@@ -370,7 +390,7 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
             try {
                 scope.close();
             } finally {
-                observations.setCurrentObservationScope(previous);
+                restoreScope(observations, previous);
             }
         }
     }
@@ -409,7 +429,7 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
                     handed.add(records.get(i));
                     continue;
                 }
-                var record = injector.inject(started[i], records.get(i));
+                var record = injector.inject(observations, started[i], records.get(i));
                 byRecord.put(record, started[i]);
                 handed.add(record);
             }
@@ -427,7 +447,7 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
             try (var scope = observation.openScope()) {
                 return call.call();
             } finally {
-                observations.setCurrentObservationScope(previous);
+                restoreScope(observations, previous);
             }
         }
 
