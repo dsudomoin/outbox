@@ -644,6 +644,36 @@ class KafkaOutboxSenderTest {
         assertThat(seen.get(1)).isEqualTo(expected);
     }
 
+    /**
+     * A set {@code client.id} is a prefix: Kafka keys a producer's JMX metrics by it, so producers sharing one id
+     * overwrite each other's metrics and closing any of them unregisters the metrics of the rest.
+     */
+    @Test
+    void eachProducerGetsItsOwnClientId() throws Exception {
+        var seen = new CopyOnWriteArrayList<Map<String, Object>>();
+        var sender = new KafkaOutboxSender(() -> props("bootstrap.servers", "localhost:9092", "client.id", "orders-svc"),
+                properties -> {
+                    seen.add(properties);
+                    var producer = new TestProducer(false, r -> null);
+                    producers.add(producer);
+                    return producer;
+                });
+        var remembered = record(1, keyOnPartition(0));
+        var first = sendAsync(sender, List.of(remembered));
+        awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)")); // the failed producer is closed
+        first.get(5, SECONDS);
+        assertThat(sender.send(List.of(remembered))).singleElement().isInstanceOf(Outcome.NotAttempted.class);
+        var next = sendAsync(sender, List.of(record(2, keyOnPartition(1))));
+        awaitSent(2, 1).completeNext();
+        assertThat(next.get(5, SECONDS)).containsExactly(Outcome.delivered());
+
+        var ids = seen.stream().map(p -> (String) p.get("client.id")).toList();
+        assertThat(ids).doesNotHaveDuplicates().hasSize(3);
+        assertThat(ids.get(0)).matches("orders-svc-outbox-\\d+");
+        assertThat(ids.get(1)).matches("orders-svc-outbox-unbatched-\\d+");
+        assertThat(ids.get(2)).matches("orders-svc-outbox-\\d+");
+    }
+
     /** A client-side refusal says nothing about the partition: its cooldown, here a probe's lease, stays. */
     @Test
     void clientSideRefusalLeavesThePartitionsCooldown() throws Exception {

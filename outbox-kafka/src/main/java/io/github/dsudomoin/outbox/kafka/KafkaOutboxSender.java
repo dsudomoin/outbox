@@ -5,6 +5,7 @@ import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static org.apache.kafka.clients.producer.ProducerConfig.ACKS_CONFIG;
 import static org.apache.kafka.clients.producer.ProducerConfig.BATCH_SIZE_CONFIG;
 import static org.apache.kafka.clients.producer.ProducerConfig.BOOTSTRAP_SERVERS_CONFIG;
+import static org.apache.kafka.clients.producer.ProducerConfig.CLIENT_ID_CONFIG;
 import static org.apache.kafka.clients.producer.ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG;
 import static org.apache.kafka.clients.producer.ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG;
 import static org.apache.kafka.clients.producer.ProducerConfig.ENABLE_METRICS_PUSH_CONFIG;
@@ -41,6 +42,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
@@ -124,6 +126,8 @@ public final class KafkaOutboxSender implements AutoCloseable {
     private static final int EXPIRED_REMEMBERED = 10_000;
     private static final Duration REMEMBERED_FOR = Duration.ofMinutes(10);
     private static final Logger log = LoggerFactory.getLogger(KafkaOutboxSender.class);
+    /** Numbers the client ids, unique across the senders of the JVM as Kafka's own {@code producer-<n>}. */
+    private static final AtomicLong PRODUCERS_MADE = new AtomicLong();
 
     private final Supplier<Producer<byte[], byte[]>> factory;
     private final Supplier<Producer<byte[], byte[]>> unbatchedFactory;
@@ -148,7 +152,8 @@ public final class KafkaOutboxSender implements AutoCloseable {
      * {@code producers} makes each producer the sender pools, from the validated properties (the forced and defaulted
      * ones set): the application's own Kafka client factory, e.g. one that adds its metrics or interceptors. It must
      * build each producer from the properties it receives: the sender passes {@code batch.size=0} for its second pool
-     * (see the class javadoc), and a factory that builds from its own configuration silently loses that.
+     * (see the class javadoc), and a factory that builds from its own configuration silently loses that. A set
+     * {@code client.id} arrives with a per-producer suffix.
      */
     public KafkaOutboxSender(KafkaOutboxConfig config,
             Function<Map<String, Object>, Producer<byte[], byte[]>> producers) {
@@ -157,12 +162,26 @@ public final class KafkaOutboxSender implements AutoCloseable {
 
     private KafkaOutboxSender(ProducerConfig config,
             Function<Map<String, Object>, Producer<byte[], byte[]>> producers) {
-        this(() -> producers.apply(config.originals()), () -> {
-            var unbatched = config.originals();
+        this(() -> producers.apply(properties(config, "-outbox-")), () -> {
+            var unbatched = properties(config, "-outbox-unbatched-");
             unbatched.put(BATCH_SIZE_CONFIG, "0");
             return producers.apply(unbatched);
         }, Duration.ofMillis(config.getInt(DELIVERY_TIMEOUT_MS_CONFIG)),
                 Duration.ofMillis(config.getLong(MAX_BLOCK_MS_CONFIG)), Clock.systemUTC(), System::nanoTime);
+    }
+
+    /**
+     * A fresh copy of the properties for one producer. A set {@code client.id} becomes a prefix: Kafka registers a
+     * producer's JMX metrics under its client id, so pooled producers sharing one would overwrite each other's metrics,
+     * and closing any of them would unregister the metrics of the rest.
+     */
+    private static Map<String, Object> properties(ProducerConfig config, String infix) {
+        var properties = config.originals();
+        if (properties.containsKey(CLIENT_ID_CONFIG)) { // an unset one Kafka replaces with a unique producer-<n>
+            properties.put(CLIENT_ID_CONFIG,
+                    config.getString(CLIENT_ID_CONFIG) + infix + PRODUCERS_MADE.incrementAndGet());
+        }
+        return properties;
     }
 
     /**

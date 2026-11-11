@@ -230,7 +230,10 @@ remains on ≤ 4.1: the first call waits for the expiry or the cut, and calls wi
 (about 0.2 s per 1 000 records instead of 0.02 s on a local stand). Keep `batch.size` ≤ the topic's
 `max.message.bytes` and `relay.retry.maxDelay` < 10 min.
 
-Producer client metrics are not bound to Micrometer; they are visible through JMX only.
+Producer client metrics are not bound to Micrometer; they are visible through JMX only. A set `client.id` is a
+prefix, since JMX tells producers apart by it: each producer gets `<client.id>-outbox-<n>`, one of the second pool
+`<client.id>-outbox-unbatched-<n>`. Broker quotas match the whole `client.id`, so a quota on the bare id does not
+cover the outbox producers: set it on the user principal. With no `client.id` Kafka names them `producer-<n>`.
 
 ## Spring Boot
 
