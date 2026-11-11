@@ -67,7 +67,8 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
     public Enqueue enqueueStarted() {
         var context = new OutboxEnqueueContext();
         var observation = Observation.createNotStarted(enqueueConvention,
-                DefaultOutboxEnqueueObservationConvention.INSTANCE, () -> context, observations).start();
+                DefaultOutboxEnqueueObservationConvention.INSTANCE, () -> context, observations);
+        start(observation);
         return new ObservedEnqueue(observation, List.copyOf(context.getCarrier()));
     }
 
@@ -82,8 +83,10 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
                 }
                 var context = new OutboxDeliveryContext(records.get(i), now);
                 contexts[i] = context;
+                // stored before it starts: a handler that throws in onStart may have started a meter sample already
                 started[i] = Observation.createNotStarted(deliveryConvention,
-                        DefaultOutboxDeliveryObservationConvention.INSTANCE, () -> context, observations).start();
+                        DefaultOutboxDeliveryObservationConvention.INSTANCE, () -> context, observations);
+                started[i].start();
             }
         } catch (Throwable e) {
             // the caller gets no Delivery to stop them with: stop the ones already started, or they never end
@@ -95,6 +98,20 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
             throw e;
         }
         return new ObservedDelivery(records, started, contexts);
+    }
+
+    /**
+     * Starts the observation, or stops it when starting throws: Micrometer notifies the handlers' {@code onStart} in
+     * turn without a catch, so the ones before a handler that throws have started (a meter handler its active sample),
+     * and the caller gets nothing to stop it with.
+     */
+    private static void start(Observation observation) {
+        try {
+            observation.start();
+        } catch (Throwable e) {
+            end(observation, e, e);
+            throw e;
+        }
     }
 
     /**
@@ -190,7 +207,8 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
     public RelayStep stepStarted(List<Integer> shards) {
         var context = new OutboxStepContext(shards);
         var observation = Observation.createNotStarted(stepConvention, DefaultOutboxStepObservationConvention.INSTANCE,
-                () -> context, observations).start();
+                () -> context, observations);
+        start(observation);
         var previous = observations.getCurrentObservationScope();
         Observation.Scope scope;
         try {

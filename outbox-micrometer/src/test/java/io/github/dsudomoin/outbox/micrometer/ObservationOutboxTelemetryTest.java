@@ -451,6 +451,36 @@ class ObservationOutboxTelemetryTest {
     }
 
     @Test
+    void aHandlerFailingOnStartLeavesNoObservationRunning() {
+        // registered after the meter handler, whose onStart has already started the active sample when this throws
+        observations.observationConfig().observationHandler(new ObservationHandler<>() {
+            @Override
+            public void onStart(Observation.Context context) {
+                if (!(context instanceof OutboxDeliveryContext d) || d.record().topic().equals("bad")) {
+                    throw new IllegalStateException("onStart");
+                }
+            }
+
+            @Override
+            public boolean supportsContext(Observation.Context context) {
+                return true;
+            }
+        });
+        var telemetry = telemetry();
+        var bad = new OutboxRecord(2, UUID.randomUUID(), "bad", null, null, List.of(), NOW.minusSeconds(1), 0, 0);
+
+        assertThatThrownBy(telemetry::enqueueStarted).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> telemetry.stepStarted(List.of(1))).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> telemetry.deliveryStarted(List.of(record(List.of()), bad), NOW))
+                .isInstanceOf(IllegalStateException.class);
+
+        assertThat(meters.get("outbox.enqueue.active").longTaskTimer().activeTasks()).isZero();
+        assertThat(meters.get("outbox.relay.step.active").longTaskTimer().activeTasks()).isZero();
+        assertThat(meters.get("outbox.deliver.active").longTaskTimer().activeTasks()).isZero();
+        assertThat(observations.getCurrentObservation()).isNull();
+    }
+
+    @Test
     void aConventionFailingOnOneRecordAtStopStillStopsTheOthers() {
         var telemetry = ObservationOutboxTelemetry.builder(observations, new OutboxMetrics(meters))
                 .deliveryConvention(new OutboxDeliveryObservationConvention() {
