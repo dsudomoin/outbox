@@ -228,6 +228,11 @@ final class InboxPartitions {
                 .toEpochMilli();
     }
 
+    /** {@link PartitionDdl#reown}: the ranges, attached or not. */
+    void reown(Connection c) throws SQLException {
+        PartitionDdl.reown(c, table, "_t[0-9]{10}([0-9]{2})?");
+    }
+
     /**
      * Drops a range whose detach was left pending when its whole range is past retention, as {@link #dropExpired}
      * would: without {@code FINALIZE}, which waits for every older snapshot in the database, by

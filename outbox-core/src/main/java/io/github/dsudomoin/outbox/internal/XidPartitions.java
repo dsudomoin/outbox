@@ -1190,6 +1190,11 @@ public final class XidPartitions {
         }
     }
 
+    /** {@link PartitionDdl#reown}: the tail, the next tail, the ranges and the ranges set aside. */
+    void reown(Connection c) throws SQLException {
+        PartitionDdl.reown(c, names.base(), "_(tail|tail_next|[xo][0-9]+)");
+    }
+
     /**
      * Finishes a detach that an interrupted run left pending. Postgres allows one pending detach per parent and fails
      * every other {@code DETACH ... CONCURRENTLY} meanwhile (SQLState 55000), so this goes before any other partition

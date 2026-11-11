@@ -142,6 +142,44 @@ public final class PartitionDdl {
     }
 
     /**
+     * Gives {@code parent}'s owner the tables in its schema named {@code <parent><suffix>} ({@code suffix} a regex),
+     * attached or not, that the current role owns while the parent's owner is another role: what a member made before
+     * {@link #create} gave each new table to the owner. Only a table's owner may give it away, so each instance's role
+     * hands over its own; when it cannot ({@link #ownerProblem}), they stay, with {@link #foreignOwner}'s WARN. One
+     * {@code ALTER TABLE ... OWNER TO} each, under {@link #CREATE_LOCK_TIMEOUT}: one that fails (behind a long reader)
+     * is logged and left to the next run.
+     */
+    static void reown(Connection c, String parent, String suffix) throws SQLException {
+        var tables = new ArrayList<String>();
+        try (var ps = c.prepareStatement("select t.oid::regclass::text from pg_class p join pg_class t on"
+                + " t.relnamespace = p.relnamespace and t.relowner <> p.relowner where p.oid = to_regclass(?)"
+                + " and t.relkind = 'r' and t.relname ~ ? and pg_get_userbyid(t.relowner) = current_user")) {
+            ps.setString(1, parent);
+            ps.setString(2, "^" + parent.substring(parent.indexOf('.') + 1) + suffix + "$");
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    if (!dropped(rs.getString(1))) {
+                        tables.add(unquoted(rs.getString(1)));
+                    }
+                }
+            }
+        }
+        var owner = tables.isEmpty() ? null : foreignOwner(c, parent, "the tables of " + parent);
+        if (owner == null) {
+            return;
+        }
+        for (var table : tables) {
+            try {
+                execute(c, CREATE_LOCK_TIMEOUT, "alter table " + name(table) + " owner to " + owner);
+                log.info("gave table {} to {}, the owner of {}", table, owner, parent);
+            } catch (SQLException e) {
+                log.warn("outbox could not give table {} to {}, the owner of {} (SQLState {}); the next maintenance"
+                        + " run retries: {}", table, owner, parent, e.getSQLState(), e.getMessage());
+            }
+        }
+    }
+
+    /**
      * Why the current role cannot give a new partition {@code table} of {@code parent} to {@code parent}'s owner, with
      * the statement to run; null when it can, or when the owner is the current role or the parent is missing.
      */

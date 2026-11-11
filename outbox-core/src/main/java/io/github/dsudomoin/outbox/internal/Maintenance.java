@@ -668,6 +668,10 @@ public final class Maintenance {
             partitions.finishPendingDetach(c, detachLockTimeout, quiesceTimeout);
             return null;
         });
+        step("partition owner", () -> {
+            partitions.reown(c);
+            return null;
+        });
         step("partition extension", () -> {
             partitions.ensurePremade(c, detachLockTimeout, quiesceTimeout);
             if (partitions.tailStuck()) { // its ERROR said why: no success while nothing will convert it

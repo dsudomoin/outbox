@@ -346,6 +346,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
                             + " consumer text not null default '', received_at timestamptz not null default now(),"
                             + " primary key (message_id, consumer)) partition by range (message_id)");
                 }
+                partitions.reown(c);
                 partitions.ensurePremade(c, clock.millis());
             } finally {
                 advisory(c, "pg_advisory_unlock", ns);
@@ -373,6 +374,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
                 long now = clock.millis();
                 var timeout = PartitionDdl.DETACH_LOCK_TIMEOUT;
                 step("finish pending detach", () -> partitions.finishPendingDetach(c, now, timeout));
+                step("partition owner", () -> partitions.reown(c));
                 step("partition drop", () -> partitions.dropExpired(c, now, timeout));
                 // before the orphan check: a table of the next range whose attach was cut off is attached, not reported
                 step("partition premake", () -> partitions.ensurePremade(c, now));

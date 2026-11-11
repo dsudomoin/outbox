@@ -134,7 +134,8 @@ schema, gets its own message with the `GRANT`). Render the grants with `OutboxSq
 must not have `CREATE` on any schema of the owner's `search_path` (startup WARNs with the `REVOKE`). Every partition
 is given to the parent table's owner: an owner source that is only a member of that role needs the `SET` option on
 PG 16+, and the owner role needs `CREATE` on the schema; otherwise the partition stays the creating role's and a
-WARN, at most hourly, names the `GRANT`.
+WARN, at most hourly, names the `GRANT`. Partitions a member made before the handoff existed are given to the owner
+by that member's next start or maintenance run (`REASSIGN OWNED BY <member> TO <owner>` for a retired member).
 
 ## Shard count and the emergency reshard
 

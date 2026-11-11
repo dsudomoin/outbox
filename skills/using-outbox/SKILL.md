@@ -311,6 +311,8 @@ for ops:
    of the owner role (per-instance credentials) can maintain it: a role that is only a member needs the `SET` option
    on PG 16+, and the owner role itself needs `CREATE` on the schema; otherwise the partition stays the creating
    role's (enough for a single DDL role, not for per-instance members) and a WARN, at most hourly, names the `GRANT`.
+   Tables a member made before this handoff existed are given to the owner by that member's next start or
+   maintenance run; for a member no instance runs as any more, run `REASSIGN OWNED BY <member> TO <owner>` as it.
    `pg_read_all_stats` recommended for the role that runs maintenance; no role `statement_timeout` of
    seconds, nor a short role `transaction_timeout` (PG 17+): a relay step that moves a large parked key into retry
    can run for tens of seconds.

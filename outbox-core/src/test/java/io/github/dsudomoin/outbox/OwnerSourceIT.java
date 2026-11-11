@@ -4,7 +4,9 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.dsudomoin.outbox.internal.Maintenance;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
+import io.github.dsudomoin.outbox.internal.PgInbox;
 import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.internal.UuidV7;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
@@ -151,6 +153,56 @@ class OwnerSourceIT {
             second.start(); // an extension is due: it reads the tail and swaps it
         }
         assertThat(foreignTables()).as("tables owned by another role than " + owner).isEmpty();
+    }
+
+    /**
+     * Partitions a member made before the library gave them to the owner (an earlier release) are that member's:
+     * its next start, and its next maintenance run, give them to the owner, for the outbox and the inbox alike.
+     */
+    @Test
+    void partitionsAMemberMadeEarlierAreGivenToTheOwner() throws Exception {
+        var members = memberRoles();
+        sql("alter schema " + schema + " owner to current_user");
+        sql("grant usage, create on schema " + schema + " to " + owner);
+        migrate();
+        config.xidsPerPartition(1000).premake(2);
+        var member = new JdbcTransactions(as(members[0]));
+        try (var first = new OutboxSchema(new JdbcTransactions(as(app)), member, config)) {
+            first.start();
+        }
+        var inbox = new PgInbox(new JdbcTransactions(as(app)), member, config, OutboxTelemetry.NONE);
+        inbox.start();
+        var made = "^(outbox_(tail|tail_next|[xo][0-9]+)|inbox_t[0-9]+)$";
+        assertThat(giveTo(members[0], made)).as("partitions").hasSizeGreaterThan(4);
+
+        try (var again = new OutboxSchema(new JdbcTransactions(as(app)), member, config)) {
+            again.start();
+        }
+        new PgInbox(new JdbcTransactions(as(app)), member, config, OutboxTelemetry.NONE).start();
+        assertThat(foreignTables()).as("tables owned by another role than " + owner + " after a start").isEmpty();
+
+        giveTo(members[0], made);
+        assertThat(new Maintenance(member, names, config, OutboxTelemetry.NONE).runOnce()).isTrue();
+        inbox.runMaintenance();
+        assertThat(foreignTables()).as("tables owned by another role than " + owner + " after maintenance").isEmpty();
+    }
+
+    /** Gives the schema's tables named like {@code regex} to {@code role}, as an earlier release left them. */
+    private List<String> giveTo(String role, String regex) throws SQLException {
+        var tables = new ArrayList<String>();
+        try (var c = TestDataSources.newDataSource().getConnection()) {
+            try (var st = c.createStatement(); var rs = st.executeQuery("select c.relname from pg_class c join"
+                    + " pg_namespace n on n.oid = c.relnamespace where n.nspname = '" + schema + "' and c.relkind = 'r'"
+                    + " and c.relname ~ '" + regex + "'")) {
+                while (rs.next()) {
+                    tables.add(rs.getString(1));
+                }
+            }
+            for (var table : tables) {
+                TestSql.execute(c, "alter table " + schema + "." + table + " owner to " + role);
+            }
+        }
+        return tables;
     }
 
     /**
