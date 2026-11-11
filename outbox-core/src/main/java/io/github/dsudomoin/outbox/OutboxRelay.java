@@ -97,6 +97,9 @@ public final class OutboxRelay implements AutoCloseable {
      * maxLifetime and its leak detection.
      */
     private final long passBound;
+    /** {@code relay.retry}, in nanoseconds: the paths that handle a fatal error compute pauses without allocating. */
+    private final long retryInitialNanos;
+    private final long retryMaxNanos;
     private final SocketBound socket;
     /**
      * An idle tick attempt inserts only when the newest tick, any instance's, is older than this: so a cluster makes
@@ -209,6 +212,8 @@ public final class OutboxRelay implements AutoCloseable {
         this.idleNanos = relay.idlePollInterval().toNanos();
         this.minTickNanos = relay.minTickInterval().toNanos();
         this.passBound = relay.connectionHold().toNanos();
+        this.retryInitialNanos = relay.retry().initialDelay().toNanos();
+        this.retryMaxNanos = relay.retry().maxDelay().toNanos();
         this.roundWaitNanos = Math.max(TimeUnit.SECONDS.toNanos(1), 5 * idleNanos);
         this.roundReadSince = System.nanoTime() - roundWaitNanos;
         this.socket = new SocketBound(config.networkTimeout());
@@ -627,6 +632,7 @@ public final class OutboxRelay implements AutoCloseable {
      */
     private void runDeadLetters() {
         var interval = config.partitions().maintenanceInterval();
+        long intervalNanos = interval.toNanos();
         int failures = 0;
         while (!stopping) {
             long seen = deadLettered.get();
@@ -644,13 +650,20 @@ public final class OutboxRelay implements AutoCloseable {
                     return;
                 }
                 Thread.interrupted(); // not stopping: a stray interrupt is one more failure
-                var backoff = Backoff.delay(failures++, relay.retry().initialDelay(), interval);
-                if (t instanceof VirtualMachineError) {
-                    fatal(() -> log.error("outbox dead-letter pass hit a fatal error, retrying in {}", backoff, t));
-                } else {
-                    log.warn("outbox dead-letter pass failed, retrying in {}", backoff, t);
+                // allocates nothing outside the try: reporting the failure may itself run out of memory, and the
+                // thread must outlive that, not end on it
+                long backoff = Backoff.delayNanos(failures++, retryInitialNanos, intervalNanos);
+                try {
+                    if (t instanceof VirtualMachineError) {
+                        log.error("outbox dead-letter pass hit a fatal error, retrying in {}",
+                                Duration.ofNanos(backoff), t);
+                    } else {
+                        log.warn("outbox dead-letter pass failed, retrying in {}", Duration.ofNanos(backoff), t);
+                    }
+                } catch (VirtualMachineError again) {
+                    // nothing left to report with; the next failure is reported again
                 }
-                park(System.nanoTime() + backoff.toNanos(), () -> false);
+                sleepUntil(System.nanoTime() + backoff);
             }
         }
     }
@@ -660,20 +673,11 @@ public final class OutboxRelay implements AutoCloseable {
         try {
             maintenance.runOnce();
         } catch (Throwable t) {
-            fatal(() -> log.error("outbox maintenance failed; next run in {}",
-                    config.partitions().maintenanceInterval(), t));
-        }
-    }
-
-    /**
-     * {@code report} of a failure, at most one more fatal error swallowed: logging may itself run out of memory, and
-     * a thread of the relay must outlive that, not end on it.
-     */
-    static void fatal(Runnable report) {
-        try {
-            report.run();
-        } catch (VirtualMachineError ignored) {
-            // nothing left to report with; the thread goes on, its next failure is reported again
+            try {
+                log.error("outbox maintenance failed; next run in {}", config.partitions().maintenanceInterval(), t);
+            } catch (VirtualMachineError again) {
+                // logging ran out of memory too; the next run reports again
+            }
         }
     }
 
@@ -719,6 +723,14 @@ public final class OutboxRelay implements AutoCloseable {
             }
             LockSupport.parkNanos(this, left);
             Thread.interrupted(); // a stray interrupt must not turn parking into a spin; close() sets stopping
+        }
+    }
+
+    /** Parks until {@code deadline} or release, allocating nothing: the pause after a failure, a fatal one too. */
+    private void sleepUntil(long deadline) {
+        for (long left; !stopping && (left = deadline - System.nanoTime()) > 0; ) {
+            LockSupport.parkNanos(this, left);
+            Thread.interrupted(); // as in park
         }
     }
 
@@ -776,7 +788,10 @@ public final class OutboxRelay implements AutoCloseable {
             long rows = 0;
             long now = System.nanoTime();
             while (group.size() < groupSize && !queue.isEmpty()) {
-                int shard = queue.peekFirst();
+                // added as is: from the inFlight CAS on nothing allocates (the group is sized), so no OutOfMemoryError
+                // can leave a shard in flight without its step
+                Integer boxed = queue.peekFirst();
+                int shard = boxed;
                 if (backingOff(shard, now)) { // failed after this round was read
                     drop(shard);
                     continue;
@@ -800,7 +815,7 @@ public final class OutboxRelay implements AutoCloseable {
                     continue;
                 }
                 drop(shard);
-                group.add(shard);
+                group.add(boxed);
                 rows += expected.get(shard);
                 if (alone) {
                     break;
@@ -855,12 +870,22 @@ public final class OutboxRelay implements AutoCloseable {
                     if (stopping) {
                         return;
                     }
-                    var backoff = Backoff.delay(fatal++, relay.retry().initialDelay(), relay.retry().maxDelay());
-                    fatal(() -> log.error("outbox relay worker {} hit a fatal error, going on in {}",
-                            Thread.currentThread().getName(), backoff, e));
-                    fatal(() -> telemetry.relayFailed(e));
-                    fatal(processor::forgetRowSizes); // rows may have grown: the next chunk reads are budgeted
-                    park(System.nanoTime() + backoff.toNanos(), false, seen, seenTicks, seenRequeued);
+                    // allocates nothing outside the tries: reporting the error may itself run out of memory, and the
+                    // worker must outlive that, not end on it
+                    long backoff = Backoff.delayNanos(fatal++, retryInitialNanos, retryMaxNanos);
+                    try {
+                        log.error("outbox relay worker {} hit a fatal error, going on in {}",
+                                Thread.currentThread().getName(), Duration.ofNanos(backoff), e);
+                    } catch (VirtualMachineError again) {
+                        // nothing left to report with; the next failure is reported again
+                    }
+                    try {
+                        telemetry.relayFailed(e);
+                    } catch (VirtualMachineError again) {
+                        // as above
+                    }
+                    processor.forgetRowSizes(); // rows may have grown: the next chunk reads are budgeted
+                    sleepUntil(System.nanoTime() + backoff);
                     continue;
                 } catch (Throwable t) { // outside a shard step (tick, cursor read, connection)
                     if (stopping) {
@@ -871,10 +896,13 @@ public final class OutboxRelay implements AutoCloseable {
                         return;
                     }
                     Thread.interrupted(); // not stopping: a stray interrupt is one more failure
-                    warn("outbox relay worker failed, retrying in " + relay.idlePollInterval(), t);
-                    telemetry.relayFailed(t);
-                    // wake-ups do not cut it short
-                    park(System.nanoTime() + idleNanos, false, seen, seenTicks, seenRequeued);
+                    try {
+                        warn("outbox relay worker failed, retrying in " + relay.idlePollInterval(), t);
+                        telemetry.relayFailed(t);
+                    } catch (VirtualMachineError again) {
+                        // reporting it ran out of memory: the worker pauses all the same, allocating nothing
+                    }
+                    sleepUntil(System.nanoTime() + idleNanos); // wake-ups do not cut it short
                     continue;
                 }
                 if (!worked) {
@@ -1001,24 +1029,31 @@ public final class OutboxRelay implements AutoCloseable {
          * any a newer round passed over meanwhile ({@link #wanted}), and one parked worker is woken for them.
          */
         private boolean step(Connection c, Round r, List<Integer> group) throws Exception {
-            var back = new ArrayList<Integer>();
+            List<Integer> back = null;
             try {
+                back = new ArrayList<>(); // in the try: an OutOfMemoryError here must not leave the group in flight
                 return stepHeld(c, r, group, back);
             } finally {
-                for (var shard : group) {
-                    inFlight.set(shard, 0);
+                for (int i = 0; i < group.size(); i++) { // first, allocating nothing (no iterator), for the same reason
+                    inFlight.set(group.get(i), 0);
                 }
-                long now = System.nanoTime();
-                for (var shard : group) { // after inFlight: a take that saw it in flight set wanted before
-                    if (wanted.getAndSet(shard, 0) == 1 && !back.contains(shard) && !backingOff(shard, now)) {
-                        back.add(shard);
-                    }
+                if (back != null) { // else it failed to allocate: a want left set costs one spare put-back later
+                    putBack(group, back);
                 }
-                if (!back.isEmpty()) {
-                    round.putBack(back);
-                    requeued.incrementAndGet();
-                    wakeOne();
+            }
+        }
+
+        private void putBack(List<Integer> group, List<Integer> back) {
+            long now = System.nanoTime();
+            for (var shard : group) { // after inFlight: a take that saw it in flight set wanted before
+                if (wanted.getAndSet(shard, 0) == 1 && !back.contains(shard) && !backingOff(shard, now)) {
+                    back.add(shard);
                 }
+            }
+            if (!back.isEmpty()) {
+                round.putBack(back);
+                requeued.incrementAndGet();
+                wakeOne();
             }
         }
 
@@ -1043,7 +1078,23 @@ public final class OutboxRelay implements AutoCloseable {
             List<ShardResult> results;
             try {
                 results = processInOwnTransaction(c, group, r.latest, now, now);
-            } catch (InterruptedException | VirtualMachineError e) {
+            } catch (InterruptedException e) {
+                throw e;
+            } catch (VirtualMachineError e) { // rolled back; run() pauses the worker
+                // as after an ordinary failure, allocating nothing: the group's shards go alone, and one failing alone
+                // backs off, so a shard that fails so on every step (an error too large to describe) holds up no
+                // neighbour, whose records the group's call delivered, and is not stepped first in every round
+                for (int i = 0; i < group.size(); i++) {
+                    isolated.set(group.get(i), 1);
+                }
+                if (group.size() == 1) {
+                    int shard = group.get(0);
+                    int failures = failedAlone.incrementAndGet(shard);
+                    if (failures > 1) {
+                        retryAfter.set(shard,
+                                System.nanoTime() + Backoff.delayNanos(failures - 2, retryInitialNanos, retryMaxNanos));
+                    }
+                }
                 throw e;
             } catch (Throwable e) { // rolled back
                 if (stopping || connectionLost(c, e)) { // run() logs it (at debug while stopping)
