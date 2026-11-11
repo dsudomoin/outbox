@@ -493,7 +493,7 @@ class OutboxAdminIT {
             TestSql.execute(maintenance, "select pg_advisory_lock(" + names.internalNamespace() + ", "
                     + TableNames.LOCK_MAINTENANCE + ")");
             assertThatThrownBy(() -> admin.restoreOrphan(orphan, 0)).isInstanceOf(IllegalStateException.class)
-                    .hasMessageContaining("maintenance is running, retry");
+                    .hasMessageContaining("maintenance or another outbox admin recovery call is running, retry");
             assertThat(count(orphan)).isOne();
         }
 

@@ -759,7 +759,7 @@ class XidRecoveryIT {
         try (var other = TestDb.connect()) {
             advisory(other, "pg_advisory_lock");
             assertThatThrownBy(admin::recoverXidRegression).isInstanceOf(IllegalStateException.class)
-                    .hasMessageStartingWith("maintenance is running, retry");
+                    .hasMessageStartingWith("maintenance or another outbox admin recovery call is running, retry");
         }
         assertThat(count(names.base())).as("nothing re-sent").isEqualTo(3);
         assertThat(wakes).hasValue(0);

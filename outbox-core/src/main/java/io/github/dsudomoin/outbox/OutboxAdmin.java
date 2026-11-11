@@ -60,8 +60,9 @@ public interface OutboxAdmin {
      * Moves the rows of {@code table}, an orphan of {@link OutboxStatus#orphans()}, with an xid at or above
      * {@code fromXid} back into the outbox, then drops it: <b>its rows below {@code fromXid} go with the table</b>.
      * Moved rows are new messages, with new ids, so they are delivered after later messages of their keys, and the
-     * same message ids. Runs as no maintenance run does at the same time: waits up to 60 s for one in progress, then
-     * fails with {@link IllegalStateException} "maintenance is running, retry". A restore that fails midway loses and
+     * same message ids. Runs as no maintenance run or other recovery call does at the same time: waits up to 60 s for
+     * one in progress, then fails with {@link IllegalStateException}
+     * "maintenance or another outbox admin recovery call is running, retry". A restore that fails midway loses and
      * repeats nothing; calling again goes on. Wakes the relay; returns the rows moved.
      *
      * @throws IllegalArgumentException before any SQL that names it, unless {@code table} is {@code <base>_x<digits>}
@@ -76,9 +77,10 @@ public interface OutboxAdmin {
      * in {@code halt} mode or above {@code maxRows}. One transaction re-sends the rows the relay may not have
      * delivered, as new messages with the same message ids (consumers drop within their inbox window the ones delivered
      * before); writers wait for it, 2.5 to 3 s per million rows in the library's measurement. A failed recovery rolls
-     * back. Runs as no maintenance run does at the same time: waits up to 60 s for one in progress, then fails with
-     * {@link IllegalStateException} "maintenance is running, retry". Once the recovery committed the call returns the
-     * rows re-sent, and a failure after it is a WARN. Wakes the relay.
+     * back. Runs as no maintenance run or other recovery call does at the same time: waits up to 60 s for one in
+     * progress, then fails with {@link IllegalStateException}
+     * "maintenance or another outbox admin recovery call is running, retry". Once the recovery committed the call
+     * returns the rows re-sent, and a failure after it is a WARN. Wakes the relay.
      *
      * @throws IllegalStateException "no xid regression to recover" when the xid counter is at or above every tick's
      *     xmax and no halt is recorded; "outbox.shards = N but ... cursors for M shards" when the shard count changed
@@ -98,12 +100,14 @@ public interface OutboxAdmin {
      * dropped for them. Rows in the retry, parked and dead tables stay there. Then the shard's cursor moves to the
      * latest tick. A transaction committing meanwhile loses nothing: what the tick does not cover the relay delivers.
      *
-     * <p>Under the maintenance lock: waits up to 60 s for a maintenance run in progress, then fails with
-     * {@link IllegalStateException} "maintenance is running, retry". Shard by shard, in chunks of 1 000 rows, one
-     * transaction each under the shard's lock, the one a relay step holds, waited for up to
-     * {@code outbox.relay.batchTimeout} + 5 s. A key another transaction holds (an open {@code send} of it) is waited
-     * for last. Whatever keeps a lock too long fails the call with {@link IllegalStateException} "... busy, retry": the
-     * rows moved stay moved, each once, and calling again goes on. Wakes the relay; returns the rows re-sent.
+     * <p>Under the maintenance lock, for the whole call, so maintenance runs on every instance are skipped meanwhile:
+     * waits up to 60 s for a maintenance run or another recovery call in progress, then fails with
+     * {@link IllegalStateException} "maintenance or another outbox admin recovery call is running, retry". Shard by
+     * shard, in chunks of 1 000 rows, one transaction each under the shard's lock, the one a relay step holds, waited
+     * for up to {@code outbox.relay.batchTimeout} + 5 s. A key another transaction holds (an open {@code send} of it)
+     * is waited for last. Whatever keeps a lock too long fails the call with {@link IllegalStateException} "... busy,
+     * retry": the rows moved stay moved, each once, and calling again goes on. Wakes the relay; returns the rows
+     * re-sent.
      *
      * @throws IllegalStateException "no stranded shards" when no shard is stranded; "recover the xid regression first"
      *     while an xid regression halt is recorded: that recovery rebuilds every cursor

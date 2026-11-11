@@ -1089,9 +1089,11 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
                 throw e;
             }
-            throw new IllegalStateException("maintenance is running, retry: outbox maintenance of " + names.base()
-                    + " held its lock pg_advisory_lock(" + names.internalNamespace() + ", "
-                    + TableNames.LOCK_MAINTENANCE + ") for longer than " + maintenanceWait.toMillis() / 1e3 + " s", e);
+            // a maintenance run holds it, or another admin call under it: the first try of a retried one, say
+            throw new IllegalStateException("maintenance or another outbox admin recovery call is running, retry: the"
+                    + " maintenance lock of " + names.base() + ", pg_advisory_lock(" + names.internalNamespace() + ", "
+                    + TableNames.LOCK_MAINTENANCE + "), was held for longer than " + maintenanceWait.toMillis() / 1e3
+                    + " s", e);
         }
     }
 

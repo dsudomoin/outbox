@@ -62,7 +62,7 @@ curl -s -H "$KEY" -H "$JSON" -d '{"topic":"orders","key":"order-42","reason":"ha
 
 - 200 with JSON (changing calls: `{"count": N}`; `waiting/abandon`, `keys/abandon`: `{"keys": N, "records": M}`); 400 rejected input
   (unknown or repeated field, so a mistyped `key` or a second `"key": null` never widens an abandon; over 1 000 `ids`, empty filter, not an orphan, blank
-  `topic` or `reason`; in `keys/abandon` not exactly one of `key` and `messageId`, or the `messageId` of a keyed record, or a body with no `Content-Type`); 401 / 403 from the authorizer; 415 a body that is not `application/json`; 409 not now (maintenance running, or a relay step holding the
+  `topic` or `reason`; in `keys/abandon` not exactly one of `key` and `messageId`, or the `messageId` of a keyed record, or a body with no `Content-Type`); 401 / 403 from the authorizer; 415 a body that is not `application/json`; 409 not now (maintenance or another recovery call running, or a relay step holding the
   shard past `batchTimeout` + 5 s: retry; no xid regression); 500 otherwise. Every error body is `{"message": "..."}`.
 - Decide by a credential sent on purpose (a header), not a cookie. A non-GET/HEAD call gets 403 before the authorizer
   when `Sec-Fetch-Site` is other than `same-origin`/`none`, or, with no `Sec-Fetch-Site` (browsers send none on plain
@@ -144,6 +144,8 @@ class ApiKeyAuthorizer implements OutboxAdminAuthorizer {
   nothing, the other shards keep flowing. 409: nothing is stranded, or something holds a lock (call again, what moved
   stays moved), or an xid regression halt is recorded (recover that first). Consumers get those shards' rows again,
   delivered ones too: all of them when the starting tick is gone, those it does not see when only the batch's target is.
+  The call holds the maintenance lock throughout, so `since_success` grows and the pid the stale-maintenance WARN points
+  at is the repair itself: leave it running (killing it loses nothing, the next call finishes the rest).
 - **Waiting records after a final rollback** («Версии контрактов и откат»): `waitingSize` in `/status`, the topic and
   cause in the ERROR line or `outbox.messages.waiting{kind}`. If the release that reads them will not return,
   `waiting/abandon` with `dryRun: true`, then without; body `{"topic", "key"?, "reason", "dryRun"?}`, `key` as UTF-8.

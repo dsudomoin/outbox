@@ -546,6 +546,39 @@ class StrandedShardsIT {
         assertThat(idOf(rows.get(0))).as("nothing moved").isEqualTo(id);
     }
 
+    /** A retry while the first call still runs (say after a gateway timeout) is told the holder may be that call. */
+    @Test
+    void aSecondCallWhileOneRunsSaysTheLockMayBeAnotherRecoveryCall() throws Exception {
+        leaveTheOtherShardsOnANewerTick();
+        var rows = sendMany(1, 5);
+        makeATick();
+        deleteTheirTick();
+        startRelay();
+        var inChunk = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        admin().afterChunk = c -> {
+            inChunk.countDown();
+            try {
+                release.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                throw new AssertionError(e);
+            }
+        };
+        var first = pool.submit(() -> admin().recoverStrandedShards());
+        assertThat(inChunk.await(10, TimeUnit.SECONDS)).isTrue();
+
+        admin().maintenanceWait = Duration.ofMillis(200);
+        try {
+            assertThatThrownBy(() -> admin().recoverStrandedShards()).isInstanceOf(IllegalStateException.class)
+                    .hasMessageStartingWith("maintenance or another outbox admin recovery call is running, retry");
+        } finally {
+            release.countDown();
+        }
+
+        assertThat(first.get(10, TimeUnit.SECONDS)).isEqualTo(5);
+        await(() -> delivered.containsAll(rows));
+    }
+
     @Test
     void aHaltRecordedDuringTheCallLeavesDuplicatesAtMost() throws Exception {
         leaveTheOtherShardsOnANewerTick();
