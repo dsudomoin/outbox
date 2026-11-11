@@ -49,6 +49,21 @@ class OutboxConfigTest {
         assertDefaults(parse(""));
     }
 
+    /**
+     * Kora's graph refresh stops at a component whose new value equals the old one, so a config edit outside
+     * {@code outbox} must extract an equal {@code OutboxConfig}; otherwise every reload rebuilds the outbox.
+     */
+    @Test
+    void sameHoconExtractsEqualConfig() {
+        for (var hocon : new String[] {
+            "", "outbox {}", "outbox { relay.workers = 8 }", "outbox { relay { retry.maxAttempts = 3 } }"
+        }) {
+            assertThat(parse(hocon)).as(hocon).isEqualTo(parse(hocon));
+        }
+        assertThat(parse("outbox { relay.workers = 8 }")).isNotEqualTo(parse("outbox { relay.workers = 9 }"));
+        assertThat(parse("outbox.partitions.tailConversion.maxStall = 2s")).isNotEqualTo(parse("outbox {}"));
+    }
+
     @Test
     void defaultsWhenNestedBlocksMissing() {
         var config = parse("outbox { table = orders_outbox, relay { workers = 2 } }");

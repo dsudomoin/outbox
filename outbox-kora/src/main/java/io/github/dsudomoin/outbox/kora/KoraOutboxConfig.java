@@ -12,32 +12,32 @@ public interface KoraOutboxConfig extends OutboxConfig {
 
     @Override
     default KoraRelayConfig relay() {
-        return new KoraRelayConfig() {};
+        return KoraConfigDefaults.RELAY;
     }
 
     @Override
     default KoraPartitionsConfig partitions() {
-        return new KoraPartitionsConfig() {};
+        return KoraConfigDefaults.PARTITIONS;
     }
 
     @Override
     default KoraInboxConfig inbox() {
-        return new KoraInboxConfig() {};
+        return KoraConfigDefaults.INBOX;
     }
 
     @Override
     default KoraDeadLettersConfig deadLetters() {
-        return new KoraDeadLettersConfig() {};
+        return KoraConfigDefaults.DEAD_LETTERS;
     }
 
     @Override
     default KoraRecoveryConfig recovery() {
-        return new KoraRecoveryConfig() {};
+        return KoraConfigDefaults.RECOVERY;
     }
 
     @Override
     default KoraSchemaConfig schema() {
-        return new KoraSchemaConfig() {};
+        return KoraConfigDefaults.SCHEMA;
     }
 
     @ConfigValueExtractor
@@ -45,17 +45,17 @@ public interface KoraOutboxConfig extends OutboxConfig {
 
         @Override
         default KoraRetryConfig retry() {
-            return new KoraRetryConfig() {};
+            return KoraConfigDefaults.RETRY;
         }
 
         @Override
         default KoraRequeueConfig requeue() {
-            return new KoraRequeueConfig() {};
+            return KoraConfigDefaults.REQUEUE;
         }
 
         @Override
         default KoraWaitConfig waiting() {
-            return new KoraWaitConfig() {};
+            return KoraConfigDefaults.WAITING;
         }
     }
 
@@ -73,7 +73,7 @@ public interface KoraOutboxConfig extends OutboxConfig {
 
         @Override
         default KoraTailConversionConfig tailConversion() {
-            return new KoraTailConversionConfig() {};
+            return KoraConfigDefaults.TAIL_CONVERSION;
         }
     }
 
