@@ -155,7 +155,11 @@ public final class OutboxRuntime implements AutoCloseable {
         try {
             schema.start();
         } catch (SQLException e) {
+            schema.close(); // the row, if the bootstrap wrote it before it failed
             throw transactions.translate(e);
+        } catch (RuntimeException | Error e) {
+            schema.close();
+            throw e;
         }
         SocketBound.warnIfUnbounded(transactions, config.table());
         try {

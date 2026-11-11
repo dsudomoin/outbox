@@ -116,6 +116,9 @@ public final class OutboxSchema implements AutoCloseable {
     Duration tickWait = Duration.ofMinutes(2);
     @Nullable
     private volatile TableNames names;
+    /** The names the bootstrap wrote this instance's row under, for {@link #close()} after a failed start. */
+    @Nullable
+    private volatile TableNames written;
     @Nullable
     private volatile OutboxConfig resolved;
 
@@ -435,11 +438,12 @@ public final class OutboxSchema implements AutoCloseable {
 
     /**
      * Deletes this instance's row, within {@link Heartbeat#STOP_BUDGET}, or leaves it to expire: for a schema without a
-     * relay, whose {@link Heartbeat} does it otherwise.
+     * relay, whose {@link Heartbeat} does it otherwise, and for a {@link #start()} that failed after the bootstrap
+     * wrote it.
      */
     @Override
     public void close() {
-        var n = names;
+        var n = names != null ? names : written;
         if (n != null) {
             Heartbeat.delete(heartbeat != null ? heartbeat : db, n, instanceId, Heartbeat.STOP_BUDGET);
         }
@@ -492,6 +496,7 @@ public final class OutboxSchema implements AutoCloseable {
                         contracts.routes(), config.partitions().maintenanceInterval());
                 ps.executeUpdate();
             }
+            written = n; // committed already: a failure from here on leaves it for close() to delete
             contracts.refresh(c, n); // this row too: a send right after start is guarded
             resolved = r;
         }

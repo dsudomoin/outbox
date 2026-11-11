@@ -12,6 +12,8 @@ import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import jakarta.annotation.Nullable;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
@@ -255,6 +257,26 @@ class OutboxRuntimeIT {
         }
     }
 
+    /**
+     * A bootstrap that fails after it wrote this instance's row (here its read of the live rows right after the
+     * upsert) leaves no row behind that would count as a live relay until it expires.
+     */
+    @Test
+    void aBootstrapFailingAfterItsUpsertLeavesNoInstanceRow() throws Exception {
+        var config = new TestOutboxConfig();
+        var ds = TestDataSources.newDataSource();
+        var runtime = OutboxRuntime.builder(config, new FailingContractRead(new JdbcTransactions(ds)),
+                new RecordingHandler()).build();
+
+        assertThatThrownBy(runtime::start).hasStackTraceContaining("no answer to the contract read");
+
+        try (var c = ds.getConnection(); var rs = c.createStatement().executeQuery(
+                "select count(*) from " + config.table() + "_instance where expires_at > now()")) {
+            rs.next();
+            assertThat(rs.getInt(1)).as("live instance rows after the failed bootstrap").isZero();
+        }
+    }
+
     /** The headers stored for the message {@code id}. */
     private static List<OutboxHeader> headers(JdbcTransactions transactions, TestOutboxConfig config, UUID id) {
         return transactions.inTx(c -> {
@@ -290,6 +312,43 @@ class OutboxRuntimeIT {
                 throw new SQLException("no connection for the halt check", "08001");
             }
             return delegate.newConnection();
+        }
+
+        @Nullable
+        @Override
+        public Connection currentConnection() {
+            return delegate.currentConnection();
+        }
+
+        @Override
+        public void afterCommit(Runnable action) throws SQLException {
+            delegate.afterCommit(action);
+        }
+
+        @Override
+        public String transactionHint() {
+            return delegate.transactionHint();
+        }
+    }
+
+    /** Fails the statement the bootstrap's {@code ContractGuard.refresh} makes, as a connection cut there would. */
+    private record FailingContractRead(OutboxTransactions delegate) implements OutboxTransactions {
+        @Override
+        public Connection newConnection() throws SQLException {
+            var real = delegate.newConnection();
+            return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
+                    new Class<?>[] {Connection.class}, (proxy, method, args) -> {
+                        if (method.getName().equals("createStatement") && StackWalker.getInstance().walk(frames ->
+                                frames.anyMatch(f -> f.getMethodName().equals("refresh")
+                                        && f.getClassName().endsWith(".ContractGuard")))) {
+                            throw new SQLException("no answer to the contract read", "08006");
+                        }
+                        try {
+                            return method.invoke(real, args);
+                        } catch (InvocationTargetException e) {
+                            throw e.getCause();
+                        }
+                    });
         }
 
         @Nullable
