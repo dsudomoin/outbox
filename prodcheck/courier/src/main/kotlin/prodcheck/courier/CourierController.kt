@@ -53,7 +53,7 @@ class CourierController(private val controls: Controls, private val second: Seco
                 "parkedSize" to s.parkedSize(),
                 "waitingSize" to s.waitingSize(),
                 "waitingOldestSeconds" to s.waitingOldestSeconds(),
-                "deadLetters" to s.deadLetters().map {
+                "deadLetters" to s.deadLetters()?.map {
                     mapOf("topic" to it.topic(), "status" to it.status().name, "count" to it.count())
                 },
                 "orphans" to s.orphans().map { it.table() },
