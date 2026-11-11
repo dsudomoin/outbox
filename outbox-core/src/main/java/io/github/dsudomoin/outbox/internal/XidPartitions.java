@@ -140,6 +140,24 @@ public final class XidPartitions {
                                                       || ' s', 'for a time hidden from this role')), ', ')
                       from (select * from h order by xact_start nulls last limit 5) o)""";
     /**
+     * The sessions holding {@code LOCK_SWAP} (key {@code ?, ?}), oldest first: how many, and the first five with
+     * their age; relay steps hold it shared. Read right after the quiesce timed out on them.
+     */
+    private static final String STEP_HOLDERS = """
+            with h as (select a.pid, a.application_name, a.xact_start, l.mode from pg_stat_activity a
+                         join pg_locks l on l.pid = a.pid
+                        where l.locktype = 'advisory' and l.classid::bigint = ? and l.objid::bigint = ?
+                          and l.objsubid = 2 and l.granted
+                          and l.database = (select oid from pg_database where datname = current_database())
+                          and a.pid <> pg_backend_pid())
+            select (select count(*) from h),
+                   (select string_agg(format('pid %s (%s, %s) in a transaction open %s', pid, application_name,
+                                             case when mode = 'ShareLock' then 'a relay step'
+                                                  else mode || ', no relay step' end,
+                                             coalesce(round(extract(epoch from now() - xact_start)::numeric, 1)
+                                                      || ' s', 'for a time hidden from this role')), ', ')
+                      from (select * from h order by xact_start nulls last limit 5) o)""";
+    /**
      * The cluster's oldest prepared transaction and its oldest other session holding an xid, in any database: either
      * keeps {@code pg_snapshot_xmin} of every snapshot, and so the drop horizon, at its xid. Each is null when none
      * is seen; another role's session shows its xid to every role, but its state and xact_start only with
@@ -367,12 +385,13 @@ public final class XidPartitions {
             } catch (SQLException e) {
                 var failed = e instanceof WritersHeldTheLock w ? writersHeldTheLock(c, w) : e;
                 if (due) {
-                    missed(s, "SQLState " + failed.getSQLState() + ": " + firstLine(failed.getMessage()));
+                    missed(s, "SQLState " + failed.getSQLState() + ": " + firstLine(failed.getMessage()),
+                            failed instanceof RelayStepsInFlight);
                 }
                 throw failed;
             }
             if (blocker != null && due) {
-                missed(s, blocker);
+                missed(s, blocker, false);
             }
             return;
         }
@@ -590,11 +609,24 @@ public final class XidPartitions {
     /**
      * A due extension did not swap: deferred by {@code cause}, or its swap did not get its lock. Once
      * {@link #STUCK_SWAPS} due runs in a row missed, or the ranges ahead fell below {@code premake / 2} (one used up
-     * since the extension was due), an ERROR at most once an hour names the cause and the remedies.
+     * since the extension was due), an ERROR at most once an hour names the cause and the remedies: those for relay
+     * steps that outlasted the quiesce when {@code relaySteps}, else those for writers' locks.
      */
-    private void missed(State s, String cause) {
+    private void missed(State s, String cause, boolean relaySteps) {
         int missed = ++missedSwaps;
         if ((missed >= STUCK_SWAPS || s.ahead < premake / 2) && due(stuckLogged, STUCK_LOG_INTERVAL)) {
+            if (relaySteps) {
+                log.error("outbox partition tail swap of {} has not run on {} due runs in a row, {} ranges ahead of the"
+                        + " current xid: {}. The swap waits for the relay steps in flight to end, up to"
+                        + " outbox.relay.batchTimeout + 5 s, and pauses new ones meanwhile; a step whose handler call"
+                        + " is slow (a slow or unreachable Kafka, a slow handler, a retry pass) can run about"
+                        + " 3 × batchTimeout and time the wait out. Writers are not the cause. Writes go on and nothing"
+                        + " is lost: once the ranges run out rows go to the tail, which becomes a range at the first"
+                        + " swap that runs; the swap is tried again every run. Bring the handler's target back to"
+                        + " health or make its calls end well within batchTimeout. This ERROR repeats at most once an"
+                        + " hour", names.base(), missed, s.ahead, cause);
+                return;
+            }
             log.error("outbox partition tail swap of {} has not run on {} due runs in a row, {} ranges ahead of the"
                     + " current xid: {}. The swap needs a moment in which no transaction holds a lock on the outbox"
                     + " ({}); writer transactions that keep their lock long after"
@@ -624,6 +656,30 @@ public final class XidPartitions {
         }
         // its first line: the rest is the DO block's context ("Where: PL/pgSQL function ..."), which splits log lines
         return new SQLException(firstLine(e.getMessage()) + "; " + holders, e.getSQLState(), e);
+    }
+
+    /** The quiesce timed out (55P03): the 55P03 again, naming the relay steps in flight that it waited for. */
+    private RelayStepsInFlight relayStepsInFlight(Connection c, Duration quiesceTimeout, SQLException e) {
+        String holders;
+        try (var ps = c.prepareStatement(STEP_HOLDERS)) {
+            ps.setLong(1, Integer.toUnsignedLong(names.internalNamespace())); // pg_locks shows the key as an oid
+            ps.setLong(2, TableNames.LOCK_SWAP);
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                holders = rs.getLong(1) + " sessions hold the swap lock right after, the oldest: " + rs.getString(2);
+            }
+        } catch (SQLException | RuntimeException read) {
+            holders = "who held it could not be read: " + read;
+        }
+        return new RelayStepsInFlight(firstLine(e.getMessage()) + ": the tail swap waited " + quiesceTimeout.toMillis()
+                + " ms for the relay steps in flight to end and is left to the next run; " + holders, e);
+    }
+
+    /** The quiesce's wait for relay steps in flight timed out (55P03): no writer held the swap back. */
+    private static final class RelayStepsInFlight extends SQLException {
+        RelayStepsInFlight(String message, SQLException e) {
+            super(message, e.getSQLState(), e);
+        }
     }
 
     /** A lock wait of the swap on writers' locks timed out (55P03) on {@code table}. */
@@ -683,7 +739,11 @@ public final class XidPartitions {
         try {
             // inside the try: whatever fails once the lock is granted, even an Error, releases it below; a session
             // lock left behind would go back to the pool and keep every relay step out
-            PartitionDdl.execute(c, quiesceTimeout, quiesce); // under the session's own timeouts again afterwards
+            try {
+                PartitionDdl.execute(c, quiesceTimeout, quiesce); // under the session's own timeouts again afterwards
+            } catch (SQLException e) {
+                throw LOCK_NOT_AVAILABLE.equals(e.getSQLState()) ? relayStepsInFlight(c, quiesceTimeout, e) : e;
+            }
             return action.apply();
         } catch (Throwable t) {
             failure = t;

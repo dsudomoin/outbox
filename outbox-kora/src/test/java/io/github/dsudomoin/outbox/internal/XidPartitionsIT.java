@@ -1539,6 +1539,49 @@ class XidPartitionsIT {
         }
     }
 
+    /**
+     * A quiesce that timed out on a relay step in flight names the steps it waited for (pid, application, age), and
+     * the hourly ERROR points at them instead of at writer transactions.
+     */
+    @Test
+    void aQuiesceTimeoutNamesTheRelayStepsInFlight() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions());
+
+        try (var step = TestDb.connect(); var c = TestDb.connect()) {
+            while (partitions.premadeAhead(c) >= config.premake() / 2) { // ranges running out: the ERROR is due
+                TestDb.burnXids(200);
+            }
+            if (currentXid(c) % 1000 > 600) {
+                TestDb.burnXids(500);
+            }
+            execute(step, "set application_name = 'slow-relay-step'");
+            long stepPid = queryLong(step, "select pg_backend_pid()");
+            step.setAutoCommit(false); // a relay step in flight, past the quiesce timeout
+            try (var ps = step.prepareStatement("select pg_advisory_xact_lock_shared(?, ?)")) {
+                ps.setInt(1, names.internalNamespace());
+                ps.setInt(2, TableNames.LOCK_SWAP);
+                ps.execute();
+            }
+
+            String log;
+            try (var err = new CapturedStderr()) {
+                assertThatThrownBy(() -> partitions.ensurePremade(c, Duration.ofMillis(300), Duration.ofMillis(300)))
+                        .isInstanceOfSatisfying(SQLException.class, e -> {
+                            assertThat(e.getSQLState()).isEqualTo("55P03");
+                            assertThat(e.getMessage()).contains("relay step").contains("pid " + stepPid)
+                                    .contains("slow-relay-step");
+                        });
+                log = err.text();
+            }
+            step.commit();
+
+            assertThat(log).contains("ERROR").contains("outbox partition tail swap of " + names.base())
+                    .contains("relay step").contains("pid " + stepPid).doesNotContain("Send last in the transaction");
+        }
+    }
+
     @Test
     void errorMidSwapRollsBackAndReleasesTheSwapLock() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
