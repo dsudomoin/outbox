@@ -42,6 +42,7 @@ import java.util.RandomAccess;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
@@ -105,6 +106,8 @@ public final class ShardProcessor implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(ShardProcessor.class);
     private static final AtomicInteger THREADS = new AtomicInteger();
+    /** Whether the server behind a connection URL takes {@code tcp_user_timeout}, asked by its first transaction. */
+    private static final Map<String, Boolean> TCP_USER_TIMEOUT = new ConcurrentHashMap<>();
     /** The handler call running on this thread. */
     private static final ThreadLocal<HandlerCall> CALL = new ThreadLocal<>();
     private static final long BUG_REPORT_INTERVAL = TimeUnit.SECONDS.toNanos(10);
@@ -234,19 +237,30 @@ public final class ShardProcessor implements AutoCloseable {
      * default; the idle timeout frees the lock of a frozen worker. A backend blocked sending a batch to a client the
      * network lost is not idle, and no statement or transaction timeout ends it: {@code tcp_user_timeout}, at the same
      * bound, does, instead of the server's TCP retransmission giving up after about 15 min. It acts on TCP connections
-     * only, and a server whose OS lacks it logs one LOG line per step. No {@code transaction_timeout} (PG 17+): a
+     * only, and a server whose OS lacks it logs a LOG line for each set: the first transaction of a connection URL sets
+     * it in a statement of its own, whose answer (0 when it did not stick: no such option, or a Unix socket) decides
+     * whether the URL's later ones set it. No {@code transaction_timeout} (PG 17+): a
      * role's default would end a step waiting on a slow handler and lose the pause it writes. A step runs a statement between
      * any two handler calls, so the idle timeout never ends one waiting on a call that keeps to {@code batchTimeout}.
      */
     public static void prepareTransaction(Connection c, Duration batchTimeout) throws SQLException {
         c.setAutoCommit(false);
+        var meta = c.getMetaData();
+        var url = Objects.requireNonNullElse(meta.getURL(), ""); // a wrapping driver may not know it
+        var tcpUserTimeout = TCP_USER_TIMEOUT.get(url);
         try (var st = c.createStatement()) {
             long bound = batchTimeout.plusSeconds(30).toMillis();
             st.execute("set transaction isolation level read committed;"
                     + " set local idle_in_transaction_session_timeout = '" + bound + "ms';"
-                    + " set local tcp_user_timeout = '" + bound + "ms';"
+                    + (Boolean.TRUE.equals(tcpUserTimeout) ? " set local tcp_user_timeout = '" + bound + "ms';" : "")
                     + " set local lock_timeout = '5s'; set local plan_cache_mode = force_custom_plan"
-                    + Ticks.noTransactionTimeout(c));
+                    + Ticks.noTransactionTimeout(meta));
+            if (tcpUserTimeout == null) {
+                try (var rs = st.executeQuery("select set_config('tcp_user_timeout', '" + bound + "', true)")) {
+                    rs.next();
+                    TCP_USER_TIMEOUT.put(url, !"0".equals(rs.getString(1)));
+                }
+            }
         }
     }
 

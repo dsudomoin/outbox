@@ -2040,6 +2040,68 @@ class ShardProcessorIT {
     }
 
     @Test
+    void everyStepOnATcpConnectionBoundsABlockedSendByTcpUserTimeout() throws Exception {
+        try (var c = TestDb.connect()) {
+            for (int step = 0; step < 2; step++) { // the first asks the server, the next one knows
+                ShardProcessor.prepareTransaction(c, Duration.ofSeconds(5));
+                assertThat(queryString(c, "show tcp_user_timeout")).as("step %d", step).isEqualTo("35000");
+                c.commit();
+            }
+        }
+    }
+
+    @Test
+    void aServerWithoutTcpUserTimeoutIsAskedOnceAndItsStepsLeaveItOut() throws Exception {
+        var sent = new CopyOnWriteArrayList<String>();
+        try (var c = withoutTcpUserTimeout(TestDb.connect(), sent)) {
+            for (int step = 0; step < 3; step++) {
+                ShardProcessor.prepareTransaction(c, Duration.ofSeconds(5));
+                c.commit();
+            }
+        }
+
+        assertThat(sent).as("one LOG line on such a server, not one a step")
+                .filteredOn(sql -> sql.contains("tcp_user_timeout")).hasSize(1);
+    }
+
+    /**
+     * {@code c} as a connection to a server whose OS lacks {@code TCP_USER_TIMEOUT}, from a source of its own: the
+     * server shows 0 whatever is set; the SQL of each statement it creates is added to {@code sent}.
+     */
+    private static Connection withoutTcpUserTimeout(Connection c, List<String> sent) {
+        var url = "jdbc:postgresql://no-tcp-user-timeout/" + UUID.randomUUID();
+        return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[] {Connection.class},
+                (proxy, method, args) -> {
+                    var result = invokeOn(c, method, args);
+                    if (result instanceof java.sql.DatabaseMetaData meta) {
+                        return Proxy.newProxyInstance(java.sql.DatabaseMetaData.class.getClassLoader(),
+                                new Class<?>[] {java.sql.DatabaseMetaData.class},
+                                (p, m, a) -> m.getName().equals("getURL") ? url : invokeOn(meta, m, a));
+                    }
+                    if (!(result instanceof java.sql.Statement st) || !method.getName().equals("createStatement")) {
+                        return result;
+                    }
+                    return Proxy.newProxyInstance(java.sql.Statement.class.getClassLoader(),
+                            new Class<?>[] {java.sql.Statement.class}, (p, m, a) -> {
+                                if (m.getName().startsWith("execute") && a != null && a[0] instanceof String sql) {
+                                    sent.add(sql);
+                                    a[0] = sql.replaceAll("set_config\\('tcp_user_timeout', '[^']*'",
+                                            "set_config('tcp_user_timeout', '0'"); // what such a server shows
+                                }
+                                return invokeOn(st, m, a);
+                            });
+                });
+    }
+
+    private static Object invokeOn(Object target, java.lang.reflect.Method method, Object[] args) throws Throwable {
+        try {
+            return method.invoke(target, args);
+        } catch (InvocationTargetException e) {
+            throw e.getCause();
+        }
+    }
+
+    @Test
     void pauseMidBatchKeepsPositionAndTarget() throws Exception {
         config.batchSize(3);
         bootstrap();

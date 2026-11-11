@@ -2,6 +2,7 @@ package io.github.dsudomoin.outbox.internal;
 
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
+import java.sql.DatabaseMetaData;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Duration;
@@ -502,7 +503,11 @@ public final class Ticks {
      * Disabling it mid-transaction stops the running timer.
      */
     static String noTransactionTimeout(Connection c) throws SQLException {
-        return c.getMetaData().getDatabaseMajorVersion() >= 17 ? "; set local transaction_timeout = 0" : "";
+        return noTransactionTimeout(c.getMetaData());
+    }
+
+    static String noTransactionTimeout(DatabaseMetaData meta) throws SQLException {
+        return meta.getDatabaseMajorVersion() >= 17 ? "; set local transaction_timeout = 0" : "";
     }
 
     public Tick latest(Connection c) throws SQLException {
