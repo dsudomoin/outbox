@@ -36,7 +36,9 @@ import io.github.dsudomoin.outbox.internal.Sql.SqlFunction0;
  * {@code outbox.partitions.swapLockTimeout} asks for a wait, and the drop of a range left detach-pending
  * ({@link #dropPending}, also used on the inbox parent), always by {@code NOWAIT} tries for {@link #NOWAIT_WINDOW},
  * each hold cut by the server at 260 ms, with {@code FINALIZE} when no try gets the lock; other range drops detach
- * concurrently.
+ * concurrently. On a single attached partition (outbox or inbox) it takes ACCESS EXCLUSIVE when it gives one a member
+ * made to the parent's owner ({@link PartitionDdl#reown}): by the same {@code NOWAIT} tries and hold bound, the table
+ * left to the next run when no try gets the lock.
  */
 public final class XidPartitions {
 
@@ -53,7 +55,7 @@ public final class XidPartitions {
      */
     static final Duration NOWAIT_WINDOW = Duration.ofMillis(200);
     /** A swap statement's {@code statement_timeout} past its hold's bound: its one try for the lock. */
-    private static final Duration TRY_MARGIN = Duration.ofMillis(10);
+    static final Duration TRY_MARGIN = Duration.ofMillis(10);
     /**
      * The hold's bound by day, past its tries: the attaches and a scan within maxTailScan. Longer, the server cuts the
      * swap's statement (57014) and it rolls back; the next run tries again. Writers' bound by day: this plus
@@ -64,7 +66,7 @@ public final class XidPartitions {
      * Every other lock wait while the swap holds the parent: none is expected, as the tables it attaches are locked
      * before and the tail is locked only through the parent, but by a session that reads it directly.
      */
-    private static final Duration HOLD_LOCK_TIMEOUT = Duration.ofMillis(10);
+    static final Duration HOLD_LOCK_TIMEOUT = Duration.ofMillis(10);
 
     /** {@code idle_session_timeout} across the quiesce: a client silent this long under it has frozen or gone. */
     private static final Map<String, String> QUIESCE_IDLE = Map.of("idle_session_timeout", "'5s'");
@@ -882,7 +884,7 @@ public final class XidPartitions {
      * does, until {@link #NOWAIT_WINDOW} from {@code start}; its last result. A miss returns at once, having done
      * nothing, so no writer ever waits behind a try.
      */
-    private static String nowaitTries(long start, SqlFunction0<String> attempt) throws SQLException {
+    static String nowaitTries(long start, SqlFunction0<String> attempt) throws SQLException {
         while (true) {
             var r = attempt.apply();
             if (!r.equals("busy") || System.nanoTime() - start >= NOWAIT_WINDOW.toNanos()) {

@@ -22,6 +22,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.AfterEach;
@@ -185,6 +186,58 @@ class OwnerSourceIT {
         assertThat(new Maintenance(member, names, config, OutboxTelemetry.NONE).runOnce()).isTrue();
         inbox.runMaintenance();
         assertThat(foreignTables()).as("tables owned by another role than " + owner + " after maintenance").isEmpty();
+    }
+
+    /**
+     * A handover takes ACCESS EXCLUSIVE on each partition. Behind a long reader of the parent it never queues for it,
+     * so no writer routed there and no relay batch waits behind the handover: the partitions stay the member's until
+     * a run finds them free.
+     */
+    @Test
+    void handoverNeverQueuesBehindAReader() throws Exception {
+        var members = memberRoles();
+        sql("alter schema " + schema + " owner to current_user");
+        sql("grant usage, create on schema " + schema + " to " + owner);
+        migrate();
+        config.xidsPerPartition(1000).premake(2);
+        var member = new JdbcTransactions(as(members[0]));
+        try (var first = new OutboxSchema(new JdbcTransactions(as(app)), member, config)) {
+            first.start();
+        }
+        var made = "^outbox_(tail|tail_next|[xo][0-9]+)$";
+        var given = giveTo(members[0], made);
+        assertThat(given).as("partitions").hasSizeGreaterThan(2);
+
+        try (var reader = TestDataSources.newDataSource().getConnection();
+                var observer = TestDataSources.newDataSource().getConnection()) {
+            reader.setAutoCommit(false);
+            TestSql.queryLong(reader, "select count(*) from " + config.table()); // ACCESS SHARE on every partition
+            var start = new CompletableFuture<Void>();
+            var thread = new Thread(() -> {
+                try (var again = new OutboxSchema(new JdbcTransactions(as(app)), member, config)) {
+                    again.start();
+                    start.complete(null);
+                } catch (Throwable e) {
+                    start.completeExceptionally(e);
+                }
+            });
+            thread.start();
+            long queued = 0;
+            while (!start.isDone() && queued == 0) {
+                queued = TestSql.queryLong(observer, "select count(*) from pg_locks l join pg_class r on r.oid ="
+                        + " l.relation join pg_namespace n on n.oid = r.relnamespace where not l.granted"
+                        + " and n.nspname = '" + schema + "'");
+            }
+            assertThat(queued).as("lock requests queued on the schema's tables behind the reader").isZero();
+            start.get();
+            assertThat(foreignTables()).as("partitions the reader holds stay the member's").hasSize(given.size());
+            reader.rollback();
+        }
+
+        try (var again = new OutboxSchema(new JdbcTransactions(as(app)), member, config)) {
+            again.start();
+        }
+        assertThat(foreignTables()).as("tables owned by another role than " + owner + " once free").isEmpty();
     }
 
     /** Gives the schema's tables named like {@code regex} to {@code role}, as an earlier release left them. */

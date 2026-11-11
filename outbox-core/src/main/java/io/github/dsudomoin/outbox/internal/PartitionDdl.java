@@ -55,6 +55,8 @@ public final class PartitionDdl {
                       from (select * from s order by age(backend_xmin) desc limit 5) o)""";
 
     private static final Logger log = LoggerFactory.getLogger(PartitionDdl.class);
+    /** Where {@link #reown}'s statement leaves what it did. */
+    private static final String REOWN_RESULT = "kora_outbox.reown";
     private static final long HANDOFF_WARN_INTERVAL = TimeUnit.HOURS.toNanos(1);
     /** By parent: when {@link #foreignOwner} last warned that its partitions cannot go to its owner. */
     private static final Map<String, Long> handoffWarned = new ConcurrentHashMap<>();
@@ -145,9 +147,12 @@ public final class PartitionDdl {
      * Gives {@code parent}'s owner the tables in its schema named {@code <parent><suffix>} ({@code suffix} a regex),
      * attached or not, that the current role owns while the parent's owner is another role: what a member made before
      * {@link #create} gave each new table to the owner. Only a table's owner may give it away, so each instance's role
-     * hands over its own; when it cannot ({@link #ownerProblem}), they stay, with {@link #foreignOwner}'s WARN. One
-     * {@code ALTER TABLE ... OWNER TO} each, under {@link #CREATE_LOCK_TIMEOUT}: one that fails (behind a long reader)
-     * is logged and left to the next run.
+     * hands over its own; when it cannot ({@link #ownerProblem}), they stay, with {@link #foreignOwner}'s WARN. The
+     * {@code OWNER TO} takes ACCESS EXCLUSIVE on the table, which a queued wait would hold every writer routed to it
+     * and every reader of the parent behind: one autocommit statement each takes it {@code NOWAIT}, as
+     * {@link XidPartitions#dropPending} does, tried every millisecond for {@link XidPartitions#NOWAIT_WINDOW}, other
+     * lock waits cut at {@link XidPartitions#HOLD_LOCK_TIMEOUT} and the hold at {@link XidPartitions#DAY_HOLD}. A table
+     * no try got (behind a long reader), or whose handover failed, is logged and left to the next run.
      */
     static void reown(Connection c, String parent, String suffix) throws SQLException {
         var tables = new ArrayList<String>();
@@ -169,8 +174,31 @@ public final class PartitionDdl {
             return;
         }
         for (var table : tables) {
+            // a local commit, as the swap's: a wait for a synchronous standby ignores cancels and would hold the lock
+            var sql = "do $$ begin perform set_config('synchronous_commit', 'local', true); begin lock table "
+                    + name(table) + " in access exclusive mode nowait; exception when lock_not_available then perform"
+                    + " set_config('" + REOWN_RESULT + "', 'busy', false); return; end; alter table " + name(table)
+                    + " owner to " + owner + "; perform set_config('" + REOWN_RESULT + "', 'given', false); end $$";
+            long start = System.nanoTime();
             try {
-                execute(c, CREATE_LOCK_TIMEOUT, "alter table " + name(table) + " owner to " + owner);
+                var result = withTimeouts(c, XidPartitions.HOLD_LOCK_TIMEOUT,
+                        XidPartitions.DAY_HOLD.plus(XidPartitions.TRY_MARGIN), () ->
+                                XidPartitions.nowaitTries(start, () -> {
+                                    try (var st = c.createStatement()) {
+                                        st.execute(sql);
+                                    }
+                                    try (var st = c.createStatement(); var rs = st.executeQuery(
+                                            "select current_setting('" + REOWN_RESULT + "', true)")) {
+                                        rs.next();
+                                        return rs.getString(1);
+                                    }
+                                }));
+                if (!result.equals("given")) {
+                    log.warn("outbox could not give table {} to {}, the owner of {}: a transaction held a lock on it at"
+                            + " every try for {} ms; the next maintenance run retries", table, owner, parent,
+                            XidPartitions.NOWAIT_WINDOW.toMillis());
+                    continue;
+                }
                 log.info("gave table {} to {}, the owner of {}", table, owner, parent);
             } catch (SQLException e) {
                 log.warn("outbox could not give table {} to {}, the owner of {} (SQLState {}); the next maintenance"
