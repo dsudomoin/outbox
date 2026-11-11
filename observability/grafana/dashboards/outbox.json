@@ -2066,7 +2066,7 @@
       "type": "timeseries",
       "id": 37,
       "title": "Dead-letter decisions per second",
-      "description": "outbox.dead.decisions by decision, one per letter the hook answered: keep, discard, redrive or redrive_at. Each series appears with the first decision of its kind, so the panel is empty without a hook.",
+      "description": "outbox.dead.decisions by decision, one per letter the hook answered: keep, discard, redrive, redrive_at or retry_later (the letter stays pending and comes again after a backoff, as with a failed call). Each series appears with the first decision of its kind, so the panel is empty without a hook.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2157,6 +2157,21 @@
                 }
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "retry_later"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#898781"
+                }
+              }
+            ]
           }
         ]
       },
@@ -2192,7 +2207,7 @@
       "type": "timeseries",
       "id": 38,
       "title": "Dead-letter hook failures per second",
-      "description": "outbox.dead.hook.failures rate: hook calls that threw or exceeded outbox.deadLetters.timeout; their letters stay pending and are handed over again after a backoff. The counter appears on the first failure; the series reads 0 while the app is up and the hook has not failed.",
+      "description": "outbox.dead.hook.failures rate: hook calls that threw or exceeded outbox.deadLetters.timeout; their letters stay pending and are handed over again after a backoff. A letter the hook defers on its own, such as a Kafka dead-letter send that failed, is counted as outbox.dead.decisions{decision=\"retry_later\"}, not here. The counter appears on the first failure; the series reads 0 while the app is up and the hook has not failed.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"

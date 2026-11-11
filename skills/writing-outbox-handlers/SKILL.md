@@ -57,8 +57,9 @@ The soft deadline is a safety net, not flow control.
 ## Dead letters
 
 Without a hook dead records are `kept` for humans (operating-outbox). An `OutboxDeadLetterHandler` component
-decides instead: `keep()`, `discard()`, `redrive()` or `redriveAt(at)` per letter. First read
-[dead-letter-hook.md](dead-letter-hook.md): calls are all-or-nothing and at-least-once (idempotent by `messageId`);
+decides instead: `keep()`, `discard()`, `redrive()`, `redriveAt(at)` or `retryLater(e)` per letter. First read
+[dead-letter-hook.md](dead-letter-hook.md): a failed call fails all its letters, so for one letter that cannot be
+decided now return `retryLater(e)` and decide the rest; calls are at-least-once (idempotent by `messageId`);
 bound redrive loops with `letter.redrives()`; `active()` false (as `NONE`) keeps all, uncalled. For Kafka, set
 `outbox.kafka.deadLetterTopic` instead, minding its duplicates. Alert on `outbox.dead.size`.
 
