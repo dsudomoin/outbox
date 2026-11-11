@@ -7,6 +7,9 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -52,6 +55,9 @@ public final class PartitionDdl {
                       from (select * from s order by age(backend_xmin) desc limit 5) o)""";
 
     private static final Logger log = LoggerFactory.getLogger(PartitionDdl.class);
+    private static final long HANDOFF_WARN_INTERVAL = TimeUnit.HOURS.toNanos(1);
+    /** By parent: when {@link #foreignOwner} last warned that its partitions cannot go to its owner. */
+    private static final Map<String, Long> handoffWarned = new ConcurrentHashMap<>();
     private static final Pattern NAME = Pattern.compile("(?:[A-Za-z_][A-Za-z0-9_]*\\.)?[A-Za-z_][A-Za-z0-9_]*");
     private static final Pattern VALUE = Pattern.compile("[0-9A-Za-z:.+ -]+");
     private static final Pattern BOUNDS = Pattern.compile("FOR VALUES FROM \\((.+)\\) TO \\((.+)\\)");
@@ -110,15 +116,21 @@ public final class PartitionDdl {
 
     /**
      * {@code parent}'s owner, quoted, when it is not the current role, else null. A table the library makes belongs to
-     * it, so any other member of that role (per-instance credentials) can later lock, rename, attach or drop it. Fails
-     * naming the grant when the current role cannot give {@code table} to it: on Postgres 16+ membership needs the SET
-     * option, and the owner needs {@code CREATE} on the schema.
+     * it, so any other member of that role (per-instance credentials) can later lock, rename, attach or drop it. When
+     * the current role cannot give {@code table} to it (on Postgres 16+ membership needs the SET option, and the owner
+     * needs {@code CREATE} on the schema), null as well: the table stays the current role's, which is all a single DDL
+     * role needs, with a WARN naming the grant at most once an hour per parent.
      */
     @Nullable
     private static String foreignOwner(Connection c, String parent, String table) throws SQLException {
         var problem = ownerProblem(c, parent, table);
         if (problem != null) {
-            throw new IllegalStateException(problem);
+            long now = System.nanoTime();
+            if (handoffWarned.compute(parent, (p, last) -> last != null && now - last < HANDOFF_WARN_INTERVAL
+                    ? last : now) == now) {
+                log.warn("outbox {}; this WARN repeats at most once an hour", problem);
+            }
+            return null;
         }
         try (var ps = c.prepareStatement("select quote_ident(pg_get_userbyid(relowner)) from pg_class"
                 + " where oid = to_regclass(?) and pg_get_userbyid(relowner) <> current_user")) {
@@ -150,7 +162,8 @@ public final class PartitionDdl {
                 var owner = rs.getString(1);
                 var schema = rs.getString(2);
                 var cannot = "role " + role(c) + " cannot make " + table + " belong to " + owner + ", the owner of "
-                        + parent + ", as every partition must for the owner's other members to maintain it: ";
+                        + parent + "; until it can, the tables it creates stay its own, and the owner's other members"
+                        + " (per-instance credentials) cannot swap or drop them: ";
                 if (!rs.getBoolean(3)) {
                     return cannot + "run GRANT " + owner + " TO " + role(c)
                             + (set.equals("SET") ? " WITH SET TRUE" : "");

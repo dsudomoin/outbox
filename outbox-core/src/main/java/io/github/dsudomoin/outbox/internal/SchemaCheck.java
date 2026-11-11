@@ -356,8 +356,9 @@ final class SchemaCheck {
     }
 
     /**
-     * Partition DDL needs the parent's owner role (or membership of it) and {@code CREATE} on its schema, and the
-     * right to give each partition to that owner ({@link PartitionDdl#ownerProblem}).
+     * Partition DDL needs the parent's owner role (or membership of it) and {@code CREATE} on its schema. Lacking the
+     * right to give each partition to that owner ({@link PartitionDdl#ownerProblem}) is only a WARN: the partitions
+     * then stay the DDL role's, as before the library gave them away.
      */
     private static void partitionRights(Connection ddl, String table, List<String> problems) throws SQLException {
         boolean member = true;
@@ -383,7 +384,7 @@ final class SchemaCheck {
         }
         var owner = member ? PartitionDdl.ownerProblem(ddl, table, "the partitions of " + table) : null;
         if (owner != null) {
-            problems.add(owner);
+            log.warn("outbox schema check of {}: {}", table, owner);
         }
     }
 

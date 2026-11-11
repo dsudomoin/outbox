@@ -216,9 +216,12 @@ class OwnerSourceIT {
         return partitions;
     }
 
-    /** A member cannot give a partition to an owner without CREATE on the schema: the start names the grant. */
+    /**
+     * A member cannot give a partition to an owner without CREATE on the schema: the start goes on as before the
+     * handoff, the partitions staying the member's own, and a WARN names the grant.
+     */
     @Test
-    void ownerWithoutCreateOnSchemaFails() throws Exception {
+    void ownerWithoutCreateOnSchemaKeepsTheCreator() throws Exception {
         var members = memberRoles();
         sql("alter schema " + schema + " owner to current_user");
         sql("grant usage, create on schema " + schema + " to " + owner);
@@ -226,10 +229,13 @@ class OwnerSourceIT {
         sql("revoke create on schema " + schema + " from " + owner);
         sql("grant create on schema " + schema + " to " + members[0]);
 
-        assertThatThrownBy(() -> new OutboxSchema(new JdbcTransactions(as(app)),
-                new JdbcTransactions(as(members[0])), config).start())
-                .hasMessageContaining("GRANT CREATE ON SCHEMA " + schema + " TO " + owner);
-        assertThat(foreignTables()).as("no partition left behind").isEmpty();
+        try (var log = new CapturedStderr(); var outbox = new OutboxSchema(new JdbcTransactions(as(app)),
+                new JdbcTransactions(as(members[0])), config)) {
+            outbox.start();
+            assertThat(log.text()).contains("WARN").contains("GRANT CREATE ON SCHEMA " + schema + " TO " + owner);
+        }
+        assertThat(foreignTables()).as("the partitions, made by " + members[0]).isNotEmpty()
+                .allMatch(table -> table.endsWith(" (" + members[0] + ")"));
     }
 
     private String[] memberRoles() throws SQLException {
