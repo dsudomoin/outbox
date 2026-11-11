@@ -31,9 +31,12 @@ import io.github.dsudomoin.outbox.internal.Sql.SqlFunction0;
  * connection (but {@link #ensurePremade} for a missing tail, which {@link XidRecovery} runs in its transaction: it
  * only creates and attaches), and callers serialise them under {@code LOCK_MAINTENANCE}: bootstrap takes it after
  * {@code LOCK_SCHEMA}; {@link Maintenance} takes it with {@code pg_try_advisory_lock} and never takes
- * {@code LOCK_SCHEMA}. Besides the xid-regression recovery, the extension's tail swap ({@link #ensurePremade}) is the
- * one place the library takes ACCESS EXCLUSIVE on the parent, for milliseconds, taken without waiting unless
- * {@code outbox.partitions.swapLockTimeout} asks for a wait; range drops detach concurrently.
+ * {@code LOCK_SCHEMA}. Besides the xid-regression recovery, the library takes ACCESS EXCLUSIVE on the parent in two
+ * places, for milliseconds: the extension's tail swap ({@link #ensurePremade}), taken without waiting unless
+ * {@code outbox.partitions.swapLockTimeout} asks for a wait, and the drop of a range left detach-pending
+ * ({@link #dropPending}, also used on the inbox parent), always by {@code NOWAIT} tries for {@link #NOWAIT_WINDOW},
+ * each hold cut by the server at 260 ms, with {@code FINALIZE} when no try gets the lock; other range drops detach
+ * concurrently.
  */
 public final class XidPartitions {
 
