@@ -73,6 +73,7 @@ import java.util.Objects;
 import java.util.TreeMap;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 import ru.tinkoff.kora.common.Context;
 
 /**
@@ -89,6 +90,8 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
     private static final int DEFAULT_LIMIT = 100;
     /** As the contract's {@code maxItems}: the library binds every id in each chunk's query. */
     private static final int MAX_IDS = 1000;
+    /** The ids of a call its audit line shows, after their count: the line stays short for a thousand of them. */
+    private static final int AUDIT_IDS = 10;
 
     private final OutboxAdmin admin;
 
@@ -127,7 +130,8 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
     public RedriveDeadLettersApiResponse redriveDeadLetters(@Nullable Selection selection) {
         return call(() -> {
             var ids = ids(selection);
-            long n = ids != null ? admin.redriveDeadLetters(ids) : admin.redriveDeadLetters(filter(selection.filter()));
+            long n = ids != null ? admin.redriveDeadLetters(audited(ids))
+                    : admin.redriveDeadLetters(audited(selection.filter()));
             return new RedriveDeadLetters200ApiResponse(new Count(n));
         }, RedriveDeadLetters400ApiResponse::new, RedriveDeadLetters409ApiResponse::new);
     }
@@ -136,15 +140,20 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
     public DiscardDeadLettersApiResponse discardDeadLetters(@Nullable Selection selection) {
         return call(() -> {
             var ids = ids(selection);
-            long n = ids != null ? admin.discardDeadLetters(ids) : admin.discardDeadLetters(filter(selection.filter()));
+            long n = ids != null ? admin.discardDeadLetters(audited(ids))
+                    : admin.discardDeadLetters(audited(selection.filter()));
             return new DiscardDeadLetters200ApiResponse(new Count(n));
         }, DiscardDeadLetters400ApiResponse::new, DiscardDeadLetters409ApiResponse::new);
     }
 
     @Override
     public RestoreOrphanApiResponse restoreOrphan(String table, long fromXid) {
-        return call(() -> new RestoreOrphan200ApiResponse(new Count(admin.restoreOrphan(table, fromXid))),
-                RestoreOrphan400ApiResponse::new, RestoreOrphan409ApiResponse::new);
+        return call(() -> {
+            var detail = new LinkedHashMap<String, String>(); // the table is in the path already
+            detail.put("fromXid", String.valueOf(fromXid));
+            Context.current().set(OutboxAdminInterceptor.DETAIL, detail);
+            return new RestoreOrphan200ApiResponse(new Count(admin.restoreOrphan(table, fromXid)));
+        }, RestoreOrphan400ApiResponse::new, RestoreOrphan409ApiResponse::new);
     }
 
     @Override
@@ -229,6 +238,30 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
             throw new IllegalArgumentException("ids must be numbers, not null");
         }
         return ids;
+    }
+
+    /** {@code ids}, their count and the first {@value #AUDIT_IDS} of them put into the audit line. */
+    private static List<Long> audited(List<Long> ids) {
+        var detail = new LinkedHashMap<String, String>();
+        detail.put("count", String.valueOf(ids.size()));
+        detail.put("ids", ids.stream().limit(AUDIT_IDS).map(String::valueOf)
+                .collect(Collectors.joining(", ", "[", ids.size() > AUDIT_IDS ? ", ...]" : "]")));
+        Context.current().set(OutboxAdminInterceptor.DETAIL, detail);
+        return ids;
+    }
+
+    /** {@link #filter(Filter)}, its fields put into the audit line. */
+    private static DeadLetterFilter audited(Filter f) {
+        var filter = filter(f);
+        var detail = new LinkedHashMap<String, String>();
+        detail.put("topic", filter.topic());
+        detail.put("key", f.key());
+        detail.put("error", filter.errorContains());
+        detail.put("failedFrom", filter.failedFrom() == null ? null : filter.failedFrom().toString());
+        detail.put("failedTo", filter.failedTo() == null ? null : filter.failedTo().toString());
+        detail.put("status", f.status() == null ? null : f.status().toString());
+        Context.current().set(OutboxAdminInterceptor.DETAIL, detail);
+        return filter;
     }
 
     /**

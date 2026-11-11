@@ -31,6 +31,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -235,7 +236,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     @Override
     public long redriveDeadLetters(Collection<Long> ids) {
         requireOwnTransactions();
-        return bulk("redriveDeadLetters(" + ids + ")", Where.ids(ids), true, this::redrive);
+        return bulk("redriveDeadLetters(" + logged(ids) + ")", Where.ids(ids), true, this::redrive);
     }
 
     @Override
@@ -247,7 +248,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     @Override
     public long discardDeadLetters(Collection<Long> ids) {
         requireOwnTransactions();
-        return bulk("discardDeadLetters(" + ids + ")", Where.ids(ids), false, this::discard);
+        return bulk("discardDeadLetters(" + logged(ids) + ")", Where.ids(ids), false, this::discard);
     }
 
     @Override
@@ -882,6 +883,12 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                 failure.addSuppressed(e);
             }
         }
+    }
+
+    /** {@code <n> ids [<the first ten>, ...]}: a thousand ids would make the log line huge. */
+    private static String logged(Collection<Long> ids) {
+        return ids.size() + " ids " + ids.stream().limit(10).map(String::valueOf)
+                .collect(Collectors.joining(", ", "[", ids.size() > 10 ? ", ...]" : "]"));
     }
 
     /**

@@ -802,6 +802,47 @@ class AdminHttpIT {
         });
     }
 
+    /** A call that destroys or moves letters or rows names what it selected: the filter, the ids (the first ten). */
+    @Test
+    void destructiveAuditLinesNameTheirSelection() {
+        app(() -> {
+            var orphan = foreignOrphan();
+            orphanRow(orphan, 1, 10);
+            var ids = LongStream.rangeClosed(1, 12).boxed().toList();
+
+            List<String> audit;
+            String log;
+            try (var stderr = new CapturedStderr()) {
+                assertJson(call("POST", "/dead-letters/discard", "{\"filter\":{\"topic\":\"orders\",\"key\":\"k\","
+                    + "\"error\":\"boom\",\"failedFrom\":\"2026-01-15T13:00:00+03:00\","
+                    + "\"failedTo\":\"2026-01-16T10:00:00Z\",\"status\":\"kept\"}}"), 200);
+                assertJson(call("POST", "/dead-letters/redrive", "{\"filter\":{\"topic\":\"orders\"}}"), 200);
+                assertJson(call("POST", "/dead-letters/redrive", "{\"ids\":" + ids.toString().replace(" ", "") + "}"),
+                    200);
+                assertJson(call("POST", "/dead-letters/discard", "{\"ids\":[7]}"), 200);
+                assertJson(call("POST", "/orphans/" + orphan + "/restore?fromXid=10", null), 200);
+                audit = AdminServer.audit(stderr);
+                log = stderr.text();
+            }
+
+            assertThat(audit).containsExactly(
+                "outbox admin POST \"" + API + "/dead-letters/discard\" by \"tester\" with topic \"orders\", key"
+                    + " \"k\", error \"boom\", failedFrom \"2026-01-15T10:00:00Z\", failedTo"
+                    + " \"2026-01-16T10:00:00Z\", status \"kept\": 200",
+                "outbox admin POST \"" + API + "/dead-letters/redrive\" by \"tester\" with topic \"orders\", key"
+                    + " null, error null, failedFrom null, failedTo null, status null: 200",
+                "outbox admin POST \"" + API + "/dead-letters/redrive\" by \"tester\" with count \"12\", ids"
+                    + " \"[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, ...]\": 200",
+                "outbox admin POST \"" + API + "/dead-letters/discard\" by \"tester\" with count \"1\", ids"
+                    + " \"[7]\": 200",
+                "outbox admin POST \"" + API + "/orphans/" + orphan + "/restore\" by \"tester\" with fromXid"
+                    + " \"10\": 200");
+            assertThat(log).as("the core line caps the ids too")
+                .contains("redriveDeadLetters(12 ids [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, ...]) on ")
+                .contains("discardDeadLetters(1 ids [7]) on ");
+        });
+    }
+
     /** A typo must never widen the call: {@code kye} ignored would abandon every key of the topic. */
     @Test
     void abandonRefusesBadInput() {

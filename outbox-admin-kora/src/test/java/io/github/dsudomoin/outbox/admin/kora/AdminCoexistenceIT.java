@@ -223,6 +223,8 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
         for (var route : ROUTES) {
             var call = "outbox admin " + route.method() + " \"" + path(route) + "\"";
             var allowed = call + " by \"tester\"" + switch (route.operation()) {
+                case "redriveDeadLetters", "discardDeadLetters" -> " with count \"1\", ids \"[1]\"";
+                case "restoreOrphan" -> " with fromXid \"0\"";
                 case "abandonWaiting" -> " with topic \"t\", key null, reason \"test\", dryRun \"false\"";
                 case "abandonKey" -> " with topic \"t\", key \"k\", messageId null, reason \"test\", dryRun \"false\"";
                 default -> "";

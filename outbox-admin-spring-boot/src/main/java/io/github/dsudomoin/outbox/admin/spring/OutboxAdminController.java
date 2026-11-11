@@ -34,6 +34,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Objects;
 import java.util.TreeMap;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.NestedRuntimeException;
@@ -83,6 +84,8 @@ class OutboxAdminController implements OutboxAdminApi {
 
     /** As the contract's {@code maxItems}: the library binds every id in each chunk's query. */
     private static final int MAX_IDS = 1000;
+    /** The ids of a call its audit line shows, after their count: the line stays short for a thousand of them. */
+    private static final int AUDIT_IDS = 10;
     /** As the Kora adapter writes them: always UTC, always three fraction digits. */
     private static final DateTimeFormatter DATE_TIME =
         DateTimeFormatter.ofPattern("uuuu-MM-dd'T'HH:mm:ss.SSSXXX").withZone(ZoneOffset.UTC);
@@ -147,20 +150,23 @@ class OutboxAdminController implements OutboxAdminApi {
     public ResponseEntity<Count> redriveDeadLetters(Selection parameter) {
         var selection = RequestReaders.read(Selection.class);
         var ids = ids(selection);
-        return ResponseEntity.ok(new Count(ids != null ? admin().redriveDeadLetters(ids)
-            : admin().redriveDeadLetters(filter(selection.getFilter()))));
+        return ResponseEntity.ok(new Count(ids != null ? admin().redriveDeadLetters(audited(ids))
+            : admin().redriveDeadLetters(audited(selection.getFilter()))));
     }
 
     @Override
     public ResponseEntity<Count> discardDeadLetters(Selection parameter) {
         var selection = RequestReaders.read(Selection.class);
         var ids = ids(selection);
-        return ResponseEntity.ok(new Count(ids != null ? admin().discardDeadLetters(ids)
-            : admin().discardDeadLetters(filter(selection.getFilter()))));
+        return ResponseEntity.ok(new Count(ids != null ? admin().discardDeadLetters(audited(ids))
+            : admin().discardDeadLetters(audited(selection.getFilter()))));
     }
 
     @Override
     public ResponseEntity<Count> restoreOrphan(String table, Long fromXid) {
+        var detail = new LinkedHashMap<String, String>(); // the table is in the path already
+        detail.put("fromXid", String.valueOf(fromXid));
+        RequestContextHolder.currentRequestAttributes().setAttribute(DETAIL, detail, RequestAttributes.SCOPE_REQUEST);
         return ResponseEntity.ok(new Count(admin().restoreOrphan(table, fromXid)));
     }
 
@@ -279,6 +285,30 @@ class OutboxAdminController implements OutboxAdminApi {
             throw new IllegalArgumentException("ids must be numbers, not null");
         }
         return ids;
+    }
+
+    /** {@code ids}, their count and the first {@value #AUDIT_IDS} of them put into the audit line. */
+    private static List<Long> audited(List<Long> ids) {
+        var detail = new LinkedHashMap<String, String>();
+        detail.put("count", String.valueOf(ids.size()));
+        detail.put("ids", ids.stream().limit(AUDIT_IDS).map(String::valueOf)
+            .collect(Collectors.joining(", ", "[", ids.size() > AUDIT_IDS ? ", ...]" : "]")));
+        RequestContextHolder.currentRequestAttributes().setAttribute(DETAIL, detail, RequestAttributes.SCOPE_REQUEST);
+        return ids;
+    }
+
+    /** {@link #filter(Filter)}, its fields put into the audit line. */
+    private static DeadLetterFilter audited(Filter f) {
+        var filter = filter(f);
+        var detail = new LinkedHashMap<String, String>();
+        detail.put("topic", filter.topic());
+        detail.put("key", f.getKey());
+        detail.put("error", filter.errorContains());
+        detail.put("failedFrom", filter.failedFrom() == null ? null : filter.failedFrom().toString());
+        detail.put("failedTo", filter.failedTo() == null ? null : filter.failedTo().toString());
+        detail.put("status", f.getStatus() == null ? null : f.getStatus().toString());
+        RequestContextHolder.currentRequestAttributes().setAttribute(DETAIL, detail, RequestAttributes.SCOPE_REQUEST);
+        return filter;
     }
 
     /** A bulk call's filter, as {@link RequestReaders} read it from the body: no field of it is a mapper's. */

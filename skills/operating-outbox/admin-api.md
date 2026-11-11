@@ -24,7 +24,9 @@ A component of `OutboxModule`, a bean in Spring Boot. Each call runs its own tra
 - Bulk calls take letters dead when the call starts, in chunks of 1 000 by id, one transaction per chunk. Letters
   held by a running hook call, and (redrive) letters whose key an open transaction sends, are skipped without
   waiting and not counted: call again, then check the count with the same filter. An empty filter is rejected.
-- Every changing call logs one INFO line with its arguments and result.
+- Every changing call logs one INFO line with its arguments and result; ids as their count and the first ten.
+- Over HTTP, both adapters' audit line (`by "<identity>" with ...: <status>`) names what a destructive call selected:
+  redrive and discard the filter's six fields or `count` and the first ten `ids`, orphan restore `fromXid`.
 
 ## Over HTTP: `outbox-admin-kora`
 

@@ -2073,9 +2073,11 @@ letters, написанные одним мажором, читает друго
 **Аудит.** Логгер `io.github.dsudomoin.outbox.admin.spring.OutboxAdminGuard`, уровень INFO; не выключайте его. Строки:
 `outbox admin <method> "<path>" by "<identity>"[ with ...]: <status>` и
 `outbox admin <method> "<path>" denied: <status>`. Путь декодирован и нормализован контейнером, без context path, query
-и части после `;`, как в Kora. Подделать строку аудита значением нельзя, но текст исключений в WARN идёт как есть. Ключ
-и `reason` у `waiting/abandon` попадают в строку открытым текстом, как в Kora. Строка разрешённого вызова пишется сразу
-после отправки ответа (в Kora — до неё).
+и части после `;`, как в Kora. Подделать строку аудита значением нельзя, но текст исключений в WARN идёт как есть.
+Аргументы попадают в строку так же, как в Kora: у `waiting/abandon` и `keys/abandon` ключ и `reason` открытым текстом,
+у `dead-letters/redrive` и `dead-letters/discard` — поля фильтра или число `ids` и первые десять, у
+`orphans/{table}/restore` — `fromXid`. Строка разрешённого вызова пишется сразу после отправки ответа (в Kora — до
+неё).
 
 **Отличия от Kora:**
 
@@ -3330,7 +3332,11 @@ public final class ApiKeyAuthorizer implements OutboxAdminAuthorizer {
 - Каждый вызов оставляет строку INFO: `outbox admin POST "/kora-outbox/admin/v1/..." by "admin-key": 200` или
   `... denied: 401`. У `waiting/abandon` перед статусом стоят его аргументы, каждое значение в кавычках:
   `... by "admin-key" with topic "orders", key null, reason "v2 rolled back for good", dryRun "false": 200`.
-  То же у `keys/abandon`, с `messageId` после `key`.
+  То же у `keys/abandon`, с `messageId` после `key`. Вызовы, которые удаляют или переносят письма и строки, называют,
+  что выбрали: `dead-letters/redrive` и `dead-letters/discard` — все поля фильтра (`with topic "orders", key null,
+  error "timeout", failedFrom null, failedTo null, status null`) или число `ids` и первые десять из них (`with count
+  "12", ids "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, ...]"`), `orphans/{table}/restore` — `fromXid` (таблица уже в пути). Строка INFO
+  ядра для `ids` тоже пишет их число и первые десять.
 - Открывайте админ-API только во внутренней сети или за TLS: ключ в заголовке без TLS читается по дороге, а
   ответы несут dead letters с payload.
 - Решайте по тому, что клиент отправляет намеренно (заголовок с ключом или токеном), а не по тому, что браузер
