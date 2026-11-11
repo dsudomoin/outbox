@@ -70,7 +70,7 @@ public record OutboxProperties(
      * @param batchTimeout bound of one handler call. At 80 % of it the handler thread is interrupted and the call's
      *     real outcomes are kept (records it did not start are read again); a call still running at the full timeout
      *     is cancelled and all its records are retried, delivered ones included. Per-record timeouts of the handler
-     *     (HTTP read timeouts, each byTopic route's own) must be well below it. Default 30 s.
+     *     (HTTP read timeouts, each byTopic route's own) must be well below it. Default 30 s, at most 24 days.
      * @param shutdownTimeout on stop, unfinished batches get this long, then their workers are interrupted and the
      *     batches are delivered again later. Default 30 s.
      * @param headFailuresBeforeDivert failed attempts in a row after which a shard reads one head row and diverts the
@@ -150,7 +150,8 @@ public record OutboxProperties(
      *     heartbeat. Default 30 s.
      * @param swapLockTimeout how long the tail swap waits in the queue for its lock on the outbox once its tries
      *     without waiting failed, writers queueing behind it meanwhile: keep it below their own lock_timeout and
-     *     statement_timeout. 0 (default): no wait, so writers wait only for the swap's hold.
+     *     statement_timeout. 0 (default): no wait, so writers wait only for the swap's hold. At most 24 days, with
+     *     tailConversion.maxStall added too.
      * @param maxTailScan largest tail, in bytes (pg_relation_size), that the swap turns into a range when rows went to
      *     it, which scans it under the swap's lock: writers wait for the scan. A larger tail stays hot, writes going on
      *     into it, until tail-conversion's window. Default 16 MB.
@@ -176,7 +177,7 @@ public record OutboxProperties(
      *     03:00-05:00.
      * @param maxStall the scan's statement_timeout in the window, so about the longest writers wait for its hold: keep
      *     it below their own lock_timeout and statement_timeout. A scan that does not fit rolls back, nothing left
-     *     behind, and this instance tries again in the next window. Default 1 s.
+     *     behind, and this instance tries again in the next window. Default 1 s, at most 24 days.
      * @param zone the IANA time zone window is read in. Default: the JVM's default zone.
      */
     public record TailConversion(
@@ -218,7 +219,7 @@ public record OutboxProperties(
      * @param batchSize letters per call of the dead-letter hook, 1..1000 (a redrive batch holds a key lock each).
      *     Default 100.
      * @param timeout bound of one hook call; a call cut at it leaves its letters pending, retried with backoff. Default
-     *     30 s.
+     *     30 s, at most 24 days.
      * @param retention kept letters older than this, by their failed_at, are deleted by maintenance; 0 = kept forever,
      *     the default; at most 3650 days. Letters still pending for the hook are never deleted.
      * @param redriveHistory how long the count of a message's redrives is remembered, so a redriven message that dies
@@ -242,7 +243,7 @@ public record OutboxProperties(
      * @param clockMargin rows written since the newest pre-regression tick, less this margin for clock skew between the
      *     old and the new server, are re-sent. Default 10 min.
      * @param timeout the whole recovery transaction's deadline, writers waiting for it all along; each statement gets
-     *     what is left. Default 10 min.
+     *     what is left. Default 10 min, at most 24 days.
      */
     public record Recovery(
         @DefaultValue("auto") String xidRegression,

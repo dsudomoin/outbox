@@ -221,6 +221,24 @@ class OutboxConfigTest {
         assertRejected("outbox.recovery.timeout = 0ms", "outbox.recovery.timeout must be positive: PT0S");
     }
 
+    @Test
+    void timeoutsSentAsMillisecondSettingsAreCappedAt24Days() { // Postgres takes at most 2^31-1 ms
+        assertRejected("outbox.relay.batchTimeout = 25d", "outbox.relay.batchTimeout must be at most 24d: PT600H");
+        assertRejected("outbox.deadLetters.timeout = 25d", "outbox.deadLetters.timeout must be at most 24d: PT600H");
+        assertRejected("outbox.recovery.timeout = 25d", "outbox.recovery.timeout must be at most 24d: PT600H");
+        assertRejected("outbox.partitions.swapLockTimeout = 25d",
+                "outbox.partitions.swapLockTimeout must be at most 24d: PT600H");
+        assertRejected("outbox.partitions.tailConversion.maxStall = 25d",
+                "outbox.partitions.tailConversion.maxStall must be at most 24d: PT600H");
+        // a queued swap of an oversized tail sends statement_timeout = swapLockTimeout + maxStall
+        assertRejected("outbox.partitions { swapLockTimeout = 12d, tailConversion.maxStall = 13d }",
+                "outbox.partitions.swapLockTimeout + outbox.partitions.tailConversion.maxStall must be at most 24d:"
+                        + " PT600H");
+
+        OutboxSchema.validate(parse("outbox { relay.batchTimeout = 24d, deadLetters.timeout = 24d,"
+                + " recovery.timeout = 24d, partitions { swapLockTimeout = 12d, tailConversion.maxStall = 12d } }"));
+    }
+
     private static void assertRejected(String hocon, String message) {
         var config = parse(hocon);
 

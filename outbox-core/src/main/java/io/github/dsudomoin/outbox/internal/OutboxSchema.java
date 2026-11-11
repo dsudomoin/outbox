@@ -82,6 +82,12 @@ public final class OutboxSchema implements AutoCloseable {
     /** Bound of {@code deadLetters.retention} and {@code redriveHistory}: 10 years, an age maintenance compares. */
     private static final Duration MAX_DEAD_LETTER_AGE = Duration.ofDays(3650);
     /**
+     * Bound of the timeouts sent to Postgres as millisecond settings ({@code lock_timeout}, {@code statement_timeout},
+     * {@code idle_in_transaction_session_timeout}), which take at most 2^31-1 ms, about 24.8 days: the rest covers the
+     * margins added to them (batchTimeout + 65 s in the swap's quiesce, swapLockTimeout + 60 s in DDL).
+     */
+    private static final Duration MAX_PG_TIMEOUT = Duration.ofDays(24);
+    /**
      * Added to twice the longer of {@code idlePollInterval} and {@code minTickInterval}: a reshard is refused while the
      * newest tick is younger than that, as every running relay ticks at least that often, idle or not.
      */
@@ -189,6 +195,7 @@ public final class OutboxSchema implements AutoCloseable {
                 "outbox.relay.idlePollInterval must be positive: " + relay.idlePollInterval());
         require(relay.batchTimeout().compareTo(Duration.ZERO) > 0,
                 "outbox.relay.batchTimeout must be positive: " + relay.batchTimeout());
+        requireAtMost24d("outbox.relay.batchTimeout", relay.batchTimeout());
         require(!relay.shutdownTimeout().isNegative(),
                 "outbox.relay.shutdownTimeout must not be negative: " + relay.shutdownTimeout());
         require(config.networkTimeout().isZero() || config.networkTimeout().compareTo(Duration.ofMillis(1)) >= 0
@@ -226,6 +233,7 @@ public final class OutboxSchema implements AutoCloseable {
         var swapWait = partitions.swapLockTimeout();
         require(swapWait.isZero() || swapWait.toMillis() > 0,
                 "outbox.partitions.swapLockTimeout must be 0 or at least 1ms: " + swapWait);
+        requireAtMost24d("outbox.partitions.swapLockTimeout", swapWait);
         require(partitions.maxTailScan() >= 0,
                 "outbox.partitions.maxTailScan must not be negative: " + partitions.maxTailScan());
         XidPartitions.Window.parse(partitions.tailConversion().window()); // its message names the key
@@ -238,6 +246,10 @@ public final class OutboxSchema implements AutoCloseable {
         require(partitions.tailConversion().maxStall().toMillis() >= 1,
                 "outbox.partitions.tailConversion.maxStall must be at least 1ms: "
                         + partitions.tailConversion().maxStall());
+        requireAtMost24d("outbox.partitions.tailConversion.maxStall", partitions.tailConversion().maxStall());
+        // a queued swap of an oversized tail runs under statement_timeout = swapLockTimeout + maxStall
+        requireAtMost24d("outbox.partitions.swapLockTimeout + outbox.partitions.tailConversion.maxStall",
+                swapWait.plus(partitions.tailConversion().maxStall()));
         require(deadLetters.batchSize() >= 1,
                 "outbox.deadLetters.batchSize must be at least 1: " + deadLetters.batchSize());
         // a batch's redrive holds a key lock per letter in one transaction, as an admin chunk does
@@ -245,6 +257,7 @@ public final class OutboxSchema implements AutoCloseable {
                 "outbox.deadLetters.batchSize must be at most " + PgOutboxAdmin.CHUNK + ": " + deadLetters.batchSize());
         require(deadLetters.timeout().compareTo(Duration.ZERO) > 0,
                 "outbox.deadLetters.timeout must be positive: " + deadLetters.timeout());
+        requireAtMost24d("outbox.deadLetters.timeout", deadLetters.timeout());
         require(!deadLetters.retention().isNegative(),
                 "outbox.deadLetters.retention must not be negative: " + deadLetters.retention());
         require(deadLetters.retention().compareTo(MAX_DEAD_LETTER_AGE) <= 0,
@@ -260,11 +273,16 @@ public final class OutboxSchema implements AutoCloseable {
         require(!recovery.clockMargin().isNegative(),
                 "outbox.recovery.clockMargin must not be negative: " + recovery.clockMargin());
         require(recovery.timeout().toMillis() > 0, "outbox.recovery.timeout must be positive: " + recovery.timeout());
+        requireAtMost24d("outbox.recovery.timeout", recovery.timeout());
     }
 
     static void validateShards(int shards) {
         require(shards >= 1 && shards <= Short.MAX_VALUE,
                 "outbox.shards must be within 1.." + Short.MAX_VALUE + ": " + shards);
+    }
+
+    private static void requireAtMost24d(String key, Duration value) {
+        require(value.compareTo(MAX_PG_TIMEOUT) <= 0, key + " must be at most 24d: " + value);
     }
 
     private static void require(boolean valid, String message) {

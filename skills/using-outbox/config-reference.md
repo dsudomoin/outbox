@@ -33,7 +33,7 @@ outbox {
 | `maxTicksPerBatch` | `100` | ≥ 1. |
 | `minTickInterval` | `50ms` | ≥ 0. Under load, at most one tick per interval. |
 | `idlePollInterval` | `200ms` | > 0. Idle tick rate; how fast a commit on another instance is noticed. |
-| `batchTimeout` | `30s` | > 0. Bound of one handler call: wind-down at 80 %, abandoned (all records retried) at 100 %. With Kafka ≥ `delivery.timeout.ms + 5 s + max.block.ms`. `drain()` gives up after 2 × this without progress. |
+| `batchTimeout` | `30s` | > 0, ≤ 24 days. Bound of one handler call: wind-down at 80 %, abandoned (all records retried) at 100 %. With Kafka ≥ `delivery.timeout.ms + 5 s + max.block.ms`. `drain()` gives up after 2 × this without progress. |
 | `shutdownTimeout` | `30s` | ≥ 0. Grace for in-flight batches at shutdown; then they are interrupted and redelivered later. `close()` spends up to about 8 s more: interrupted workers and the instance row's delete (a locked row or an exhausted pool is left to expire). |
 | `headFailuresBeforeDivert` | `3` | ≥ 1. Consecutive failures before a shard isolates a single failing key. |
 | `cursorAnchorInterval` | `1h` | > 0 and ≥ `partitions.maintenanceInterval`. Maintenance writes an idle shard one cursor row this often; ticks are kept about this long (at most about 10 000: a shard that far behind is anchored at the next run), so a rollback to the previous release resumes from these anchors. |
@@ -74,11 +74,11 @@ quarter of the time it has waited, no sooner than `delay` and no later than `max
 | `xidsPerPartition` | `16777216` | ≥ 1000. Size of one xid range partition. An extension adds at most 4 ranges per maintenance run, so keep `4 × xidsPerPartition / maintenanceInterval` above the peak xid/s (a concern only for tiny ranges). Tests: `1000000`. |
 | `premake` | `64` | ≥ 2. Ranges kept ahead of the current xid; must cover the longest snapshot: `premake / 2 × xidsPerPartition ≥ peak xid/s × longest snapshot s`. Tests: `4`. |
 | `maintenanceInterval` | `30s` | > 0. Outbox and inbox maintenance period; also the heartbeat period of each instance in `<table>_instance`. |
-| `swapLockTimeout` | `0` | 0 or ≥ 1ms, whole ms. `0`: the tail swap takes `ACCESS EXCLUSIVE` on the outbox only by `NOWAIT` tries (200 ms of them), so writers never queue behind it and wait only for its hold: one server-side statement of at most 4 ranges, committed locally (`synchronous_commit = local`), cut by the server at 260 ms, plus its local WAL flush; typically 3–6 ms warm. A writer whose `lock_timeout` and `statement_timeout` are each ≥ 300 ms (or unset) never fails by day; with a wait > 0, ≥ `swapLockTimeout` + 300 ms. Above 0: after the tries it waits that long in the lock queue, writers queueing behind it; keep it below the writers' own `lock_timeout` and `statement_timeout`. Also each lock wait when the library moves rows back (orphans, dead letters), 200 ms when 0. |
+| `swapLockTimeout` | `0` | 0 or 1ms..24 days, whole ms; plus `tailConversion.maxStall` ≤ 24 days too. `0`: the tail swap takes `ACCESS EXCLUSIVE` on the outbox only by `NOWAIT` tries (200 ms of them), so writers never queue behind it and wait only for its hold: one server-side statement of at most 4 ranges, committed locally (`synchronous_commit = local`), cut by the server at 260 ms, plus its local WAL flush; typically 3–6 ms warm. A writer whose `lock_timeout` and `statement_timeout` are each ≥ 300 ms (or unset) never fails by day; with a wait > 0, ≥ `swapLockTimeout` + 300 ms. Above 0: after the tries it waits that long in the lock queue, writers queueing behind it; keep it below the writers' own `lock_timeout` and `statement_timeout`. Also each lock wait when the library moves rows back (orphans, dead letters), 200 ms when 0. |
 | `maxTailScan` | `16777216` | ≥ 0, bytes (`pg_relation_size`). A tail with rows up to this size becomes a range in the swap, Postgres scanning it under the lock (writers wait for the scan: typically 5–6 ms for 15.8 MB, warm; at most the 260 ms bound); the size is re-read under the lock. A larger one stays hot, writes going on into it, until `tailConversion.window`. No CHECK is ever put on a partition. |
 | `tailConversion.window` | `"03:00-05:00"` | `HH:mm-HH:mm` in `tailConversion.zone`, may cross midnight (`"23:00-01:00"`); `""`: never. Validated and logged at startup. Inside it maintenance also converts a hot tail over `maxTailScan`; an attempt cut by `maxStall` is not retried in that window, and one ERROR fires when the window ends without a fit. Tests: `""` (the fixture's default). |
 | `tailConversion.zone` | JVM default zone | IANA zone id (`Europe/Moscow`), validated at startup. Containers usually run in UTC: set it. |
-| `tailConversion.maxStall` | `1s` | ≥ 1ms. The window's hold bound (its statement's `statement_timeout`), so the writers' longest wait. At night writers' own `lock_timeout` and `statement_timeout` must each be ≥ `maxStall` + 300 ms (Postgres default `lock_timeout` 0 = none); else lower it. A scan that does not fit rolls back cleanly with a WARN. |
+| `tailConversion.maxStall` | `1s` | 1ms..24 days (plus `swapLockTimeout` too). The window's hold bound (its statement's `statement_timeout`), so the writers' longest wait. At night writers' own `lock_timeout` and `statement_timeout` must each be ≥ `maxStall` + 300 ms (Postgres default `lock_timeout` 0 = none); else lower it. A scan that does not fit rolls back cleanly with a WARN. |
 | `restoreOrphans` | `true` | Rows of a range the library detached as relayed, at or above the slowest shard's horizon, are moved back by maintenance; `false`: ERROR only. |
 
 ## `outbox.inbox` (`InboxModule`)
@@ -103,7 +103,7 @@ regression recovery)»).
 | `xidRegression` | `"auto"` | `auto` or `halt`. `auto`: the instance holding the maintenance lock recovers by itself when at most `maxRows` rows must be re-sent. `halt`: never by itself; the relay waits for `recoverXidRegression` (admin API). |
 | `maxRows` | `1000000` | ≥ 0. Rows the automatic recovery re-sends while writers wait for it; more leave the relay halted. |
 | `clockMargin` | `10m` | ≥ 0. Rows written since the newest tick before the regression minus this margin are re-sent, in `created_at, id` order: a new server's clock behind the old one's can put a key's new message before its old undelivered one. |
-| `timeout` | `10m` | > 0. Deadline of the whole recovery transaction (writers wait for it); each statement gets what is left; also the row count's `statement_timeout`. An automatic recovery that failed after locking the outbox is not tried again by itself. |
+| `timeout` | `10m` | > 0, ≤ 24 days. Deadline of the whole recovery transaction (writers wait for it); each statement gets what is left; also the row count's `statement_timeout`. An automatic recovery that failed after locking the outbox is not tried again by itself. |
 
 ## `outbox.deadLetters`
 
@@ -112,7 +112,7 @@ The dead-letter hook and the dead table (writing-outbox-handlers, `dead-letter-h
 | Key | Default | Rule and meaning |
 |---|---|---|
 | `batchSize` | `100` | 1..1000. Letters per hook call; also key locks per redrive transaction. |
-| `timeout` | `30s` | > 0. Bound of one hook call; a call past it leaves its letters pending with backoff `relay.retry.initialDelay` doubling to `maxDelay`. With the Kafka DLQ ≥ `delivery.timeout.ms + 5 s + max.block.ms`, else a WARN at startup. |
+| `timeout` | `30s` | > 0, ≤ 24 days. Bound of one hook call; a call past it leaves its letters pending with backoff `relay.retry.initialDelay` doubling to `maxDelay`. With the Kafka DLQ ≥ `delivery.timeout.ms + 5 s + max.block.ms`, else a WARN at startup. |
 | `retention` | `0` | 0..3650 days. Maintenance deletes `kept` letters older than this by `failed_at`; `0` keeps them forever. `pending` and `scheduled` letters are never deleted. |
 | `redriveHistory` | `30d` | > 0, ≤ 3650 days. How long `<table>_redriven` remembers a message's redrive count, which a letter that dies again carries in `redrives`. |
 

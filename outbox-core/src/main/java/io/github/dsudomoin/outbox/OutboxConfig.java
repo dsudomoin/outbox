@@ -99,7 +99,8 @@ public interface OutboxConfig {
          * Bound of one handler call. At 80 % of it the handler thread is interrupted and the call's real outcomes are
          * kept (records it did not start are read again); a call still running at the full timeout is cancelled and
          * all its records are retried, delivered ones included. Per-record timeouts of the handler (HTTP read
-         * timeouts, each {@code byTopic} route's own) must be well below it. See {@link OutboxHandler#handleBatch}.
+         * timeouts, each {@code byTopic} route's own) must be well below it. At most 24 days. See
+         * {@link OutboxHandler#handleBatch}.
          */
         default Duration batchTimeout() {
             return Duration.ofSeconds(30);
@@ -202,7 +203,8 @@ public interface OutboxConfig {
         /**
          * How long the tail swap waits in the queue for its lock on the outbox once its tries without waiting failed,
          * writers queueing behind it meanwhile: keep it below their own {@code lock_timeout} and
-         * {@code statement_timeout}. 0 (default): no wait, so writers wait only for the swap's hold.
+         * {@code statement_timeout}. 0 (default): no wait, so writers wait only for the swap's hold. At most 24 days,
+         * with {@code tailConversion.maxStall} added too.
          */
         default Duration swapLockTimeout() {
             return Duration.ZERO;
@@ -244,7 +246,7 @@ public interface OutboxConfig {
         /**
          * The scan's {@code statement_timeout} in the window, so about the longest writers wait for its hold: keep it
          * below their own {@code lock_timeout} and {@code statement_timeout}. A scan that does not fit rolls back,
-         * nothing left behind, and this instance tries again in the next window. Default 1 s.
+         * nothing left behind, and this instance tries again in the next window. Default 1 s, at most 24 days.
          */
         default Duration maxStall() {
             return Duration.ofSeconds(1);
@@ -287,7 +289,10 @@ public interface OutboxConfig {
             return 100;
         }
 
-        /** Bound of one hook call; a call cut at it leaves its letters pending, retried with backoff. Default 30 s. */
+        /**
+         * Bound of one hook call; a call cut at it leaves its letters pending, retried with backoff. Default 30 s, at
+         * most 24 days.
+         */
         default Duration timeout() {
             return Duration.ofSeconds(30);
         }
@@ -339,7 +344,7 @@ public interface OutboxConfig {
 
         /**
          * The whole recovery transaction's deadline, writers waiting for it all along; each statement gets what is
-         * left. Default 10 min.
+         * left. Default 10 min, at most 24 days.
          */
         default Duration timeout() {
             return Duration.ofMinutes(10);
