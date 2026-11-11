@@ -42,6 +42,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import org.apache.kafka.clients.producer.BufferExhaustedException;
 import org.apache.kafka.clients.producer.Callback;
@@ -129,6 +130,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
     private final Duration wait;
     private final Duration longestCall;
     private final Clock clock;
+    private final LongSupplier nanos; // measures the cooldowns; clock only dates their ends
     private final Deque<Pooled> pool = new ConcurrentLinkedDeque<>();
     private final Deque<Pooled> unbatchedPool = new ConcurrentLinkedDeque<>();
     private final Cooldown<TopicPartition> cooldown;
@@ -160,25 +162,31 @@ public final class KafkaOutboxSender implements AutoCloseable {
             unbatched.put(BATCH_SIZE_CONFIG, "0");
             return producers.apply(unbatched);
         }, Duration.ofMillis(config.getInt(DELIVERY_TIMEOUT_MS_CONFIG)),
-                Duration.ofMillis(config.getLong(MAX_BLOCK_MS_CONFIG)), Clock.systemUTC());
+                Duration.ofMillis(config.getLong(MAX_BLOCK_MS_CONFIG)), Clock.systemUTC(), System::nanoTime);
     }
 
-    /** For tests: {@code clock} drives the cooldowns; {@code factory} makes the producers of both pools. */
-    KafkaOutboxSender(Supplier<Producer<byte[], byte[]>> factory, Duration deliveryTimeout, Clock clock) {
-        this(factory, factory, deliveryTimeout, clock);
+    /**
+     * For tests: {@code nanos} (the {@link System#nanoTime} scale) measures the cooldowns and {@code clock} dates their
+     * ends; {@code factory} makes the producers of both pools.
+     */
+    KafkaOutboxSender(Supplier<Producer<byte[], byte[]>> factory, Duration deliveryTimeout, Clock clock,
+            LongSupplier nanos) {
+        this(factory, factory, deliveryTimeout, clock, nanos);
     }
 
     /** For tests: {@code unbatched} makes the producers of calls that hold remembered records. */
     KafkaOutboxSender(Supplier<Producer<byte[], byte[]>> factory, Supplier<Producer<byte[], byte[]>> unbatched,
-            Duration deliveryTimeout, Clock clock) {
-        this(factory, unbatched, deliveryTimeout, Duration.ZERO, clock);
+            Duration deliveryTimeout, Clock clock, LongSupplier nanos) {
+        this(factory, unbatched, deliveryTimeout, Duration.ZERO, clock, nanos);
     }
 
     private KafkaOutboxSender(Supplier<Producer<byte[], byte[]>> factory,
-            Supplier<Producer<byte[], byte[]>> unbatched, Duration deliveryTimeout, Duration maxBlock, Clock clock) {
+            Supplier<Producer<byte[], byte[]>> unbatched, Duration deliveryTimeout, Duration maxBlock, Clock clock,
+            LongSupplier nanos) {
         this.factory = factory;
         this.unbatchedFactory = unbatched;
         this.clock = clock;
+        this.nanos = nanos;
         this.wait = deliveryTimeout.plus(WAIT_SLACK);
         this.longestCall = wait.plus(maxBlock); // a send or metadata wait may still block at the deadline
         this.cooldown = new Cooldown<>(deliveryTimeout); // a probe resolves within delivery.timeout.ms
@@ -348,12 +356,13 @@ public final class KafkaOutboxSender implements AutoCloseable {
                 if (call.metadataTimedOut && !partitionInfos.containsKey(topic)
                         && !pooled.resolved(topic, clock.instant())) {
                     // one metadata wait per call; before the cooldown lookup, which would lease the topic to us
-                    var until = topicCooldown.peek(topic, clock.instant());
-                    call.complete(i, until == null ? Outcome.notAttempted() : Outcome.notAttempted(until), false);
+                    var until = notBefore(topicCooldown.peek(topic, nanos.getAsLong()));
+                    call.complete(i, until.isPresent() ? Outcome.notAttempted(until.get()) : Outcome.notAttempted(),
+                            false);
                     continue;
                 }
                 var topicUntil = coolingUntil.computeIfAbsent(topic,
-                        t -> Optional.ofNullable(topicCooldown.coolingUntil(topic, clock.instant())));
+                        t -> notBefore(topicCooldown.coolingUntil(topic, nanos.getAsLong())));
                 if (topicUntil.isPresent()) {
                     call.complete(i, Outcome.notAttempted(topicUntil.get()), false);
                     continue;
@@ -384,7 +393,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
                 if (partition != null) {
                     partitions[i] = partition;
                     var until = coolingUntil.computeIfAbsent(partition,
-                            p -> Optional.ofNullable(cooldown.coolingUntil(partition, clock.instant())));
+                            p -> notBefore(cooldown.coolingUntil(partition, nanos.getAsLong())));
                     if (until.isPresent()) {
                         call.complete(i, Outcome.notAttempted(until.get()), false);
                         continue;
@@ -424,7 +433,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
             }
             var partition = new TopicPartition(topic, info.partition());
             var until = coolingUntil.computeIfAbsent(partition,
-                    p -> Optional.ofNullable(cooldown.coolingUntil(partition, clock.instant()))); // may lease it
+                    p -> notBefore(cooldown.coolingUntil(partition, nanos.getAsLong()))); // may lease it
             if (until.isEmpty()) {
                 return Optional.of(partition);
             }
@@ -453,7 +462,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
         boolean metadataTimeout = e instanceof TimeoutException && !(e instanceof BufferExhaustedException);
         call.metadataTimedOut |= metadataTimeout;
         if (metadataTimeout || topicFault(e)) {
-            coolingUntil.put(topic, Optional.of(topicCooldown.failed(topic, clock.instant())));
+            coolingUntil.put(topic, notBefore(topicCooldown.failed(topic, nanos.getAsLong())));
         } else if (metadata || e instanceof InvalidTopicException) {
             refused.add(topic);
         } else if (!(e instanceof RecordTooLargeException)) {
@@ -541,9 +550,14 @@ public final class KafkaOutboxSender implements AutoCloseable {
                 result.set(i, dead);
             }
         }
-        failed.forEach(p -> cooldown.failed(p, now));
-        failedTopics.forEach(t -> topicCooldown.failed(t, now));
+        failed.forEach(p -> cooldown.failed(p, nanos.getAsLong()));
+        failedTopics.forEach(t -> topicCooldown.failed(t, nanos.getAsLong()));
         return result;
+    }
+
+    /** The end of a cooldown {@code wait} long from now, as a {@code notBefore}; empty when nothing cools. */
+    private Optional<Instant> notBefore(@Nullable Duration wait) {
+        return wait == null ? Optional.empty() : Optional.of(clock.instant().plus(wait));
     }
 
     private static ProducerRecord<byte[], byte[]> producerRecord(OutboxRecord record, @Nullable Integer partition) {

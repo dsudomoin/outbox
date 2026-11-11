@@ -319,7 +319,7 @@ class KafkaDeadLetterHandlerTest {
             var producer = new TestProducer(autoComplete, failure);
             producers.add(producer);
             return producer;
-        }, Duration.ofSeconds(20), Clock.systemUTC());
+        }, Duration.ofSeconds(20), Clock.systemUTC(), System::nanoTime);
         return new KafkaDeadLetterHandler(sender, template);
     }
 

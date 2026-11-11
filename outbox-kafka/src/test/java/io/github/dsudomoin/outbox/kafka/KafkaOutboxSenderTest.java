@@ -34,6 +34,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
@@ -304,6 +305,31 @@ class KafkaOutboxSenderTest {
         sender.send(List.of(recordTo("missing-2", 5, "k")));
         assertThat(lookups.get("missing-2")).as("missing-2 was free to probe, not leased by the call that skipped it")
                 .hasValue(2);
+    }
+
+    /** A step of the wall clock does not move a cooldown's end: it is measured on the monotonic timer. */
+    @Test
+    void cooldownIgnoresWallClockSteps() {
+        var clock = new TestClock();
+        var sender = sender(() -> new TestProducer(true, r -> null) {
+            @Override
+            public synchronized List<PartitionInfo> partitionsFor(String topic) {
+                if (topic.equals("missing")) {
+                    throw new TimeoutException("Topic " + topic + " not present in metadata after 5000 ms.");
+                }
+                return super.partitionsFor(topic);
+            }
+        }, DELIVERY_TIMEOUT, clock);
+        sender.send(List.of(recordTo("missing", 1, "k"))); // the topic cools for 1 s
+
+        clock.step(Duration.ofHours(-1));
+        assertThat(sender.send(List.of(recordTo("missing", 2, "k"))))
+                .containsExactly(Outcome.notAttempted(clock.instant().plusSeconds(1)));
+
+        clock.step(Duration.ofHours(2));
+        assertThat(sender.send(List.of(recordTo("missing", 3, "k"))))
+                .as("a step forward does not end it either")
+                .containsExactly(Outcome.notAttempted(clock.instant().plusSeconds(1)));
     }
 
     @Test
@@ -1380,16 +1406,29 @@ class KafkaOutboxSenderTest {
     }
 
     /** A clock that moves only when told. */
-    private static final class TestClock extends Clock {
+    private static final class TestClock extends Clock implements LongSupplier {
         private volatile Instant now = Instant.parse("2026-10-26T00:00:00Z");
+        private volatile long nanos;
 
+        /** Moves the wall clock and the monotonic timer together. */
         void advance(Duration duration) {
+            now = now.plus(duration);
+            nanos += duration.toNanos();
+        }
+
+        /** Steps the wall clock only, as NTP or an operator would: the monotonic timer does not move. */
+        void step(Duration duration) {
             now = now.plus(duration);
         }
 
         @Override
         public Instant instant() {
             return now;
+        }
+
+        @Override
+        public long getAsLong() {
+            return nanos;
         }
 
         @Override
@@ -1531,11 +1570,16 @@ class KafkaOutboxSenderTest {
     }
 
     private KafkaOutboxSender sender(Supplier<MockProducer<byte[], byte[]>> make, Duration deliveryTimeout) {
-        return sender(make, deliveryTimeout, Clock.systemUTC());
+        return sender(make, deliveryTimeout, Clock.systemUTC(), System::nanoTime);
     }
 
     private KafkaOutboxSender sender(Supplier<MockProducer<byte[], byte[]>> make, Duration deliveryTimeout,
-            Clock clock) {
+            TestClock clock) {
+        return sender(make, deliveryTimeout, clock, clock);
+    }
+
+    private KafkaOutboxSender sender(Supplier<MockProducer<byte[], byte[]>> make, Duration deliveryTimeout,
+            Clock clock, LongSupplier nanos) {
         Supplier<MockProducer<byte[], byte[]>> made = () -> {
             var producer = make.get();
             producers.add(producer);
@@ -1545,7 +1589,7 @@ class KafkaOutboxSenderTest {
             var producer = made.get();
             unbatched.add(producer);
             return producer;
-        }, deliveryTimeout, clock);
+        }, deliveryTimeout, clock, nanos);
     }
 
     private Future<List<Outcome>> sendAsync(KafkaOutboxSender sender, List<OutboxRecord> records) {
