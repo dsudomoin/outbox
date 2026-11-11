@@ -150,6 +150,27 @@ class KafkaDeadLetterHandlerTest {
         assertThat(producers.get(1).history()).extracting(r -> new String(r.value(), UTF_8)).containsExactly("v");
     }
 
+    /**
+     * The broker refuses letter 2 behind letter 1 in its batch: Kafka fails letter 1 first, with a generic
+     * {@link org.apache.kafka.common.KafkaException}, and that closes the producer before the refusal arrives. It is
+     * a refusal all the same: letter 1 goes again in the same call, and letter 2 is kept.
+     */
+    @Test
+    void aBrokerRefusalBehindABatchMateSendsTheBatchMateAgain() throws Exception {
+        var handler = handler(TEMPLATE, false, r -> null);
+
+        var letters = List.of(letter(1, "a", "v", null), letter(2, "b", "bad", null));
+        var call = executor.submit(() -> handler.handle(letters));
+        awaitSent(0, 2).failBatch(1);
+        awaitSent(1, 1).completeNext();
+
+        assertThat(call.get(5, SECONDS)).containsExactly(DeadLetterDecision.discard(), DeadLetterDecision.keep());
+        assertThat(producers.get(1).history()).extracting(r -> new String(r.value(), UTF_8)).containsExactly("v");
+        assertThat(handler.handle(List.of(letters.get(1)))).as("remembered: kept with no send")
+                .containsExactly(DeadLetterDecision.keep());
+        assertThat(producers.get(1).history()).hasSize(1);
+    }
+
     /** Each refusal sets its letter aside and sends the rest again: two refusals, three rounds. */
     @Test
     void everyBrokerRefusalSetsOnlyItsLetterAside() throws Exception {

@@ -48,6 +48,7 @@ import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.clients.producer.internals.BuiltInPartitioner;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.InvalidRecordException;
+import org.apache.kafka.common.InvalidRecordException;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.TopicPartition;
@@ -456,6 +457,32 @@ class KafkaOutboxSenderTest {
         assertThat(probe.get(5, SECONDS)).singleElement().isInstanceOf(Outcome.Permanent.class);
 
         var next = sendAsync(sender, List.of(record(3, onP)));
+        awaitSent(2, 1).completeNext();
+        assertThat(next.get(5, SECONDS)).containsExactly(Outcome.delivered());
+    }
+
+    /**
+     * The broker refuses a record behind a valid batch-mate: Kafka fails the batch-mate first, with a generic
+     * {@link KafkaException} that closes the call, and the refusal comes after it. The refusal still shows that the
+     * partition answers and ends the cooldown; the call waits for it, so it is {@code Permanent}.
+     */
+    @Test
+    void brokerRefusalBehindABatchMateEndsThePartitionsCooldown() throws Exception {
+        var clock = new TestClock();
+        var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
+        var first = sendAsync(sender, List.of(record(1, keyOnPartition(0, "a"))));
+        awaitSent(0, 1).errorNext(new NotEnoughReplicasException("not enough"));
+        first.get(5, SECONDS);
+        clock.advance(Duration.ofSeconds(1)); // the 1 s cooldown ends
+
+        var probe = sendAsync(sender, List.of(record(2, keyOnPartition(0, "a")), record(3, keyOnPartition(0, "b"))));
+        ((TestProducer) awaitSent(1, 2)).failBatch(1);
+        assertThat(probe.get(5, SECONDS)).satisfiesExactly(
+                o -> assertThat(o).isInstanceOf(Outcome.Retry.class),
+                o -> assertThat(o).isInstanceOfSatisfying(Outcome.Permanent.class,
+                        p -> assertThat(p.error()).isInstanceOf(InvalidRecordException.class)));
+
+        var next = sendAsync(sender, List.of(record(4, keyOnPartition(0, "c"))));
         awaitSent(2, 1).completeNext();
         assertThat(next.get(5, SECONDS)).containsExactly(Outcome.delivered());
     }
@@ -1398,11 +1425,41 @@ class KafkaOutboxSenderTest {
             return CompletableFuture.failedFuture(e);
         }
 
+        private boolean failingBatch; // a close from a callback aborts the rest once the batch's callbacks ran
+
         @Override
         public synchronized void close(Duration timeout) {
             super.close(timeout);
+            if (!failingBatch) {
+                abortIncomplete();
+            }
+        }
+
+        private void abortIncomplete() {
             while (errorNext(new KafkaException("Producer is closed forcefully."))) {
                 // abort the next incomplete send
+            }
+        }
+
+        /**
+         * The broker refuses record {@code invalid} of the batch of every incomplete send (INVALID_RECORD with
+         * record_errors), as Kafka's I/O thread reports it: callbacks in send order, the batch-mates with a generic
+         * {@link KafkaException}, and a close from a callback aborts nothing until they all ran (Sender.java:806-822,
+         * ProducerBatch.completeFutureAndFireCallbacks, KafkaProducer.close from a callback).
+         */
+        synchronized void failBatch(int invalid) {
+            failingBatch = true;
+            try {
+                for (int i = 0; errorNext(i == invalid ? new InvalidRecordException("Compacted topic cannot accept"
+                        + " message without key") : new KafkaException("Failed to append record because it was part of"
+                        + " a batch which had one more more invalid records")); i++) {
+                    // the next record of the batch
+                }
+            } finally {
+                failingBatch = false;
+            }
+            if (closed()) {
+                abortIncomplete();
             }
         }
     }

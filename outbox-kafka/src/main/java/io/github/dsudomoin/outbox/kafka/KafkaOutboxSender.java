@@ -236,8 +236,10 @@ public final class KafkaOutboxSender implements AutoCloseable {
     }
 
     /**
-     * {@link #send}'s outcomes, and whether its producer was closed by a record Kafka refused for good after the
-     * append ({@code Permanent} from the I/O thread): the records in flight with it then failed for that alone.
+     * {@link #send}'s outcomes, and whether a failure closed its producer while the broker refused a record of it for
+     * good ({@code Permanent} from the I/O thread), before or after the close: the records in flight with it then
+     * failed for that alone. A batch-mate ahead of the refused record fails first, with a generic
+     * {@link KafkaException} that closes the call (Sender.java:806-822).
      */
     record Sent(List<Outcome> outcomes, boolean closedByRefusal) {}
 
@@ -497,7 +499,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
                 } else if (call.unbatched && (outcome == Outcome.delivered() || outcome instanceof Outcome.Permanent)) {
                     expired.remove(records.get(i).messageId()); // settled
                 }
-                // a refusal from the broker shows, like a delivery, that the partition answers
+                // a refusal from the broker shows, like a delivery, that the partition answers (after the close too)
                 if (outcome == Outcome.delivered() || call.ownFailure[i] && outcome instanceof Outcome.Permanent) {
                     topicCooldown.succeeded(records.get(i).topic());
                     if (partition != null) {
@@ -710,8 +712,9 @@ public final class KafkaOutboxSender implements AutoCloseable {
 
         /**
          * Records the failure and marks the call closed in one step, so the caller never sees the outcome without the
-         * close and never pools the producer. The record's own failure is one the I/O thread reports before our close
-         * (after it, an abort); one thrown on the caller thread cools nothing.
+         * close and never pools the producer. The record's own failure is one the I/O thread reports before our close,
+         * or a {@code Permanent} one after it: an abort is never {@code Permanent}, so that is the broker's refusal of a
+         * record whose batch-mate ahead of it closed the call. One thrown on the caller thread cools nothing.
          */
         void failed(int i, Exception e, @Nullable RecordMetadata kafka) {
             boolean closeProducer;
@@ -719,7 +722,9 @@ public final class KafkaOutboxSender implements AutoCloseable {
                 if (e instanceof TimeoutException && Thread.currentThread() != caller && !closed) {
                     stall(i, kafka); // a batch expired
                 }
-                record(i, outcome(e), !closed && Thread.currentThread() != caller, kafka);
+                var outcome = outcome(e);
+                record(i, outcome, Thread.currentThread() != caller
+                        && (!closed || outcome instanceof Outcome.Permanent), kafka);
                 closeProducer = markClosed("an earlier send failed: " + e);
                 if (closeProducer) {
                     closedBy = e;
@@ -730,8 +735,14 @@ public final class KafkaOutboxSender implements AutoCloseable {
             }
         }
 
+        /** See {@link Sent}; read once the call {@link #await}ed its started records. */
         synchronized boolean closedByRefusal() {
-            return closedBy != null && outcome(closedBy) instanceof Outcome.Permanent;
+            for (int i = 0; closedBy != null && i < started; i++) {
+                if (ownFailure[i] && outcomes[i] instanceof Outcome.Permanent) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         /** Idempotent. Callers must not hold this monitor: closing from the caller joins the I/O thread. */
@@ -772,9 +783,13 @@ public final class KafkaOutboxSender implements AutoCloseable {
             return true;
         }
 
-        /** True once every started record completed or the call closed; false on deadline or interrupt (flag kept). */
+        /**
+         * True once every started record completed or the call closed; false on deadline or interrupt (flag kept). A
+         * call closed by a failure waits for the rest of its records: the close aborts them at once, and the records of
+         * the failed batch behind the one that closed it bring their own answers (a refusal among them).
+         */
         synchronized boolean await(long deadlineNanos) {
-            while (pending > 0 && !closed) {
+            while (pending > 0 && (!closed || closedBy != null)) {
                 long left = deadlineNanos - System.nanoTime();
                 if (left <= 0) {
                     return false;
