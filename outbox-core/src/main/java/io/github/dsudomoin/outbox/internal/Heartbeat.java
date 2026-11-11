@@ -95,13 +95,14 @@ public final class Heartbeat {
 
     /**
      * A beat's statements wait at most {@link Maintenance#SHARDS_LOCK_TIMEOUT} for a lock, so one still silent after an
-     * interval is lost, and waiting {@code networkTimeout} for it would let the row expire and the guards go stale.
+     * interval is lost, and waiting {@code networkTimeout} or the source's longer {@code socketTimeout} for it would let
+     * the row expire and the guards go stale.
      */
     static SocketBound socketBound(OutboxConfig config) {
         var interval = config.partitions().maintenanceInterval();
         var bound = interval.compareTo(BEAT_BOUND_FLOOR) < 0 ? BEAT_BOUND_FLOOR : interval;
         var networkTimeout = config.networkTimeout();
-        return new SocketBound(networkTimeout.compareTo(bound) < 0 ? networkTimeout : bound);
+        return SocketBound.atMost(networkTimeout.compareTo(bound) < 0 ? networkTimeout : bound);
     }
 
     /** {@code <host>/<pid>/<8 hex>}, new on every call. */

@@ -502,6 +502,28 @@ class NetworkBlackholeIT {
     }
 
     @Test
+    void aBeatOnASourceWithALongSocketTimeoutIsCutAtItsBound() throws Exception {
+        var config = new TestOutboxConfig().maintenanceInterval(Duration.ofSeconds(1)); // the beat's bound is 10 s
+        var armed = new AtomicBoolean();
+        var source = intercepting(pool(throughTheHole(3, 60)), (c, call, args) -> {
+            if (call.getName().equals("prepareStatement") && Thread.currentThread().getName().equals("outbox-heartbeat")
+                    && armed.compareAndSet(true, false)) {
+                hole.forget(); // mid-beat, past the borrow's validation
+            }
+        });
+        var relay = OutboxRuntime.builder(config, new JdbcTransactions(DIRECT), record -> {})
+                .heartbeatConnections(source::getConnection).build();
+        closing.add(relay);
+        relay.start();
+        var names = relay.schema().names();
+        armed.set(true);
+        await(() -> !armed.get());
+
+        long seen = lastSeen(names.instance(), relay);
+        await(Duration.ofSeconds(20), () -> lastSeen(names.instance(), relay) > seen); // not the 60 s socketTimeout
+    }
+
+    @Test
     void aBeatCutBeforeItsCommitDoesNotHoldTheInstancesRow() throws Exception {
         var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(1))
                 .maintenanceInterval(Duration.ofMillis(100));

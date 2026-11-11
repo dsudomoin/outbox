@@ -19,7 +19,8 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  *     no other instance runs.
  * @param networkTimeout how long the library's own connections wait on a silent socket, when they have no such bound
  *     of their own (pgjdbc's default socketTimeout = 0): the start, relay workers, drain(), maintenance, the
- *     dead-letter pass, the heartbeat and admin calls. 0: no bound from here. Default 5 min.
+ *     dead-letter pass, the heartbeat (at most its interval, at least 10 s, even under a longer socketTimeout) and
+ *     admin calls. 0: no bound from here. Default 5 min.
  * @param relay the relay that hands the outbox's records to the handlers.
  * @param partitions the outbox table's partitions.
  * @param inbox the inbox table that deduplicates handled messages.

@@ -16,7 +16,8 @@ import org.slf4j.LoggerFactory;
  * knows of the statement: most have no reason to last, and get this bound; one under a {@code statement_timeout} of the
  * library's gets that long instead ({@link #atLeast}), as the server ends it by then and answers; and the one without
  * any, the concurrent build of the dead table's index, gets none, and {@link DeadIndexBuilder} asks the database whether
- * its backend still runs it. A bound the connection has of its own (the DataSource's {@code socketTimeout}) stands.
+ * its backend still runs it. A bound the connection has of its own (the DataSource's {@code socketTimeout}) stands,
+ * but for the heartbeat's ({@link #atMost}).
  */
 public final class SocketBound {
 
@@ -28,34 +29,49 @@ public final class SocketBound {
     private static final AtomicBoolean WARNED = new AtomicBoolean();
 
     private final int millis;
+    private final boolean atMost;
 
     /** {@code timeout}: zero for none, at most {@link Integer#MAX_VALUE} ms, as the config check says. */
     public SocketBound(Duration timeout) {
+        this(timeout, false);
+    }
+
+    private SocketBound(Duration timeout, boolean atMost) {
         this.millis = (int) timeout.toMillis();
+        this.atMost = atMost;
     }
 
     /**
-     * The bound on {@code c}, unless it has one of its own; closing the result takes it back, before {@code c} goes back
+     * {@code timeout} on a connection also when its own bound is longer, given back after: the heartbeat's, whose row
+     * would expire while it waits out a {@code socketTimeout} set above the service's longest statement.
+     */
+    static SocketBound atMost(Duration timeout) {
+        return new SocketBound(timeout, true);
+    }
+
+    /**
+     * The bound on {@code c}, unless it has one of its own (shorter, for {@link #atMost}); closing the result takes it back, before {@code c} goes back
      * to whichever pool it came from, where another user may run a longer statement. Neither call goes to the database.
      * A connection that does not take it still works: a WARN, once.
      */
     public Held on(Connection c) {
         if (millis == 0) {
-            return new Held(c, false);
+            return new Held(c, false, 0);
         }
         try {
-            if (c.getNetworkTimeout() != 0) {
-                return new Held(c, false);
+            int prior = c.getNetworkTimeout();
+            if (prior != 0 && (!atMost || prior <= millis)) {
+                return new Held(c, false, 0);
             }
             c.setNetworkTimeout(Runnable::run, millis);
-            return new Held(c, true);
+            return new Held(c, true, prior);
         } catch (SQLException | RuntimeException e) {
             if (WARNED.compareAndSet(false, true)) {
                 log.warn("outbox.networkTimeout could not be set on a connection of the library ({}), so a"
                         + " connection the network drops silently holds its thread until the OS closes the socket; give"
                         + " the DataSource a socketTimeout. Logged once", e.toString());
             }
-            return new Held(c, false);
+            return new Held(c, false, 0);
         }
     }
 
@@ -64,17 +80,19 @@ public final class SocketBound {
 
         private final Connection c;
         private final boolean bound;
+        private final int prior;
 
-        private Held(Connection c, boolean bound) {
+        private Held(Connection c, boolean bound, int prior) {
             this.c = c;
             this.bound = bound;
+            this.prior = prior;
         }
 
         @Override
         public void close() {
             if (bound) {
                 try {
-                    c.setNetworkTimeout(Runnable::run, 0);
+                    c.setNetworkTimeout(Runnable::run, prior);
                 } catch (SQLException | RuntimeException e) {
                     log.debug("outbox could not take back the network timeout of a connection", e);
                 }

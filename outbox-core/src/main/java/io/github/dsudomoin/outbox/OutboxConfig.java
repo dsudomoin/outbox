@@ -32,7 +32,7 @@ public interface OutboxConfig {
      * they have no such bound of their own, as pgjdbc's default {@code socketTimeout = 0}: a connection the network
      * dropped silently fails after this, and its thread goes on with a new one. Zero: no bound from here. On the
      * start, relay workers, {@code drain()}, maintenance, the dead-letter pass, the heartbeat (at most an interval, at least
-     * 10 s) and admin calls. A statement under a {@code statement_timeout} of the library's gets that long instead,
+     * 10 s, which also cuts a longer {@code socketTimeout} of its connections) and admin calls. A statement under a {@code statement_timeout} of the library's gets that long instead,
      * and the concurrent build of the dead table's index has no bound: its thread asks the database. A step, or a
      * cleanup, that outlives it fails and is tried again. An application's transactions it cannot bound.
      */
