@@ -228,8 +228,9 @@ public final class KafkaOutboxSender implements AutoCloseable {
 
     /**
      * One outcome per record, in list order. Records never handed to Kafka (after a failure closed the
-     * producer, after an interrupt or past the deadline) are {@code NotAttempted}. Honours interrupts: returns early
-     * and keeps the flag.
+     * producer, after an interrupt or past the deadline) are {@code NotAttempted}, and so are records that failed only
+     * because the broker refused another record of the call for good: they spend no attempt. Honours interrupts:
+     * returns early and keeps the flag.
      */
     public List<Outcome> send(List<OutboxRecord> records) {
         return sendAndReport(records).outcomes();
@@ -480,6 +481,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
         var notSent = Outcome.notAttempted();
         Outcome unfinished = null;
         synchronized (call) {
+            boolean refusal = call.closedByRefusal();
             for (int i = 0; i < partitions.length; i++) {
                 var outcome = call.outcomes[i];
                 if (outcome == null && i >= call.started) {
@@ -489,6 +491,13 @@ public final class KafkaOutboxSender implements AutoCloseable {
                         unfinished = Outcome.retry(new KafkaException("not acknowledged: " + call.closeReason));
                     }
                     outcome = unfinished;
+                }
+                // records that failed only because the broker refused another one cost no attempt: the ones the close
+                // aborted or left unacked, and a batch-mate ahead of the refused record, which Kafka fails first with a
+                // generic KafkaException (Sender.java:806-822)
+                if (refusal && outcome instanceof Outcome.Retry retry
+                        && (!call.ownFailure[i] || retry.error().getClass() == KafkaException.class)) {
+                    outcome = notSent;
                 }
                 result.add(outcome);
                 var partition = partitions[i] != null ? partitions[i] : call.partitionChosenByKafka(i);

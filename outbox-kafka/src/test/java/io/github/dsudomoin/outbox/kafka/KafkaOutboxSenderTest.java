@@ -388,8 +388,29 @@ class KafkaOutboxSenderTest {
 
         var outcomes = result.get(5, SECONDS);
         assertThat(outcomes.get(0)).isInstanceOf(Outcome.Permanent.class);
-        assertThat(outcomes.get(1)).isInstanceOf(Outcome.Retry.class);
+        assertThat(outcomes.get(1)).as("aborted by the refusal's close: no attempt")
+                .isInstanceOf(Outcome.NotAttempted.class);
         assertThat(producer.closed()).isTrue();
+    }
+
+    /**
+     * A record the broker refuses closes the producer and fails the records in flight with it, of any key: those were
+     * not refused, so the relay must not charge them an attempt for it.
+     */
+    @Test
+    void aBrokerRefusalChargesNoBatchMate() throws Exception {
+        var handler = sender(DELIVERY_TIMEOUT).handler();
+        var result = executor.submit(() -> handler.handleBatch(List.of(record(1, "a"), record(2, "poison"),
+                record(3, "c"))));
+        var producer = awaitSent(0, 3);
+        producer.completeNext();
+        producer.errorNext(new RecordTooLargeException("broker says too large"));
+
+        assertThat(result.get(5, SECONDS)).satisfiesExactly(
+                o -> assertThat(o).isEqualTo(Outcome.delivered()),
+                o -> assertThat(o).isInstanceOfSatisfying(Outcome.Permanent.class,
+                        p -> assertThat(p.error()).isInstanceOf(RecordTooLargeException.class)),
+                o -> assertThat(o).isInstanceOf(Outcome.NotAttempted.class));
     }
 
     /**
@@ -397,7 +418,8 @@ class KafkaOutboxSenderTest {
      * splits it into the same batch until {@code delivery.timeout.ms}. The records of its partition unacknowledged
      * then are remembered, the batch-mates the close aborted too (the call returns before Kafka fails them). A call
      * that holds one goes through the unbatched pool, where each record is a producer batch of its own: a refused one
-     * fails on its own, as Permanent, and closes the producer as any refusal does. Settled, delivered or refused, they
+     * fails on its own, as Permanent, and closes the producer as any refusal does; the records it aborts are
+     * NotAttempted. Settled, delivered or refused, they
      * are forgotten; once none is left the unbatched producers are closed and calls batch again.
      */
     @Test
@@ -421,7 +443,7 @@ class KafkaOutboxSenderTest {
                 o -> assertThat(o).isEqualTo(Outcome.delivered()),
                 o -> assertThat(o).isInstanceOfSatisfying(Outcome.Permanent.class,
                         p -> assertThat(p.error()).isInstanceOf(RecordTooLargeException.class)),
-                o -> assertThat(o).isInstanceOf(Outcome.Retry.class));
+                o -> assertThat(o).isInstanceOf(Outcome.NotAttempted.class));
 
         var third = sendAsync(sender, List.of(other)); // aborted, not settled: still remembered
         var next = awaitSent(2, 1);
@@ -464,7 +486,8 @@ class KafkaOutboxSenderTest {
     /**
      * The broker refuses a record behind a valid batch-mate: Kafka fails the batch-mate first, with a generic
      * {@link KafkaException} that closes the call, and the refusal comes after it. The refusal still shows that the
-     * partition answers and ends the cooldown; the call waits for it, so it is {@code Permanent}.
+     * partition answers and ends the cooldown; the call waits for it, so it is {@code Permanent}, and the batch-mate,
+     * which failed for it alone, is {@code NotAttempted}.
      */
     @Test
     void brokerRefusalBehindABatchMateEndsThePartitionsCooldown() throws Exception {
@@ -478,7 +501,8 @@ class KafkaOutboxSenderTest {
         var probe = sendAsync(sender, List.of(record(2, keyOnPartition(0, "a")), record(3, keyOnPartition(0, "b"))));
         ((TestProducer) awaitSent(1, 2)).failBatch(1);
         assertThat(probe.get(5, SECONDS)).satisfiesExactly(
-                o -> assertThat(o).isInstanceOf(Outcome.Retry.class),
+                o -> assertThat(o).as("failed for its batch-mate: no attempt")
+                        .isInstanceOf(Outcome.NotAttempted.class),
                 o -> assertThat(o).isInstanceOfSatisfying(Outcome.Permanent.class,
                         p -> assertThat(p.error()).isInstanceOf(InvalidRecordException.class)));
 
