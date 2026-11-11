@@ -330,13 +330,16 @@ public final class PgOutboxAdmin implements OutboxAdmin {
      * ({@link XidRecovery#recover}), whatever {@code outbox.recovery} says. Once it committed the call no longer fails:
      * the INFO line, then this instance's halt refreshed ({@link Maintenance#checkHalt}), so the relay woken resumes
      * at once (other instances resume at their next maintenance run); a failure of that refresh, or of releasing the
-     * lock and the session setting, is a WARN, and the relay is woken whatever happens.
+     * lock and the session setting, is a WARN, and the relay is woken whatever happens. A commit that fails may still
+     * have gone through on the server ({@link #recoveredAfterAll}): when a read on a new connection finds the recovery
+     * done, the call goes on as committed and returns -1, the count unknown; otherwise it fails with "outcome unknown".
      */
     @Override
     public long recoverXidRegression() {
         requireOwnTransactions();
         var call = "recoverXidRegression()";
         var recovering = new AtomicBoolean();
+        var committing = new AtomicBoolean();
         var sent = new AtomicLong(-1); // the rows re-sent, once the recovery committed
         Exception cleanup = null;
         try (var c = ddl.newConnection(); var bound = socket.on(c)) {
@@ -349,11 +352,20 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                             + ") and " + names.halt() + " holds no row");
                 }
                 recovering.set(true);
-                sent.set(recovery.recover(c));
+                sent.set(recovery.recover(c, committing));
                 return null;
             });
         } catch (SQLException | RuntimeException e) {
-            if (sent.get() < 0) {
+            if (sent.get() < 0 && committing.get() && !recoveredAfterAll(e)) {
+                log.warn("outbox admin {} on {} failed at its commit, outcome unknown: call again; a repeat is refused"
+                        + " with \"no xid regression to recover\" if it committed: {}", call, names.base(),
+                        printable(e.toString()));
+                wakeRelay.run(); // in case it committed
+                throw new IllegalStateException("the xid-regression recovery of " + names.base() + " failed at its"
+                        + " commit, outcome unknown, call again: a repeat is refused with \"no xid regression to"
+                        + " recover\" if it committed", e);
+            }
+            if (sent.get() < 0 && !committing.get()) {
                 // refused, nothing changed: maintenance running, no regression, or a transaction-pooled connection
                 boolean refused = e instanceof IllegalStateException && !recovering.get();
                 if (!refused) {
@@ -365,8 +377,14 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             cleanup = e; // after the commit: releasing the maintenance lock, the session setting or the connection
         }
         try {
-            log.info("outbox admin {} on {} returned {}, the rows re-sent", call, names.base(), sent.get());
-            if (cleanup != null) {
+            if (sent.get() < 0) {
+                log.info("outbox admin {} on {} returned -1: its commit failed ({}), but a read on a new connection"
+                        + " found the recovery done; how many rows it re-sent is unknown", call, names.base(),
+                        printable(cleanup.toString()));
+            } else {
+                log.info("outbox admin {} on {} returned {}, the rows re-sent", call, names.base(), sent.get());
+            }
+            if (cleanup != null && sent.get() >= 0) {
                 log.warn("outbox admin {} on {}: the recovery committed, then releasing the maintenance lock,"
                         + " giving idle_session_timeout back or closing the connection failed: {}", call, names.base(),
                         printable(cleanup.toString()));
@@ -382,6 +400,29 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             wakeRelay.run();
         }
         return sent.get();
+    }
+
+    /**
+     * After the recovery's commit failed: whether a read on a new connection finds no regression and no halt row, so
+     * the commit went through (or another recovery ran since). A {@code lock_timeout} of 5 s bounds it: a session
+     * whose reply was lost may still hold the recovery's locks. False, its failure added to {@code failure}, when the
+     * read fails.
+     */
+    private boolean recoveredAfterAll(Exception failure) {
+        try (var c = ddl.newConnection(); var bound = socket.on(c)) {
+            c.setAutoCommit(false);
+            try (var st = c.createStatement()) {
+                st.execute("set local lock_timeout = 5000");
+                var check = recovery.check(c);
+                return check.current() >= check.tickXmax() && check.recorded() == null;
+            } finally {
+                c.rollback();
+                c.setAutoCommit(true);
+            }
+        } catch (SQLException | RuntimeException e) {
+            failure.addSuppressed(e);
+            return false;
+        }
     }
 
     /**

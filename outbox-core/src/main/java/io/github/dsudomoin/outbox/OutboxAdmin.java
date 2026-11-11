@@ -80,13 +80,16 @@ public interface OutboxAdmin {
      * back. Runs as no maintenance run or other recovery call does at the same time: waits up to 60 s for one in
      * progress, then fails with {@link IllegalStateException}
      * "maintenance or another outbox admin recovery call is running, retry". Once the recovery committed the call
-     * returns the rows re-sent, and a failure after it is a WARN. Wakes the relay.
+     * returns the rows re-sent, and a failure after it is a WARN. A failed commit may still have gone through: when a
+     * read on a new connection then finds the recovery done, the call returns -1, the count unknown. Wakes the relay.
      *
      * @throws IllegalStateException "no xid regression to recover" when the xid counter is at or above every tick's
      *     xmax and no halt is recorded; "outbox.shards = N but ... cursors for M shards" when the shard count changed
      *     since the cursors were made: calling again does not help until {@code outbox.shards} is set back to M; "the
      *     detach of ... became pending" when someone began a partition detach while the call ran: calling again
-     *     retries, finishing it first
+     *     retries, finishing it first; "... failed at its commit, outcome unknown, call again" when the commit failed
+     *     and the recovery is not found done: a repeat recovers, or is refused with "no xid regression to recover"
+     *     if the commit went through after all
      */
     long recoverXidRegression();
 

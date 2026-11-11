@@ -55,7 +55,7 @@ curl -s -H "$KEY" -H "$JSON" -d '{"filter":{"topic":"orders","error":"timeout"}}
 curl -s -H "$KEY" -H "$JSON" -d '{"ids":[1003]}' $API/dead-letters/discard
 curl -s -X POST -H "$KEY" "$API/orphans/outbox_x83886080/restore?fromXid=83900000"
 curl -s -X POST -H "$KEY" $API/recovery/stranded-shards                         # {"count": N}
-curl -s -X POST -H "$KEY" $API/recovery/xid-regression
+curl -s -X POST -H "$KEY" $API/recovery/xid-regression                         # {"count": N}; -1: commit failed, recovery found done
 curl -s -H "$KEY" -H "$JSON" -d '{"topic":"orders","reason":"v2 rolled back for good","dryRun":true}' \
     $API/waiting/abandon                                                       # {"keys":3,"records":5}
 curl -s -H "$KEY" -H "$JSON" -d '{"topic":"orders","key":"order-42","reason":"handler bug, TASK-1","dryRun":true}' \
@@ -65,7 +65,7 @@ curl -s -H "$KEY" -H "$JSON" -d '{"topic":"orders","key":"order-42","reason":"ha
 - 200 with JSON (changing calls: `{"count": N}`; `waiting/abandon`, `keys/abandon`: `{"keys": N, "records": M}`); 400 rejected input
   (unknown or repeated field, so a mistyped `key` or a second `"key": null` never widens an abandon; over 1 000 `ids`, empty filter, not an orphan, blank
   `topic` or `reason`; in `keys/abandon` not exactly one of `key` and `messageId`, or the `messageId` of a keyed record, or a body with no `Content-Type`); 401 / 403 from the authorizer; 415 a body that is not `application/json`; 409 not now (maintenance or another recovery call running, or a relay step holding the
-  shard past `batchTimeout` + 5 s: retry; no xid regression); 500 otherwise. Every error body is `{"message": "..."}`.
+  shard past `batchTimeout` + 5 s: retry; no xid regression; an xid recovery whose commit failed, «outcome unknown»: call again, a repeat that finds it committed gets «no xid regression»); 500 otherwise. Every error body is `{"message": "..."}`.
 - Decide by a credential sent on purpose (a header), not a cookie. A non-GET/HEAD call gets 403 before the authorizer
   when `Sec-Fetch-Site` is other than `same-origin`/`none`, or, with no `Sec-Fetch-Site` (browsers send none on plain
   HTTP to a non-localhost address), when `Origin` is `null` or another host:port than the request's `Host` (the scheme

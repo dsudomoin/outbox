@@ -241,10 +241,11 @@ paths:
       summary: Runs the xid-regression recovery now, whatever outbox.recovery says
       description: >-
         Re-sends the rows the relay may not have delivered, in one transaction, as new messages with the same message
-        ids. Answers 409 when there is no regression to recover, or when a maintenance run held the lock for 60 s.
+        ids. Answers 409 when there is no regression to recover, when a maintenance run held the lock for 60 s, or
+        when the commit failed and the recovery is not found done (outcome unknown: call again).
       responses:
         '200':
-          description: How many rows were re-sent
+          description: How many rows were re-sent; -1 when the commit failed but the recovery is found done
           content:
             application/json:
               schema:

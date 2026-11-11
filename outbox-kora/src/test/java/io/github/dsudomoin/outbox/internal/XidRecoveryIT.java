@@ -991,6 +991,59 @@ class XidRecoveryIT {
         assertThat(maintenance.runOnce()).as("the maintenance lock went with the session").isTrue();
     }
 
+    /** The commit went through but its reply was lost: a read on a new connection finds the recovery done. */
+    @Test
+    void adminFindsTheRecoveryDoneWhenItsCommitGotNoReply() throws Exception {
+        config.xidRegression("halt");
+        bootstrap();
+        send(outbox(null), messages("m", 5));
+        forgeRegression();
+        var maintenance = maintenance();
+        assertThat(maintenance.runOnce()).isTrue();
+        assertThat(maintenance.halted()).isTrue();
+        var admin = new PgOutboxAdmin(new KoraOutboxTransactions(TestDb.killedInCommit(db, true)), names, config,
+                maintenance, wakes::incrementAndGet);
+
+        try (var err = new CapturedStderr()) {
+            assertThat(admin.recoverXidRegression()).as("the count is unknown").isEqualTo(-1);
+
+            assertThat(err.text()).contains("INFO").contains("returned -1").contains("An I/O error occurred")
+                    .doesNotContain("nothing re-sent");
+        }
+        assertThat(maintenance.halted()).as("this instance resumes at once").isFalse();
+        assertThat(wakes).hasValue(1);
+        assertThat(haltRows()).isZero();
+        assertThat(count(names.base())).isEqualTo(5);
+    }
+
+    /** The session died before the commit: the halt stays, the call says to call again, and calling again recovers. */
+    @Test
+    void adminSaysCallAgainWhenItsCommitFailedAndTheRecoveryIsNotFoundDone() throws Exception {
+        config.xidRegression("halt");
+        bootstrap();
+        send(outbox(null), messages("m", 5));
+        forgeRegression();
+        var maintenance = maintenance();
+        assertThat(maintenance.runOnce()).isTrue();
+        var admin = new PgOutboxAdmin(new KoraOutboxTransactions(TestDb.killedInCommit(db, false)), names, config,
+                maintenance, wakes::incrementAndGet);
+
+        try (var err = new CapturedStderr()) {
+            assertThatThrownBy(admin::recoverXidRegression).isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("outcome unknown, call again")
+                    .cause().as("the commit's failure, not the cleanup's after it").isInstanceOf(SQLException.class)
+                    .extracting(e -> ((SQLException) e).getSQLState()).isNotEqualTo("08003");
+
+            assertThat(err.text()).contains("WARN").contains("outcome unknown").doesNotContain("nothing re-sent");
+        }
+        assertThat(wakes).hasValue(1);
+        assertThat(haltRows()).isOne();
+        assertThat(maintenance.halted()).isTrue();
+
+        assertThat(admin(maintenance).recoverXidRegression()).isEqualTo(5);
+        assertThat(maintenance.halted()).isFalse();
+    }
+
     @Test
     void adminReturnsTheRowsWhenReadingTheHaltAgainFails() throws Exception {
         bootstrap();

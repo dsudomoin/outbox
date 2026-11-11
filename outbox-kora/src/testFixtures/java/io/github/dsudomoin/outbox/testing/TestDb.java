@@ -224,6 +224,19 @@ public final class TestDb {
      * goes through, then the backend is terminated, and waited for until gone, so the next statement fails.
      */
     public static JdbcConnectionFactory killedAfterCommit(JdbcConnectionFactory db) {
+        return killedAtCommit(db, true, false);
+    }
+
+    /**
+     * {@code db} whose new connections lose their server session in their first {@code commit()}, which fails: when
+     * {@code committed}, the commit goes through and then fails with SQLState 08006 as when its reply is lost;
+     * otherwise the backend is terminated first, so the commit fails as the driver reports it.
+     */
+    public static JdbcConnectionFactory killedInCommit(JdbcConnectionFactory db, boolean committed) {
+        return killedAtCommit(db, committed, true);
+    }
+
+    private static JdbcConnectionFactory killedAtCommit(JdbcConnectionFactory db, boolean commits, boolean fails) {
         return new JdbcConnectionFactory() {
             @Override
             public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
@@ -255,7 +268,9 @@ public final class TestDb {
                         rs.next();
                         pid = rs.getInt(1);
                     }
-                    c.commit();
+                    if (commits) {
+                        c.commit();
+                    }
                     try (var other = connect(); var st = other.createStatement()) {
                         st.execute("select pg_terminate_backend(" + pid + ")");
                         long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
@@ -272,6 +287,11 @@ public final class TestDb {
                             }
                             Thread.sleep(5);
                         }
+                    }
+                    if (!commits) {
+                        c.commit();
+                    } else if (fails) {
+                        throw new SQLException("An I/O error occurred while sending to the backend.", "08006");
                     }
                     return Boolean.TRUE; // non-null: the delegate's commit is not called again
                 });

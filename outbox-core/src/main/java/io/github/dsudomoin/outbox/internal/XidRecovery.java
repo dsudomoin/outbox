@@ -10,6 +10,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import io.github.dsudomoin.outbox.internal.Sql.SqlConsumer;
@@ -286,10 +287,18 @@ public final class XidRecovery {
      *     finishes it first
      */
     public long recover(Connection autocommit) throws SQLException {
-        return SocketBound.atLeast(autocommit, timeout, () -> recoverBounded(autocommit));
+        return recover(autocommit, new AtomicBoolean());
     }
 
-    private long recoverBounded(Connection autocommit) throws SQLException {
+    /**
+     * {@link #recover(Connection)}, setting {@code committing} right before the commit: a failure from there on may
+     * come after the server committed.
+     */
+    long recover(Connection autocommit, AtomicBoolean committing) throws SQLException {
+        return SocketBound.atLeast(autocommit, timeout, () -> recoverBounded(autocommit, committing));
+    }
+
+    private long recoverBounded(Connection autocommit, AtomicBoolean committing) throws SQLException {
         var c = autocommit;
         outboxLocked = false;
         partitions.finishPendingDetach(c, LOCK_TIMEOUT, LOCK_TIMEOUT);
@@ -298,6 +307,7 @@ public final class XidRecovery {
         }
         long sent;
         long deadline = System.nanoTime() + timeout.toNanos();
+        Throwable failure = null;
         c.setAutoCommit(false);
         try (var st = c.createStatement()) {
             st.execute("set transaction isolation level read committed"); // first: before any statement of the tx
@@ -388,8 +398,10 @@ public final class XidRecovery {
                     + " order by created_at, id");
             timeLeft(st, deadline);
             st.execute("drop table " + holding);
+            committing.set(true);
             c.commit();
         } catch (Throwable e) { // an Error too: setAutoCommit(true) below would commit the work so far
+            failure = e;
             try {
                 c.rollback();
             } catch (SQLException cleanup) { // a terminated session, its transaction gone with it
@@ -397,7 +409,14 @@ public final class XidRecovery {
             }
             throw e;
         } finally {
-            c.setAutoCommit(true);
+            try {
+                c.setAutoCommit(true);
+            } catch (SQLException e) { // a dead session: keep the cause
+                if (failure == null) {
+                    throw e;
+                }
+                failure.addSuppressed(e);
+            }
         }
         return sent;
     }
