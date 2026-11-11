@@ -200,6 +200,8 @@ public final class XidPartitions {
     private final String markDropping;
     private final String unmarkDropping;
     private final String deleteStaleMarkers;
+    private final String markOversized;
+    private final String clearOversized;
     private final long size;
     private final int premake;
     private final Duration swapLockTimeout;
@@ -217,8 +219,9 @@ public final class XidPartitions {
     private volatile ZonedDateTime cutUntil;
     private volatile long cutBytes;
     /**
-     * When the hot tail over maxTailScan this instance sees is stuck ({@link #tailStuck}): the end of the first whole
-     * window after it was first seen, then at once when there is no window; null while there is no such tail.
+     * When the hot tail over maxTailScan is stuck ({@link #tailStuck}): the end of the first whole window after any
+     * instance first saw it ({@code tail_oversized_since} of the maintenance table), then at once when there is no
+     * window; null while there is no such tail.
      */
     @Nullable
     private volatile ZonedDateTime stuckAt;
@@ -285,6 +288,11 @@ public final class XidPartitions {
         this.deleteStaleMarkers = "delete from " + names.dropping() + " d where not exists (select 1 from pg_class c"
                 + " where c.relname = d.table_name"
                 + " and c.relnamespace = (select p.relnamespace from pg_class p where p.oid = to_regclass(?)))";
+        // in the database, so a restart or another instance counts from the fleet's first sighting, not its own
+        this.markOversized = "update " + names.maintenance() + " set tail_oversized_since"
+                + " = coalesce(tail_oversized_since, ?) returning tail_oversized_since";
+        this.clearOversized = "update " + names.maintenance() + " set tail_oversized_since = null"
+                + " where tail_oversized_since is not null";
         this.size = cfg.xidsPerPartition();
         this.premake = cfg.premake();
         this.swapLockTimeout = cfg.swapLockTimeout();
@@ -368,7 +376,9 @@ public final class XidPartitions {
             if (!due && !(s.ahead < premake && PartitionDdl.attachment(c, names.base(),
                     names.partitionPrefix() + s.tailLower) == Attachment.STANDALONE)) {
                 overflow = false;
-                stuckAt = null;
+                if (stuckAt != null) {
+                    notOversized(c);
+                }
                 return;
             }
             boolean rows = PartitionDdl.hasRows(c, names.tail());
@@ -380,7 +390,7 @@ public final class XidPartitions {
             String blocker;
             try {
                 if (!rows && s.current + size <= s.tailLower) {
-                    stuckAt = null;
+                    notOversized(c);
                     blocker = extend(c, s, target, quiesceTimeout);
                 } else if (!bootstrap) { // rows may reach the tail any moment: it becomes a range, holding them
                     blocker = heal(c, s, floor + 2 * size, quiesceTimeout);
@@ -404,7 +414,7 @@ public final class XidPartitions {
             return;
         }
         overflow = false;
-        stuckAt = null;
+        notOversized(c);
         // the first ranges start at the oldest running transaction's: it holds an xid already, and may send once they
         // exist, as a request on an instance that started earlier would when another makes the table
         long from = s.upper == null ? Math.floorDiv(s.oldest, size) * size : s.upper;
@@ -499,10 +509,11 @@ public final class XidPartitions {
         long bytes = relationSize(c, names.tail());
         boolean oversized = bytes > maxTailScan;
         if (!oversized) {
-            stuckAt = null;
-        } else if (stuckAt == null) { // the window it is first seen in may be mostly over: the next whole one
-            stuckAt = window == null ? now
-                    : window.contains(now.toLocalTime()) ? window.endAfter(window.endAfter(now)) : window.endAfter(now);
+            notOversized(c);
+        } else { // the window it is first seen in may be mostly over: the next whole one
+            var seen = oversizedSince(c, now);
+            stuckAt = window == null ? seen
+                    : window.endAfter(window.contains(seen.toLocalTime()) ? window.endAfter(seen) : seen);
         }
         if (oversized && !oversizedNow(now)) {
             if (cutUntil == null && due(largeLogged, STUCK_LOG_INTERVAL)) { // in a window that did not fit: said
@@ -556,7 +567,7 @@ public final class XidPartitions {
             if (reason == null) {
                 overflow = false;
                 cutUntil = null;
-                stuckAt = null;
+                notOversized(c);
             }
             return reason == null || reason.isEmpty() ? null : reason;
         } catch (SQLException e) {
@@ -595,6 +606,25 @@ public final class XidPartitions {
 
     private static String firstLine(@Nullable String message) {
         return message == null ? "" : message.lines().findFirst().orElse("");
+    }
+
+    /** When any instance first saw the tail over maxTailScan, {@code now} when none had: recorded then. */
+    private ZonedDateTime oversizedSince(Connection c, ZonedDateTime now) throws SQLException {
+        try (var ps = c.prepareStatement(markOversized)) {
+            ps.setObject(1, now.toOffsetDateTime());
+            try (var rs = ps.executeQuery()) { // no row before bootstrap's: this instance's own sighting, as it was
+                var seen = rs.next() ? rs.getObject(1, java.time.OffsetDateTime.class) : null;
+                return seen == null ? now : seen.atZoneSameInstant(now.getZone());
+            }
+        }
+    }
+
+    /** The tail is not over maxTailScan, or no longer the one seen so: nothing stuck, for every instance. */
+    private void notOversized(Connection c) throws SQLException {
+        stuckAt = null;
+        try (var st = c.createStatement()) {
+            st.executeUpdate(clearOversized);
+        }
     }
 
     static long relationSize(Connection c, String table) throws SQLException {

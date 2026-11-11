@@ -163,6 +163,7 @@ CREATE TABLE accounts.account_events_halt (
 CREATE TABLE accounts.account_events_maintenance (
     id integer NOT NULL DEFAULT 1,
     succeeded_at timestamptz NOT NULL,
+    tail_oversized_since timestamptz,
     PRIMARY KEY (id),
     CHECK (id = 1)
 );

@@ -1273,10 +1273,15 @@ class XidPartitionsIT {
                 .tailConversion("03:00-05:00", Duration.ofMillis(1));
         var names = bootstrap(config);
         var outside = new XidPartitions(names, config.partitions());
-        var inside = new XidPartitions(names, config.partitions());
+        // its own table: the first sighting is the fleet's, so on one table it would be outside's
+        var insideConfig = new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(0)
+                .tailConversion("03:00-05:00", Duration.ofMillis(1));
+        var insideNames = bootstrap(insideConfig);
+        var inside = new XidPartitions(insideNames, insideConfig.partitions());
 
         try (var c = TestDb.connect()) {
             overflowTail(c, names, 600_000);
+            overflowTail(c, insideNames, 600_000);
             outside.clock = at(1, 0);
             ensurePremadeAsMaintenance(outside, c);
             assertThat(outside.tailStuck()).as("before its first window").isFalse();
@@ -1300,6 +1305,42 @@ class XidPartitionsIT {
             execute(c, "truncate " + names.tail());
             ensurePremadeAsMaintenance(outside, c);
             assertThat(outside.tailStuck()).as("no longer over maxTailScan").isFalse();
+        }
+    }
+
+    /**
+     * When the tail was first seen over maxTailScan is kept in the database: an instance started later, as after a
+     * restart inside the window, or one more pod, counts from it and not from its own first sighting, so it does not
+     * keep {@code since_success} fresh. Once the tail is no longer over maxTailScan the moment is cleared.
+     */
+    @Test
+    void anOversizedTailIsStuckOnAnInstanceThatFirstSeesItLater() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(0)
+                .tailConversion("03:00-05:00", Duration.ofMillis(1));
+        var names = bootstrap(config);
+        var first = new XidPartitions(names, config.partitions());
+
+        try (var c = TestDb.connect()) {
+            overflowTail(c, names, 600_000);
+            first.clock = at(1, 0);
+            ensurePremadeAsMaintenance(first, c);
+            var restarted = new XidPartitions(names, config.partitions());
+            restarted.clock = at(3, 30);
+            ensurePremadeAsMaintenance(restarted, c);
+            assertThat(restarted.oversizedAttempts).as("cut by maxStall").hasValue(1);
+
+            restarted.clock = at(5, 10);
+            ensurePremadeAsMaintenance(restarted, c);
+            var added = new XidPartitions(names, config.partitions());
+            added.clock = at(5, 10);
+            ensurePremadeAsMaintenance(added, c);
+
+            assertThat(restarted.tailStuck()).as("restarted inside the window, after the first sighting").isTrue();
+            assertThat(added.tailStuck()).as("started after the window").isTrue();
+            execute(c, "truncate " + names.tail());
+            ensurePremadeAsMaintenance(added, c);
+            assertThat(queryLong(c, "select count(tail_oversized_since) from " + names.maintenance()))
+                    .as("cleared once no longer over maxTailScan").isZero();
         }
     }
 

@@ -124,7 +124,8 @@ public record SchemaObjects(List<Table> tables) {
                         List.of("primary key (id)", "check (id = 1)"), List.of(), List.of()),
                 plain(n.maintenance(), List.of(
                         column("id", "integer", true, "1"),
-                        column("succeeded_at", TIMESTAMPTZ, true)),
+                        column("succeeded_at", TIMESTAMPTZ, true),
+                        column("tail_oversized_since", TIMESTAMPTZ, false)),
                         List.of("primary key (id)", "check (id = 1)"), List.of(), List.of()),
                 plain(n.stranded(), List.of(
                         column("shard", "smallint", true),
