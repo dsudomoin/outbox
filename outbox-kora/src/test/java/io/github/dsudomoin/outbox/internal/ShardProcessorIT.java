@@ -47,6 +47,7 @@ import io.opentelemetry.sdk.trace.SdkTracerProvider;
 import io.opentelemetry.sdk.trace.data.EventData;
 import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
 import jakarta.annotation.Nullable;
+import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
@@ -1776,6 +1777,73 @@ class ShardProcessorIT {
         assertThat(delivered()).containsExactly("a#1", "b#1");
         assertThat(rows("select last_error from " + names.retry() + " where payload = 'k#1'::bytea",
                 rs -> rs.getString(1))).containsExactly(described);
+    }
+
+    @Test
+    void telemetryThatThrowsAnErrorReadingAFailureDoesNotRollTheStepBack() throws Exception {
+        telemetryReadingAFailureDoesNotRollTheStepBack(new AssertionError("no message"));
+    }
+
+    @Test
+    void telemetryThatThrowsACheckedExceptionReadingAFailureDoesNotRollTheStepBack() throws Exception {
+        telemetryReadingAFailureDoesNotRollTheStepBack(new IOException("no message"));
+    }
+
+    /** The handler fails k#1 with an error whose message throws {@code thrown}; telemetry reads it in finished(). */
+    private void telemetryReadingAFailureDoesNotRollTheStepBack(Throwable thrown) throws Exception {
+        var reading = new OutboxTelemetry() {
+            @Override
+            public Delivery deliveryStarted(List<OutboxRecord> records, Instant now) {
+                return new Delivery() {
+                    @Override
+                    public void finished(List<Outcome> outcomes) {
+                        for (var o : outcomes) {
+                            if (o instanceof Outcome.Retry r) {
+                                r.error().getMessage(); // what a span's recordException does
+                            }
+                        }
+                    }
+                };
+            }
+        };
+        bootstrap(GuardedTelemetry.of(reading));
+        script = ((OutboxHandler) record -> {
+            if (payload("k#1").test(record)) {
+                throw new MessageThrowing(thrown);
+            }
+            handler.handle(record);
+        })::handleBatch;
+        send(msg("t", "a", "a#1"), msg("t", "k", "k#1"), msg("t", "b", "b#1"));
+        tick();
+
+        try (var err = new CapturedStderr()) {
+            assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, true));
+            assertThat(err.text()).contains("WARN " + GuardedTelemetry.class.getName()).contains("Delivery.finished");
+        }
+        assertThat(delivered()).containsExactly("a#1", "b#1");
+        assertThat(rows("select last_error from " + names.retry() + " where payload = 'k#1'::bytea",
+                rs -> rs.getString(1))).containsExactly(MessageThrowing.class.getName() + " (its toString() threw "
+                        + thrown.getClass().getName() + ")");
+    }
+
+    /** A failure whose message throws {@code thrown}, a checked one too. */
+    private static final class MessageThrowing extends RuntimeException {
+
+        private final Throwable thrown;
+
+        MessageThrowing(Throwable thrown) {
+            this.thrown = thrown;
+        }
+
+        @Override
+        public String getMessage() {
+            return MessageThrowing.<RuntimeException>sneaky(thrown);
+        }
+
+        @SuppressWarnings("unchecked")
+        private static <T extends Throwable> String sneaky(Throwable t) throws T {
+            throw (T) t;
+        }
     }
 
     /** An Error whose message reads a field it never set. */

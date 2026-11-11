@@ -18,8 +18,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * An {@link OutboxTelemetry} that never throws: a hook's exception is logged at WARN, at most once per 10 s per hook,
- * and the outbox goes on as without it (headers and records unchanged, the record's call run once).
+ * An {@link OutboxTelemetry} that throws nothing but a {@link VirtualMachineError} other than a stack overflow: whatever
+ * else a hook throws is logged at WARN, at most once per 10 s per hook, and the outbox goes on as without it (headers
+ * and records unchanged, the record's call run once).
  */
 public final class GuardedTelemetry implements OutboxTelemetry {
 
@@ -44,7 +45,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         Enqueue enqueue;
         try {
             enqueue = delegate.enqueueStarted();
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("enqueueStarted", e);
             return Enqueue.NONE;
         }
@@ -55,7 +56,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     public void enqueued(String topic) {
         try {
             delegate.enqueued(topic);
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("enqueued", e);
         }
     }
@@ -65,7 +66,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         Delivery delivery;
         try {
             delivery = delegate.deliveryStarted(records, now);
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("deliveryStarted", e);
             return Delivery.NONE;
         }
@@ -76,7 +77,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     public void delivered(String topic, Duration delay) {
         try {
             delegate.delivered(topic, delay);
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("delivered", e);
         }
     }
@@ -85,7 +86,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     public void retried(String topic) {
         try {
             delegate.retried(topic);
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("retried", e);
         }
     }
@@ -94,7 +95,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     public void deadLettered(String topic) {
         try {
             delegate.deadLettered(topic);
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("deadLettered", e);
         }
     }
@@ -103,7 +104,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     public void requeued(String topic) {
         try {
             delegate.requeued(topic);
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("requeued", e);
         }
     }
@@ -112,7 +113,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     public void waited(String topic, Outcome.Waiting.Kind kind) {
         try {
             delegate.waited(topic, kind);
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("waited", e);
         }
     }
@@ -121,7 +122,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     public void contractRejected(String topic, String type, int version) {
         try {
             delegate.contractRejected(topic, type, version);
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("contractRejected", e);
         }
     }
@@ -130,7 +131,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     public void routeRejected(String topic) {
         try {
             delegate.routeRejected(topic);
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("routeRejected", e);
         }
     }
@@ -139,7 +140,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     public void routeUnchecked(String topic) {
         try {
             delegate.routeUnchecked(topic);
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("routeUnchecked", e);
         }
     }
@@ -149,7 +150,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         RelayStep step;
         try {
             step = delegate.stepStarted(shards);
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("stepStarted", e);
             return RelayStep.NONE;
         }
@@ -160,7 +161,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     public void stepFinished(Duration duration) {
         try {
             delegate.stepFinished(duration);
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("stepFinished", e);
         }
     }
@@ -169,7 +170,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     public void relayFailed(Throwable error) {
         try {
             delegate.relayFailed(error);
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("relayFailed", e);
         }
     }
@@ -178,7 +179,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     public void shardPaused() {
         try {
             delegate.shardPaused();
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("shardPaused", e);
         }
     }
@@ -187,7 +188,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     public void deadLetterDecision(String decision) {
         try {
             delegate.deadLetterDecision(decision);
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("deadLetterDecision", e);
         }
     }
@@ -196,7 +197,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     public void deadLetterHookFailed() {
         try {
             delegate.deadLetterHookFailed();
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("deadLetterHookFailed", e);
         }
     }
@@ -205,7 +206,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     public void inboxOutsideWindow() {
         try {
             delegate.inboxOutsideWindow();
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("inboxOutsideWindow", e);
         }
     }
@@ -214,7 +215,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     public void releaseThread() {
         try {
             delegate.releaseThread();
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("releaseThread", e);
         }
     }
@@ -223,18 +224,26 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     public void gauge(OutboxGauge gauge, DoubleSupplier value) {
         try {
             delegate.gauge(gauge, value);
-        } catch (RuntimeException | LinkageError e) {
+        } catch (Throwable e) {
             warn("gauge", e);
         }
     }
 
+    /**
+     * Logs {@code error} by its {@link RetryStore#describe} text, which cannot throw, and rethrows only a
+     * {@link VirtualMachineError} other than {@link StackOverflowError}: an {@code AssertionError} or a sneaky checked
+     * exception from a hook is a telemetry bug like any other.
+     */
     private void warn(String hook, Throwable error) {
+        if (error instanceof VirtualMachineError v && !(error instanceof StackOverflowError)) {
+            throw v;
+        }
         long now = System.nanoTime();
         var last = warned.computeIfAbsent(hook, h -> new AtomicLong(now - WARN_INTERVAL));
         long at = last.get();
         if (now - at >= WARN_INTERVAL && last.compareAndSet(at, now)) {
-            log.warn("outbox telemetry hook {} failed and is ignored; failures of it in the next 10 s are not logged",
-                    hook, error);
+            log.warn("outbox telemetry hook {} failed and is ignored: {}; failures of it in the next 10 s are not logged",
+                    hook, RetryStore.describe(error));
         }
     }
 
@@ -251,7 +260,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
             try {
                 var result = delegate.headers(headers);
                 return result == null ? headers : result;
-            } catch (RuntimeException | LinkageError e) {
+            } catch (Throwable e) {
                 warn("Enqueue.headers", e);
                 return headers;
             }
@@ -261,7 +270,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         public void finished() {
             try {
                 delegate.finished();
-            } catch (RuntimeException | LinkageError e) {
+            } catch (Throwable e) {
                 warn("Enqueue.finished", e);
             }
         }
@@ -270,7 +279,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         public void failed(Throwable error) {
             try {
                 delegate.failed(error);
-            } catch (RuntimeException | LinkageError e) {
+            } catch (Throwable e) {
                 warn("Enqueue.failed", e);
             }
         }
@@ -288,7 +297,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         public void finished() {
             try {
                 delegate.finished();
-            } catch (RuntimeException | LinkageError e) {
+            } catch (Throwable e) {
                 warn("RelayStep.finished", e);
             }
         }
@@ -297,7 +306,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         public void failed(Throwable error) {
             try {
                 delegate.failed(error);
-            } catch (RuntimeException | LinkageError e) {
+            } catch (Throwable e) {
                 warn("RelayStep.failed", e);
             }
         }
@@ -320,7 +329,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
                             + " records for " + records.size());
                 }
                 return result;
-            } catch (RuntimeException | LinkageError e) {
+            } catch (Throwable e) {
                 warn("Delivery.handed", e);
                 return records;
             }
@@ -338,9 +347,6 @@ public final class GuardedTelemetry implements OutboxTelemetry {
                         warn("Delivery.inRecordScope", e);
                     }
                     throw rethrow(tracked.error); // the handler's own failure, whatever the scope made of it
-                }
-                if (!(e instanceof Exception || e instanceof LinkageError)) {
-                    throw e;
                 }
                 warn("Delivery.inRecordScope", e);
                 return tracked.state == TrackedCall.RETURNED ? tracked.result : call.call();
@@ -361,7 +367,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         public void finished(List<Outcome> outcomes) {
             try {
                 delegate.finished(outcomes);
-            } catch (RuntimeException | LinkageError e) {
+            } catch (Throwable e) {
                 warn("Delivery.finished", e);
             }
         }
@@ -370,7 +376,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         public void failed(Throwable error) {
             try {
                 delegate.failed(error);
-            } catch (RuntimeException | LinkageError e) {
+            } catch (Throwable e) {
                 warn("Delivery.failed", e);
             }
         }
