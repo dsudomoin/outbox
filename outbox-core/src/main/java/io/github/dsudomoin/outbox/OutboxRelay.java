@@ -149,10 +149,12 @@ public final class OutboxRelay implements AutoCloseable {
     private final AtomicIntegerArray wanted;
     /** Per shard, the latest tick of the step of it that {@link #stepStarted} times. */
     private final AtomicLongArray steppedTick;
-    /** The candidates of the latest tick a worker read them for; replaced under {@link #roundSwap}, never by an older. */
+    /** The candidates the latest read found; replaced under {@link #roundSwap}, never by an earlier read. */
     @Nullable
     private volatile Round round;
     private final Object roundSwap = new Object();
+    /** Orders the reads of {@link #readRound}: taken before the read of the latest tick, kept in its round. */
+    private final AtomicLong roundTickets = new AtomicLong();
     /** Held by the worker reading the cursors for a new tick, so the others wait for its round instead of reading too. */
     private final ReentrantLock roundLock = new ReentrantLock();
     /** When the {@link #roundLock}'s holder took it ({@code nanoTime}). */
@@ -726,6 +728,8 @@ public final class OutboxRelay implements AutoCloseable {
     private final class Round {
 
         final long latest;
+        /** Its read's place among this relay's reads ({@link #roundTickets}). */
+        final long ticket;
         /** When the cursors were read ({@code nanoTime}). */
         final long read;
         /** {@code min(MAX_GROUP, max(1, ceil(candidates / workers)))}. */
@@ -736,8 +740,9 @@ public final class OutboxRelay implements AutoCloseable {
         /** Put back by a step after the read: not stale however recently it was stepped. */
         private final BitSet back = new BitSet();
 
-        Round(long latest, long read, List<Integer> candidates) {
+        Round(long latest, long ticket, long read, List<Integer> candidates) {
             this.latest = latest;
+            this.ticket = ticket;
             this.read = read;
             this.groupSize = Math.min(MAX_GROUP, Math.max(1,
                     (candidates.size() + relay.workers() - 1) / relay.workers()));
@@ -923,13 +928,16 @@ public final class OutboxRelay implements AutoCloseable {
         }
 
         /**
-         * Makes sure {@link #round} is of the latest tick or a newer one: reads the latest tick and, when the round is
-         * older, the cursors, under {@link #roundLock}, so the workers of this relay read the cursors once per tick. A
+         * Makes sure {@link #round} is of the latest tick: reads the latest tick and, when the round is of another, the
+         * cursors, under {@link #roundLock}, so the workers of this relay read the cursors once per tick. A
          * worker waits for a sibling's read only until it is {@link #roundWaitNanos} old, then reads on its own
          * connection without the lock: a sibling whose connection went silent in its read holds nobody else past that.
-         * A round is never replaced with one of an older tick, as such a sibling's read may land late.
+         * A round is never replaced with one of an earlier read, as such a sibling's read may land late; it is compared
+         * by read order, not by tick id, which goes down when the tick table and its sequence are restored to an
+         * earlier point.
          */
         private void readRound(Connection c) throws SQLException, InterruptedException {
+            long ticket = roundTickets.incrementAndGet();
             long latest = ticks.latest(c, clock).id();
             if (current(latest)) {
                 return;
@@ -945,9 +953,10 @@ public final class OutboxRelay implements AutoCloseable {
                 }
                 var selected = clock.now();
                 long read = System.nanoTime();
-                var next = new Round(latest, read, candidates(cursors.positions(c, latest), selected));
+                var next = new Round(latest, ticket, read, candidates(cursors.positions(c, latest), selected));
                 synchronized (roundSwap) {
-                    if (!current(latest)) {
+                    var r = round;
+                    if (r == null || r.ticket < ticket) {
                         round = next;
                     }
                 }
@@ -960,7 +969,7 @@ public final class OutboxRelay implements AutoCloseable {
 
         private boolean current(long latest) {
             var r = round;
-            return r != null && r.latest >= latest;
+            return r != null && r.latest == latest;
         }
 
         /**

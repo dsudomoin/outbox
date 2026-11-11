@@ -487,6 +487,42 @@ class StrandedShardsIT {
         await(() -> delivered.containsAll(row));
     }
 
+    /**
+     * A restore to an earlier point under a running relay brings the tick table, its sequence, the cursors and the
+     * checkpoint back together: the relay's round, of a tick above every id the restored table has, is not current.
+     */
+    @Test
+    void aRunningRelayDeliversAfterTheTickTableAndItsSequenceAreRewoundBelowItsRound() throws Exception {
+        startRelay();
+        long restored;
+        long cursorSeq;
+        long checkpointSeq;
+        try (var c = direct.getConnection()) {
+            restored = new Ticks(names, SHARDS).latest(c).id();
+            cursorSeq = queryLong(c, "select coalesce(max(seq), 0) from " + names.cursor());
+            checkpointSeq = queryLong(c, "select coalesce(max(seq), 0) from " + names.checkpoint());
+            // the ticks of the hour the restore takes back, in one jump
+            execute(c, "select setval(pg_get_serial_sequence('" + names.tick() + "', 'id'), " + (restored + 1_000_000)
+                    + ")");
+        }
+        makeATick();
+        var before = sendMany(0, 1);
+        await(() -> delivered.containsAll(before)); // on a round of a tick above restored + 1 000 000
+        try (var c = direct.getConnection()) {
+            execute(c, "delete from " + names.tick() + " where id > " + restored);
+            execute(c, "delete from " + names.cursor() + " where seq > " + cursorSeq);
+            execute(c, "delete from " + names.checkpoint() + " where seq > " + checkpointSeq);
+            execute(c, "select setval(pg_get_serial_sequence('" + names.tick() + "', 'id'), " + restored + ")");
+        }
+
+        var after = new ArrayList<UUID>();
+        for (int shard = 0; shard < SHARDS; shard++) {
+            after.addAll(sendMany(shard, 1));
+        }
+
+        await(() -> delivered.containsAll(after));
+    }
+
     @Test
     void aFailedStepLeavesItsConnectionInAutocommit() throws Exception {
         var atClose = new ConcurrentLinkedQueue<Boolean>();
