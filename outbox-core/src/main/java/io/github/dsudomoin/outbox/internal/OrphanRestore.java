@@ -35,6 +35,10 @@ public final class OrphanRestore {
     /** For tests: runs after each chunk's commit, to end the session there. */
     @Nullable
     SqlConsumer<Connection> afterChunk;
+    /** Replaces {@link PartitionDdl#DDL_MARGIN} in the statement bounds, for tests. */
+    Duration margin = PartitionDdl.DDL_MARGIN;
+    /** Replaces {@link XidPartitions#ATTACH_SCAN_RATE}, for tests. */
+    long scanRate = XidPartitions.ATTACH_SCAN_RATE;
 
     /**
      * {@code keyLockTimeout} bounds each lock wait of a chunk's insert (key locks are only tried, never waited for), so
@@ -53,9 +57,12 @@ public final class OrphanRestore {
 
     /**
      * Moves the rows of {@code table} with an xid at or above {@code fromXid} back into the outbox, then drops it:
-     * <b>its rows below {@code fromXid} go with the table</b>. First {@code create index if not exists <table>_id};
-     * then chunks of {@link #CHUNK} rows in id order, each one read-committed transaction that holds ACCESS EXCLUSIVE
-     * on {@code table} alone, never on the outbox, waited for at most {@code lockTimeout}, idle in it at most
+     * <b>its rows below {@code fromXid} go with the table</b>. First {@code create index if not exists <table>_id},
+     * which, as each chunk's read before its key locks, may take {@code lockTimeout} + 60 s + a second per
+     * {@link XidPartitions#ATTACH_SCAN_RATE} bytes of the table (a cut one fails the call with 57014 and says what to
+     * run by hand); then chunks of {@link #CHUNK} rows in id order, each one read-committed transaction that holds
+     * ACCESS EXCLUSIVE on {@code table} alone, never on the outbox, waited for at most {@code lockTimeout}, idle in it
+     * at most
      * {@code lockTimeout} + 30 s ({@code idle_in_transaction_session_timeout}): it inserts the rows and
      * deletes them from {@code table} together, so a restore that dies loses and repeats nothing, and the next call
      * resumes it. Its key locks are tried without waiting ({@link Resender#tryKeyLocks}): the rows of a key another
@@ -80,7 +87,7 @@ public final class OrphanRestore {
             throw new IllegalArgumentException("fromXid " + fromXid + " is below 0: xids are never negative, and 0"
                     + " moves every row");
         }
-        return SocketBound.atLeast(autocommit, lockTimeout.plus(PartitionDdl.DDL_MARGIN),
+        return SocketBound.atLeast(autocommit, lockTimeout.plus(margin),
                 () -> restoreBounded(autocommit, table, fromXid, lockTimeout));
     }
 
@@ -91,8 +98,33 @@ public final class OrphanRestore {
                     + ": a table " + names.partitionPrefix() + "<digits> or " + names.setAsidePrefix() + "<digits> in"
                     + " its schema and in no partition tree");
         }
-        PartitionDdl.execute(autocommit, lockTimeout,
-                "create index if not exists " + names.unqualified(table) + "_id on " + table + " (id)");
+        long bytes = XidPartitions.relationSize(autocommit, table);
+        // the index build and the first chunk's walk past the rows below fromXid each read the whole table: time for
+        // that at scanRate. Neither holds a writer back (ACCESS EXCLUSIVE on the standalone table alone, no key lock)
+        var scan = lockTimeout.plus(margin).plusMillis(bytes * 1000 / scanRate);
+        String index = "create index if not exists " + names.unqualified(table) + "_id on " + table + " (id)";
+        try {
+            return SocketBound.atLeast(autocommit, scan,
+                    () -> move(autocommit, table, fromXid, lockTimeout, scan, index));
+        } catch (SQLException e) {
+            if (!"57014".equals(e.getSQLState())) {
+                throw e;
+            }
+            throw new SQLException("restoring " + table + " reads all its " + XidPartitions.mb(bytes) + " MB to"
+                    + " build its id index and to find the rows at or above xid " + fromXid + ", and the server cut a"
+                    + " statement of it at the " + scan.toMillis() / 1000.0 + " s it was given (" + e.getMessage()
+                    + "): every call is given the same, so calling again is cut the same way. Rows moved so far stay"
+                    + " moved. In a session without a statement_timeout, which blocks no writer, run " + index
+                    + ", then call again; if it is still cut, move the rest by hand: insert into " + names.base()
+                    + " (shard, message_id, topic, key, payload, headers) select shard, message_id, topic, key,"
+                    + " payload, headers from " + table + " where xid >= '" + fromXid + "'::xid8, then drop table "
+                    + table, "57014", e);
+        }
+    }
+
+    private long move(Connection autocommit, String table, long fromXid, Duration lockTimeout, Duration scan,
+            String index) throws SQLException {
+        PartitionDdl.execute(autocommit, lockTimeout, scan, index);
         String chunk = "select id, topic, key from " + table
                 + " where xid >= ?::text::xid8 and id > ? order by id limit " + CHUNK;
         long moved = 0;
@@ -115,7 +147,8 @@ public final class OrphanRestore {
                 // session lock it holds (the maintenance lock of a restoreOrphan call)
                 st.execute("set local idle_in_transaction_session_timeout = "
                         + lockTimeout.plusSeconds(30).toMillis());
-                st.execute("set local statement_timeout = " + lockTimeout.plus(PartitionDdl.DDL_MARGIN).toMillis());
+                // the first chunk's read walks the rows below fromXid
+                st.execute("set local statement_timeout = " + scan.toMillis());
                 st.execute("lock table " + table + " in access exclusive mode");
                 try (var ps = c.prepareStatement(chunk)) {
                     ps.setString(1, Long.toString(fromXid));
@@ -133,6 +166,7 @@ public final class OrphanRestore {
                 }
                 // from here on, writers may queue behind this chunk's key locks: wait no longer than the swap may
                 st.execute("set local lock_timeout = " + keyLockTimeout.toMillis());
+                st.execute("set local statement_timeout = " + lockTimeout.plus(margin).toMillis());
                 var hashes = rows.stream().map(r -> r.key() == null ? null : Hashing.keyHash(r.topic(), r.key()))
                         .toList();
                 busy.addAll(resender.tryKeyLocks(c,
@@ -214,7 +248,7 @@ public final class OrphanRestore {
             st.execute("set transaction isolation level read committed");
             st.execute("set local lock_timeout = " + lockTimeout.toMillis());
             st.execute("set local idle_in_transaction_session_timeout = " + lockTimeout.plusSeconds(30).toMillis());
-            st.execute("set local statement_timeout = " + lockTimeout.plus(PartitionDdl.DDL_MARGIN).toMillis());
+            st.execute("set local statement_timeout = " + lockTimeout.plus(margin).toMillis());
             st.execute("lock table " + table + " in access exclusive mode");
             st.execute("set local lock_timeout = " + keyLockTimeout.toMillis());
             try (var ps = c.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {

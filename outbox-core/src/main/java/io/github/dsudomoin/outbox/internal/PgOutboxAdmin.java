@@ -310,8 +310,11 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             boolean refused = e instanceof IllegalArgumentException
                     || e instanceof IllegalStateException && !restoring.get();
             if (!refused) {
-                log.warn("outbox admin {} on {} failed; rows moved so far stay moved, and calling again goes on: {}",
-                        call, names.base(), printable(e.toString()));
+                // a statement cut at its bound would be cut the same way: the exception says what to run by hand
+                var again = e instanceof SQLException s && "57014".equals(s.getSQLState()) ? ""
+                        : ", and calling again goes on";
+                log.warn("outbox admin {} on {} failed; rows moved so far stay moved{}: {}", call, names.base(),
+                        again, printable(e.toString()));
             }
             if (restoring.get() && !(e instanceof IllegalArgumentException)) {
                 wakeRelay.run(); // for the chunks it may have moved before it failed

@@ -597,7 +597,7 @@ public final class XidPartitions {
         return message == null ? "" : message.lines().findFirst().orElse("");
     }
 
-    private static long relationSize(Connection c, String table) throws SQLException {
+    static long relationSize(Connection c, String table) throws SQLException {
         try (var ps = c.prepareStatement("select pg_relation_size(to_regclass(?))")) {
             ps.setString(1, table);
             try (var rs = ps.executeQuery()) {
@@ -607,7 +607,7 @@ public final class XidPartitions {
         }
     }
 
-    private static String mb(long bytes) {
+    static String mb(long bytes) {
         return String.format(java.util.Locale.ROOT, "%.1f", bytes / 1048576.0);
     }
 

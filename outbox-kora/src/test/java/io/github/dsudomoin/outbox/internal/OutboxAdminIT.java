@@ -524,6 +524,58 @@ class OutboxAdminIT {
         assertThat(wakes).hasValue(1);
     }
 
+    /**
+     * The id index build and the first chunk's walk past the rows below fromXid each read the whole table: their
+     * bound grows with its size, so a large orphan is restored, not cut at the same bound on every call.
+     */
+    @Test
+    void restoreOrphanOfALargeRangeIsNotCutAtAFixedBound() throws Exception {
+        var orphan = largeOrphan();
+        admin.orphanRestore.margin = Duration.ZERO; // a bound a CI-sized table can pass: the 20 ms lock wait alone
+
+        try (var c = TestDb.connect()) {
+            assertThat(admin.orphanRestore.restore(c, orphan, LARGE_ROWS - 2999, Duration.ofMillis(20)))
+                    .isEqualTo(3000);
+        }
+
+        assertThat(exists(orphan)).as("dropped").isFalse();
+        assertThat(outboxMessageIds()).hasSize(3000);
+    }
+
+    /** With the id index already there, the first chunk still walks every row below fromXid through it. */
+    @Test
+    void restoreOrphanOfALargeRangeWithItsIndexIsNotCutAtAFixedBound() throws Exception {
+        var orphan = largeOrphan();
+        execute("create index " + orphan + "_id on " + orphan + " (id)");
+        admin.orphanRestore.margin = Duration.ZERO;
+
+        try (var c = TestDb.connect()) {
+            assertThat(admin.orphanRestore.restore(c, orphan, LARGE_ROWS - 2999, Duration.ofMillis(20)))
+                    .isEqualTo(3000);
+        }
+
+        assertThat(exists(orphan)).as("dropped").isFalse();
+    }
+
+    /** A statement cut all the same says so, with the table's size and what to run by hand, and keeps every row. */
+    @Test
+    void restoreOrphanCutByTheServerSaysCallingAgainIsCutTheSameWay() throws Exception {
+        var orphan = largeOrphan();
+        admin.orphanRestore.margin = Duration.ZERO;
+        admin.orphanRestore.scanRate = Long.MAX_VALUE; // no time for the scan
+
+        try (var c = TestDb.connect()) {
+            assertThatThrownBy(() -> admin.orphanRestore.restore(c, orphan, 0, Duration.ofMillis(20)))
+                    .isInstanceOfSatisfying(SQLException.class, e -> assertThat(e.getSQLState()).isEqualTo("57014"))
+                    .hasMessageContaining(" MB").hasMessageContaining("cut the same way")
+                    .hasMessageContaining("create index if not exists " + orphan + "_id on " + orphan + " (id)")
+                    .hasMessageNotContaining("goes on");
+        }
+
+        assertThat(count(orphan)).isEqualTo(LARGE_ROWS);
+        assertThat(outboxMessageIds()).isEmpty();
+    }
+
     /** Postgres reads a negative xid8 as one above every real xid: such a cut would move nothing and drop every row. */
     @Test
     void restoreOrphanRefusesANegativeFromXid() throws Exception {
@@ -1279,6 +1331,18 @@ class OutboxAdminIT {
         try (var c = TestDb.connect()) {
             PartitionDdl.create(c, names.base(), orphan, Duration.ofSeconds(5));
         }
+        return orphan;
+    }
+
+    private static final int LARGE_ROWS = 200_000;
+
+    /** A foreign orphan of {@link #LARGE_ROWS} rows of about 500 bytes, xid = id, too large to scan within 20 ms. */
+    private String largeOrphan() throws SQLException {
+        var orphan = foreignOrphan();
+        execute("insert into " + orphan + " (id, shard, xid, message_id, topic, key, payload) select g, 0,"
+                + " g::text::xid8, gen_random_uuid(), 't', convert_to('k' || g, 'UTF8'), convert_to(repeat('x', 400),"
+                + " 'UTF8') from generate_series(1, " + LARGE_ROWS + ") g");
+        execute("analyze " + orphan);
         return orphan;
     }
 

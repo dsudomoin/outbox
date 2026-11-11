@@ -144,6 +144,9 @@ class ApiKeyAuthorizer implements OutboxAdminAuthorizer {
   inbox consumers deduplicate it within `retention − partitionInterval` (23 h by default).
 - **Orphans** («Осиротевшие партиции»): compare the orphan's rows with what consumers got (the README's `select`),
   then one `restore` call with the cut-off `fromXid` (`0` returns all; a negative one gets 400, nothing changed).
+  Its id-index build and first chunk read the whole orphan, given 90 s + 1 s per 20 MB; a call failing with SQLState
+  57014 is cut the same way every time: run the `create index` its error names in a session without
+  `statement_timeout`, then call again.
 - **xid halt** («Восстановление после регрессии xid (xid regression recovery)»): one `POST /recovery/xid-regression`;
   writers wait about 2.5–3 s per million rows re-sent. On a large outbox, or after the ERROR «failed after it locked
   the outbox», first raise `outbox.recovery.timeout` on the calling instance and restart it. Never delete the

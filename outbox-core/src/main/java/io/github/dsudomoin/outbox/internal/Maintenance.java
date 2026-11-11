@@ -785,9 +785,11 @@ public final class Maintenance {
                     + " went with the table, which is dropped", table, names.base(), moved, horizon);
             return true;
         } catch (SQLException e) {
+            // a statement cut at its bound is cut the same way on every run: the message says what to run by hand
             log.warn("outbox maintenance could not move the rows of {}, a range of {} detached as relayed, back into"
-                    + " the outbox (SQLState {}): {}. It is kept (gauge outbox.partitions.orphaned) and the next run"
-                    + " goes on from the rows moved so far", table, names.base(), e.getSQLState(), e.getMessage());
+                    + " the outbox (SQLState {}): {}. It is kept (gauge outbox.partitions.orphaned){}", table,
+                    names.base(), e.getSQLState(), e.getMessage(), "57014".equals(e.getSQLState()) ? ""
+                            : " and the next run goes on from the rows moved so far");
         } catch (RuntimeException e) {
             log.error("outbox maintenance could not move the rows of {}, a range of {} detached as relayed, back into"
                     + " the outbox. It is kept (gauge outbox.partitions.orphaned) and the next run goes on from the"
