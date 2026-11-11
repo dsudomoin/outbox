@@ -166,12 +166,13 @@ class PgOutboxIT {
     @Test
     void sameKeyIdsFollowCommitOrder() throws Exception {
         var aLocked = new CountDownLatch(1);
+        var bQueued = new CountDownLatch(1);
         var aBeforeCommit = new AtomicLong();
         var a = pool.submit(() -> db.inTx((SqlFunction0<List<UUID>>) () -> {
             var first = outbox.send(OutboxMessage.of("t", "k", bytes("a1")));
             aLocked.countDown();
-            sleep(300);
-            // B is queued on the key lock by now: its row id must not be assigned before it holds the lock
+            await(bQueued);
+            // B waits on the key lock: its row id must not be assigned before it holds the lock
             var second = outbox.send(OutboxMessage.of("t", "k", bytes("a2")));
             aBeforeCommit.set(System.nanoTime());
             return List.of(first, second);
@@ -181,6 +182,9 @@ class PgOutboxIT {
             var id = outbox.send(OutboxMessage.of("t", "k", bytes("b")));
             return new Sent(id, System.nanoTime());
         }));
+        awaitKeyLockWaiter("t", "k");
+        assertThat(b.isDone()).isFalse();
+        bQueued.countDown();
 
         var aIds = a.get(10, SECONDS);
         var bSent = b.get(10, SECONDS);
@@ -465,6 +469,19 @@ class PgOutboxIT {
             }
         }
         return ids;
+    }
+
+    /** Until another session waits for the key lock of {@code topic}/{@code key}, failing after 10 s. */
+    private void awaitKeyLockWaiter(String topic, String key) throws Exception {
+        try (var c = TestDb.connect()) {
+            long deadline = System.nanoTime() + SECONDS.toNanos(10);
+            while (queryLong(c, "select count(*) from pg_locks where locktype = 'advisory' and not granted"
+                    + " and objsubid = 2 and classid::bigint = " + Integer.toUnsignedLong(names.keyNamespace())
+                    + " and objid::bigint = " + Integer.toUnsignedLong(Hashing.keyHash(topic, bytes(key)))) == 0) {
+                assertThat(System.nanoTime()).as("B waits for the key lock").isLessThan(deadline);
+                Thread.sleep(5);
+            }
+        }
     }
 
     private static byte[] bytes(String s) {
