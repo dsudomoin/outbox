@@ -266,7 +266,8 @@ public final class PartitionDdl {
 
     /**
      * Whether {@code table} has what an attach to {@code parent} requires of it: the same column names, types, NOT
-     * NULLs and generation expressions in the same order, and the same CHECK constraints.
+     * NULLs and generation expressions in the same order, and the same CHECK constraints by name and expression: one
+     * the parent has NOT VALID is copied validated, which an attach accepts.
      */
     static boolean sameShape(Connection c, String parent, String table) throws SQLException {
         String shape = "(select array_agg(attname::text || ' ' || atttypid::regtype::text || ' ' || attnotnull::text"
@@ -274,7 +275,7 @@ public final class PartitionDdl {
                 + " order by attnum)"
                 + " from pg_attribute left join pg_attrdef d on d.adrelid = attrelid and d.adnum = attnum"
                 + " and attgenerated <> '' where attrelid = to_regclass(?) and attnum > 0 and not attisdropped)"
-                + " || (select array_agg(conname::text || ' ' || pg_get_constraintdef(oid) order by conname)"
+                + " || (select array_agg(conname::text || ' ' || pg_get_expr(conbin, conrelid) order by conname)"
                 + " from pg_constraint where conrelid = to_regclass(?) and contype = 'c')";
         try (var ps = c.prepareStatement("select " + shape + " is not distinct from " + shape)) {
             ps.setString(1, parent);

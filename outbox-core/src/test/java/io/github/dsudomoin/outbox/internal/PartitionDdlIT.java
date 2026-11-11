@@ -144,6 +144,29 @@ class PartitionDdlIT {
         }
     }
 
+    /**
+     * A CHECK added to the parent {@code NOT VALID} is copied to a range validated, which an attach accepts: an empty
+     * range made after it is kept, not dropped and made again on every run.
+     */
+    @Test
+    void anEmptyRangeIsKeptWhenTheParentsCheckIsNotValid() throws Exception {
+        var parent = TestSql.uniqueTable();
+        var range = parent + "_a";
+        try (var c = TestDataSources.newDataSource().getConnection()) {
+            TestSql.execute(c, "create table " + parent + " (xid xid8 not null, payload bytea not null)"
+                    + " partition by range (xid)");
+            TestSql.execute(c, "alter table " + parent + " add constraint payload_small"
+                    + " check (octet_length(payload) < 1000000) not valid");
+            PartitionDdl.create(c, parent, range, Duration.ofSeconds(5), true);
+            long oid = TestSql.queryLong(c, "select '" + range + "'::regclass::oid");
+
+            PartitionDdl.create(c, parent, range, Duration.ofSeconds(5), true);
+
+            assertThat(TestSql.queryLong(c, "select '" + range + "'::regclass::oid")).isEqualTo(oid);
+            PartitionDdl.attach(c, parent, range, "0", "100", Duration.ofSeconds(5));
+        }
+    }
+
     /** Takes a lock on {@code table} in a transaction of {@code reader} and ends it 3 s later. */
     private static CompletableFuture<Void> holdFor3s(Connection reader, String table) throws Exception {
         reader.setAutoCommit(false);
