@@ -408,6 +408,46 @@ public final class Ticks {
                 e.getMessage(), probeUnwarned.getAndSet(0));
     }
 
+    /**
+     * Moves the tick identity past the highest tick id the cursor rows (their batches' targets too) and the checkpoint
+     * name, so none of them is made again: after a restore of the tick table that brought its sequence back, a new tick
+     * at such an id would see rows a shard standing on it never read. Under the tick lock, so no tick being made takes
+     * an id below meanwhile. Returns the identity's last value when it was below and moved, else null. Its own
+     * transaction on an autocommit connection, as {@link #make}; the identity is the table owner's to move.
+     */
+    @Nullable
+    public Long skipReferencedIds(Connection autocommit) throws SQLException {
+        var c = autocommit;
+        c.setAutoCommit(false);
+        try {
+            if (!lock(c)) {
+                throw new SQLException("the tick lock stayed taken for 1 s", LOCK_NOT_AVAILABLE);
+            }
+            Long moved;
+            try (var ps = c.prepareStatement("with q as materialized (select s, coalesce(pg_sequence_last_value(s), 0)"
+                    + " last, greatest((select max(greatest(tick_id, coalesce(target_tick_id, 0))) from "
+                    + names.cursor() + "), (select max(greatest(tick_id, busy_tick_id)) from " + names.checkpoint()
+                    + ")) referenced from (select pg_get_serial_sequence(?, 'id')::regclass s) n)"
+                    + " select last, setval(s, referenced) from q where referenced > last")) {
+                ps.setString(1, names.tick());
+                try (var rs = ps.executeQuery()) {
+                    moved = rs.next() ? rs.getLong(1) : null;
+                }
+            }
+            c.commit();
+            return moved;
+        } catch (SQLException e) {
+            try {
+                c.rollback();
+            } catch (SQLException cleanup) {
+                e.addSuppressed(cleanup);
+            }
+            throw e;
+        } finally {
+            c.setAutoCommit(true);
+        }
+    }
+
     /** The first two statements of {@link #make}, for tests that hold the tick lock as a frozen instance would. */
     void lockForTest(Connection inTransaction) throws SQLException {
         lock(inTransaction);

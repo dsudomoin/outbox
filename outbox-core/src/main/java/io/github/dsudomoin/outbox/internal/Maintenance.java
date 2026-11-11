@@ -520,7 +520,7 @@ public final class Maintenance {
         var positions = cursors.positions(c, latest.id());
         var wanted = new TreeSet<Long>();
         for (var p : positions) {
-            if (Cursors.busy(p) && p.effectiveTickId() != latest.id()) {
+            if (checked(p, latest) && p.effectiveTickId() != latest.id()) {
                 wanted.add(p.effectiveTickId());
             }
             var target = p.cursor().targetTickId();
@@ -532,7 +532,8 @@ public final class Maintenance {
         var stranded = new TreeMap<Integer, Long>();
         for (var p : positions) {
             var target = p.cursor().targetTickId();
-            if (Cursors.busy(p) && wanted.contains(p.effectiveTickId()) && !found.containsKey(p.effectiveTickId())) {
+            if (checked(p, latest) && wanted.contains(p.effectiveTickId())
+                    && !found.containsKey(p.effectiveTickId())) {
                 stranded.put(p.cursor().shard(), p.effectiveTickId());
             } else if (target != null && wanted.contains(target) && !found.containsKey(target)) {
                 stranded.put(p.cursor().shard(), target);
@@ -542,6 +543,15 @@ public final class Maintenance {
         var slowest = !stranded.isEmpty() ? null : slowestId == latest.id() ? latest : found.get(slowestId);
         return new Read(latest, positions, slowest, stranded, slowest != null ? slowest : ticks.oldestAfter(c, 0),
                 cursors.ignoredCheckpointTick(c));
+    }
+
+    /**
+     * Whether {@link #read} looks up {@code p}'s effective tick: busy, or above the latest tick, as after a restore of
+     * the tick table that brought its sequence back (a cursor read after the latest tick may be on a newer one, which
+     * the look-up then finds).
+     */
+    private static boolean checked(Position p, Tick latest) {
+        return Cursors.busy(p) || p.effectiveTickId() > latest.id();
     }
 
     /**
@@ -648,6 +658,21 @@ public final class Maintenance {
         }
         if (read != null && !read.stranded().isEmpty() && due(strandedLogged)) {
             logStranded(read);
+        }
+        if (read != null && read.stranded().values().stream().anyMatch(tick -> tick > read.latest().id())) {
+            // tick ids went backwards under the cursors: none they stand on may be made again, or the shard would
+            // find a tick there that sees rows it never read, and stop being stranded with them skipped
+            step("tick ids", () -> {
+                var from = ticks.skipReferencedIds(c);
+                if (from != null) {
+                    log.error("outbox ticks of {} went backwards under its cursors: the newest tick is {}, but"
+                            + " shards stand on ticks above it, {} restored together with its sequence (as a"
+                            + " pg_dump -t of it does). Its identity is moved on from {} past every tick id {} and {}"
+                            + " name, so none is made again and the shards stay stranded until repaired",
+                            names.base(), read.latest().id(), names.tick(), from, names.cursor(), names.checkpoint());
+                }
+                return null;
+            });
         }
         // the drops and tick cleanup go by the effective ticks of this run's checkpoint: without it, none this run.
         // The checkpoint is written with stranded shards too: it moves the others on, and keeps them busy at their own

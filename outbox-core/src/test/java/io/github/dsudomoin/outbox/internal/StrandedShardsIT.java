@@ -341,6 +341,50 @@ class StrandedShardsIT {
         assertThat(times.get(row.get(0))).as("once: the relay's, no repair's").isEqualTo(1);
     }
 
+    /**
+     * A table-level dump of the tick table restored alone brings its sequence back too: an idle shard's cursor then
+     * lies above the newest tick, and the ids it stands on would be made again, by ticks that see rows it never read.
+     */
+    @Test
+    void aShardAheadOfATickTableRestoredWithItsSequenceIsStrandedNotSkipped() throws Exception {
+        var ticks = new Ticks(names, SHARDS);
+        var maintenance = writer.maintenance();
+        long restored;
+        long ahead;
+        try (var c = direct.getConnection()) {
+            makeATick();
+            restored = ticks.latest(c).id();
+            for (int i = 0; i < 3; i++) {
+                makeATick();
+            }
+            ahead = ticks.latest(c).id();
+            new Cursors(names, SHARDS).append(c, new Cursor(1, ahead, null, 0, null, 0, null, null));
+        }
+        assertThat(maintenance.runOnce()).isTrue(); // the checkpoint on it too
+        try (var c = direct.getConnection()) { // what restoring a pg_dump -t of the tick table taken at it does
+            execute(c, "delete from " + names.tick() + " where id > " + restored);
+            execute(c, "select setval(pg_get_serial_sequence('" + names.tick() + "', 'id'), " + restored + ")");
+        }
+        var row = sendMany(1, 1);
+        makeATick();
+
+        assertThat(maintenance.runOnce()).isTrue();
+
+        try (var c = direct.getConnection()) {
+            assertThat(maintenance.strandedShards(c)).as("its tick is gone, though above the newest")
+                    .containsEntry(1, ahead);
+            while (ticks.latest(c).id() <= ahead + 1) {
+                makeATick();
+                assertThat(maintenance.runOnce()).isTrue();
+            }
+            assertThat(ticks.get(c, List.of(ahead))).as("its id is never made again").isEmpty();
+            assertThat(maintenance.strandedShards(c)).as("so it stays stranded").containsKey(1);
+        }
+        startRelay();
+        admin().recoverStrandedShards();
+        await(() -> delivered.containsAll(row));
+    }
+
     @Test
     void aFailedStepLeavesItsConnectionInAutocommit() throws Exception {
         var atClose = new ConcurrentLinkedQueue<Boolean>();
