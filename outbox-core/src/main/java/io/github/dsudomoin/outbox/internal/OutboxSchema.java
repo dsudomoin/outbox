@@ -1091,9 +1091,11 @@ public final class OutboxSchema implements AutoCloseable {
      * regression. A rewound tick id leaves every new tick below the newest one (no shard sees work again), a rewound
      * cursor seq leaves new cursor rows ignored (the same batch re-sent forever), a rewound outbox id reuses retry,
      * parked and dead ids (23505 on every step) and breaks key order. Bootstrap and every {@link Maintenance} run;
-     * reads primary keys and the small tick and cursor tables, never the outbox: the outbox id goes by the ids the
-     * ticks recorded ({@code max_id}), the cursors' {@code last_id} and the retry, parked and dead tables. On the
-     * owner's connection: {@code setval} needs UPDATE on the sequence.
+     * reads primary keys and the small tick and cursor tables: the outbox id goes by the ids the ticks recorded
+     * ({@code max_id}), the cursors' {@code last_id} and the retry, parked and dead tables, and only when a sequence is
+     * behind also by the outbox rows the newest tick may not cover ({@code xid >= xmin}, the top ranges alone), as the
+     * rows written after it hold ids above all of those. On the owner's connection: {@code setval} needs UPDATE on the
+     * sequence.
      */
     static void raiseRewoundSequences(Connection c, TableNames n) throws SQLException {
         try (var ps = c.prepareStatement("with q as materialized (select t, s, coalesce(pg_sequence_last_value(s), 0)"
@@ -1103,14 +1105,21 @@ public final class OutboxSchema implements AutoCloseable {
                 + " (select max(id) from " + n.dead() + "))),"
                 + " (?::text, pg_get_serial_sequence(?, 'id')::regclass, (select max(id) from " + n.tick() + ")),"
                 + " (?::text, pg_get_serial_sequence(?, 'seq')::regclass, (select max(seq) from " + n.cursor() + ")))"
-                + " v(t, s, held)) select string_agg(format('%s of %s from %s to %s', s, t, last, held), ', '),"
-                + " count(setval(s, held)) from q where held > last")) {
+                + " v(t, s, held)),"
+                // the source's last rows, written after its newest tick, lie above every value above: read the
+                // ranges that tick may not cover, only when a sequence is behind (CASE runs the scan only then)
+                + " r as materialized (select t, s, last, case when t = ? and exists (select from q where held > last)"
+                + " then greatest(held, (select max(id) from " + n.base() + " where xid >= coalesce((select"
+                + " pg_snapshot_xmin(snapshot) from " + n.tick() + " order by id desc limit 1), '0'::xid8))) else held"
+                + " end held from q) select string_agg(format('%s of %s from %s to %s', s, t, last, held), ', '),"
+                + " count(setval(s, held)) from r where held > last")) {
             ps.setString(1, n.base());
             ps.setString(2, n.base());
             ps.setString(3, n.tick());
             ps.setString(4, n.tick());
             ps.setString(5, n.cursor());
             ps.setString(6, n.cursor());
+            ps.setString(7, n.base());
             try (var rs = ps.executeQuery()) {
                 rs.next();
                 var raised = rs.getString(1);

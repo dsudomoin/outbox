@@ -155,6 +155,42 @@ class XidRecoveryIT {
     }
 
     @Test
+    void aRewoundOutboxIdIsRaisedPastTheCopiedRowsNoTickCovers() throws Exception {
+        bootstrap();
+        var handler = new RecordingHandler();
+        var relay = relay(handler, maintenance());
+        relay.start();
+        var before = send(outbox(relay), messages("before", 10));
+        await(Duration.ofSeconds(5), () -> delivered(handler).containsAll(before));
+        relay.close();
+        // the source's last rows: written after its newest tick, so above every max_id and last_id
+        var copied = send(outbox(null), messages("copied", 10));
+        try (var c = TestDb.connect()) { // the cutover: rows copied, sequences at their start
+            execute(c, "alter table " + names.tick() + " alter column id restart with 1");
+            execute(c, "alter table " + names.cursor() + " alter column seq restart with 1");
+            execute(c, "alter table " + names.base() + " alter column id restart with 1");
+        }
+
+        bootstrap();
+        var relayAfter = relay(handler, maintenance());
+        relayAfter.start();
+        var after = send(outbox(relayAfter), messages("after", 10)); // the same keys k0..k4
+        try (var c = TestDb.connect()) {
+            assertThat(queryLong(c, "select count(*) from (select id from " + names.base()
+                    + " group by id having count(*) > 1) d")).as("ids shared by a copied and a new row").isZero();
+        }
+        await(Duration.ofSeconds(10), () -> delivered(handler).containsAll(copied) && delivered(handler)
+                .containsAll(after));
+        var order = handler.delivered().stream().map(r -> new String(r.payload(), UTF_8))
+                .filter(p -> !p.startsWith("before")).toList();
+        for (int k = 0; k < 5; k++) { // per key, every copied row before every new one
+            int key = k;
+            var ofKey = order.stream().filter(p -> Integer.parseInt(p.replaceAll("\\D", "")) % 5 == key).toList();
+            assertThat(ofKey).as("key k" + k).hasSize(4).startsWith("copied" + k, "copied" + (k + 5));
+        }
+    }
+
+    @Test
     void maintenanceRaisesARewoundOutboxIdAboveTheDeadLetters() throws Exception {
         bootstrap();
         var handler = new RecordingHandler().failAlways(r -> "x".equals(key(r)),
