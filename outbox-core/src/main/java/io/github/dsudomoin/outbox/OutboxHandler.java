@@ -15,6 +15,9 @@ import java.util.concurrent.Callable;
 /**
  * Delivers relayed records to their target: every topic, or those no {@link OutboxTopicHandler} route claims. The
  * application graph holds at most one.
+ *
+ * <p>The {@code key} and {@code payload} arrays of an {@link OutboxRecord} belong to the relay, which writes them back
+ * on a retry, park or dead letter, and use the key for ordering: never modify them in place, copy first.
  */
 public interface OutboxHandler {
 

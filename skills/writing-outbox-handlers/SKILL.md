@@ -38,6 +38,8 @@ The soft deadline is a safety net, not flow control.
   record lets later records of its key overtake it: with ordered Kafka topics keep 0 and bound only the slow route
   (`Outcome.permanent(e)` once `record.attempts() + 1 >= N`).
 - Idempotency key = `record.messageId()` (stable across attempts and redrive), not `record.id()`.
+- `record.key()` and `record.payload()` arrays belong to the relay (it writes them back on retry, park and dead): never
+  modify them in place; copy first.
 
 ## Overriding handleBatch
 

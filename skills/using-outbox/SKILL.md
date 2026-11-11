@@ -53,7 +53,10 @@ data (a record no running release reads waits; it is never lost or dead-lettered
 - `@OutboxContract(n)` on an event class is its payload version (none = 1). `TypedOutbox<T>` (Kora injects it; by
   hand `new TypedOutbox<>(outbox, serializer, OrderCreated.class)`) and `KafkaOutboxPublisher` (last argument the
   value class) stamp it in the `outbox-contract` header; `ProtobufOutbox` and `Outbox.send` send headers as given.
-- Additive change: a new field nullable or with a default, old readers skipping unknown fields; no version bump.
+- Additive change: a new field nullable or with a default, old readers skipping unknown fields; no version bump. The
+  new field must be a nullable reference type: `@Nullable` in Kora `@Json`, a boxed type or `Optional` in Jackson. A
+  primitive, or a field that is not `@Nullable` in Kora, is a breaking change: Kora always rejects the payload as
+  missing the field, Jackson 3 too (Jackson 2 reads 0), and old records go to dead letters.
 - **Breaking change** (a field the handler needs, a changed meaning): mandatory two releases.
   1. Release N writes v1 with the old class and reads v1 and v2 with the new one:
 

@@ -21,7 +21,12 @@ import java.util.UUID;
  * ids up to {@code retention - partitionInterval} old are always deduplicated while inbox maintenance makes ranges ahead
  * (the gauge {@code outbox.inbox.window.remaining}). An id outside the window, or an id that is not UUIDv7, is accepted
  * without dedup ({@code true}, nothing recorded, a rate-limited WARN and {@code outbox.inbox.outside_window}); it never
- * fails the transaction.
+ * fails the transaction. A forward step of X on the inbox database's clock lowers that always-deduplicated age by X, so
+ * size {@code retention} with the largest expected clock error as margin.
+ *
+ * <p>Services that share one inbox table must use the same {@code outbox.inbox.retention},
+ * {@code partitionInterval} and {@code premake}: otherwise the shortest retention wins for all of them. Give each
+ * service its own {@code outbox.inbox.table} if the settings must differ.
  */
 public interface Inbox {
 
@@ -43,7 +48,8 @@ public interface Inbox {
      * other instead of deadlocking, as long as each transaction accepts its poll with one call. Several accept calls in
      * one transaction ({@code tryAccept} or {@code tryAcceptAll}) record their ids in call order and can deadlock with a
      * concurrent consumer of the same ids: Postgres then aborts one of the transactions (SQLState 40P01) and that
-     * consumer retries its poll, as after any failed transaction.
+     * consumer retries its poll, as after any failed transaction. Under REPEATABLE READ or SERIALIZABLE a duplicate
+     * committed concurrently surfaces as SQLState 40001 instead, and the poll is retried the same way.
      */
     Set<UUID> tryAcceptAll(Collection<UUID> messageIds);
 
