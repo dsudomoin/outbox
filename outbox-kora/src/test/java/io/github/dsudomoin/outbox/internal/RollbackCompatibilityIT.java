@@ -295,7 +295,8 @@ class RollbackCompatibilityIT {
         }
         PartitionDdl.detach(c, names.base(), names.tail(), PartitionDdl.DETACH_LOCK_TIMEOUT);
         assertThat(PartitionDdl.dropIfEmptyElseAttach(c, names.base(), names.tail(), Long.toString(upper), null,
-                PartitionDdl.DETACH_LOCK_TIMEOUT)).isTrue();
+                PartitionDdl.DETACH_LOCK_TIMEOUT, PartitionDdl.DETACH_LOCK_TIMEOUT.plus(PartitionDdl.DDL_MARGIN)))
+                .isTrue();
         long floor = Math.floorDiv(current, size) * size;
         long from = upper;
         if (from < floor) {

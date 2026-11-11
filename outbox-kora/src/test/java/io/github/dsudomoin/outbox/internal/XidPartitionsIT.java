@@ -1761,6 +1761,55 @@ class XidPartitionsIT {
         }
     }
 
+    /**
+     * Attaching a detached tail back scans all of it to check its bounds, so its statement bound grows with its size:
+     * with the fixed margin taken out, a 1 ms lock wait alone would cut the scan of 100k rows on every run.
+     */
+    @Test
+    void aLargeStandaloneTailIsAttachedBackUnderABoundScaledToItsSize() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions());
+        partitions.attachMargin = Duration.ZERO;
+
+        try (var c = TestDb.connect()) {
+            long lower = tail(c, names);
+            fillTail(c, names, lower, 100_000);
+            execute(c, "alter table " + names.base() + " detach partition " + names.tail());
+
+            partitions.ensurePremade(c, Duration.ofMillis(1), Duration.ofSeconds(5));
+
+            assertThat(PartitionDdl.attachment(c, names.base(), names.tail())).isEqualTo(Attachment.ATTACHED);
+            assertThat(tail(c, names)).isEqualTo(lower);
+            assertThat(partitions.xidsLeft(c)).isNull();
+            assertThat(queryLong(c, "select count(*) from " + names.base())).isEqualTo(100_000);
+        }
+    }
+
+    /** At startup a detached tail over maxTailScan is left to maintenance: its scan would hold the schema lock. */
+    @Test
+    void bootstrapLeavesALargeStandaloneTailToMaintenance() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(64 * 1024);
+        var names = bootstrap(config);
+        var atStartup = XidPartitions.forBootstrap(names, config.partitions());
+
+        try (var c = TestDb.connect()) {
+            long lower = tail(c, names);
+            fillTail(c, names, lower, 10_000);
+            execute(c, "alter table " + names.base() + " detach partition " + names.tail());
+
+            atStartup.ensurePremade(c, Duration.ofSeconds(5), Duration.ofSeconds(5));
+
+            assertThat(PartitionDdl.attachment(c, names.base(), names.tail())).isEqualTo(Attachment.STANDALONE);
+            assertThat(atStartup.overflow()).isTrue();
+
+            new XidPartitions(names, config.partitions()).ensurePremade(c);
+
+            assertThat(PartitionDdl.attachment(c, names.base(), names.tail())).isEqualTo(Attachment.ATTACHED);
+            assertThat(queryLong(c, "select count(*) from " + names.base())).isEqualTo(10_000);
+        }
+    }
+
     @Test
     void missingTailIsAttachedAboveLastRange() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
@@ -1900,6 +1949,13 @@ class XidPartitionsIT {
             }
         }
         return id;
+    }
+
+    /** {@code rows} rows routed to the tail by an {@code xid} at its lower bound, without burning xids to get there. */
+    static void fillTail(Connection c, TableNames names, long lower, int rows) throws SQLException {
+        execute(c, "insert into " + names.base() + " (shard, xid, message_id, topic) select s % 4, '" + lower
+                + "'::xid8, gen_random_uuid(), 't' from generate_series(1, " + rows + ") s");
+        assertThat(queryLong(c, "select count(*) from " + names.tail())).isEqualTo(rows);
     }
 
     private static long countThroughParent(Connection c, TableNames names, UUID id) throws SQLException {

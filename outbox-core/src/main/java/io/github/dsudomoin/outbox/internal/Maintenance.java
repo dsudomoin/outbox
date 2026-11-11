@@ -121,7 +121,7 @@ public final class Maintenance {
      * defers the swap to the next run, with premake / 2 ranges of xids left before rows reach the tail.
      */
     private final Duration quiesceTimeout;
-    private final XidPartitions partitions;
+    final XidPartitions partitions; // for tests
     private final Ticks ticks;
     private final Cursors cursors;
     private final int shards;
@@ -921,7 +921,12 @@ public final class Maintenance {
         }
         var left = partitions.xidsLeft(c);
         xidsLeft = left == null ? Double.NaN : left;
-        if (left != null) {
+        var cut = partitions.attachBackCut();
+        if (left != null && cut != null) {
+            log.error("outbox partition tail {} is not attached, so no partition takes rows above the last range:"
+                    + " inserts into {} fail once {} more xids are used. Each maintenance run tries to attach it back;"
+                    + " {}", names.tail(), names.base(), left, cut);
+        } else if (left != null) {
             log.error("outbox partition tail {} is not attached, so no partition takes rows above the last range:"
                     + " inserts into {} fail once {} more xids are used. Each maintenance run tries to attach it back"
                     + " or make a new one; a long transaction or snapshot (pg_dump, a repeatable-read report) blocks"

@@ -61,6 +61,13 @@ public final class XidPartitions {
      * before and the tail is locked only through the parent, but by a session that reads it directly.
      */
     private static final Duration HOLD_LOCK_TIMEOUT = Duration.ofMillis(10);
+    /**
+     * The scan rate, bytes a second, a tail's attach back is given time for past its lock wait and
+     * {@link PartitionDdl#DDL_MARGIN}: well below a cold sequential read, so a slow disk fits too. The scan holds no
+     * writer back (SHARE UPDATE EXCLUSIVE on the parent, ACCESS EXCLUSIVE on the standalone tail alone), so its bound
+     * is only there to tell a dead socket from a long statement.
+     */
+    static final long ATTACH_SCAN_RATE = 20L * 1024 * 1024;
     /** Ranges a swap attaches at most besides the former and the new tail: each attach adds to its hold. */
     static final int RANGES_PER_SWAP = 4;
     /** Where a swap statement leaves what it did, for the next statement of the session to read. */
@@ -214,6 +221,13 @@ public final class XidPartitions {
     /** For tests: the warnings of a hot tail's attach as a range, its DEBUG1 lines once the session asks for them. */
     @Nullable
     Consumer<SQLWarning> attachWarnings;
+    /** Replaces {@link PartitionDdl#DDL_MARGIN} in the attach-back's statement bound, for tests. */
+    Duration attachMargin = PartitionDdl.DDL_MARGIN;
+    /** Replaces {@link #ATTACH_SCAN_RATE}, for tests. */
+    long attachScanRate = ATTACH_SCAN_RATE;
+    /** Why the server cut this instance's last attach back of the tail (57014), else null. */
+    @Nullable
+    private volatile String attachBackCut;
 
     public XidPartitions(TableNames names, OutboxConfig.PartitionsConfig cfg) {
         this(names, cfg, LONG_TRANSACTION, false);
@@ -1090,7 +1104,8 @@ public final class XidPartitions {
 
     /** Finishes a tail that is no longer attached; false when it held rows and was attached back. */
     private boolean dropOrAttachBack(Connection c, State s, Duration lockTimeout) throws SQLException {
-        if (PartitionDdl.hasRows(c, names.tail())) {
+        boolean rows = PartitionDdl.hasRows(c, names.tail());
+        if (rows) {
             overflow = true; // stays set until the tail is attached again, even if the steps below time out
         }
         PartitionDdl.detach(c, names.base(), names.tail(), lockTimeout); // FINALIZE when pending, else no-op
@@ -1099,11 +1114,36 @@ public final class XidPartitions {
                 : s.upper != null ? s.upper
                 : Math.floorDiv(s.current, size) * size;
         String tail = names.tail();
-        if (PartitionDdl.dropIfEmptyElseAttach(c, names.base(), tail, Long.toString(lower), null, lockTimeout)) {
-            return true;
+        long bytes = relationSize(c, tail);
+        if (bootstrap && rows && bytes > maxTailScan) { // its scan would hold the schema lock and others' startup
+            return false;
+        }
+        // the attach scans the whole tail to check its bounds: time for that at ATTACH_SCAN_RATE, blocking no writer
+        var bound = lockTimeout.plus(attachMargin).plusMillis(bytes * 1000 / attachScanRate);
+        try {
+            boolean dropped = PartitionDdl.dropIfEmptyElseAttach(
+                    c, names.base(), tail, Long.toString(lower), null, lockTimeout, bound);
+            attachBackCut = null;
+            if (dropped) {
+                return true;
+            }
+        } catch (SQLException e) {
+            attachBackCut = !QUERY_CANCELED.equals(e.getSQLState()) ? null
+                    : "attaching it back scans all its " + mb(bytes) + " MB to check its bounds, and the server cut"
+                            + " that at the " + bound.toMillis() / 1000.0 + " s it was given ("
+                            + firstLine(e.getMessage()) + "). Run it by hand in a session without a statement_timeout;"
+                            + " it blocks no writer: alter table " + names.base() + " attach partition " + tail + " "
+                            + PartitionDdl.bounds(Long.toString(lower), null);
+            throw e;
         }
         overflowed();
         return false;
+    }
+
+    /** Why the server cut this instance's last attach back of a detached tail, its scan too long, else null. */
+    @Nullable
+    String attachBackCut() {
+        return attachBackCut;
     }
 
     /**

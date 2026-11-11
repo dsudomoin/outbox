@@ -17,6 +17,7 @@ import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.OutboxTransactions;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Park;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
+import io.github.dsudomoin.outbox.internal.PartitionDdl.Attachment;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
@@ -1043,6 +1044,34 @@ class MaintenanceIT {
         assertThat(gauge(registry, "outbox.partitions.xids_left")).isNaN();
         assertThat(ranges()).filteredOn(b -> b.to() == null).singleElement()
                 .satisfies(tail -> assertThat(tail.name()).isEqualTo(names.tail()));
+    }
+
+    /** An attach back that the server cut mid-scan gets an ERROR saying so, with its size and the statement to run. */
+    @Test
+    void anAttachBackCutMidScanSaysSoAndHowToAttachByHand() throws Exception {
+        bootstrap();
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null), Duration.ofMillis(1));
+        maintenance.partitions.attachMargin = Duration.ZERO; // the bound is the 1 ms lock wait alone
+        maintenance.partitions.attachScanRate = Long.MAX_VALUE;
+        try (var c = TestDb.connect()) {
+            long lower = ranges().stream().filter(b -> b.to() == null).mapToLong(b -> Long.parseLong(b.from()))
+                    .findFirst().orElseThrow();
+            XidPartitionsIT.fillTail(c, names, lower, 100_000);
+            execute(c, "alter table " + names.base() + " detach partition " + names.tail());
+
+            String log;
+            try (var err = new CapturedStderr()) {
+                assertThat(maintenance.runOnce()).isTrue(); // it ran, its partition step failing
+                log = err.text();
+            }
+
+            assertThat(log).contains("ERROR").contains("is not attached").contains("server cut")
+                    .contains(" MB to check its bounds")
+                    .contains("alter table " + names.base() + " attach partition " + names.tail()
+                            + " for values from ('" + lower + "') to (maxvalue)")
+                    .doesNotContain("a long transaction or snapshot");
+            assertThat(PartitionDdl.attachment(c, names.base(), names.tail())).isEqualTo(Attachment.STANDALONE);
+        }
     }
 
     @Test

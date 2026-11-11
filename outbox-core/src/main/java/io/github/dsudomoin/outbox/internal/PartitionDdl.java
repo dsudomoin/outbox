@@ -292,23 +292,22 @@ public final class PartitionDdl {
      * For a table that is no longer a partition: in one transaction under {@code ACCESS EXCLUSIVE}, drops it when
      * empty, otherwise attaches it back {@code FOR VALUES FROM (from) TO (to)}. The lock waits for a writer that was
      * routed to the table before its detach completed, so a row committed by that writer is seen, never dropped.
-     * Returns true when the table was dropped.
+     * Each statement runs under {@code statementTimeout}, the caller's: the attach scans the whole table to check its
+     * bounds. Returns true when the table was dropped.
      */
-    static boolean dropIfEmptyElseAttach(
-            Connection c, String parent, String table, String from, @Nullable String to, Duration lockTimeout)
-            throws SQLException {
-        return SocketBound.atLeast(c, lockTimeout.plus(DDL_MARGIN),
-                () -> dropIfEmptyElseAttachBounded(c, parent, table, from, to, lockTimeout));
+    static boolean dropIfEmptyElseAttach(Connection c, String parent, String table, String from, @Nullable String to,
+            Duration lockTimeout, Duration statementTimeout) throws SQLException {
+        return SocketBound.atLeast(c, statementTimeout,
+                () -> dropIfEmptyElseAttachBounded(c, parent, table, from, to, lockTimeout, statementTimeout));
     }
 
-    private static boolean dropIfEmptyElseAttachBounded(
-            Connection c, String parent, String table, String from, @Nullable String to, Duration lockTimeout)
-            throws SQLException {
+    private static boolean dropIfEmptyElseAttachBounded(Connection c, String parent, String table, String from,
+            @Nullable String to, Duration lockTimeout, Duration statementTimeout) throws SQLException {
         boolean empty;
         c.setAutoCommit(false);
         try (var st = c.createStatement()) {
             st.execute("set local lock_timeout = " + lockTimeout.toMillis());
-            st.execute("set local statement_timeout = " + lockTimeout.plus(DDL_MARGIN).toMillis());
+            st.execute("set local statement_timeout = " + statementTimeout.toMillis());
             st.execute("set local idle_in_transaction_session_timeout = " + lockTimeout.plusSeconds(30).toMillis());
             st.execute("lock table " + name(table) + " in access exclusive mode");
             try (var rs = st.executeQuery("select 1 from " + name(table) + " limit 1")) {
