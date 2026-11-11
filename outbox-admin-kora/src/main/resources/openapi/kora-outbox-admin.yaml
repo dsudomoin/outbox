@@ -437,8 +437,8 @@ components:
         deadLetters:
           type: array
           description: >-
-            Dead letters by topic and status; absent when counting them took longer than the read's 60 s limit (a
-            full scan of the dead table), the rest of the status read all the same
+            Dead letters by topic and status; absent when counting them took longer than their own 10 s limit
+            (a full scan of the dead table), short of a proxy's usual 60 s, the rest of the status read all the same
           items:
             $ref: '#/components/schemas/DeadLetterCount'
         orphans:

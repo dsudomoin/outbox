@@ -96,7 +96,10 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     private final String waitingOldest;
     /** How long a call under the maintenance lock waits for a maintenance run in progress; shorter in tests. */
     Duration maintenanceWait = Duration.ofSeconds(60);
-    /** Each statement's limit in {@code status} and the dead-letter reads; shorter in tests. */
+    /**
+     * Each statement's limit in {@code status} (its dead-letter counts get a sixth) and the dead-letter reads; shorter
+     * in tests.
+     */
     Duration readTimeout = Duration.ofSeconds(60);
     /** How long {@code abandonWaiting} waits for a relay step holding a shard: batchTimeout + 5 s; shorter in tests. */
     Duration shardWait;
@@ -156,9 +159,9 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         try (var conn = ddl.newConnection(); var bound = socket.on(conn)) {
             // in a transaction of its own: its lock on the tail lasts until the commit, and a swap's hold waits 10 ms at
             // most for it, so the reads after it would make a swap running meanwhile miss
-            boolean tailOverflow = read(conn, c -> PartitionDdl.attachment(c, names.base(), names.tail())
+            boolean tailOverflow = read(conn, readTimeout, c -> PartitionDdl.attachment(c, names.base(), names.tail())
                     != Attachment.MISSING && PartitionDdl.hasRows(c, names.tail()));
-            var s = read(conn, c -> new OutboxStatus(
+            var s = read(conn, readTimeout, c -> new OutboxStatus(
                     queryBoolean(c, "select exists (select 1 from " + names.halt() + ")"),
                     maintenance.lagSeconds(c),
                     retries.size(c),
@@ -175,18 +178,19 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                     maintenance.secondsSinceSuccess(c),
                     shards,
                     instances(c)));
-            // a full scan of the dead table, kept forever by default: on its own, so a count cut by readTimeout
-            // leaves the rest of the status standing
+            // a full scan of the dead table, kept forever by default: on its own, so a cut count leaves the rest of the
+            // status standing, and under a sixth of readTimeout (10 s), so that rest arrives well inside a proxy's 60 s
+            Duration deadCountTimeout = readTimeout.dividedBy(6);
             List<DeadLetterCount> deadLetters;
             try {
-                deadLetters = read(conn, this::deadLetterCounts);
+                deadLetters = read(conn, deadCountTimeout, this::deadLetterCounts);
             } catch (SQLException e) {
                 if (!QUERY_CANCELED.equals(e.getSQLState())) {
                     throw e;
                 }
                 log.warn("outbox admin status: the dead-letter counts took longer than {}, reported unknown; a"
                         + " retention (outbox.deadLetters.retention) or a discard keeps the dead table small",
-                        readTimeout);
+                        deadCountTimeout);
                 deadLetters = null;
             }
             return new OutboxStatus(s.halted(), s.lagSeconds(), s.retrySize(), s.parkedSize(), s.waitingSize(),
@@ -219,7 +223,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         }
         var where = Where.of(filter);
         try (var conn = db.newConnection(); var bound = socket.on(conn)) {
-            var letters = read(conn, c -> {
+            var letters = read(conn, readTimeout, c -> {
                 try (var ps = c.prepareStatement("select " + DeadLetters.COLUMNS + " from " + dead + " where "
                         + where.sql() + " and id > ? order by id limit ?")) {
                     int next = where.bind(ps);
@@ -245,7 +249,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         requireOwnTransactions();
         var where = Where.of(filter);
         try (var conn = db.newConnection(); var bound = socket.on(conn)) {
-            return read(conn, c -> {
+            return read(conn, readTimeout, c -> {
                 try (var ps = c.prepareStatement("select count(*) from " + dead + " where " + where.sql())) {
                     where.bind(ps);
                     try (var rs = ps.executeQuery()) {
@@ -697,7 +701,8 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                 long after = Long.MIN_VALUE;
                 while (true) {
                     long above = after;
-                    var chunk = dryRun ? read(c, tx -> abandonChunk(tx, shard, topic, key, above, true, error))
+                    var chunk = dryRun
+                            ? read(c, readTimeout, tx -> abandonChunk(tx, shard, topic, key, above, true, error))
                             : inTx(c, tx -> abandonChunk(tx, shard, topic, key, above, false, error));
                     keys += chunk.claimed();
                     records += chunk.done();
@@ -759,9 +764,9 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         long records = 0;
         try (var c = db.newConnection(); var bound = socket.on(c)) {
             c.setAutoCommit(true);
-            for (int shard : read(c, tx -> shardsOf(tx, topic, condition, value))) {
+            for (int shard : read(c, readTimeout, tx -> shardsOf(tx, topic, condition, value))) {
                 if (dryRun) {
-                    records += read(c, tx -> countRows(tx, shard, topic, condition, value));
+                    records += read(c, readTimeout, tx -> countRows(tx, shard, topic, condition, value));
                     continue;
                 }
                 var upTo = new AtomicReference<Long>();
@@ -1137,11 +1142,12 @@ public final class PgOutboxAdmin implements OutboxAdmin {
 
     /**
      * A read-only call's {@code body} in one transaction ({@link #inTx}) under {@code statement_timeout} =
-     * {@link #readTimeout} (each statement's, lock waits included), so a slow read gives its pool connection back.
+     * {@code timeout}, mostly {@link #readTimeout} (each statement's, lock waits included), so a slow read gives its
+     * pool connection back.
      */
-    private <T> T read(Connection c, SqlFunction1<Connection, T> body) throws SQLException {
-        return SocketBound.atLeast(c, readTimeout, () -> inTx(c, tx -> {
-            execute(tx, "set local statement_timeout = " + readTimeout.toMillis());
+    private <T> T read(Connection c, Duration timeout, SqlFunction1<Connection, T> body) throws SQLException {
+        return SocketBound.atLeast(c, timeout, () -> inTx(c, tx -> {
+            execute(tx, "set local statement_timeout = " + timeout.toMillis());
             return body.apply(tx);
         }));
     }

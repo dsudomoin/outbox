@@ -58,6 +58,7 @@ import java.util.stream.LongStream;
 import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
@@ -675,6 +676,27 @@ class OutboxAdminIT {
             assertThat(status.deadLetters()).as("unknown").isNull();
             assertThat(status.halted()).isFalse();
             assertThat(status.shards()).isEqualTo(config.shards());
+        }
+    }
+
+    /**
+     * The dead-letter count gets a sixth of readTimeout, so the partial status arrives well inside a proxy's timeout
+     * equal to readTimeout (60 s, nginx's default) instead of after it.
+     */
+    @Test
+    @Tag("timing")
+    void statusCutsTheDeadLetterCountWellBeforeTheReadTimeout() throws Exception {
+        admin.readTimeout = Duration.ofSeconds(4); // under the 5 s lock_timeout, so the statement timeout cuts the wait
+        try (var holder = TestDb.connect()) {
+            holder.setAutoCommit(false);
+            TestSql.execute(holder, "lock table " + names.dead() + " in access exclusive mode");
+
+            long start = System.nanoTime();
+            var status = admin.status();
+            assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(3));
+            assertThat(status.deadLetters()).as("unknown").isNull();
+            assertThat(status.shards()).isEqualTo(config.shards());
+            holder.rollback();
         }
     }
 

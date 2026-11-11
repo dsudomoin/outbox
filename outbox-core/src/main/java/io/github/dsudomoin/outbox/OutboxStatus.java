@@ -13,8 +13,8 @@ import java.util.Map;
  * {@code parkedSize}: rows in {@code <base>_parked}; {@code waitingSize}: retry heads waiting for an instance that can
  * handle them ({@code outbox.waiting.size}); {@code waitingOldestSeconds}: since the oldest of them began to wait, 0
  * when none waits ({@code outbox.waiting.oldest}); {@code deadLetters}: dead letters by topic and status, null when
- * counting them took longer than the read's 60 s limit (a full scan of the dead table: keep it small with
- * {@code outbox.deadLetters.retention}), the rest of the status read all the same;
+ * counting them took longer than their own 10 s limit (a full scan of the dead table: keep it small with
+ * {@code outbox.deadLetters.retention}), short of a proxy's usual 60 s, the rest of the status read all the same;
  * {@code orphans}: standalone ranges whose rows lie outside the outbox, which the relay cannot deliver;
  * {@code tailOverflow}: rows went to the partition tail ({@code outbox.partitions.overflow}); {@code premade}: ranges
  * ahead of the current xid ({@code outbox.partitions.premade}); {@code xidsLeft}: xids before inserts fail, null while
