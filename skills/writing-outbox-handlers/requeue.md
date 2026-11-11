@@ -99,8 +99,8 @@ public final class AccountJobsHandler implements OutboxTopicHandler {
   `<table>_dead` with the error «requeue limit reached», attempts unchanged. Every hand-back answered with `requeue`
   counts, a merge ahead of a new record of the key and an early offer ahead of a newer due record of the key included,
   so a busy key spends requeues faster than one per
-  `delay`, at a rate you cannot predict. To give up after a time instead, use `record.createdAt()`:
-  `Duration.between(record.createdAt(), Instant.now())` past a limit → `Outcome.permanent(e)`.
+  `delay`, at a rate you cannot predict. Bound the count, not the age: `record.createdAt()` is the database's time and
+  `Instant.now()` the JVM's, so the two differ by the clock offset.
 
 ## Order
 

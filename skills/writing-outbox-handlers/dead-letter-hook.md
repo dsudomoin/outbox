@@ -82,7 +82,8 @@ it by message id within their window.
 - **Mixed fleets.** Keep the hook the same on every instance. During a rolling deploy that adds it, instances without
   an active hook leave `pending` letters alone while an instance with an active hook heartbeats. The previous release
   (5fc60dd) writes its dead letters `kept`, and the hook never sees them, nor letters that were dead before the
-  upgrade.
+  upgrade. Letters that die on instances without the hook during a deploy that adds one are kept the same way:
+  find them by the deploy window (`status=kept&failedFrom=<start>&failedTo=<end>`) and redrive them after the deploy.
 
 ## Kafka DLQ instead of code
 
