@@ -1882,6 +1882,54 @@ class MaintenanceIT {
     }
 
     @Test
+    void retentionOfABacklogIsNotEndedByARoleStatementTimeout() throws Exception {
+        bootstrap();
+        oldKeptLetters(500_000);
+        config.deadLettersRetention(Duration.ofDays(30));
+        var props = new java.util.Properties();
+        props.setProperty("options", "-c statement_timeout=100"); // a role or pool default, below one big delete
+        var timed = TestDb.newDatabase(2, props);
+        pools.add(timed);
+        var maintenance = new Maintenance(timed, names, config, new OutboxMetrics(null));
+
+        try (var err = new CapturedStderr()) {
+            for (int i = 0; i < 3; i++) {
+                assertThat(maintenance.runOnce()).isTrue();
+            }
+            assertThat(err.text()).doesNotContain("step 'dead-letter retention'");
+        }
+
+        try (var c = TestDb.connect()) {
+            assertThat(queryLong(c, "select count(*) from " + names.dead())).isZero();
+        }
+        assertThat(lastSuccess()).as("the runs are recorded as successes").isNotNull();
+    }
+
+    @Test
+    void retentionStoppedByItsBudgetIsNotAFailureAndTheNextRunsGoOn() throws Exception {
+        bootstrap();
+        oldKeptLetters(300_000);
+        config.deadLettersRetention(Duration.ofDays(30)).maintenanceInterval(Duration.ofMillis(1)); // the budget
+        var maintenance = maintenance();
+
+        try (var err = new CapturedStderr(); var c = TestDb.connect()) {
+            assertThat(maintenance.runOnce()).isTrue();
+            long left = queryLong(c, "select count(*) from " + names.dead());
+            assertThat(left).as("one range of blocks per run once the budget is spent").isPositive()
+                    .isLessThan(300_000);
+            assertThat(lastSuccess()).as("a run stopped by its budget succeeded").isNotNull();
+            for (int run = 0; run < 50 && left > 0; run++) {
+                assertThat(maintenance.runOnce()).isTrue();
+                long now = queryLong(c, "select count(*) from " + names.dead());
+                assertThat(now).as("each run goes on where the last stopped").isLessThan(left);
+                left = now;
+            }
+            assertThat(left).isZero();
+            assertThat(err.text()).doesNotContain("step 'dead-letter retention'");
+        }
+    }
+
+    @Test
     void redriveHistoryIsCleaned() throws Exception {
         config.deadLettersRedriveHistory(Duration.ofDays(30));
         bootstrap();
@@ -2324,6 +2372,15 @@ class MaintenanceIT {
             execute(c, "insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts,"
                     + " failed_at, status, due_at) values (" + id + ", 0, gen_random_uuid(), 't', now(), 1, now() -"
                     + " interval '" + age + "', '" + status + "', " + (status.equals("kept") ? "null" : "now()") + ")");
+        }
+    }
+
+    /** {@code rows} kept dead letters that failed 400 days ago. */
+    private void oldKeptLetters(int rows) throws SQLException {
+        try (var c = TestDb.connect()) {
+            execute(c, "insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts,"
+                    + " failed_at) select s, 0, gen_random_uuid(), 't', now(), 1, now() - interval '400 days' from"
+                    + " generate_series(1, " + rows + ") s");
         }
     }
 

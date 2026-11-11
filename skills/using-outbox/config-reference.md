@@ -113,8 +113,8 @@ The dead-letter hook and the dead table (writing-outbox-handlers, `dead-letter-h
 |---|---|---|
 | `batchSize` | `100` | 1..1000. Letters per hook call; also key locks per redrive transaction. |
 | `timeout` | `30s` | > 0, ≤ 24 days. Bound of one hook call; a call past it leaves its letters pending with backoff `relay.retry.initialDelay` doubling to `maxDelay`. With the Kafka DLQ ≥ `delivery.timeout.ms + 5 s + max.block.ms`, else a WARN at startup. |
-| `retention` | `0` | 0..3650 days. Maintenance deletes `kept` letters older than this by `failed_at`; `0` keeps them forever. `pending` and `scheduled` letters are never deleted. |
-| `redriveHistory` | `30d` | > 0, ≤ 3650 days. How long `<table>_redriven` remembers a message's redrive count, which a letter that dies again carries in `redrives`. |
+| `retention` | `0` | 0..3650 days. Maintenance deletes `kept` letters older than this by `failed_at`; `0` keeps them forever. `pending` and `scheduled` letters are never deleted. Deleted in portions, at most `maintenanceInterval` per run; later runs finish the rest. |
+| `redriveHistory` | `30d` | > 0, ≤ 3650 days. How long `<table>_redriven` remembers a message's redrive count, which a letter that dies again carries in `redrives`. Old entries go in portions, within the same per-run budget as `retention`. |
 
 ## `outbox.schema`
 

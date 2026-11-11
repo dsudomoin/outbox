@@ -63,7 +63,8 @@ import org.slf4j.LoggerFactory;
  * outbox), tick cleanup (below the lowest effective tick, but never below a latest cursor row's tick, where the
  * previous release starts its steps: see {@link Cursors}), cursor cleanup, deletion of kept dead letters older than
  * {@code outbox.deadLetters.retention} (by {@code failed_at}; none when it is 0, pending or scheduled ones never) and
- * of redrive counts older than {@code outbox.deadLetters.redriveHistory}, the start of the dead table's
+ * of redrive counts older than {@code outbox.deadLetters.redriveHistory} (both by ranges of blocks, at most a
+ * {@code maintenanceInterval} per run: {@link AgedDelete}), the start of the dead table's
  * {@code <dead>_due} build when it is missing or invalid ({@link DeadIndexBuilder}: on its own thread, off the
  * maintenance lock; never a failed step; none with {@code outbox.schema.bootstrap = false}), gauges; when none
  * failed, the run is recorded as the last success. One long-lived instance per outbox table: it registers the gauges
@@ -106,6 +107,10 @@ public final class Maintenance {
      */
     static final Duration ABANDONED_AFTER = Duration.ofSeconds(5);
     private static final String LOCK_NOT_AVAILABLE = "55P03";
+    /** Blocks one statement of an age cleanup ({@link AgedDelete}) reads: 8 MB of 8 kB blocks. */
+    static final int CLEANUP_BLOCKS = 1024;
+    /** The {@code statement_timeout} of one such statement: far above what its blocks take. */
+    static final Duration CLEANUP_TIMEOUT = Duration.ofSeconds(30);
 
     private final OutboxTransactions db;
     private final TableNames names;
@@ -133,8 +138,10 @@ public final class Maintenance {
     private final String succeeded;
     private final Duration deadRetention;
     private final Duration redriveHistory;
-    private final String deleteOldKept;
-    private final String deleteOldRedrives;
+    private final AgedDelete deleteOldKept;
+    private final AgedDelete deleteOldRedrives;
+    /** How long a run's age cleanups may take together: one {@code maintenanceInterval}. */
+    private final Duration cleanupBudget;
     private final String deadPending;
     private final String waiting;
     private final String oldestRetried;
@@ -223,10 +230,9 @@ public final class Maintenance {
         this.buildsDeadIndex = config.schema().bootstrap();
         this.deadRetention = config.deadLetters().retention();
         this.redriveHistory = config.deadLetters().redriveHistory();
-        // ponytail: one statement per run, a scan of the dead table; chunk it if a first retention ever meets millions
-        this.deleteOldKept = "delete from " + names.dead() + " where status = 'kept'"
-                + " and failed_at < now() - make_interval(secs => ?)";
-        this.deleteOldRedrives = "delete from " + names.redriven() + " where at < now() - make_interval(secs => ?)";
+        this.deleteOldKept = new AgedDelete(names.dead(), "status = 'kept' and failed_at");
+        this.deleteOldRedrives = new AgedDelete(names.redriven(), "at");
+        this.cleanupBudget = config.partitions().maintenanceInterval();
         // due_at is set on every pending letter: the partial index finds them, not a scan of all the kept ones
         this.deadPending = "select count(*), coalesce(extract(epoch from now() - min(failed_at)), 0)::float8 from "
                 + names.dead() + " where status = 'pending' and due_at is not null";
@@ -689,10 +695,11 @@ public final class Maintenance {
             });
         }
         step("cursor cleanup", () -> cursors.deleteSuperseded(c));
+        long cleanupEnd = System.nanoTime() + cleanupBudget.toNanos();
         if (!deadRetention.isZero()) {
-            step("dead-letter retention", () -> deleteOlder(c, deleteOldKept, deadRetention));
+            step("dead-letter retention", () -> deleteOldKept.run(c, deadRetention, cleanupEnd));
         }
-        step("redrive history cleanup", () -> deleteOlder(c, deleteOldRedrives, redriveHistory));
+        step("redrive history cleanup", () -> deleteOldRedrives.run(c, redriveHistory, cleanupEnd));
         if (buildsDeadIndex) {
             step("dead-letter index", () -> {
                 deadIndex.startIfDue(c);
@@ -821,11 +828,63 @@ public final class Maintenance {
         }
     }
 
-    /** {@code delete} with the one parameter: {@code age} in seconds; returns the rows deleted. */
-    private static int deleteOlder(Connection c, String delete, Duration age) throws SQLException {
-        try (var ps = c.prepareStatement(delete)) {
-            ps.setDouble(1, age.toNanos() / 1e9);
-            return ps.executeUpdate();
+    /**
+     * The rows of a table older than an age, deleted by ranges of {@link #CLEANUP_BLOCKS} blocks (a TID range scan,
+     * each its own autocommit statement under {@link #CLEANUP_TIMEOUT}, whatever the role's {@code statement_timeout}):
+     * a backlog of millions never runs into a timeout, as one statement would on every run, and each row is deleted,
+     * and written to the WAL, once. A pass reads the table once, as one statement's scan would, and needs no index.
+     * Past the run's budget, after at least one range, it stops, not a failure, and this instance's next run goes on
+     * from there; a pass that reached the end starts the next from the first block. Rows that age out behind it
+     * meanwhile go in the next pass.
+     */
+    private static final class AgedDelete {
+
+        private final String table;
+        private final String delete;
+        /** The block this instance's next run starts at. */
+        private volatile long next;
+
+        /** {@code aged}: the predicate up to the timestamp compared with now() less the age. */
+        AgedDelete(String table, String aged) {
+            this.table = table;
+            this.delete = "delete from " + table + " where ctid >= ('(' || ?::bigint || ',0)')::tid"
+                    + " and ctid < ('(' || ?::bigint || ',0)')::tid and " + aged
+                    + " < now() - make_interval(secs => ?)";
+        }
+
+        /** Returns the rows deleted. */
+        long run(Connection c, Duration age, long end) throws SQLException {
+            long blocks;
+            try (var ps = c.prepareStatement("select pg_relation_size(to_regclass(?))"
+                    + " / current_setting('block_size')::bigint")) {
+                ps.setString(1, table);
+                try (var rs = ps.executeQuery()) {
+                    rs.next();
+                    blocks = rs.getLong(1);
+                }
+            }
+            long from = next < blocks ? next : 0;
+            var settings = Map.of("statement_timeout", String.valueOf(CLEANUP_TIMEOUT.toMillis()));
+            return SocketBound.atLeast(c, CLEANUP_TIMEOUT, () -> SessionSettings.with(c, settings, () -> {
+                long deleted = 0;
+                try (var ps = c.prepareStatement(delete)) {
+                    for (long at = from; at < blocks; ) {
+                        ps.setLong(1, at);
+                        ps.setLong(2, at + CLEANUP_BLOCKS);
+                        ps.setDouble(3, age.toNanos() / 1e9);
+                        deleted += ps.executeUpdate();
+                        at += CLEANUP_BLOCKS;
+                        next = at < blocks ? at : 0;
+                        if (at < blocks && System.nanoTime() - end >= 0) {
+                            log.info("outbox maintenance deleted {} rows of {} older than {} this run and stopped at"
+                                    + " its budget, at block {} of {}: the next run goes on from there", deleted,
+                                    table, age, at, blocks);
+                            break;
+                        }
+                    }
+                }
+                return deleted;
+            }));
         }
     }
 

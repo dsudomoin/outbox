@@ -222,7 +222,8 @@ public record OutboxProperties(
      * @param timeout bound of one hook call; a call cut at it leaves its letters pending, retried with backoff. Default
      *     30 s, at most 24 days.
      * @param retention kept letters older than this, by their failed_at, are deleted by maintenance; 0 = kept forever,
-     *     the default; at most 3650 days. Letters still pending for the hook are never deleted.
+     *     the default; at most 3650 days. Letters still pending for the hook are never deleted. Deleted in portions,
+     *     at most a maintenanceInterval per run with the redrive history's cleanup; later runs finish the rest.
      * @param redriveHistory how long the count of a message's redrives is remembered, so a redriven message that dies
      *     again carries it. Default 30 days, at most 3650 days.
      */

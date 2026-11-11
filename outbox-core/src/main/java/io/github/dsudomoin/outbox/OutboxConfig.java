@@ -299,7 +299,9 @@ public interface OutboxConfig {
 
         /**
          * Kept letters older than this, by their {@code failed_at}, are deleted by maintenance; 0 = kept forever, the
-         * default; at most 3650 days. Letters still pending for the hook are never deleted.
+         * default; at most 3650 days. Letters still pending for the hook are never deleted. Deleted in portions, at
+         * most a {@code maintenanceInterval} per run with {@link #redriveHistory()}'s cleanup; later runs finish the
+         * rest.
          */
         default Duration retention() {
             return Duration.ZERO;
