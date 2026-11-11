@@ -44,7 +44,7 @@ README «Наблюдаемость» → «Контракт по этапам»
 | `outbox.partitions.premade` | gauge | | xid ranges above the current xid. |
 | `outbox.partitions.overflow` | gauge | | 1 while the tail partition holds rows: writes go on into it; the next swap turns it into a range (over `maxTailScan`: inside `tailConversion.window`; a whole window without that fails maintenance runs, so `since_success` pages). |
 | `outbox.partitions.xids_left` | gauge | | xids left before inserts fail while the tail is detached; NaN while attached. |
-| `outbox.partitions.retained` | gauge | | Attached ranges entirely below the one holding the current xid: passed, not dropped yet; 0 after a run normally. At ≥ 2 for 3 runs in a row a WARN «outbox keeps N ranges of ...» (at most once a minute) names the cluster's oldest xid holders. |
+| `outbox.partitions.retained` | gauge | | Attached ranges entirely below the one holding the current xid: passed, not dropped yet; 0 after a run normally. Counts ranges a shard behind keeps too. When ≥ 2 of them lie above the latest tick's xmin (kept with every shard past them) for 3 runs in a row, a WARN «outbox keeps N ranges of ...» (at most once a minute) names the cluster's oldest xid holders; another role's session is named without `pg_read_all_stats` too, with its state and transaction age hidden. |
 | `outbox.partitions.orphaned` | gauge | | Detached ranges kept because they hold rows. |
 | `outbox.maintenance.transaction_pooling` | gauge | | 1 when the last maintenance run detected a transaction pooler. |
 | `outbox.maintenance.since_success` | gauge, seconds | | Since the last finished maintenance run on any instance. |

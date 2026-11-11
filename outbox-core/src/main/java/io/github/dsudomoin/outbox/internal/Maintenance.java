@@ -79,9 +79,9 @@ import org.slf4j.LoggerFactory;
  * {@code outbox.parked.size}, {@code outbox.partitions.premade},
  * {@code outbox.partitions.overflow}, {@code outbox.partitions.xids_left} (xids before inserts fail while the tail is
  * not attached, with an ERROR each run; NaN while it is), {@code outbox.partitions.retained} (ranges below the one
- * holding the current xid that are not dropped yet; at {@link #RETAINED_WARN} or more for {@link #RETAINED_RUNS} runs
- * in a row, a WARN at most once a minute names the cluster's oldest xid holders, which pin the drop horizon even from
- * another database), {@code outbox.maintenance.transaction_pooling} and
+ * holding the current xid that are not dropped yet; when {@link #RETAINED_WARN} or more of them lie above the latest
+ * tick's xmin for {@link #RETAINED_RUNS} runs in a row, a WARN at most once a minute names the cluster's oldest xid
+ * holders, which pin the drop horizon even from another database), {@code outbox.maintenance.transaction_pooling} and
  * {@code outbox.maintenance.since_success} (NaN until the first run).
  */
 public final class Maintenance {
@@ -91,8 +91,9 @@ public final class Maintenance {
     /** Maintenance not completing for this many intervals is a WARN. */
     private static final int STALE_INTERVALS = 5;
     /**
-     * Retained ranges ({@code outbox.partitions.retained}) at or above this many for {@link #RETAINED_RUNS} runs in a
-     * row is a WARN naming the cluster's oldest xid holders: one range may just wait for the next tick.
+     * Retained ranges above the latest tick's xmin, kept with every shard caught up, at or above this many for
+     * {@link #RETAINED_RUNS} runs in a row is a WARN naming the cluster's oldest xid holders: one range may just wait
+     * for the next tick.
      */
     static final int RETAINED_WARN = 2;
     static final int RETAINED_RUNS = 3;
@@ -159,7 +160,10 @@ public final class Maintenance {
     private final SocketBound socket;
     private final AtomicLong premadeLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong retainedLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
-    /** Runs in a row with {@link #RETAINED_WARN} or more retained ranges; written by the gauges step only. */
+    /**
+     * Runs in a row with {@link #RETAINED_WARN} or more retained ranges above the latest tick's xmin; written by the
+     * gauges step only.
+     */
     private int retainedRuns;
     /** One each, so the first ERROR past {@code alertAfter} is not held back by a WARN just before it. */
     private final AtomicLong waitingWarned = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
@@ -925,17 +929,19 @@ public final class Maintenance {
         int ahead = state.ahead();
         premade = ahead;
         retained = state.retained();
-        retainedRuns = state.retained() >= RETAINED_WARN ? retainedRuns + 1 : 0;
-        // the slowest tick's xmin is the drop horizon; while the latest tick's stays as low, an xid holds them both
-        if (retainedRuns >= RETAINED_RUNS && read != null && read.slowest() != null && due(retainedLogged)) {
-            log.warn("outbox keeps {} ranges of {} below the range of the current xid, {} runs in a row: a range is"
-                    + " dropped once its upper bound is at or below the xmin of the slowest shard's tick, {} (the"
-                    + " latest tick's is {}). A latest xmin that stays put is the xid of the cluster's oldest open or"
-                    + " prepared transaction, in any database: {}. Until it ends (COMMIT PREPARED or ROLLBACK PREPARED,"
-                    + " or pg_terminate_backend), the outbox grows by all that is written; a latest xmin that moves"
-                    + " with outbox.shard.lag growing is a shard behind instead. This WARN repeats at most once a"
-                    + " minute", state.retained(), names.base(), retainedRuns, read.slowest().snapshot().xmin(),
-                    read.latest().snapshot().xmin(), XidPartitions.oldestXidHolders(c));
+        // a range is dropped once the slowest shard's tick xmin passes its upper bound; one above even the latest
+        // tick's xmin is kept with every shard caught up, by the xid that holds that xmin. Ranges kept only by a shard
+        // behind are the gauge's and outbox.shard.lag's, not this WARN's
+        long latestXmin = read == null ? Long.MAX_VALUE : read.latest().snapshot().xmin();
+        int held = state.retainedAbove(latestXmin);
+        retainedRuns = held >= RETAINED_WARN ? retainedRuns + 1 : 0;
+        if (retainedRuns >= RETAINED_RUNS && due(retainedLogged)) {
+            log.warn("outbox keeps {} ranges of {} below the range of the current xid although every shard has passed"
+                    + " them, {} runs in a row: their upper bounds are above the xmin of the latest tick, {}, the xid"
+                    + " of the cluster's oldest open or prepared transaction, in any database: {}. Until it ends"
+                    + " (COMMIT PREPARED or ROLLBACK PREPARED, or pg_terminate_backend), the outbox grows by all that"
+                    + " is written. This WARN repeats at most once a minute", held, names.base(), retainedRuns,
+                    latestXmin, XidPartitions.oldestXidHolders(c));
         }
         var left = partitions.xidsLeft(c);
         xidsLeft = left == null ? Double.NaN : left;

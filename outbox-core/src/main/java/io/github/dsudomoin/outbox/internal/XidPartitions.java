@@ -142,7 +142,8 @@ public final class XidPartitions {
     /**
      * The cluster's oldest prepared transaction and its oldest other session holding an xid, in any database: either
      * keeps {@code pg_snapshot_xmin} of every snapshot, and so the drop horizon, at its xid. Each is null when none
-     * is seen; another role's session may be hidden without {@code pg_read_all_stats}.
+     * is seen; another role's session shows its xid to every role, but its state and xact_start only with
+     * {@code pg_read_all_stats}.
      */
     private static final String OLDEST_XID_HOLDERS = """
             select (select format('prepared transaction %L in database %s, prepared %s s ago', gid, database,
@@ -916,8 +917,8 @@ public final class XidPartitions {
             var prepared = rs.getString(1);
             var session = rs.getString(2);
             if (prepared == null && session == null) {
-                return "none is visible: no prepared transaction, and a session of another role hides its xid unless"
-                        + " this role has pg_read_all_stats (or pg_monitor)";
+                return "none now: no prepared transaction and no session holds an xid, so the one that did has ended"
+                        + " since the latest tick, and the next tick moves past it (no tick is made while no relay runs)";
             }
             return prepared == null ? session : session == null ? prepared : prepared + "; " + session;
         }
@@ -1305,7 +1306,7 @@ public final class XidPartitions {
         Long upper = null;
         Long tailLower = null;
         int ahead = 0;
-        int retained = 0;
+        var retainedTo = new ArrayList<Long>();
         for (var b : PartitionDdl.listRanges(c, names.base())) {
             if (b.to() == null) {
                 tailLower = Long.parseLong(b.from());
@@ -1316,12 +1317,12 @@ public final class XidPartitions {
             }
             long to = Long.parseLong(b.to());
             if (to <= current) {
-                retained++;
+                retainedTo.add(to);
             }
             upper = upper == null ? to : Math.max(upper, to);
         }
-        return new State(current, oldest, upper, ahead, retained,
-                PartitionDdl.attachment(c, names.base(), names.tail()), tailLower);
+        return new State(current, oldest, upper, ahead, retainedTo.size(),
+                retainedTo.stream().mapToLong(Long::longValue).toArray(), PartitionDdl.attachment(c, names.base(), names.tail()), tailLower);
     }
 
     /** {@code tailConversion.window}: from (inclusive) to (exclusive), across midnight when to comes first. */
@@ -1365,8 +1366,21 @@ public final class XidPartitions {
 
     /**
      * {@code ahead}: ranges above the current xid ({@link #premadeAhead}); {@code retained}: attached ranges lying
-     * entirely below the range holding it, which {@link #dropProcessed} has not dropped yet.
+     * entirely below the range holding it, which {@link #dropProcessed} has not dropped yet, and {@code retainedTo}
+     * their upper bounds.
      */
-    record State(long current, long oldest, @Nullable Long upper, int ahead, int retained, Attachment tail,
-            @Nullable Long tailLower) {}
+    record State(long current, long oldest, @Nullable Long upper, int ahead, int retained, long[] retainedTo,
+            Attachment tail, @Nullable Long tailLower) {
+
+        /** Retained ranges with an upper bound above {@code xmin}: kept even with every shard at a tick of it. */
+        int retainedAbove(long xmin) {
+            int n = 0;
+            for (long to : retainedTo) {
+                if (to > xmin) {
+                    n++;
+                }
+            }
+            return n;
+        }
+    }
 }

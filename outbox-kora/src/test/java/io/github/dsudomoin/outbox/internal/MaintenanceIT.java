@@ -1915,6 +1915,29 @@ class MaintenanceIT {
     }
 
     @Test
+    void rangesKeptOnlyByAShardBehindNameNoXidHolder() throws Exception {
+        bootstrap();
+        var registry = new SimpleMeterRegistry();
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
+        send(msg("t", "k", "a")); // never relayed: its shard stays at the bootstrap tick, as with its target down
+        makeTick();
+        TestDb.burnXids(3000);
+        makeTick(); // the latest tick's xmin is past those ranges: only the shard behind keeps them
+
+        String log;
+        try (var err = new CapturedStderr()) {
+            for (int i = 0; i < 3; i++) {
+                assertThat(maintenance.runOnce()).isTrue();
+            }
+            log = err.text();
+        }
+
+        assertThat(gauge(registry, "outbox.partitions.retained")).as("the gauge counts them all")
+                .isGreaterThanOrEqualTo(2);
+        assertThat(log).doesNotContain("outbox keeps");
+    }
+
+    @Test
     void retentionDeletesOnlyOldKeptLetters() throws Exception {
         bootstrap();
         deadLetter(1, "kept", "2 days");
