@@ -1212,8 +1212,9 @@ public final class ShardProcessor implements AutoCloseable {
         boolean deadLettered;
         /** The rows that got an outcome. */
         final Set<Long> answered = new HashSet<>();
-        /** A handed parked row was written. */
+        /** A handed retry or parked row answered requeue and was parked: progress for drain(). */
         boolean requeued;
+        /** A handed parked row was written. */
         boolean wroteParked;
         /** Re-parks, keeps and unparks of handed parked rows, written as JDBC batches when the round ends. */
         final List<Action> parkedWrites = new ArrayList<>();
@@ -1377,6 +1378,7 @@ public final class ShardProcessor implements AutoCloseable {
                     parked.fromRetry(c, row, row.requeues() + 1, requeueDue(q.notBefore(), now));
                     telemetry.requeued(row.topic());
                     pass.fromRetry = true;
+                    pass.requeued = true;
                 }
             } else if (outcome instanceof Outcome.Permanent p) {
                 dead(c, pass, row, attempts, RetryStore.describe(p.error()));

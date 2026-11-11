@@ -3352,6 +3352,33 @@ class ShardProcessorIT {
     }
 
     @Test
+    void aRetryRowAnsweringRequeueIsReportedAsRequeued() throws Exception {
+        bootstrap();
+        script = answering(Map.of("k#1", Outcome.retry(new RuntimeException("k down"))));
+        send(msg("t", "k", "k#1"), msg("t", "j", "j#1")); // j#1 delivered: a key failure, not a call failure
+        tick();
+        process();
+        assertThat(retryRows()).containsExactly("k#1:1:" + now.plus(INITIAL));
+        script = answering(Map.of("k#1", Outcome.requeue()));
+        now = now.plus(INITIAL);
+        long latest;
+        try (var c = TestDb.connect()) {
+            latest = ticks.latest(c).id();
+        }
+        ShardResult result;
+        try (var c = recording(TestDb.connect())) { // process() drops requeued from its result
+            ShardProcessor.prepareTransaction(c, config.batchTimeout());
+            result = processor.tryProcess(c, 0, latest, now);
+            c.commit();
+        }
+
+        assertThat(parkedRows()).containsExactly("k#1:1:" + now.plus(REQUEUE_DELAY));
+        assertThat(retryRows()).isEmpty();
+        assertThat(result.delivered()).isZero();
+        assertThat(result.requeued()).as("drain() counts it as progress").isTrue();
+    }
+
+    @Test
     void aParkedRowFailingTransientlyBlocksItsKeyWithTheNewerParkedRows() throws Exception {
         bootstrap();
         script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.requeue()));
