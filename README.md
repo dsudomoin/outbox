@@ -3182,7 +3182,14 @@ Gauge показывает, сколько xid осталось, а обслуж
 строками) или заменяет новым (пустой), как только ему не мешает длинная транзакция.
 
 Длинные транзакции не стопорят relay (см. [Заметки о дизайне](#заметки-о-дизайне)), но до своего окончания не дают
-удалять пройденные партиции и замедляют все таблицы с интенсивными update, включая retry-таблицу.
+удалять пройденные партиции и замедляют все таблицы с интенсивными update, включая retry-таблицу. Держит не только
+транзакция над outbox: xmin снапшота общий на весь кластер, поэтому удаление останавливает любая транзакция с
+назначенным xid — забытая подготовленная (`PREPARE TRANSACTION`) или сессия `idle in transaction` хоть в другой базе.
+Блокировок на outbox у неё нет, и WARN «deferred» её не видит. Такие диапазоны считает gauge
+`outbox.partitions.retained`: это диапазоны ниже того, где лежит текущий xid, которые ещё не удалены. Если их 2 и больше
+три запуска обслуживания подряд, раз в минуту приходит WARN «outbox keeps N ranges of ...» с самой старой
+подготовленной транзакцией и самой старой сессией с xid во всём кластере. Сессии чужой роли без `pg_read_all_stats`
+Postgres прячет, и WARN так и пишет.
 
 ### Алерты
 
@@ -3219,6 +3226,7 @@ Gauge показывает, сколько xid осталось, а обслуж
 | `outbox.partitions.orphaned` > 0, `outbox.inbox.partitions.orphaned` > 0 | Отсоединённый диапазон со строками, который библиотека не вернула сама ([Осиротевшие партиции](#осиротевшие-партиции)). |
 | `outbox.partitions.overflow` = 1 дольше одного цикла расширения | Строки ушли в хвост, а своп не прошёл: держатель блокировки на outbox (WARN «deferred» и часовой ERROR «has not run on N due runs» называют его) или хвост больше `maxTailScan` вне окна (часовой ERROR «over outbox.partitions.maxTailScan»: его превратит окно `tailConversion`). Запись идёт, ничего не теряется ([Переполнение хвоста](#переполнение-хвоста-tail-overflow)). Одна выборка `overflow` = 1 — информация, а не авария. |
 | `outbox.partitions.premade` < 2 | Расширение отстаёт, строки скоро пойдут в хвост. |
+| `outbox.partitions.retained` ≥ 2 дольше трёх `maintenanceInterval` или WARN «outbox keeps N ranges of ...» | Пройденные партиции не удаляются, и outbox растёт на весь объём записи, пока не кончится диск. Горизонт держит самая старая транзакция с xid в кластере, в любой базе: WARN называет подготовленную транзакцию (gid, база) и сессию (pid, база, приложение). Завершите её: `COMMIT PREPARED` / `ROLLBACK PREPARED` или `pg_terminate_backend`, и следующие запуски удалят диапазоны сами. Если xmin последнего тика в WARN от запуска к запуску растёт, а вместе с ним растёт `outbox.shard.lag`, держит не транзакция, а отстающий шард ([Партиции](#партиции)). |
 | `outbox.messages.route_unchecked` растёт | Heartbeat инстанса не читает отчёты других инстансов дольше 3 × `maintenanceInterval` (WARN «outbox heartbeat of instance ... failed»), и проверка при записи пропускает сообщения по последнему чтению (WARN «... through unchecked ...»). Ничего не теряется: запись, которую инстанс прочитать не сможет, ждёт. Чините heartbeat. Собственный пул heartbeat (в Kora по умолчанию) от исчерпанного пула приложения не зависит, поэтому смотрите сам источник heartbeat: WARN «outbox heartbeat connection source of ... failed, this beat uses the application's connections ...» (тогда beat ушёл в пул приложения), ERROR «outbox heartbeat connection source reaches another database ...», метры `hikaricp_*` с `pool="<db.poolName>-outbox-heartbeat"`, не выключен ли `outbox.heartbeat.dedicatedConnection` (тогда при старте INFO «outbox heartbeat shares the application's connections ...»). Медленная база и пулер в режиме transaction задерживают heartbeat и со своим пулом ([Версии контрактов и откат](#версии-контрактов-и-откат)). |
 | `outbox.parked.size` не возвращается к обычному уровню или растёт | Записи откладываются снова и снова: блокирующий их процесс не заканчивается. `outbox.shard.lag` отложенных записей не видит. Предел задаёт обработчик или `relay.requeue.maxRequeues` ([Свой обработчик](#свой-обработчик)); снять одну запись сейчас — `keys/abandon` ([Ключ, который не проходит никогда](#ключ-который-не-проходит-никогда)). |
 | WARN «outbox tick made without its shard set» | Проба шардов при записи тика не прошла, чаще всего потому, что партицию держит ACCESS EXCLUSIVE (ALTER TABLE, VACUUM FULL, TRUNCATE, LOCK вручную). Тики идут дальше без набора шардов, и relay шагает по всем шардам; пока партиция заблокирована, шаги ждут её, и растёт `outbox.shard.lag`. Не чаще раза в минуту. |
@@ -4407,6 +4415,7 @@ Boot](#метрики-и-трассы-в-spring-boot)); без фреймвор�
 | `outbox.partitions.premade` | gauge | — | Диапазоны выше текущего xid. |
 | `outbox.partitions.overflow` | gauge | — | 1, пока используется хвост («tail overflow»). |
 | `outbox.partitions.xids_left` | gauge | — | Сколько xid осталось до того, как вставки начнут падать, пока хвост не присоединён; NaN, пока присоединён. |
+| `outbox.partitions.retained` | gauge | — | Присоединённые диапазоны целиком ниже того, где лежит текущий xid: пройденные, но ещё не удалённые. Обычно 0 после каждого запуска обслуживания. |
 | `outbox.partitions.orphaned` | gauge | — | Отсоединённые диапазоны, сохранённые, потому что в них есть строки. |
 | `outbox.maintenance.transaction_pooling` | gauge | — | 1, если последний запуск обнаружил transaction pooler. |
 | `outbox.maintenance.since_success` | gauge, с | — | Время с последнего завершённого запуска обслуживания на любом инстансе (по часам базы). |

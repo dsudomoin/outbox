@@ -1559,7 +1559,7 @@ class MaintenanceIT {
                 "outbox.waiting.oldest",
                 "outbox.dead.size", "outbox.dead.pending", "outbox.dead.pending.oldest", "outbox.parked.size",
                 "outbox.partitions.premade",
-                "outbox.partitions.overflow", "outbox.partitions.xids_left",
+                "outbox.partitions.overflow", "outbox.partitions.xids_left", "outbox.partitions.retained",
                 "outbox.partitions.orphaned", "outbox.maintenance.transaction_pooling",
                 "outbox.maintenance.since_success");
         var handler = new RecordingHandler()
@@ -1700,6 +1700,48 @@ class MaintenanceIT {
         assertThat(gauge(registry, "outbox.retry.oldest")).as("seconds since the failing head's created_at")
                 .isBetween(3600.0, 3660.0);
         assertThat(gauge(registry, "outbox.shard.lag")).as("the shard is not behind").isLessThan(1.0);
+    }
+
+    @Test
+    void aHorizonPinnedByAHolderOutsideTheOutboxIsReported() throws Exception {
+        bootstrap();
+        var registry = new SimpleMeterRegistry();
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
+        var relay = relay(new RecordingHandler(), maintenance);
+        send(msg("t", "k", "a"));
+        try (var holder = TestDb.connect()) {
+            holder.setAutoCommit(false); // an xid, but no lock on the outbox: invisible to the swap's blocker checks
+            long pid = queryLong(holder, "select pg_backend_pid()");
+            queryString(holder, "select pg_current_xact_id()::text");
+            TestDb.burnXids(3000);
+            assertThat(relay.drain()).as("the relay is not stalled").isEqualTo(1);
+
+            String log;
+            try (var err = new CapturedStderr()) {
+                for (int i = 0; i < 3; i++) {
+                    assertThat(maintenance.runOnce()).isTrue();
+                }
+                log = err.text();
+            }
+
+            long current = currentXid();
+            long currentLower = ranges().stream()
+                    .filter(b -> b.to() != null && Long.parseLong(b.from()) <= current
+                            && current < Long.parseLong(b.to()))
+                    .mapToLong(b -> Long.parseLong(b.from())).findFirst().orElseThrow();
+            assertThat(ranges()).as("kept: the retention rule").filteredOn(
+                    b -> b.to() != null && Long.parseLong(b.to()) <= currentLower).hasSizeGreaterThanOrEqualTo(2);
+            assertThat(gauge(registry, "outbox.partitions.retained")).isGreaterThanOrEqualTo(2);
+            assertThat(log).contains("ranges of " + names.base()).contains("pid " + pid);
+            holder.commit();
+        }
+        assertThat(relay.drain()).isZero(); // a tick past the holder, then a maintenance run
+
+        assertThat(maintenance.runOnce()).isTrue();
+
+        assertThat(gauge(registry, "outbox.partitions.retained")).isZero();
+        long current = currentXid();
+        assertThat(ranges()).filteredOn(b -> b.to() != null && Long.parseLong(b.to()) <= current).isEmpty();
     }
 
     @Test

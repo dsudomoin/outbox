@@ -15,6 +15,7 @@ public enum OutboxGauge {
     PARTITIONS_PREMADE("outbox.partitions.premade"),
     PARTITIONS_OVERFLOW("outbox.partitions.overflow"),
     PARTITIONS_XIDS_LEFT("outbox.partitions.xids_left"),
+    PARTITIONS_RETAINED("outbox.partitions.retained"),
     PARTITIONS_ORPHANED("outbox.partitions.orphaned"),
     MAINTENANCE_TRANSACTION_POOLING("outbox.maintenance.transaction_pooling"),
     MAINTENANCE_SINCE_SUCCESS("outbox.maintenance.since_success"),

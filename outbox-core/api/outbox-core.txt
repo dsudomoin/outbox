@@ -253,6 +253,7 @@ package io.github.dsudomoin.outbox {
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge PARTITIONS_ORPHANED;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge PARTITIONS_OVERFLOW;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge PARTITIONS_PREMADE;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge PARTITIONS_RETAINED;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge PARTITIONS_XIDS_LEFT;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge RETRY_OLDEST;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge RETRY_SIZE;

@@ -130,6 +130,21 @@ public final class XidPartitions {
                                              coalesce(round(extract(epoch from now() - xact_start)::numeric, 1)
                                                       || ' s', 'for a time hidden from this role')), ', ')
                       from (select * from h order by xact_start nulls last limit 5) o)""";
+    /**
+     * The cluster's oldest prepared transaction and its oldest other session holding an xid, in any database: either
+     * keeps {@code pg_snapshot_xmin} of every snapshot, and so the drop horizon, at its xid. Each is null when none
+     * is seen; another role's session may be hidden without {@code pg_read_all_stats}.
+     */
+    private static final String OLDEST_XID_HOLDERS = """
+            select (select format('prepared transaction %L in database %s, prepared %s s ago', gid, database,
+                                  round(extract(epoch from now() - prepared)))
+                      from pg_prepared_xacts order by age(transaction) desc limit 1),
+                   (select format('pid %s in database %s (user %s, application %L, %s) in a transaction open %s',
+                                  pid, datname, usename, application_name, coalesce(state, 'state hidden'),
+                                  coalesce(round(extract(epoch from now() - xact_start)) || ' s',
+                                           'for a time hidden from this role'))
+                      from pg_stat_activity where backend_xid is not null and pid <> pg_backend_pid()
+                     order by age(backend_xid) desc limit 1)""";
     /** A row of a standalone range at or above the bound, shard by shard through the (shard, xid) index it keeps. */
     private static final String ROW_AT_OR_ABOVE = """
             with recursive s(shard) as (
@@ -812,6 +827,20 @@ public final class XidPartitions {
         return state(c).ahead;
     }
 
+    /** The oldest holders of an xid across the cluster ({@link #OLDEST_XID_HOLDERS}), for a log line. */
+    static String oldestXidHolders(Connection c) throws SQLException {
+        try (var st = c.createStatement(); var rs = st.executeQuery(OLDEST_XID_HOLDERS)) {
+            rs.next();
+            var prepared = rs.getString(1);
+            var session = rs.getString(2);
+            if (prepared == null && session == null) {
+                return "none is visible: no prepared transaction, and a session of another role hides its xid unless"
+                        + " this role has pg_read_all_stats (or pg_monitor)";
+            }
+            return prepared == null ? session : session == null ? prepared : prepared + "; " + session;
+        }
+    }
+
     /**
      * True while the tail holds rows, until a swap turns it into a range: informational, they are relayed as any, and
      * the next extension heals it within maxTailScan ({@link #heal}). Also set while an unattached tail holds rows,
@@ -1114,7 +1143,8 @@ public final class XidPartitions {
         return now - last >= interval && logged.compareAndSet(last, now);
     }
 
-    private State state(Connection c) throws SQLException {
+    /** The current xid, the premade ranges, {@code retained} ones and the tail: one snapshot and one catalog read. */
+    State state(Connection c) throws SQLException {
         long current;
         long oldest;
         try (var st = c.createStatement();
@@ -1127,6 +1157,7 @@ public final class XidPartitions {
         Long upper = null;
         Long tailLower = null;
         int ahead = 0;
+        int retained = 0;
         for (var b : PartitionDdl.listRanges(c, names.base())) {
             if (b.to() == null) {
                 tailLower = Long.parseLong(b.from());
@@ -1136,10 +1167,13 @@ public final class XidPartitions {
                 ahead++;
             }
             long to = Long.parseLong(b.to());
+            if (to <= current) {
+                retained++;
+            }
             upper = upper == null ? to : Math.max(upper, to);
         }
-        return new State(current, oldest, upper, ahead, PartitionDdl.attachment(c, names.base(), names.tail()),
-                tailLower);
+        return new State(current, oldest, upper, ahead, retained,
+                PartitionDdl.attachment(c, names.base(), names.tail()), tailLower);
     }
 
     /** {@code tailConversion.window}: from (inclusive) to (exclusive), across midnight when to comes first. */
@@ -1181,6 +1215,10 @@ public final class XidPartitions {
         }
     }
 
-    private record State(
-            long current, long oldest, @Nullable Long upper, int ahead, Attachment tail, @Nullable Long tailLower) {}
+    /**
+     * {@code ahead}: ranges above the current xid ({@link #premadeAhead}); {@code retained}: attached ranges lying
+     * entirely below the range holding it, which {@link #dropProcessed} has not dropped yet.
+     */
+    record State(long current, long oldest, @Nullable Long upper, int ahead, int retained, Attachment tail,
+            @Nullable Long tailLower) {}
 }

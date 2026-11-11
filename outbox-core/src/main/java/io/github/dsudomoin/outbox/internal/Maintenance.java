@@ -77,7 +77,10 @@ import org.slf4j.LoggerFactory;
  * none),
  * {@code outbox.parked.size}, {@code outbox.partitions.premade},
  * {@code outbox.partitions.overflow}, {@code outbox.partitions.xids_left} (xids before inserts fail while the tail is
- * not attached, with an ERROR each run; NaN while it is), {@code outbox.maintenance.transaction_pooling} and
+ * not attached, with an ERROR each run; NaN while it is), {@code outbox.partitions.retained} (ranges below the one
+ * holding the current xid that are not dropped yet; at {@link #RETAINED_WARN} or more for {@link #RETAINED_RUNS} runs
+ * in a row, a WARN at most once a minute names the cluster's oldest xid holders, which pin the drop horizon even from
+ * another database), {@code outbox.maintenance.transaction_pooling} and
  * {@code outbox.maintenance.since_success} (NaN until the first run).
  */
 public final class Maintenance {
@@ -86,6 +89,12 @@ public final class Maintenance {
     private static final long LOG_INTERVAL = TimeUnit.MINUTES.toNanos(1);
     /** Maintenance not completing for this many intervals is a WARN. */
     private static final int STALE_INTERVALS = 5;
+    /**
+     * Retained ranges ({@code outbox.partitions.retained}) at or above this many for {@link #RETAINED_RUNS} runs in a
+     * row is a WARN naming the cluster's oldest xid holders: one range may just wait for the next tick.
+     */
+    static final int RETAINED_WARN = 2;
+    static final int RETAINED_RUNS = 3;
     /** Shards per anchor transaction, so one holds at most this many advisory locks. */
     static final int ANCHOR_CHUNK = 128;
     /** How long a read outside the maintenance lock waits for a table a recovery holds; also the heartbeat's. */
@@ -139,6 +148,9 @@ public final class Maintenance {
     private final AtomicLong mismatchLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final SocketBound socket;
     private final AtomicLong premadeLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
+    private final AtomicLong retainedLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
+    /** Runs in a row with {@link #RETAINED_WARN} or more retained ranges; written by the gauges step only. */
+    private int retainedRuns;
     /** One each, so the first ERROR past {@code alertAfter} is not held back by a WARN just before it. */
     private final AtomicLong waitingWarned = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong waitingAlerted = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
@@ -169,6 +181,7 @@ public final class Maintenance {
     private volatile double parkedSize = Double.NaN;
     private volatile double premade = Double.NaN;
     private volatile double xidsLeft = Double.NaN;
+    private volatile double retained = Double.NaN;
     private volatile double orphaned = Double.NaN;
     private volatile double transactionPooling = Double.NaN;
     /** {@link System#nanoTime()} of the last success known on any instance, null before the first read. */
@@ -237,6 +250,7 @@ public final class Maintenance {
         telemetry.gauge(OutboxGauge.PARTITIONS_PREMADE, () -> premade);
         telemetry.gauge(OutboxGauge.PARTITIONS_OVERFLOW, () -> partitions.overflow() ? 1 : 0);
         telemetry.gauge(OutboxGauge.PARTITIONS_XIDS_LEFT, () -> xidsLeft);
+        telemetry.gauge(OutboxGauge.PARTITIONS_RETAINED, () -> retained);
         telemetry.gauge(OutboxGauge.PARTITIONS_ORPHANED, () -> orphaned);
         telemetry.gauge(OutboxGauge.MAINTENANCE_TRANSACTION_POOLING, () -> transactionPooling);
         telemetry.gauge(OutboxGauge.MAINTENANCE_SINCE_SUCCESS, () -> {
@@ -830,8 +844,22 @@ public final class Maintenance {
             deadPendingOldest = rs.getDouble(2);
         }
         parkedSize = parked.size(c);
-        int ahead = partitions.premadeAhead(c);
+        var state = partitions.state(c);
+        int ahead = state.ahead();
         premade = ahead;
+        retained = state.retained();
+        retainedRuns = state.retained() >= RETAINED_WARN ? retainedRuns + 1 : 0;
+        // the slowest tick's xmin is the drop horizon; while the latest tick's stays as low, an xid holds them both
+        if (retainedRuns >= RETAINED_RUNS && read != null && read.slowest() != null && due(retainedLogged)) {
+            log.warn("outbox keeps {} ranges of {} below the range of the current xid, {} runs in a row: a range is"
+                    + " dropped once its upper bound is at or below the xmin of the slowest shard's tick, {} (the"
+                    + " latest tick's is {}). A latest xmin that stays put is the xid of the cluster's oldest open or"
+                    + " prepared transaction, in any database: {}. Until it ends (COMMIT PREPARED or ROLLBACK PREPARED,"
+                    + " or pg_terminate_backend), the outbox grows by all that is written; a latest xmin that moves"
+                    + " with outbox.shard.lag growing is a shard behind instead. This WARN repeats at most once a"
+                    + " minute", state.retained(), names.base(), retainedRuns, read.slowest().snapshot().xmin(),
+                    read.latest().snapshot().xmin(), XidPartitions.oldestXidHolders(c));
+        }
         var left = partitions.xidsLeft(c);
         xidsLeft = left == null ? Double.NaN : left;
         if (left != null) {

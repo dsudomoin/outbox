@@ -331,7 +331,8 @@ for ops:
 7. **Relay** enabled on at least one instance: maintenance and the dead-letter pass run only there.
 8. **Alerts**: `outbox.shard.lag` growing, `outbox.dead.size > 0`, `outbox.maintenance.since_success > 5 ×
    maintenanceInterval`, `outbox.maintenance.transaction_pooling = 1`, `outbox.partitions.premade < 2`, `overflow = 1`,
-   `xids_left` not NaN, `orphaned > 0`, `outbox.waiting.oldest > 900` (`relay.waiting.alertAfter`),
+   `xids_left` not NaN, `orphaned > 0`, `retained ≥ 2` over 3 runs, `outbox.waiting.oldest > 900`
+   (`relay.waiting.alertAfter`),
    `outbox.messages.contract_rejected` or `outbox.messages.route_rejected` growing, `outbox.messages.route_unchecked`
    growing (morning: the heartbeat fails, operating-outbox); with a dead-letter hook, `outbox.dead.pending.oldest`.
    Dead letters: admin API, never SQL.
