@@ -81,6 +81,8 @@ import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.postgresql.util.PSQLException;
+import org.postgresql.util.PSQLState;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import ru.tinkoff.kora.common.Context;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
@@ -107,6 +109,8 @@ class ShardProcessorIT {
     private final List<List<OutboxRecord>> calls = new CopyOnWriteArrayList<>();
     /** Test clock passed to {@code tryProcess}; Postgres keeps microseconds. */
     private Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+    /** Statements {@link #recording} fails to prepare while set, as pgjdbc fails a read that ran out of memory. */
+    private volatile @Nullable Predicate<String> failing;
     /** Answers {@code handleBatch} instead of {@link #handler} while set. */
     private volatile @Nullable Function<List<OutboxRecord>, List<Outcome>> script;
     private @Nullable Tracer tracer;
@@ -509,6 +513,62 @@ class ShardProcessorIT {
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 3, true));
         assertThat(delivered()).containsExactly("k#1", "k#2", "k#3");
         assertThat(retryRows()).isEmpty();
+    }
+
+    /** The followers a head takes along stop at {@code batchBytes}; the rest follow once the head's call is done. */
+    @Test
+    void retryFollowersKeepToTheByteBudget() throws Exception {
+        config.batchBytes(20); // k#1..k#9 hold 4 bytes a row, k#10 5
+        bootstrap();
+        for (int i = 1; i <= 10; i++) {
+            insertRetry(i, "k", "k#" + i, i == 1);
+        }
+
+        processUntilNoWork();
+
+        assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(
+                List.of("k#1", "k#2", "k#3", "k#4", "k#5"), List.of("k#6", "k#7", "k#8", "k#9"), List.of("k#10"));
+        assertThat(retryRows()).isEmpty();
+    }
+
+    /** Due heads too stop at {@code batchBytes}; those left are due for the next step. */
+    @Test
+    void retryHeadsKeepToTheByteBudget() throws Exception {
+        config.batchBytes(8);
+        bootstrap();
+        insertRetry(1, "a", "a#1", true);
+        insertRetry(2, "b", "b#1", true);
+        insertRetry(3, "c", "c#1", true);
+
+        processUntilNoWork();
+
+        assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(List.of("a#1", "b#1"),
+                List.of("c#1"));
+        assertThat(retryRows()).isEmpty();
+    }
+
+    /** A retry row of shard 0, topic t: a head due now, or a follower. */
+    private void insertRetry(long id, String key, String payload, boolean head) throws SQLException {
+        try (var c = TestDb.connect(); var ps = c.prepareStatement("insert into " + names.retry() + " (id, shard,"
+                + " message_id, topic, key, payload, created_at, next_attempt_at) values (?, 0, gen_random_uuid(),"
+                + " 't', ?, ?, now(), ?)")) {
+            ps.setLong(1, id);
+            ps.setBytes(2, key.getBytes(UTF_8));
+            ps.setBytes(3, payload.getBytes(UTF_8));
+            ps.setObject(4, head ? now.atOffset(ZoneOffset.UTC) : null);
+            ps.executeUpdate();
+        }
+    }
+
+    /** What a call holds, counted as {@code batchBytes} counts it. */
+    private static long bytesOf(List<OutboxRecord> call) {
+        long bytes = 0;
+        for (var r : call) {
+            var headers = HeaderCodec.encode(r.headers());
+            bytes += (r.payload() == null ? 0 : r.payload().length) + (r.key() == null ? 0 : r.key().length)
+                    + (headers == null ? 0 : headers.length);
+        }
+        return bytes;
     }
 
     @Test
@@ -3502,6 +3562,42 @@ class ShardProcessorIT {
         assertThat(calls).first().satisfies(call -> assertThat(payloads(call)).containsExactly("k#new"));
     }
 
+    /** A parked key past {@code batchBytes} does not fit in a call: it comes in portions of the budget, in its order. */
+    @Test
+    void aParkedKeyLargerThanTheByteBudgetComesInPortionsInOrder() throws Exception {
+        config.batchBytes(12); // a row of k#1..k#9 holds 4 bytes, k#10 5: three rows a call
+        bootstrap();
+        seedParked(10);
+        script = answering(Map.of());
+
+        processUntilNoWork();
+
+        assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(List.of("k#1", "k#2", "k#3"),
+                List.of("k#4", "k#5", "k#6"), List.of("k#7", "k#8", "k#9"), List.of("k#10"));
+        assertThat(parkedRows()).isEmpty();
+    }
+
+    /** A new record of a key whose parked rows pass {@code batchBytes} brings none of them, as a key past batchSize. */
+    @Test
+    void aNewRecordOfAKeyPastTheByteBudgetBringsNoneOfItsParkedRows() throws Exception {
+        config.batchBytes(16);
+        bootstrap();
+        seedParked(10);
+        try (var c = TestDb.connect()) {
+            execute(c, "update " + names.parked() + " set due_at = '" + now.plusSeconds(3600) + "'::timestamptz");
+            execute(c, "update " + names.cursor() + " set parked_due_at = '" + now.plusSeconds(3600)
+                    + "'::timestamptz");
+        }
+        script = answering(Map.of());
+        send(msg("t", "k", "k#new"));
+        tick();
+
+        process();
+
+        assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(List.of("k#new"));
+        assertThat(parkedRows()).hasSize(10);
+    }
+
     /** 30 keys of 60 parked rows each, not due, and a chunk of new records of them with a healthy key behind. */
     private void seedAStorm() throws Exception {
         try (var c = TestDb.connect()) {
@@ -4084,13 +4180,14 @@ class ShardProcessorIT {
     void invalidRelayConfigIsRejected() {
         var cases = List.<Consumer<TestOutboxConfig>>of(
                 c -> c.batchSize(0),
+                c -> c.batchBytes(-1),
                 c -> c.maxTicksPerBatch(0),
                 c -> c.batchTimeout(Duration.ZERO),
                 c -> c.headFailuresBeforeDivert(0),
                 c -> c.retry(Duration.ZERO, Duration.ofSeconds(1), 0),
                 c -> c.retry(Duration.ofSeconds(2), Duration.ofSeconds(1), 0),
                 c -> c.retry(Duration.ofSeconds(1), Duration.ofSeconds(1), -1));
-        var keys = List.of("outbox.relay.batchSize", "outbox.relay.maxTicksPerBatch", "outbox.relay.batchTimeout",
+        var keys = List.of("outbox.relay.batchSize", "outbox.relay.batchBytes", "outbox.relay.maxTicksPerBatch", "outbox.relay.batchTimeout",
                 "outbox.relay.headFailuresBeforeDivert", "outbox.relay.retry.initialDelay",
                 "outbox.relay.retry.maxDelay", "outbox.relay.retry.maxAttempts");
         for (int i = 0; i < cases.size(); i++) {
@@ -4221,6 +4318,351 @@ class ShardProcessorIT {
             int shard = Integer.compare(x.charAt(1), y.charAt(1));
             return shard != 0 ? shard : Integer.compare(x.charAt(3), y.charAt(3));
         });
+    }
+
+    /**
+     * A read cut by {@code batchBytes} is a cut at its row, though no limit was reached: the shard it stopped in is
+     * mid-batch at its last row handed, the shards after it untouched, and nothing is skipped.
+     */
+    @Test
+    void aByteCutInsideAGroupLeavesItsShardMidBatchAndTheLaterOnesUntouched() throws Exception {
+        groupOfFourWithFiveRowsEach(true);
+        long t0 = cursor(0).tickId();
+        long t = tick();
+
+        // 7 rows fit: shard 0's 5 and shard 1's first 2; 2 and 3 are not read and stay as they were
+        assertThat(processGroup(0, 1, 2, 3)).containsExactly(new ShardResult(PROGRESS, 5, false),
+                new ShardResult(PROGRESS, 2, false), new ShardResult(PROGRESS, 0, true),
+                new ShardResult(PROGRESS, 0, true));
+        var ids = handler.delivered().stream().map(OutboxRecord::id).toList();
+        assertThat(cursor(0)).isEqualTo(new Cursor(0, t0, t, ids.get(4), null, 0, null, null));
+        assertThat(cursor(1)).isEqualTo(new Cursor(1, t0, t, ids.get(6), null, 0, null, null));
+        assertThat(cursorRows(2)).as("untouched").isEqualTo(1);
+        assertThat(cursorRows(3)).as("untouched").isEqualTo(1);
+
+        for (int i = 0; i < 10 && handler.delivered().size() < 20; i++) {
+            processGroup(0, 1, 2, 3);
+        }
+        processGroup(0, 1, 2, 3);
+        assertThat(calls).allSatisfy(call -> assertThat(bytesOf(call)).isLessThanOrEqualTo(config.batchBytes()));
+        assertThat(delivered()).as("every row once, shard by shard in id order").isEqualTo(IntStream.range(0, 4)
+                .boxed().flatMap(s -> IntStream.rangeClosed(1, 5).mapToObj(i -> "s" + s + "#" + i)).toList());
+        for (int s = 0; s < 4; s++) {
+            assertThat(cursor(s)).isEqualTo(new Cursor(s, t, null, 0, null, 0, null, null));
+        }
+    }
+
+    /** {@code batchBytes = 0}: no byte limit, the group is read as by row limits alone. */
+    @Test
+    void withoutAByteLimitTheGroupIsReadByRowsAlone() throws Exception {
+        groupOfFourWithFiveRowsEach(false);
+        long t = tick();
+
+        assertThat(processGroup(0, 1, 2, 3)).containsOnly(new ShardResult(PROGRESS, 5, true));
+
+        assertThat(calls).hasSize(1);
+        for (int s = 0; s < 4; s++) {
+            assertThat(cursor(s)).isEqualTo(new Cursor(s, t, null, 0, null, 0, null, null));
+        }
+    }
+
+    /**
+     * Four shards with a key each, 5 rows on each (payloads {@code s<shard>#<n>}), and when {@code limited} a
+     * {@code batchBytes} that holds shard 0's rows and the first 2 of shard 1 (else 0: no limit).
+     */
+    private void groupOfFourWithFiveRowsEach(boolean limited) throws Exception {
+        config.shards(4).batchSize(100);
+        var keys = IntStream.range(0, 4).mapToObj(this::keyOnShard).toList();
+        config.batchBytes(limited ? 5 * (keys.get(0).length() + 4L) + 2 * (keys.get(1).length() + 4L) : 0);
+        bootstrap();
+        for (int s = 0; s < 4; s++) {
+            var key = keys.get(s);
+            int shard = s;
+            send(IntStream.rangeClosed(1, 5).mapToObj(i -> msg("t", key, "s" + shard + "#" + i))
+                    .toArray(OutboxMessage[]::new));
+        }
+    }
+
+    /**
+     * A shard's first chunk read is budgeted; after small rows it goes by the plain statement (100 rows within a
+     * quarter of 16 MiB: rows up to 41 943 bytes), and after a large row it is budgeted again.
+     */
+    @Test
+    void aShardsFirstChunkReadIsBudgetedThenPlainWhileItsRowsAreSmall() throws Exception {
+        bootstrap();
+        var large = "b#" + "x".repeat(50_000);
+
+        assertThat(chunkReadsOfAStep(msg("t", "k", "a#1"))).as("size unknown").containsExactly("budgeted");
+        assertThat(chunkReadsOfAStep(msg("t", "k", "a#2"))).as("rows small").containsExactly("plain");
+        assertThat(chunkReadsOfAStep(msg("t", "k", large))).as("rows known small").containsExactly("plain");
+        assertThat(chunkReadsOfAStep(msg("t", "k", "a#3"))).as("after a large row").containsExactly("budgeted");
+        assertThat(chunkReadsOfAStep(msg("t", "k", "a#4"))).containsExactly("plain");
+
+        assertThat(delivered()).containsExactly("a#1", "a#2", large, "a#3", "a#4");
+    }
+
+    @Test
+    void withoutAByteLimitNoChunkReadIsBudgeted() throws Exception {
+        config.batchBytes(0);
+        bootstrap();
+
+        assertThat(chunkReadsOfAStep(msg("t", "k", "a#1"))).containsExactly("plain");
+        assertThat(chunkReadsOfAStep(msg("t", "k", "b#" + "x".repeat(50_000)))).containsExactly("plain");
+        assertThat(chunkReadsOfAStep(msg("t", "k", "a#2"))).containsExactly("plain");
+    }
+
+    /** As after a fatal error in a worker: every shard's size is unknown again. */
+    @Test
+    void forgottenRowSizesBudgetTheNextChunkRead() throws Exception {
+        bootstrap();
+        chunkReadsOfAStep(msg("t", "k", "a#1"));
+        assertThat(chunkReadsOfAStep(msg("t", "k", "a#2"))).containsExactly("plain");
+
+        processor.forgetRowSizes();
+
+        assertThat(chunkReadsOfAStep(msg("t", "k", "a#3"))).containsExactly("budgeted");
+        assertThat(delivered()).containsExactly("a#1", "a#2", "a#3");
+    }
+
+    /**
+     * Rows that suddenly grow past what the plain statement was picked for are read by it once, all of them (memory
+     * is not the point here: nothing lost, nothing out of order); the read after it is budgeted.
+     */
+    @Test
+    void aSuddenBacklogOfLargeRowsAfterSmallOnesIsReadWholeByThePlainStatement() throws Exception {
+        config.batchBytes(1_000_000); // plain while rows stay within 2500 bytes
+        bootstrap();
+        chunkReadsOfAStep(msg("t", "a", "a#1"));
+        var backlog = new ArrayList<OutboxMessage>();
+        var pad = "x".repeat(50_000);
+        for (int i = 0; i < 90; i++) {
+            backlog.add(msg("t", "k" + i % 3, "k" + i % 3 + "#" + i + pad)); // 4.5 MB in all
+        }
+        send(backlog.toArray(OutboxMessage[]::new));
+        tick();
+        statements.clear();
+
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 90, true));
+
+        assertThat(chunkReads()).containsExactly("plain");
+        assertThat(handler.delivered()).hasSize(91).extracting(OutboxRecord::messageId).doesNotHaveDuplicates();
+        assertIdOrderPerKey(handler.delivered());
+        assertThat(chunkReadsOfAStep(msg("t", "a", "a#2"))).containsExactly("budgeted");
+    }
+
+    /**
+     * A budgeted read of small rows that stops at a large one does not leave its shard's size small: the next read
+     * would go plain and take the large rows unbounded, every other step with small and large rows mixed.
+     */
+    @Test
+    void aReadCutByBytesKeepsTheNextReadOfItsShardsBudgeted() throws Exception {
+        config.batchBytes(1_000_000).batchSize(5);
+        bootstrap();
+        var pad = "x".repeat(1_100_000);
+        var messages = new ArrayList<OutboxMessage>(List.of(msg("t", "a", "a#1")));
+        for (int i = 0; i < 12; i++) {
+            messages.add(msg("t", "k" + i, "H" + i + pad));
+            messages.add(msg("t", "s" + i, "s" + i));
+        }
+        send(messages.toArray(OutboxMessage[]::new));
+        tick();
+        statements.clear();
+
+        processUntilNoWork();
+
+        assertThat(calls).allSatisfy(call -> assertThat(call.size() == 1 || bytesOf(call) <= 1_000_000)
+                .as("%s rows of %s bytes", call.size(), bytesOf(call)).isTrue());
+        assertThat(chunkReads()).as("never plain while large rows come").doesNotContain("plain");
+        assertThat(handler.delivered()).hasSize(25).extracting(OutboxRecord::messageId).doesNotHaveDuplicates();
+    }
+
+    /**
+     * pgjdbc turns an {@code OutOfMemoryError} in a read into an SQL error (53200), an ordinary step failure: the plain
+     * read that failed so forgets its shards' sizes, or each retry would go plain and fail the same way.
+     */
+    @Test
+    void aPlainReadThatFailsMakesTheNextReadOfItsShardsBudgeted() throws Exception {
+        bootstrap();
+        chunkReadsOfAStep(msg("t", "k", "a#1"));
+        assertThat(chunkReadsOfAStep(msg("t", "k", "a#2"))).containsExactly("plain");
+        send(msg("t", "k", "a#3"));
+        tick();
+        var reader = new BatchReader(names);
+        failing = sql -> sql.equals(reader.sql(false)) || sql.equals(reader.sql(true));
+
+        assertThatThrownBy(this::process).isInstanceOf(PSQLException.class).hasMessageContaining("out of memory");
+
+        failing = null;
+        statements.clear();
+        process();
+        assertThat(chunkReads()).containsExactly("budgeted");
+        assertThat(delivered()).containsExactly("a#1", "a#2", "a#3");
+    }
+
+    /** {@code message} sent and ticked, then one step: its chunk reads, as {@link #chunkReads} names them. */
+    private List<String> chunkReadsOfAStep(OutboxMessage message) throws Exception {
+        send(message);
+        tick();
+        statements.clear();
+        process();
+        return chunkReads();
+    }
+
+    /** The chunk reads among {@link #statements}, in order: {@code plain} or {@code budgeted} each. */
+    private List<String> chunkReads() {
+        var reader = new BatchReader(names);
+        var plain = List.of(reader.sql(true), reader.sql(false), reader.manySql(), reader.uncheckedManySql());
+        var budgeted = List.of(reader.budgetedSql(true), reader.budgetedSql(false), reader.budgetedManySql(true),
+                reader.budgetedManySql(false));
+        return statements.stream().filter(sql -> plain.contains(sql) || budgeted.contains(sql))
+                .map(sql -> budgeted.contains(sql) ? "budgeted" : "plain").toList();
+    }
+
+    /** A row larger than {@code batchBytes} goes alone, and the shard moves on past it. */
+    @Test
+    void aRowLargerThanTheByteBudgetGoesAloneAndTheShardMovesOn() throws Exception {
+        config.batchBytes(20);
+        bootstrap();
+        var big = "b#" + "x".repeat(100);
+        send(msg("t", "k", "a#1"), msg("t", "k", big), msg("t", "k", "a#2"), msg("t", "k", "a#3"));
+        long t = tick();
+
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, false));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, false));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, true));
+
+        assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(List.of("a#1"), List.of(big),
+                List.of("a#2", "a#3"));
+        assertThat(cursor()).isEqualTo(new Cursor(0, t, null, 0, null, 0, null, null));
+    }
+
+    /**
+     * A probe that read a row of a key in retry reads on behind it; that read cut by bytes leaves the shard mid-batch
+     * at its last row, so the row it stopped at comes next.
+     */
+    @Test
+    void aProbeReadingBehindABlockedRowStopsAtTheByteBudgetAndGoesOnFromThere() throws Exception {
+        config.batchBytes(100); // the rows of b and c hold 61 bytes each: one a read
+        bootstrap();
+        var later = now.plus(Duration.ofHours(1));
+        script = records -> records.stream().map(r -> payload("k#1").test(r)
+                ? Outcome.retry(new RuntimeException("k busy"), later) : handler.handleBatch(List.of(r)).get(0))
+                .toList();
+        send(msg("t", "k", "k#1"), msg("t", "a", "a#1"));
+        tick();
+        process(); // k#1 diverted, its head due in an hour
+        script = null;
+        var b = "b#1" + "x".repeat(57);
+        var c = "c#1" + "x".repeat(57);
+        send(msg("t", "k", "k#2"), msg("t", "b", b), msg("t", "c", c));
+        long t = tick();
+        try (var conn = TestDb.connect()) {
+            execute(conn, "update " + names.cursor() + " set failures = 3"); // probe mode
+        }
+
+        processUntilNoWork();
+
+        assertThat(delivered()).containsExactly("a#1", b, c);
+        assertThat(retryRows()).extracting(row -> row.split(":")[0]).containsExactly("k#1", "k#2");
+        assertThat(cursor().tickId()).isEqualTo(t);
+        assertThat(cursor().targetTickId()).isNull();
+    }
+
+    /**
+     * A retry head larger than {@code batchBytes} still goes, with the parked rows of its key that fit a call, though
+     * they do not fit in what the head leaves of twice the budget: dropped from every step its key would stay stuck.
+     */
+    @Test
+    void aRetryHeadLargerThanTheByteBudgetGoesWithItsKeysOlderParkedRows() throws Exception {
+        config.batchBytes(100); // parked rows of 34 bytes each: the key's two fit; the head holds 253
+        bootstrap();
+        var later = now.plus(Duration.ofHours(1));
+        try (var c = TestDb.connect()) {
+            execute(c, "insert into " + names.parked() + " (id, shard, message_id, topic, key, payload, created_at,"
+                    + " attempts, requeues, due_at) select i, 0, gen_random_uuid(), 't', 'k'::bytea,"
+                    + " convert_to('p#' || i || repeat('x', 30), 'UTF8'), now(), 0, 1, '" + later + "'::timestamptz"
+                    + " from generate_series(1, 2) i");
+            execute(c, "update " + names.cursor() + " set parked_due_at = '" + later + "'::timestamptz");
+        }
+        var head = "h#3" + "x".repeat(249);
+        insertRetry(3, "k", head, true);
+
+        processUntilNoWork();
+
+        assertThat(delivered()).containsExactly("p#1" + "x".repeat(30), "p#2" + "x".repeat(30), head);
+        assertThat(retryRows()).isEmpty();
+        assertThat(parkedRows()).isEmpty();
+    }
+
+    /**
+     * Shards sharing a call share its byte room for parked rows too: a key of the next shard that fits a call but
+     * finds none left is held, as one finding no room for its rows.
+     */
+    @Test
+    void aKeyOfAShardFindingNoByteRoomInASharedCallIsHeld() throws Exception {
+        config.shards(2).batchBytes(100);
+        var a = keyOnShard(0);
+        var b = keyOnShard(1);
+        bootstrap();
+        var later = now.plus(Duration.ofHours(1));
+        try (var c = TestDb.connect()) { // 2 parked rows of about 42 bytes per key: each key fits, not both
+            for (var key : List.of(a, b)) {
+                int shard = key.equals(a) ? 0 : 1;
+                execute(c, "insert into " + names.parked() + " (id, shard, message_id, topic, key, payload, created_at,"
+                        + " attempts, requeues, due_at) select -10 * " + (shard + 1) + " + i, " + shard
+                        + ", gen_random_uuid(), 't', convert_to('" + key + "', 'UTF8'), convert_to('" + key
+                        + "#old' || i || repeat('x', 34), 'UTF8'), now(), 0, 1, '" + later + "'::timestamptz"
+                        + " from generate_series(1, 2) i");
+            }
+            execute(c, "update " + names.cursor() + " set parked_due_at = '" + later + "'::timestamptz");
+        }
+        script = answering(Map.of());
+        send(msg("t", a, a + "#new"), msg("t", b, b + "#new"));
+        tick();
+
+        processGroup(0, 1);
+
+        assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly(
+                a + "#old1" + "x".repeat(34), a + "#old2" + "x".repeat(34), a + "#new"));
+        assertThat(parkedRows()).filteredOn(row -> row.startsWith(b + "#new:")).as("held: no requeue, due at once")
+                .containsExactly(b + "#new:0:" + now);
+
+        for (int i = 0; i < 5; i++) {
+            processGroup(0, 1);
+        }
+        assertThat(delivered()).containsSubsequence(b + "#old1" + "x".repeat(34), b + "#old2" + "x".repeat(34),
+                b + "#new");
+        assertThat(parkedRows()).isEmpty();
+    }
+
+    /** A step going on into the next batch stops at the byte budget inside it, and the next step goes on from there. */
+    @Test
+    void aChainCutByTheByteBudgetInsideTheNextBatchGoesOnFromItsLastRow() throws Exception {
+        config.shards(2).batchSize(1000); // a batch spans at most 2000 ids: one tick of the filler below
+        var keys = keysOnShard(0, 3);
+        long first = 0;
+        var second = new ArrayList<Long>();
+        for (var key : keys) {
+            for (int i = 0; i < 30; i++) {
+                first += key.length() + ("t1#" + key + "#" + i).length();
+                second.add((long) key.length() + ("t2#" + key + "#" + i).length());
+            }
+        }
+        config.batchBytes(first + second.subList(0, 25).stream().mapToLong(Long::longValue).sum());
+        bootstrap();
+        lagTick(keys, "t1#", 30, 2100);
+        long t1 = tick();
+        lagTick(keys, "t2#", 30, 2100);
+        long t2 = tick();
+
+        assertThat(processGroup(0)).containsExactly(new ShardResult(PROGRESS, 115, false));
+        var ids = handler.delivered().stream().map(OutboxRecord::id).toList();
+        assertThat(cursor(0)).isEqualTo(new Cursor(0, t1, t2, ids.get(114), null, 0, null, null));
+
+        assertThat(processGroup(0)).containsExactly(new ShardResult(PROGRESS, 65, true));
+        assertThat(cursor(0)).isEqualTo(new Cursor(0, t2, null, 0, null, 0, null, null));
+        assertThat(handler.delivered()).hasSize(180).extracting(OutboxRecord::messageId).doesNotHaveDuplicates();
+        assertIdOrderPerKey(handler.delivered());
     }
 
     /** A probe asks its one row: a long queue on a probing shard does not take its group's read from the others. */
@@ -4791,6 +5233,11 @@ class ShardProcessorIT {
                     if (method.getName().startsWith("prepare")) {
                         statements.add((String) args[0]);
                         statementTimes.add(System.nanoTime());
+                        var fail = failing;
+                        if (fail != null && fail.test((String) args[0])) {
+                            throw new PSQLException("Ran out of memory retrieving query results.",
+                                    PSQLState.OUT_OF_MEMORY);
+                        }
                     }
                     try {
                         return method.invoke(c, args);

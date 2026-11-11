@@ -796,6 +796,7 @@ public final class OutboxRelay implements AutoCloseable {
                     fatal(() -> log.error("outbox relay worker {} hit a fatal error, going on in {}",
                             Thread.currentThread().getName(), backoff, e));
                     fatal(() -> telemetry.relayFailed(e));
+                    fatal(processor::forgetRowSizes); // rows may have grown: the next chunk reads are budgeted
                     park(System.nanoTime() + backoff.toNanos(), false, seen, seenTicks, seenRequeued);
                     continue;
                 } catch (Throwable t) { // outside a shard step (tick, cursor read, connection)

@@ -44,8 +44,15 @@ public final class ParkedStore {
 
     private static final int PULLED_KEYS = 1024;
 
+    /** How many parked rows a key holds and their bytes ({@link RowBytes}), as {@link #rowsOfKeys} counts them. */
+    public record KeySize(long rows, long bytes) {
+
+        static final KeySize NONE = new KeySize(0, 0);
+    }
+
     private final Duration delay;
     private final int batch;
+    private final long batchBytes;
     private final String insert;
     private final String repark;
     private final String keep;
@@ -78,10 +85,19 @@ public final class ParkedStore {
         this(names, retries, Duration.ZERO, Integer.MAX_VALUE);
     }
 
-    /** {@code delay}, {@code batch}: {@code relay.requeue.delay} and {@code relay.batchSize}. */
+    /** {@link #ParkedStore(TableNames, RetryStore, Duration, int, long)} without a byte limit. */
     public ParkedStore(TableNames names, RetryStore retries, Duration delay, int batch) {
+        this(names, retries, delay, batch, RowBytes.NO_LIMIT);
+    }
+
+    /**
+     * {@code delay}, {@code batch}, {@code batchBytes}: {@code relay.requeue.delay}, {@code relay.batchSize} and the
+     * budget of {@code relay.batchBytes} ({@link RowBytes#budget}).
+     */
+    public ParkedStore(TableNames names, RetryStore retries, Duration delay, int batch, long batchBytes) {
         this.delay = delay;
         this.batch = batch;
+        this.batchBytes = batchBytes;
         var parked = names.parked();
         var retry = names.retry();
         insert = "insert into " + parked + " (" + COLUMNS + ", attempts, requeues, due_at)"
@@ -105,16 +121,17 @@ public final class ParkedStore {
                 + " insert into " + parked + " (" + COLUMNS + ", attempts, requeues, due_at)"
                 + " select " + COLUMNS + ", attempts, ?, ? from moved";
         // in the order rows came due, by the index on it, so a row far along a key is reached however slow the handler
-        selectDue = "select " + RECORD_COLUMNS + " from " + parked
-                + " where shard = ? and due_at <= ? order by due_at, id limit ?";
+        selectDue = RowBytes.upTo("select " + RECORD_COLUMNS + ", due_at, " + RowBytes.sql("p") + " b from " + parked
+                + " p where shard = ? and due_at <= ? order by due_at, id limit ?", "q.due_at, q.id", RECORD_COLUMNS);
         // at most limit rows read per key: a key with thousands of parked rows costs no more than any other
         selectOfKeys = "select " + RECORD_COLUMNS + " from (select distinct t, b from unnest(?::text[], ?::bytea[])"
                 + " u(t, b)) k cross join lateral (select " + RECORD_COLUMNS + " from " + parked
                 + " where shard = ? and topic = k.t and key = k.b order by id limit ?) p order by id limit ?";
-        // each key's rows, up to the limit: past it the key is larger than a call, and how much larger does not matter
-        fitting = "select k.t, k.b, n.c from (select distinct t, b from unnest(?::text[], ?::bytea[]) u(t, b)) k"
-                + " cross join lateral (select count(*) c from (select 1 from " + parked
-                + " where shard = ? and topic = k.t and key = k.b limit ?) l) n";
+        // each key's rows and their bytes, up to the limit: past it the key is larger than a call, and how much larger
+        // does not matter
+        fitting = "select k.t, k.b, n.c, n.s from (select distinct t, b from unnest(?::text[], ?::bytea[]) u(t, b)) k"
+                + " cross join lateral (select count(*) c, coalesce(sum(l.s), 0) s from (select " + RowBytes.sql("p")
+                + " s from " + parked + " p where p.shard = ? and p.topic = k.t and p.key = k.b limit ?) l) n";
         // of each key that fits, all but its rows above the highest handed that are not due
         wholeKeys = "select " + RECORD_COLUMNS + " from unnest(?::text[], ?::bytea[], ?::int8[]) k(t, b, above)"
                 + " cross join lateral (select " + RECORD_COLUMNS + " from " + parked
@@ -332,10 +349,18 @@ public final class ParkedStore {
 
     /** Rows of {@code shard} due at {@code now}, in id order. */
     public List<OutboxRecord> due(Connection c, int shard, Instant now, int limit) throws SQLException {
+        return due(c, shard, now, limit, RowBytes.NO_LIMIT, true);
+    }
+
+    /** {@link #due(Connection, int, Instant, int)} within {@code bytes}, the first however large when {@code oneAtLeast}. */
+    private List<OutboxRecord> due(Connection c, int shard, Instant now, int limit, long bytes, boolean oneAtLeast)
+            throws SQLException {
         try (var ps = c.prepareStatement(selectDue)) {
             ps.setShort(1, (short) shard);
             ps.setObject(2, timestamp(now));
             ps.setInt(3, limit);
+            ps.setLong(4, bytes);
+            ps.setBoolean(5, oneAtLeast);
             return records(ps.executeQuery());
         }
     }
@@ -347,11 +372,13 @@ public final class ParkedStore {
      * with the rows due: it would otherwise bring its oldest rows on every step of a sweep, spending their requeues
      * without a delay, and a row of it may go ahead of older ones, each of which was offered and answered requeue. A
      * key that does not fit in what is left of the call stays due for the next step; in a call with room for a batch
-     * the first always fits, so a step moves rows. An unkeyed row comes alone.
+     * the first always fits, so a step moves rows. An unkeyed row comes alone. Bytes are bounded the same way: the due
+     * rows read within {@code limitBytes}, the call within {@code mostBytes}, and a key fits in a batch only within
+     * {@code batchBytes}; with {@code oneAtLeast} the first due row comes however large, alone if need be.
      */
-    public List<OutboxRecord> dueWithOlder(Connection c, int shard, Instant now, int limit, long most)
-            throws SQLException {
-        var due = due(c, shard, now, limit);
+    public List<OutboxRecord> dueWithOlder(Connection c, int shard, Instant now, int limit, long most, long limitBytes,
+            long mostBytes, boolean oneAtLeast) throws SQLException {
+        var due = due(c, shard, now, limit, limitBytes, oneAtLeast);
         var ofKey = new LinkedHashMap<Object, List<OutboxRecord>>();
         for (var row : due) {
             ofKey.computeIfAbsent(BatchClassifier.orderingKey(row), k -> new ArrayList<>()).add(row);
@@ -360,15 +387,21 @@ public final class ParkedStore {
         var handed = new TreeMap<Long, OutboxRecord>();
         var whole = new ArrayList<OutboxRecord>(); // the highest row due of each key that fits
         long room = most;
+        long roomBytes = mostBytes;
         for (var e : ofKey.entrySet()) {
             var rows = e.getValue();
-            long ofIt = rowsOfKey.getOrDefault(e.getKey(), 0L);
+            var ofIt = rowsOfKey.getOrDefault(e.getKey(), KeySize.NONE);
             boolean fits = fits(ofIt);
-            long size = fits ? ofIt : rows.size();
-            if (size > room) {
+            long size = fits ? ofIt.rows() : rows.size();
+            long bytes = fits ? ofIt.bytes() : RowBytes.of(rows);
+            // a key that fits holds at most batchBytes, so only a single due row larger than that can pass the room
+            // of the first: it goes alone when one at least is asked for
+            boolean first = handed.isEmpty() && whole.isEmpty();
+            if (size > room || bytes > roomBytes && !(first && oneAtLeast)) {
                 break;
             }
             room -= size;
+            roomBytes -= bytes;
             if (fits) {
                 whole.add(rows.stream().max(Comparator.comparingLong(OutboxRecord::id)).orElseThrow());
             } else {
@@ -386,13 +419,20 @@ public final class ParkedStore {
         return List.copyOf(handed.values());
     }
 
+    /** {@link #dueWithOlder(Connection, int, Instant, int, long, long, long, boolean)} without a byte limit. */
+    public List<OutboxRecord> dueWithOlder(Connection c, int shard, Instant now, int limit, long most)
+            throws SQLException {
+        return dueWithOlder(c, shard, now, limit, most, RowBytes.NO_LIMIT, RowBytes.NO_LIMIT, true);
+    }
+
     /**
-     * How many parked rows each key of {@code keyed} holds, those with none absent, up to a batch and one more: above a
-     * batch, the key does not fit in a call, and how far above does not matter.
+     * How many parked rows each key of {@code keyed} holds and their bytes, those with none absent, up to a batch and
+     * one more: above a batch, the key does not fit in a call, and how far above does not matter.
      */
-    public Map<Object, Long> rowsOfKeys(Connection c, int shard, Collection<OutboxRecord> keyed) throws SQLException {
+    public Map<Object, KeySize> rowsOfKeys(Connection c, int shard, Collection<OutboxRecord> keyed)
+            throws SQLException {
         var withKey = keyed.stream().filter(row -> row.key() != null).toList();
-        var rows = new HashMap<Object, Long>();
+        var rows = new HashMap<Object, KeySize>();
         if (withKey.isEmpty()) {
             return rows;
         }
@@ -404,7 +444,8 @@ public final class ParkedStore {
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
                     if (rs.getLong(3) > 0) {
-                        rows.put(List.of(rs.getString(1), ByteBuffer.wrap(rs.getBytes(2))), rs.getLong(3));
+                        rows.put(List.of(rs.getString(1), ByteBuffer.wrap(rs.getBytes(2))),
+                                new KeySize(rs.getLong(3), rs.getLong(4)));
                     }
                 }
             }
@@ -412,9 +453,9 @@ public final class ParkedStore {
         return rows;
     }
 
-    /** Whether a key with these {@link #rowsOfKeys} fits in a call. */
-    public boolean fits(long rows) {
-        return rows > 0 && rows <= batch;
+    /** Whether a key with these {@link #rowsOfKeys} fits in a call: at most a batch of rows and of bytes. */
+    public boolean fits(KeySize size) {
+        return size.rows() > 0 && size.rows() <= batch && size.bytes() <= batchBytes;
     }
 
     /**

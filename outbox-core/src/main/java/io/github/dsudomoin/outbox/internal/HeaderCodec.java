@@ -48,6 +48,18 @@ public final class HeaderCodec {
         return buffer.array();
     }
 
+    /** The length of {@link #encode}'s result without encoding, 0 for none (stored as null). */
+    public static int size(List<OutboxHeader> headers) {
+        if (headers.isEmpty()) {
+            return 0;
+        }
+        int size = 2;
+        for (var header : headers) {
+            size += 2 + header.name().getBytes(UTF_8).length + 4 + (header.value() == null ? 0 : header.value().length);
+        }
+        return size;
+    }
+
     public static List<OutboxHeader> decode(@Nullable byte[] bytes) {
         if (bytes == null) {
             return List.of();

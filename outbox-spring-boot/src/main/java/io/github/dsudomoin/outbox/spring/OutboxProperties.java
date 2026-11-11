@@ -62,6 +62,10 @@ public record OutboxProperties(
      * @param batchSize rows per chunk read and per handler call. Keep batchSize × the handler's time per record well
      *     below batch-timeout: a longer call is cut at its soft deadline and the shard moves on only by the records the
      *     handler finished. Default 1000.
+     * @param batchBytes bytes per chunk read and per handler call, as batch-size bounds its rows: a row counts its
+     *     payload, key and headers as stored, and a call takes rows while they fit, at least one, so a row larger than
+     *     this goes alone. Parked and retry rows of a call get as much again, so a call holds at most about twice this.
+     *     0: no byte limit. Default 16 MB.
      * @param maxTicksPerBatch the most ticks one batch may span. Default 100.
      * @param minTickInterval under load, ticks come at most once per this interval; a commit waits for its tick up to
      *     about twice it. Default 50 ms.
@@ -87,6 +91,7 @@ public record OutboxProperties(
         @DefaultValue("true") boolean enabled,
         @DefaultValue("4") int workers,
         @DefaultValue("1000") int batchSize,
+        @DefaultValue("16777216") long batchBytes,
         @DefaultValue("100") int maxTicksPerBatch,
         @DefaultValue("50ms") Duration minTickInterval,
         @DefaultValue("200ms") Duration idlePollInterval,

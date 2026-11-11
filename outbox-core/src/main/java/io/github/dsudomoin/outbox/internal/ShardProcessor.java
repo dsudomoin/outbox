@@ -114,6 +114,14 @@ public final class ShardProcessor implements AutoCloseable {
      * failure and diverts nothing. A private instance, told apart from a handler's own NotAttempted by identity.
      */
     private static final Outcome BUSY = new Outcome.NotAttempted(null);
+    /**
+     * How far below {@code batchBytes} a chunk read must stay, by its shards' recent rows, to go by the plain
+     * statement: rows may grow from one read to the next, and the driver keeps a copy of the rows it reads, so a read
+     * of {@code batchSize} rows as large as the shards' largest recent one has room for both four times over.
+     */
+    private static final int PLAIN_READ_MARGIN = 4;
+    /** {@link #recentRowBytes} of a shard not read yet, or forgotten. */
+    private static final long UNKNOWN = -1;
 
     private final int internalNamespace;
     private final OutboxConfig.RelayConfig relay;
@@ -133,6 +141,18 @@ public final class ShardProcessor implements AutoCloseable {
     private final int divertAt;
     /** Ids a new batch may span, all shards together: {@code batchSize × shards}. */
     private final long batchIds;
+    /**
+     * {@code batchBytes} as a budget ({@link RowBytes#budget}): wherever a call's rows are bounded by
+     * {@code batchSize} (or twice it), their bytes are bounded by this (or twice it), at least one row.
+     */
+    private final long batchBytes;
+    /**
+     * Per shard, the largest row ({@link RowBytes}) of its last chunk read that returned rows, {@link #UNKNOWN} before
+     * one; shared by the workers of this processor, a race only picks a statement. A chunk read goes by the budgeted
+     * statement unless its shards' rows are known small ({@link #budgeted}): the byte cut's window costs a third of a
+     * read of small rows.
+     */
+    private final AtomicLongArray recentRowBytes;
     /**
      * Per shard, the rows the next main-pass step reads, halved by a failed call and doubled by a delivery (AIMD,
      * between 1 and {@code batchSize}): a record failing its whole call is alone after about log2 of its depth in the
@@ -191,7 +211,11 @@ public final class ShardProcessor implements AutoCloseable {
         this.cursors = new Cursors(names, config.shards());
         this.reader = new BatchReader(names);
         this.retries = new RetryStore(names, deadLetterHook);
-        this.parked = new ParkedStore(names, retries, requeue.delay(), relay.batchSize());
+        this.batchBytes = RowBytes.budget(relay.batchBytes());
+        var unknown = new long[config.shards()];
+        Arrays.fill(unknown, UNKNOWN);
+        this.recentRowBytes = new AtomicLongArray(unknown);
+        this.parked = new ParkedStore(names, retries, requeue.delay(), relay.batchSize(), batchBytes);
         this.hasRetryRows = "select exists (select 1 from " + names.retry() + " where shard = ?)";
         this.divertAt = retry.maxAttempts() > 0
                 ? Math.min(relay.headFailuresBeforeDivert(), retry.maxAttempts())
@@ -376,7 +400,7 @@ public final class ShardProcessor implements AutoCloseable {
             s.full = !deferred && fullCheckDue(shard);
             s.retryDue = cursor.retryDueAt();
             var dueHeads = !deferred && (s.full || s.retryDue != null && !s.retryDue.isAfter(now))
-                    ? retries.dueHeads(inTx, shard, now, relay.batchSize())
+                    ? retries.dueHeads(inTx, shard, now, relay.batchSize(), batchBytes, true)
                     : List.<RetryStore.DueHead>of();
             // parked_due_at works as retry_due_at: every step that writes to the parked table stores min(due_at), so
             // null means no parked rows, and a step looks up parked rows only then or on its full check
@@ -384,9 +408,12 @@ public final class ShardProcessor implements AutoCloseable {
             // the heads' older rows first: of what is left of the call a head cannot be short, the due rows can wait
             var older = olderOf(inTx, shard, dueHeads, s.parkedDue != null);
             var heads = older.heads();
+            long headBytes = headBytes(heads);
+            // with heads in the call, a due row larger than what they leave waits for a step without them
             var dueParked = !deferred && s.parkedDue != null && !s.parkedDue.isAfter(parkedUntil)
                     ? parked.dueWithOlder(inTx, shard, parkedUntil, relay.batchSize() - heads.size(), 2L * relay.batchSize()
-                            - heads.size() - older.rows().size())
+                            - heads.size() - older.rows().size(), batchBytes - headBytes,
+                            2 * batchBytes - headBytes - RowBytes.of(older.rows()), heads.isEmpty())
                     : List.<OutboxRecord>of();
             if (s.target == null && heads.isEmpty() && dueParked.isEmpty()) {
                 var checked = cursor.withRetryDueAt(s.full ? retries.minDue(inTx, shard) : s.retryDue)
@@ -433,9 +460,14 @@ public final class ShardProcessor implements AutoCloseable {
                 shardReads.add(new BatchReader.ShardRead(s.shard, s.prev.snapshot(), s.target.snapshot(),
                         s.cursor.lastId(), s.limit, s.checkBlocked));
             }
-            var batch = reader.readMany(inTx, shardReads, relay.batchSize());
+            boolean budgeted = budgeted(reads.stream().map(s -> s.shard).toList());
+            var batch = budgeted ? reader.readMany(inTx, shardReads, relay.batchSize(), batchBytes, true)
+                    : plainRead(inTx, shardReads, relay.batchSize());
+            noteRowBytes(batch);
             // limits that fit in batchSize read all they asked for: a read of exactly batchSize rows then cuts nothing
-            boolean cut = batch.cut() && reads.stream().mapToLong(s -> s.limit).sum() > relay.batchSize();
+            boolean rowCut = batch.cut() && reads.stream().mapToLong(s -> s.limit).sum() > relay.batchSize();
+            // a byte cut is a cut whatever the limits: it stopped before a row the read would have returned
+            boolean cut = budgeted ? batch.bytesCut() || rowCut : rowCut;
             var shared = new ArrayList<Step>(reads.size());
             var alone = new ArrayList<Step>();
             for (var s : reads) {
@@ -448,9 +480,10 @@ public final class ShardProcessor implements AutoCloseable {
                 s.segments.add(new Segment(s.cursor.tickId(), s.target, 0, s.rows.size(), finished));
             }
             if (!cut) {
-                chain(inTx, reads, latestTickId, started);
+                chain(inTx, reads, latestTickId, started, batch.bytes());
             }
             long sharedRoom = relay.batchSize();
+            long sharedRoomBytes = batchBytes;
             for (var s : reads) {
                 if (s.cut && s.rows.isEmpty()) {
                     s.untouched = true; // maybe unread: the shards after the cut have no rows they would have had
@@ -461,9 +494,12 @@ public final class ShardProcessor implements AutoCloseable {
                 // that fits in a call go first in its call (a key blocked in the retry table hands no record, so none);
                 // a probe merges none, so the head it isolates is the only record of its call
                 long room = byItself ? relay.batchSize() : sharedRoom;
-                long taken = s.probe || s.parkedDue == null && !s.wroteParked ? 0 : mergeParked(inTx, s, room);
+                long roomBytes = byItself ? batchBytes : sharedRoomBytes;
+                var taken = s.probe || s.parkedDue == null && !s.wroteParked ? ParkedStore.KeySize.NONE
+                        : mergeParked(inTx, s, room, roomBytes);
                 if (!byItself) {
-                    sharedRoom -= taken;
+                    sharedRoom -= taken.rows();
+                    sharedRoomBytes -= taken.bytes();
                 }
                 (byItself ? alone : shared).add(s);
             }
@@ -581,7 +617,7 @@ public final class ShardProcessor implements AutoCloseable {
         List<BatchRow> rows = List.of();
         /** The batches its read covers: the first, then the ones {@link #chain} went on into. */
         final List<Segment> segments = new ArrayList<>();
-        /** The read was cut at {@code batchSize} rows. */
+        /** The read was cut at {@code batchSize} rows or at {@code batchBytes}. */
         boolean cut;
         /** Its chunk's rows whose key found no room in the call: not handed, see {@link #mergeParked}. */
         final Set<Long> held = new HashSet<>();
@@ -632,12 +668,15 @@ public final class ShardProcessor implements AutoCloseable {
      * up one such tick per step. It goes on only while the batch it just read would fit again in what is left: a batch
      * cut by the limit is read again in full for its rest, which costs more than the step saves (bulk at 32 shards,
      * batches of about 750 rows and a limit of 1000, lost 5 % of its throughput that way). Statements are shared by
-     * the shards of each round; the chain stops at a shard's limit, the latest tick, a cut read,
+     * the shards of each round; the chain stops at a shard's limit, the latest tick, a cut read (by rows, or by what
+     * is left of {@code batchBytes} after the {@code readBytes} so far, no row past it),
      * {@link #MAX_SEGMENTS} batches or a quarter of {@code batchTimeout} spent.
      */
-    private void chain(Connection c, List<Step> reads, long latestTickId, long started) throws SQLException {
+    private void chain(Connection c, List<Step> reads, long latestTickId, long started, long readBytes)
+            throws SQLException {
         long budget = relay.batchSize() - reads.stream().mapToLong(s -> s.rows.size()).sum();
-        while (budget > 0 && System.nanoTime() - started < relay.batchTimeout().toNanos() / 4) {
+        long bytesLeft = batchBytes - readBytes;
+        while (budget > 0 && bytesLeft > 0 && System.nanoTime() - started < relay.batchTimeout().toNanos() / 4) {
             var more = new ArrayList<Step>();
             var afterIds = new HashMap<Integer, Long>();
             for (var s : reads) {
@@ -709,8 +748,13 @@ public final class ShardProcessor implements AutoCloseable {
             if (chained.isEmpty()) {
                 return;
             }
-            var batch = reader.readMany(c, shardReads, (int) budget);
-            boolean cut = batch.cut() && asked > budget;
+            boolean budgeted = budgeted(chained.stream().map(s -> s.shard).toList());
+            var batch = budgeted ? reader.readMany(c, shardReads, (int) budget, bytesLeft, false)
+                    : plainRead(c, shardReads, (int) budget);
+            noteRowBytes(batch);
+            boolean rowCut = batch.cut() && asked > budget;
+            boolean cut = budgeted ? batch.bytesCut() || rowCut : rowCut;
+            bytesLeft -= batch.bytes();
             for (int i = 0; i < chained.size(); i++) {
                 var s = chained.get(i);
                 var rows = batch.rows().get(s.shard);
@@ -731,27 +775,30 @@ public final class ShardProcessor implements AutoCloseable {
 
     /**
      * The parked rows of each key of {@code s}'s chunk that fits in a call go into {@code s.parkedRows}, whole, as long as
-     * {@code room} lasts, so the call stays within 2 × {@code batchSize}. The chunk's rows of a key that finds no room
+     * {@code room} and {@code roomBytes} last, so the call stays within 2 × {@code batchSize} and 2 ×
+     * {@code batchBytes}. The chunk's rows of a key that finds no room
      * are held ({@code s.held}): they go to the parked table behind the key's rows, due at once, with no call and no
      * requeue counted, and the due pass offers the key whole next; the cursor and the other keys go on, and no record
      * goes without the older rows of its key. A key larger than a call brings none: it would bring its oldest rows with
-     * every chunk, spending their requeues without a delay. Returns the rows taken.
+     * every chunk, spending their requeues without a delay. Returns the rows and bytes taken.
      */
-    private long mergeParked(Connection c, Step s, long room) throws SQLException {
+    private ParkedStore.KeySize mergeParked(Connection c, Step s, long room, long roomBytes) throws SQLException {
         var keyed = s.rows.stream().filter(row -> !row.blocked() && row.record().key() != null).map(BatchRow::record)
                 .toList();
         var rowsOf = parked.rowsOfKeys(c, s.shard, keyed);
         var admitted = new HashSet<Object>();
         var whole = new ArrayList<OutboxRecord>();
         long taken = 0;
+        long takenBytes = 0;
         for (var row : keyed) {
             var key = BatchClassifier.orderingKey(row);
-            long rows = rowsOf.getOrDefault(key, 0L);
-            if (!parked.fits(rows) || admitted.contains(key)) {
+            var size = rowsOf.getOrDefault(key, ParkedStore.KeySize.NONE);
+            if (!parked.fits(size) || admitted.contains(key)) {
                 continue;
             }
-            if (taken + rows <= room) {
-                taken += rows;
+            if (taken + size.rows() <= room && takenBytes + size.bytes() <= roomBytes) {
+                taken += size.rows();
+                takenBytes += size.bytes();
                 admitted.add(key);
                 whole.add(row);
             } else {
@@ -759,7 +806,7 @@ public final class ShardProcessor implements AutoCloseable {
             }
         }
         s.parkedRows = whole.isEmpty() ? List.of() : parked.ofEachKey(c, s.shard, whole, relay.batchSize());
-        return taken;
+        return new ParkedStore.KeySize(taken, takenBytes);
     }
 
     /**
@@ -767,15 +814,19 @@ public final class ShardProcessor implements AutoCloseable {
      * rows up to the row it can hand, which it stops at. Returns whether that read all of the shard's batch.
      */
     private boolean readBehindABlockedRow(Connection c, Step s) throws SQLException {
-        var rest = reader.readMany(c, List.of(new BatchReader.ShardRead(s.shard, s.prev.snapshot(), s.target.snapshot(),
-                s.rows.get(0).record().id(), relay.batchSize(), true)), relay.batchSize()).rows().get(s.shard);
+        var behind = List.of(new BatchReader.ShardRead(s.shard, s.prev.snapshot(), s.target.snapshot(),
+                s.rows.get(0).record().id(), relay.batchSize(), true));
+        var read = budgeted(List.of(s.shard)) ? reader.readMany(c, behind, relay.batchSize(), batchBytes, true)
+                : plainRead(c, behind, relay.batchSize());
+        noteRowBytes(read);
+        var rest = read.rows().get(s.shard);
         int head = 0;
         while (head < rest.size() && rest.get(head).blocked()) {
             head++;
         }
         boolean stopped = head + 1 < rest.size();
         s.rows.addAll(stopped ? rest.subList(0, head + 1) : rest);
-        return !stopped && rest.size() < relay.batchSize();
+        return !stopped && !read.bytesCut() && rest.size() < relay.batchSize();
     }
 
     /**
@@ -954,6 +1005,70 @@ public final class ShardProcessor implements AutoCloseable {
         return target;
     }
 
+    /**
+     * Whether a chunk read of {@code shards} goes by the budgeted statement: unless {@code batchBytes} is 0, when a
+     * shard's recent row size is unknown or {@code batchSize} rows of the largest of them, with
+     * {@link #PLAIN_READ_MARGIN}, may pass {@code batchBytes}. A shard whose rows suddenly grow is read once by the
+     * plain statement, in full: the read after it is budgeted.
+     */
+    private boolean budgeted(List<Integer> shards) {
+        if (relay.batchBytes() == 0) {
+            return false;
+        }
+        long largest = 0;
+        for (int shard : shards) {
+            long recent = recentRowBytes.get(shard);
+            if (recent == UNKNOWN) {
+                return true;
+            }
+            largest = Math.max(largest, recent);
+        }
+        return (long) relay.batchSize() * largest * PLAIN_READ_MARGIN > batchBytes; // no overflow: int × int × 4
+    }
+
+    /**
+     * Each shard of {@code batch} with rows: its largest, as its {@link #recentRowBytes}. A read cut by bytes makes
+     * every shard of it unknown: the row it stopped at, larger than what fitted, is not among them, and a size from
+     * the rows that fitted would send the next read plain, unbounded, to that row.
+     */
+    private void noteRowBytes(BatchReader.Batch batch) {
+        batch.rows().forEach((shard, rows) -> {
+            if (batch.bytesCut()) {
+                recentRowBytes.set(shard, UNKNOWN);
+            } else if (!rows.isEmpty()) {
+                recentRowBytes.set(shard, rows.stream().mapToLong(BatchRow::bytes).max().getAsLong());
+            }
+        });
+    }
+
+    /**
+     * {@link BatchReader#readMany(Connection, List, int)}, its shards' sizes forgotten when it throws: pgjdbc turns
+     * an {@code OutOfMemoryError} while reading rows into an {@code SQLException} (53200), an ordinary step failure
+     * that reaches no fatal-error handler, so without this each retry would go plain and fail the same way. Not
+     * before every plain read: one that returns no rows would then make sparse shards budgeted for good.
+     */
+    private BatchReader.Batch plainRead(Connection c, List<BatchReader.ShardRead> reads, int totalLimit)
+            throws SQLException {
+        try {
+            return reader.readMany(c, reads, totalLimit);
+        } catch (Throwable t) {
+            for (var r : reads) {
+                recentRowBytes.set(r.shard(), UNKNOWN);
+            }
+            throw t;
+        }
+    }
+
+    /**
+     * Forgets every shard's recent row size, so each next chunk read is budgeted: after a fatal error such as
+     * {@code OutOfMemoryError}, the rows may have grown past what the plain statement was picked for.
+     */
+    public void forgetRowSizes() {
+        for (int i = 0; i < recentRowBytes.length(); i++) {
+            recentRowBytes.set(i, UNKNOWN);
+        }
+    }
+
     /** Stops the handler threads, interrupting running calls. */
     @Override
     public void close() {
@@ -1023,7 +1138,8 @@ public final class ShardProcessor implements AutoCloseable {
      * first round, the due parked rows with the older ones of their keys ({@code dueParked}, a group per key;
      * {@link ParkedStore#dueWithOlder}, {@link ParkedStore#pullNext}), at most {@code batchSize} rows in all; the
      * followers of keyed heads that do not wait share what the heads and parked rows leave of it, and a waiting head
-     * is handed alone, a call never holding more than 2 × {@code batchSize} rows of the heads and parked rows. In each round the parked rows of a key that come before its handed retry rows are offered ahead
+     * is handed alone, a call never holding more than 2 × {@code batchSize} rows of the heads and parked rows; their
+     * bytes are bounded so by {@code batchBytes}, a head at least. In each round the parked rows of a key that come before its handed retry rows are offered ahead
      * of them, due or not, as the main pass offers them ahead of a new record of their key
      * ({@link #olderOf}), none of it read while {@code parkedRows} and the pass say the shard has none; a call one group
      * at a time ({@link #handOver}: a probe,
@@ -1042,18 +1158,24 @@ public final class ShardProcessor implements AutoCloseable {
     private Pass retryPass(Connection c, int shard, List<RetryStore.DueHead> heads, Older firstOlder,
             List<OutboxRecord> dueParked, boolean parkedRows, Instant now) throws SQLException, InterruptedException {
         int budget = relay.batchSize() - dueParked.size();
+        long bytesBudget = batchBytes - RowBytes.of(dueParked);
         var pass = new Pass(System.nanoTime() + relay.batchTimeout().toNanos());
         boolean probe = probing.get(shard) == 1; // the first round only: later rounds hand promoted rows
         var dueRows = dueParked;
         var older = firstOlder;
         while (!heads.isEmpty() || !dueRows.isEmpty()) {
             budget -= heads.size();
+            bytesBudget -= headBytes(heads);
             var dueIds = new HashSet<Long>();
             dueRows.forEach(row -> dueIds.add(row.id()));
-            budget -= older.rows().stream().filter(row -> !dueIds.contains(row.id())).count();
+            var notDue = older.rows().stream().filter(row -> !dueIds.contains(row.id())).toList();
+            budget -= notDue.size();
+            bytesBudget -= RowBytes.of(notDue);
             long followed = heads.stream().filter(RetryStore.DueHead::takesFollowers).count();
             int perKey = followed == 0 ? 0 : (int) (budget / followed);
-            var followers = perKey <= 0 ? Map.<Long, List<OutboxRecord>>of() : retries.followers(c, heads, perKey);
+            long perKeyBytes = followed == 0 ? 0 : bytesBudget / followed;
+            var followers = perKey <= 0 || perKeyBytes <= 0 ? Map.<Long, List<OutboxRecord>>of()
+                    : retries.followers(c, heads, perKey, perKeyBytes);
             var groups = new ArrayList<Group>(heads.size());
             var handed = new HashSet<Long>();
             var highest = new HashMap<Object, Long>(); // of a key's handed retry rows
@@ -1072,6 +1194,7 @@ public final class ShardProcessor implements AutoCloseable {
                 }
                 var after = followers.getOrDefault(head.id(), List.of());
                 budget -= probe ? 0 : after.size(); // a probe hands heads alone: their followers wait for a round
+                bytesBudget -= probe ? 0 : RowBytes.of(after);
                 rows.addAll(after);
                 after.forEach(row -> handed.add(row.id()));
                 groups.add(new Group(head, rows, false, due.waitingSince()));
@@ -1102,10 +1225,12 @@ public final class ShardProcessor implements AutoCloseable {
                 probing.set(shard, 0); // no call of the probe failed as a whole: batch again
             }
             probe = false;
-            if (!promoted || budget <= 0 || pass.outOfTime() || pass.busy) {
+            if (!promoted || budget <= 0 || bytesBudget <= 0 || pass.outOfTime() || pass.busy) {
                 break; // nothing promoted, or out of budget or time: promoted rows are due at now for the next step
             }
-            older = olderOf(c, shard, retries.dueHeads(c, shard, now, budget), parkedRows || pass.fromRetry);
+            // no head larger than what is left: it is due for the next step, which takes it first
+            older = olderOf(c, shard, retries.dueHeads(c, shard, now, budget, bytesBudget, false),
+                    parkedRows || pass.fromRetry);
             heads = older.heads(); // promoted rows are due at now
         }
         return pass;
@@ -1114,8 +1239,8 @@ public final class ShardProcessor implements AutoCloseable {
     /**
      * What a retry call offers ahead of {@code heads}: the whole of each key that fits in a call, so a head never goes
      * ahead of an older row of such a key, and nothing of a larger key, as a due pass; a head that would take the call
-     * past 2 × {@code batchSize} with its rows stays due for the next step, with those behind it. The first always fits.
-     * {@code rows} may hold rows above their head, which the caller leaves.
+     * past 2 × {@code batchSize} with its rows, or past 2 × {@code batchBytes}, stays due for the next step, with those
+     * behind it. The first always fits. {@code rows} may hold rows above their head, which the caller leaves.
      */
     private record Older(List<RetryStore.DueHead> heads, List<OutboxRecord> rows) {}
 
@@ -1127,22 +1252,34 @@ public final class ShardProcessor implements AutoCloseable {
         }
         var rowsOf = parked.rowsOfKeys(c, shard, keyed);
         long room = 2L * relay.batchSize() - heads.size();
+        long roomBytes = 2 * batchBytes - headBytes(heads);
         var seen = new HashSet<Object>();
         var admitted = new ArrayList<RetryStore.DueHead>(heads.size());
         var whole = new ArrayList<OutboxRecord>();
         for (var due : heads) {
             var key = BatchClassifier.orderingKey(due.r());
-            long rows = rowsOf.getOrDefault(key, 0L);
-            if (seen.add(key) && parked.fits(rows)) {
-                if (rows > room) {
+            var size = rowsOf.getOrDefault(key, ParkedStore.KeySize.NONE);
+            if (seen.add(key) && parked.fits(size)) {
+                // the first fits by rows as there are at most batchSize heads; by bytes not when it is a head larger
+                // than batchBytes, which then goes with its key's rows anyway
+                if (!admitted.isEmpty() && (size.rows() > room || size.bytes() > roomBytes)) {
                     break;
                 }
-                room -= rows;
+                room -= size.rows();
+                roomBytes -= size.bytes();
                 whole.add(due.r());
             }
             admitted.add(due);
         }
         return new Older(admitted, whole.isEmpty() ? List.of() : parked.ofEachKey(c, shard, whole, relay.batchSize()));
+    }
+
+    private static long headBytes(List<RetryStore.DueHead> heads) {
+        long bytes = 0;
+        for (var head : heads) {
+            bytes += RowBytes.of(head.r());
+        }
+        return bytes;
     }
 
     /** One group per (topic, key) of the parked {@code rows} (one per unkeyed row), each in id order. */

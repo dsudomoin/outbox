@@ -30,6 +30,7 @@ outbox {
 | `enabled` | `true` | `false`: no relay workers, no partition maintenance and no dead-letter pass on this instance (the hook then gets letters only from the pass at the end of `drain()`); `OutboxRelay.drain()` still works; the heartbeat still runs. Keep it on for at least one production instance. |
 | `workers` | `4` | ≥ 1. Relay threads per instance; each holds a DB connection while working. |
 | `batchSize` | `1000` | ≥ 1. Rows per chunk read and per handler call, for every handler. A call may also carry the parked (requeued) records of the chunk's keys: up to 2 × `batchSize` records. A key with more parked records than `batchSize` brings none of them: it comes in portions, see `requeue.md`. |
+| `batchBytes` | `16777216` | ≥ 0, 0 = no limit. Bytes (payload + key + headers as stored) per chunk read and per handler call, as `batchSize` bounds rows: a call takes records while they fit, at least one, so a record larger than this goes alone. Parked records and the retry pass get as much again (up to 2 × `batchBytes` a call); a key whose parked records pass `batchBytes` does not fit in a call. Heap for the relay: about `workers × 2 × batchBytes × 2` (the driver keeps a copy). While a shard's rows are small, its chunk is read by the plain statement at no extra cost; the first read of a shard after a start or a worker's fatal error is always bounded, and a sudden jump in message size can make one unbounded read per worker. |
 | `maxTicksPerBatch` | `100` | ≥ 1. |
 | `minTickInterval` | `50ms` | ≥ 0. Under load, at most one tick per interval. |
 | `idlePollInterval` | `200ms` | > 0. Idle tick rate; how fast a commit on another instance is noticed. |
@@ -52,7 +53,7 @@ Records a `handleBatch` override set aside with `Outcome.requeue()` (writing-out
 
 | Key | Default | Rule and meaning |
 |---|---|---|
-| `delay` | `1s` | > 0. A requeued record comes back after this unless its key fits in a call (`batchSize` parked records at most) and a new record of the key, its retry head, or a newer parked record whose time has come, brings it back first, so a longer `delay` does not cut the repeats of a busy key (bound them with `maxRequeues` or the handler); `requeue(notBefore)` due not before `notBefore` (capped at 24 h). A parked record handed back and not attempted waits at least this too. |
+| `delay` | `1s` | > 0. A requeued record comes back after this unless its key fits in a call (`batchSize` parked records and `batchBytes` at most) and a new record of the key, its retry head, or a newer parked record whose time has come, brings it back first, so a longer `delay` does not cut the repeats of a busy key (bound them with `maxRequeues` or the handler); `requeue(notBefore)` due not before `notBefore` (capped at 24 h). A parked record handed back and not attempted waits at least this too. |
 | `maxRequeues` | `0` | ≥ 0. The requeue past this moves the record to `<table>_dead` with «requeue limit reached», attempts unchanged. Every hand-back answered with `requeue` counts, merges ahead of a new record of the key and early offers ahead of a newer due record of the key included. `0` = unlimited. Global; a handler can bound per route with `record.requeues()`, or by time, since merges spend requeues at an unpredictable rate: `Duration.between(record.createdAt(), now)` past a limit → `permanent`. |
 
 ## `outbox.relay.waiting`

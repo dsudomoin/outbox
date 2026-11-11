@@ -180,6 +180,7 @@ public final class OutboxSchema implements AutoCloseable {
         }
         require(relay.workers() >= 1, "outbox.relay.workers must be at least 1: " + relay.workers());
         require(relay.batchSize() >= 1, "outbox.relay.batchSize must be at least 1: " + relay.batchSize());
+        require(relay.batchBytes() >= 0, "outbox.relay.batchBytes must not be negative: " + relay.batchBytes());
         require(relay.maxTicksPerBatch() >= 1,
                 "outbox.relay.maxTicksPerBatch must be at least 1: " + relay.maxTicksPerBatch());
         require(!relay.minTickInterval().isNegative(),

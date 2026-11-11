@@ -83,6 +83,19 @@ public interface OutboxConfig {
             return 1000;
         }
 
+        /**
+         * Bytes per chunk read and per handler call, as {@link #batchSize()} bounds its rows: a row counts its payload,
+         * key and headers as stored (a null counts nothing), and a call takes rows while they fit, at least one, so a
+         * row larger than this goes alone. Parked and retry rows of a call get as much again, so a call holds at most
+         * about twice this; each worker holds about one call, and the driver keeps another copy while it reads.
+         * While a shard's recent rows are small, its chunk goes by a plain read without the byte count, so a sudden
+         * jump in message size can make one read per worker past this; the first read of each shard after a start or
+         * a worker's fatal error is always bounded. 0: no byte limit.
+         */
+        default long batchBytes() {
+            return 16L * 1024 * 1024;
+        }
+
         default int maxTicksPerBatch() {
             return 100;
         }

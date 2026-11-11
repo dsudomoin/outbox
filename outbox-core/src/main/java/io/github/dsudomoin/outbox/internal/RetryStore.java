@@ -64,12 +64,16 @@ public final class RetryStore {
                 + " waiting_since) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         insertDead = "insert into " + deadColumns() + " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, " + deadState("?") + ")";
         // waiting heads last: a head that may fail or deliver never starves behind ones that wait
-        selectDue = "select " + RECORD_COLUMNS + ", waiting_since from " + retry
-                + " where shard = ? and next_attempt_at <= ? order by waiting_since is not null, id limit ?";
+        selectDue = RowBytes.upTo("select " + RECORD_COLUMNS + ", waiting_since, " + RowBytes.sql("r") + " b from "
+                + retry + " r where shard = ? and next_attempt_at <= ? order by waiting_since is not null, id limit ?",
+                "q.waiting_since is not null, q.id", RECORD_COLUMNS + ", waiting_since");
+        // per key up to its byte share, none at least: its head goes anyway, and the rest follow it later
         selectFollowers = "select h.id, f.id, f.message_id, f.topic, f.key, f.payload, f.headers, f.created_at,"
-                + " f.attempts, f.requeues, f.shard from " + retry + " h cross join lateral (select * from " + retry
-                + " f where f.shard = h.shard and f.topic = h.topic and f.key = h.key and f.id > h.id"
-                + " order by f.id limit ?) f where h.id = any(?) order by f.id";
+                + " f.attempts, f.requeues, f.shard from " + retry + " h cross join lateral (select * from (select f.*,"
+                + " sum(" + RowBytes.sql("f") + ") over (order by f.id rows between unbounded preceding and current row)"
+                + " run from (select * from " + retry + " f where f.shard = h.shard and f.topic = h.topic"
+                + " and f.key = h.key and f.id > h.id order by f.id limit ?) f) f where f.run <= ?) f"
+                + " where h.id = any(?) order by f.id";
         delete = "delete from " + retry + " where id = any(?)";
         promote = "update " + retry + " set next_attempt_at = ? where id = (select id from " + retry
                 + " where shard = ? and topic = ? and key = ? order by id limit 1)";
@@ -167,15 +171,24 @@ public final class RetryStore {
         }
     }
 
+    /** {@link #dueHeads(Connection, int, Instant, int, long, boolean)} without a byte limit. */
+    public List<DueHead> dueHeads(Connection c, int shard, Instant now, int limit) throws SQLException {
+        return dueHeads(c, shard, now, limit, RowBytes.NO_LIMIT, true);
+    }
+
     /**
      * Heads of {@code shard} due at {@code now}: those that do not wait in id order, then the waiting ones in id
-     * order; {@code attempts} as stored.
+     * order; {@code attempts} as stored. At most {@code limit} and as many as fit in {@code bytes}, the first however
+     * large when {@code oneAtLeast}.
      */
-    public List<DueHead> dueHeads(Connection c, int shard, Instant now, int limit) throws SQLException {
+    public List<DueHead> dueHeads(Connection c, int shard, Instant now, int limit, long bytes, boolean oneAtLeast)
+            throws SQLException {
         try (var ps = c.prepareStatement(selectDue)) {
             ps.setShort(1, (short) shard);
             ps.setObject(2, timestamp(now));
             ps.setInt(3, limit);
+            ps.setLong(4, bytes);
+            ps.setBoolean(5, oneAtLeast);
             try (var rs = ps.executeQuery()) {
                 var heads = new ArrayList<DueHead>();
                 while (rs.next()) {
@@ -187,16 +200,23 @@ public final class RetryStore {
         }
     }
 
+    /** {@link #followers(Connection, List, int, long)} without a byte limit. */
+    public Map<Long, List<OutboxRecord>> followers(Connection c, List<DueHead> heads, int perKey)
+            throws SQLException {
+        return followers(c, heads, perKey, RowBytes.NO_LIMIT);
+    }
+
     /**
      * The followers of each head in {@code heads} that {@linkplain DueHead#takesFollowers takes them} (rows of its
-     * (topic, key) after it), at most {@code perKey} each, in id order, keyed by the head's id; a head without
-     * followers is absent.
+     * (topic, key) after it), at most {@code perKey} each and as many as fit in {@code perKeyBytes}, in id order, keyed
+     * by the head's id; a head without followers is absent.
      */
-    public Map<Long, List<OutboxRecord>> followers(Connection c, List<DueHead> heads, int perKey)
+    public Map<Long, List<OutboxRecord>> followers(Connection c, List<DueHead> heads, int perKey, long perKeyBytes)
             throws SQLException {
         try (var ps = c.prepareStatement(selectFollowers)) {
             ps.setInt(1, perKey);
-            ps.setArray(2, ids(c, heads.stream().filter(DueHead::takesFollowers).map(DueHead::r).toList()));
+            ps.setLong(2, perKeyBytes);
+            ps.setArray(3, ids(c, heads.stream().filter(DueHead::takesFollowers).map(DueHead::r).toList()));
             try (var rs = ps.executeQuery()) {
                 var followers = new HashMap<Long, List<OutboxRecord>>();
                 while (rs.next()) {

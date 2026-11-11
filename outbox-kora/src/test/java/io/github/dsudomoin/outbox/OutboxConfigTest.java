@@ -136,6 +136,13 @@ class OutboxConfigTest {
     }
 
     @Test
+    void batchBytesIsReadAndValidated() {
+        assertThat(parse("outbox.relay.batchBytes = 0").relay().batchBytes()).as("no byte limit").isZero();
+        OutboxSchema.validate(parse("outbox.relay.batchBytes = 0"));
+        assertRejected("outbox.relay.batchBytes = -1", "outbox.relay.batchBytes must not be negative: -1");
+    }
+
+    @Test
     void negativeMaxTailScanIsRejected() {
         var config = parse("outbox.partitions.maxTailScan = -1");
 
@@ -239,6 +246,7 @@ class OutboxConfigTest {
         assertThat(relay.enabled()).isTrue();
         assertThat(relay.workers()).isEqualTo(4);
         assertThat(relay.batchSize()).isEqualTo(1000);
+        assertThat(relay.batchBytes()).isEqualTo(16L * 1024 * 1024);
         assertThat(relay.maxTicksPerBatch()).isEqualTo(100);
         assertThat(relay.minTickInterval()).isEqualTo(Duration.ofMillis(50));
         assertThat(relay.idlePollInterval()).isEqualTo(Duration.ofMillis(200));
