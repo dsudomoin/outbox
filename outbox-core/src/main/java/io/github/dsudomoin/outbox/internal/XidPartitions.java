@@ -323,8 +323,9 @@ public final class XidPartitions {
      * not swap, deferred or without its lock, counts towards the hourly ERROR ({@link #missed}). A tail left detached,
      * detach-pending (an operator's {@code DETACH CONCURRENTLY}) or missing is finished first: dropped when empty,
      * attached back when it holds rows; ranges and a new tail are then attached without a swap, nothing being attached
-     * above the last range. Lock timeouts surface as {@link SQLException} (SQLState 55P03), the tail still attached;
-     * the next run retries.
+     * above the last range. With the tail attached, a hole first: ranges between the current xid's and the tail's
+     * lower bound that are missing, detached or dropped by hand, are attached back or made anew ({@link #fillHole}).
+     * Lock timeouts surface as {@link SQLException} (SQLState 55P03), the tail still attached; the next run retries.
      */
     public void ensurePremade(Connection autocommit) throws SQLException {
         ensurePremade(autocommit, PartitionDdl.DETACH_LOCK_TIMEOUT, PartitionDdl.DETACH_LOCK_TIMEOUT);
@@ -335,6 +336,10 @@ public final class XidPartitions {
         long floor = Math.floorDiv(s.current, size) * size; // lower bound of the range holding the current xid
         long target = floor + (premake + 1) * size; // premake whole ranges above the current xid's
         if (s.tail == Attachment.ATTACHED) {
+            if (s.holeLower != null) {
+                fillHole(c, s);
+                s = state(c);
+            }
             boolean due = s.ahead <= premake / 2;
             // an extension goes on, RANGES_PER_SWAP a run, while the next range waits made ahead of the tail
             if (!due && !(s.ahead < premake && PartitionDdl.attachment(c, names.base(),
@@ -388,6 +393,42 @@ public final class XidPartitions {
         }
         PartitionDdl.createAndAttach(
                 c, names.base(), names.tail(), Long.toString(from), null, PartitionDdl.CREATE_LOCK_TIMEOUT);
+    }
+
+    /**
+     * Closes the hole {@code [holeLower, holeUpper)} of {@code s} range by range, with an ERROR naming what it did: a
+     * standalone empty {@code <base>_x<lower>} (detached by hand) is attached back, made anew first when its columns
+     * are stale, and a missing one (dropped by hand) is made and attached. The attach takes SHARE UPDATE EXCLUSIVE on
+     * the parent, which no writer waits for. One that holds rows is left standalone, for {@link #dropOrphans} to keep
+     * and report as a foreign orphan: its rows may be ones the relay skipped while it was detached, so it is not
+     * attached back with them, and inserts fail with 23514 once the xid counter reaches it until it is restored.
+     */
+    private void fillHole(Connection c, State s) throws SQLException {
+        var attached = new ArrayList<String>();
+        var kept = new ArrayList<String>();
+        try {
+            for (long lower = s.holeLower; lower < s.holeUpper; ) {
+                long upper = Math.min((Math.floorDiv(lower, size) + 1) * size, s.holeUpper);
+                var range = names.partitionPrefix() + lower;
+                if (PartitionDdl.attachment(c, names.base(), range) == Attachment.STANDALONE
+                        && PartitionDdl.hasRows(c, range)) {
+                    kept.add(range);
+                } else {
+                    precreate(c, lower, upper); // the one range from lower, made anew when empty with stale columns
+                    PartitionDdl.attach(c, names.base(), range, Long.toString(lower), Long.toString(upper),
+                            PartitionDdl.CREATE_LOCK_TIMEOUT);
+                    attached.add(range);
+                }
+                lower = upper;
+            }
+        } finally {
+            log.error("outbox partitions of {} had a hole at xids [{}, {}), above the range of the current xid {} and"
+                    + " below the tail: a range detached or dropped by hand (never do either). Inserts there fail with"
+                    + " SQLState 23514 once the xid counter reaches it; attached again: {}{}", names.base(),
+                    s.holeLower, s.holeUpper, s.current, attached, kept.isEmpty() ? ""
+                            : "; kept standalone, as they hold rows: " + kept + ", restore or drop them"
+                                    + " (OutboxAdmin.restoreOrphan), and the next run fills the hole");
+        }
     }
 
     /**
@@ -982,7 +1023,9 @@ public final class XidPartitions {
      * {@code <base>_dropping} was detached by {@link #dropProcessed} as relayed: dropped when no row is at or above
      * {@code minCursorXmin}, checked on the data. Any other was detached by someone else, perhaps before the relay
      * reached its rows: dropped only when empty (as a create whose attach never ran leaves one), as is a range the
-     * xid-regression recovery set aside ({@code <base>_o<digits>}). Records whose table is gone are deleted first.
+     * xid-regression recovery set aside ({@code <base>_o<digits>}), but not one lying above the current xid: detached
+     * by hand, it would leave a hole, so {@link #ensurePremade} attaches it back ({@link #fillHole}). Records whose
+     * table is gone are deleted first.
      * Ranges at or above the tail's lower bound are not looked at: only the extension makes them there, standalone
      * until its swap, and a swap that failed or was deferred leaves them for the next attempt; set-aside ones are
      * looked at whatever their digits. Returns the ones kept.
@@ -993,8 +1036,14 @@ public final class XidPartitions {
             ps.executeUpdate();
         }
         var kept = new ArrayList<Orphan>();
+        long current = state(c).current();
+        int prefix = names.unqualified(names.partitionPrefix()).length();
         for (var orphan : orphans(c)) {
             var table = orphan.table();
+            if (!orphan.ours() && !orphan.setAside()
+                    && xidOf(names.unqualified(table).substring(prefix)) > current && !PartitionDdl.hasRows(c, table)) {
+                continue; // a hole: ensurePremade attaches it back
+            }
             // anyone else's detach may have come before the relay reached its rows: only an empty one goes
             boolean dropped = orphan.ours()
                     ? PartitionDdl.dropUnlessFound(c, table, ROW_AT_OR_ABOVE, Long.toString(minCursorXmin), lockTimeout)
@@ -1307,6 +1356,7 @@ public final class XidPartitions {
         Long tailLower = null;
         int ahead = 0;
         var retainedTo = new ArrayList<Long>();
+        var bounded = new ArrayList<long[]>();
         for (var b : PartitionDdl.listRanges(c, names.base())) {
             if (b.to() == null) {
                 tailLower = Long.parseLong(b.from());
@@ -1320,9 +1370,33 @@ public final class XidPartitions {
                 retainedTo.add(to);
             }
             upper = upper == null ? to : Math.max(upper, to);
+            bounded.add(new long[] {Long.parseLong(b.from()), to});
+        }
+        // the first xids above the current one that no range covers below the tail: a range detached or dropped by
+        // hand, as the library leaves none. Not when no range covers the current xid (its rows a foreign orphan, or
+        // an xid regression): inserts fail at once then, and the recovery or the orphan's restore has to come first
+        bounded.sort(Comparator.comparingLong(r -> r[0]));
+        long reach = current;
+        boolean covered = false;
+        long[] hole = null;
+        for (var r : bounded) {
+            if (r[1] <= reach) {
+                continue;
+            }
+            if (r[0] > reach) {
+                hole = covered ? new long[] {reach, r[0]} : null;
+                break;
+            }
+            reach = r[1];
+            covered = true;
+        }
+        if (hole == null && covered && tailLower != null && reach < tailLower) {
+            hole = new long[] {reach, tailLower};
         }
         return new State(current, oldest, upper, ahead, retainedTo.size(),
-                retainedTo.stream().mapToLong(Long::longValue).toArray(), PartitionDdl.attachment(c, names.base(), names.tail()), tailLower);
+                retainedTo.stream().mapToLong(Long::longValue).toArray(),
+                PartitionDdl.attachment(c, names.base(), names.tail()), tailLower,
+                hole == null ? null : hole[0], hole == null ? null : hole[1]);
     }
 
     /** {@code tailConversion.window}: from (inclusive) to (exclusive), across midnight when to comes first. */
@@ -1367,10 +1441,11 @@ public final class XidPartitions {
     /**
      * {@code ahead}: ranges above the current xid ({@link #premadeAhead}); {@code retained}: attached ranges lying
      * entirely below the range holding it, which {@link #dropProcessed} has not dropped yet, and {@code retainedTo}
-     * their upper bounds.
+     * their upper bounds; {@code [holeLower, holeUpper)}: the first xids above the current one that no range covers
+     * below the tail, null when none.
      */
     record State(long current, long oldest, @Nullable Long upper, int ahead, int retained, long[] retainedTo,
-            Attachment tail, @Nullable Long tailLower) {
+            Attachment tail, @Nullable Long tailLower, @Nullable Long holeLower, @Nullable Long holeUpper) {
 
         /** Retained ranges with an upper bound above {@code xmin}: kept even with every shard at a tick of it. */
         int retainedAbove(long xmin) {

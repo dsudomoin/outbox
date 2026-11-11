@@ -1867,6 +1867,51 @@ class XidPartitionsIT {
         }
     }
 
+    /**
+     * A premade range detached or dropped by hand leaves a hole below the attached tail, in which every insert would
+     * fail with 23514 once the xid counter reached it: the detached one is not dropped as an empty orphan but attached
+     * back, a dropped one is made anew, each with an ERROR, and the runs need not be due for an extension.
+     */
+    @Test
+    void aRangeDetachedOrDroppedByHandBelowTheTailIsAttachedAgain() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions());
+
+        try (var c = TestDb.connect()) {
+            long lower = tail(c, names);
+            var detached = names.partitionPrefix() + (lower - 2000);
+            var dropped = names.partitionPrefix() + (lower - 3000);
+            assertThat(currentXid(c)).as("both above the current xid").isLessThan(lower - 3000);
+            execute(c, "alter table " + names.base() + " detach partition " + detached);
+
+            assertThat(partitions.dropOrphans(c, 0, Duration.ofSeconds(5))).isEmpty();
+            assertThat(PartitionDdl.attachment(c, names.base(), detached)).as("not dropped")
+                    .isEqualTo(Attachment.STANDALONE);
+            try (var err = new CapturedStderr()) {
+                partitions.ensurePremade(c);
+
+                assertThat(err.text()).contains("ERROR").contains(detached);
+            }
+            assertThat(PartitionDdl.listRanges(c, names.base())).contains(
+                    new Bound(detached, Long.toString(lower - 2000), Long.toString(lower - 1000)));
+
+            execute(c, "drop table " + dropped);
+            try (var err = new CapturedStderr()) {
+                partitions.ensurePremade(c);
+
+                assertThat(err.text()).contains("ERROR").contains(dropped);
+            }
+            assertThat(PartitionDdl.listRanges(c, names.base())).contains(
+                    new Bound(dropped, Long.toString(lower - 3000), Long.toString(lower - 2000)));
+            assertThat(tail(c, names)).isEqualTo(lower);
+
+            TestDb.burnXids((int) (lower - 3000 - currentXid(c)) + 10);
+            execute(c, "insert into " + names.base()
+                    + " (shard, message_id, topic) values (0, gen_random_uuid(), 't')");
+        }
+    }
+
     @Test
     void missingTailIsAttachedAboveLastRange() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
