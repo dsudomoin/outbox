@@ -198,7 +198,8 @@ public record OutboxProperties(
      *
      * @param table the inbox table's name, same rules as outbox.table; created only when a component uses Inbox.
      *     Default inbox.
-     * @param partitionInterval the time span of one inbox range (by UUIDv7 time). Default 1 h.
+     * @param partitionInterval the time span of one inbox range (by UUIDv7 time), a whole number of minutes, at
+     *     least 1 m. Default 1 h.
      * @param premake inbox ranges are kept up to now + premake. Default 24 h.
      * @param retention ranges older than this are dropped; ids up to retention - partition-interval old are always
      *     deduplicated. Default 24 h.

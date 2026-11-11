@@ -86,7 +86,7 @@ quarter of the time it has waited, no sooner than `delay` and no later than `max
 | Key | Default | Rule and meaning |
 |---|---|---|
 | `table` | `"inbox"` | Same naming rules as `outbox.table`. Created only when a component uses `Inbox`. |
-| `partitionInterval` | `1h` | ≥ 1m. |
+| `partitionInterval` | `1h` | ≥ 1m, a whole number of minutes. |
 | `premake` | `24h` | ≥ 2 × `partitionInterval`; `premake − partitionInterval` > `outbox.partitions.maintenanceInterval`. |
 | `retention` | `24h` | ≥ 2 × `partitionInterval`; `(retention + premake) / partitionInterval` ≤ 1000. Ids younger than `retention − partitionInterval` (23 h) are always deduplicated while inbox maintenance makes ranges ahead (`outbox.inbox.window.remaining`). Change on all instances at once. |
 | `attachOrphans` | `true` | A range detached inside the dedup window is attached back by inbox maintenance; `false`: ERROR only. |

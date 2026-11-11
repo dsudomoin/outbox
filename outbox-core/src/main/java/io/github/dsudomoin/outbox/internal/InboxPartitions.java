@@ -11,8 +11,10 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -22,10 +24,11 @@ import org.slf4j.LoggerFactory;
 /**
  * Inbox range partitions. A range {@code [a, b)} holds the message ids whose UUIDv7 timestamp lies in
  * {@code [a, b)} ms, as bounds {@link UuidV7#lowerBound}{@code (a)} and {@code (b)} (uuids compare bytewise). Ranges
- * are {@code partitionInterval} long, aligned to multiples of it since the epoch, named
- * {@code <inbox>_t<yyyyMMddHH>} after their lower bound in UTC ({@code yyyyMMddHHmm} when the interval is not whole
- * hours). They are made from {@code now - retention} on a fresh table up to past {@code now + premake}, and dropped
- * once their upper bound is older than {@code now - retention}. The DDL methods need an autocommit connection, and
+ * are {@code partitionInterval} (a whole number of minutes) long, aligned to multiples of it since the epoch,
+ * named {@code <inbox>_t<yyyyMMddHH>} after their lower bound in UTC ({@code yyyyMMddHHmm} when the interval is not
+ * whole hours, or the range does not start on a whole hour, as after an interval change). They are made from
+ * {@code now - retention} on a fresh table up to past {@code now + premake}, and dropped once their upper bound is
+ * older than {@code now - retention}. The DDL methods need an autocommit connection, and
  * callers serialise them under {@code LOCK_INBOX_MAINTENANCE}.
  */
 final class InboxPartitions {
@@ -33,8 +36,14 @@ final class InboxPartitions {
     private static final Logger log = LoggerFactory.getLogger(InboxPartitions.class);
     private static final long HOUR = Duration.ofHours(1).toMillis();
     private static final long LOG_INTERVAL = TimeUnit.MINUTES.toNanos(1);
+    private static final DateTimeFormatter HOURS = DateTimeFormatter.ofPattern("yyyyMMddHH").withZone(ZoneOffset.UTC);
+    private static final DateTimeFormatter MINUTES =
+            DateTimeFormatter.ofPattern("yyyyMMddHHmm").withZone(ZoneOffset.UTC);
 
-    /** A standalone range {@link #dropOrphans} kept, with the bounds its name gives. */
+    /**
+     * A standalone range {@link #dropOrphans} kept, with the bounds its name gives: its lower bound, and one interval
+     * up or the next range's lower bound, whichever is lower.
+     */
     record Orphan(String table, String from, String to) {}
     private static final int MAX_RANGES = 1000;
 
@@ -55,7 +64,7 @@ final class InboxPartitions {
     private final long interval;
     private final long premake;
     private final long retention;
-    private final DateTimeFormatter suffix;
+    private final boolean wholeHours;
     /** Per table whose name is no valid time, when its WARN was last logged ({@code nanoTime}). */
     private final Map<String, Long> unparsableLogged = new ConcurrentHashMap<>();
 
@@ -72,6 +81,8 @@ final class InboxPartitions {
         var maintenance = config.partitions().maintenanceInterval();
         require(interval.compareTo(Duration.ofMinutes(1)) >= 0,
                 "outbox.inbox.partitionInterval must be at least 1m: " + interval);
+        require(interval.toMillis() % Duration.ofMinutes(1).toMillis() == 0,
+                "outbox.inbox.partitionInterval must be a whole number of minutes: " + interval);
         require(cfg.retention().compareTo(twice) >= 0, "outbox.inbox.retention must be at least 2 ×"
                 + " outbox.inbox.partitionInterval (" + twice + "): " + cfg.retention());
         require(cfg.premake().compareTo(twice) >= 0, "outbox.inbox.premake must be at least 2 ×"
@@ -86,9 +97,7 @@ final class InboxPartitions {
         this.interval = interval.toMillis();
         this.premake = cfg.premake().toMillis();
         this.retention = cfg.retention().toMillis();
-        // an interval of at least a minute (an hour) puts every lower bound in a minute (an hour) of its own
-        this.suffix = DateTimeFormatter.ofPattern(this.interval % HOUR == 0 ? "yyyyMMddHH" : "yyyyMMddHHmm")
-                .withZone(ZoneOffset.UTC);
+        this.wholeHours = this.interval % HOUR == 0;
     }
 
     /**
@@ -102,7 +111,7 @@ final class InboxPartitions {
         }
         int made = 0;
         for (; from < now + premake; from += interval, made++) {
-            PartitionDdl.createAndAttach(c, table, table + "_t" + suffix.format(Instant.ofEpochMilli(from)),
+            PartitionDdl.createAndAttach(c, table, table + "_t" + suffix(from),
                     bound(from), bound(from + interval), PartitionDdl.CREATE_LOCK_TIMEOUT);
         }
         return made;
@@ -129,16 +138,14 @@ final class InboxPartitions {
      * longer lists), as a run that died, or whose DROP failed, after its detach leaves them, by the same rule: only
      * when the whole range its name gives lies past {@code now - retention}, and every id in it is older than that,
      * checked on the data. One inside the dedup window is never dropped nor read, and is returned with the bounds its
-     * name gives: its ids are not deduplicated, and inserts of them fail where the inbox has ranges on both sides of
-     * it. A name that is no valid time is skipped with a WARN, at most once a minute per name.
+     * name gives ({@link Orphan}): its ids are not deduplicated, and inserts of them fail where the inbox has ranges
+     * on both sides of it. A name that is no valid time is skipped with a WARN, at most once a minute per name.
      */
     List<Orphan> dropOrphans(Connection c, long now, Duration lockTimeout) throws SQLException {
-        var bound = bound(now - retention);
-        var kept = new ArrayList<Orphan>();
+        var named = new LinkedHashMap<String, Long>();
         for (var t : PartitionDdl.standalone(c, table, "_t[0-9]{10}([0-9]{2})?")) {
-            long from;
             try {
-                from = namedFrom(t);
+                named.put(t, namedFrom(t));
             } catch (DateTimeException e) { // a user table that only looks like a range
                 long nowNanos = System.nanoTime();
                 var last = unparsableLogged.get(t);
@@ -147,11 +154,27 @@ final class InboxPartitions {
                     log.warn("outbox inbox table {} is named like a range of {} but its name is no valid time ({});"
                             + " skipped, this WARN repeats at most once a minute per table", t, table, e.getMessage());
                 }
-                continue;
             }
-            var orphan = new Orphan(t, bound(from), bound(from + interval));
+        }
+        if (named.isEmpty()) {
+            return List.of();
+        }
+        // a range ends where the next one starts when that is nearer than an interval up: one made under a shorter
+        // partitionInterval than the current one
+        var starts = new TreeSet<>(named.values());
+        for (var b : PartitionDdl.listRanges(c, table)) {
+            starts.add(millis(b.from()));
+        }
+        var bound = bound(now - retention);
+        var kept = new ArrayList<Orphan>();
+        for (var e : named.entrySet()) {
+            var t = e.getKey();
+            long from = e.getValue();
+            var next = starts.higher(from);
+            long to = next == null ? from + interval : Math.min(from + interval, next);
+            var orphan = new Orphan(t, bound(from), bound(to));
             // inside the window: kept and reported without a read of it; past it: kept when a read finds newer ids
-            if (from + interval >= now - retention || !PartitionDdl.dropUnlessFound(
+            if (to >= now - retention || !PartitionDdl.dropUnlessFound(
                     c, t, "select 1 from {table} where message_id >= ?::uuid limit 1", bound, lockTimeout)) {
                 kept.add(orphan);
             }
@@ -179,6 +202,11 @@ final class InboxPartitions {
      */
     void attachBack(Connection c, Orphan orphan) throws SQLException {
         PartitionDdl.attach(c, table, orphan.table(), orphan.from(), orphan.to(), PartitionDdl.CREATE_LOCK_TIMEOUT);
+    }
+
+    /** A range's name after its lower bound {@code from} (ms), which is a whole minute. */
+    private String suffix(long from) {
+        return (wholeHours && from % HOUR == 0 ? HOURS : MINUTES).format(Instant.ofEpochMilli(from));
     }
 
     /** The lower bound (ms) a range's name gives: {@code <inbox>_t<yyyyMMddHH[mm]>}, UTC. */

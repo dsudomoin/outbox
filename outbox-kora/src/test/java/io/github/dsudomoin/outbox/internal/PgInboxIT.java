@@ -731,6 +731,46 @@ class PgInboxIT {
     }
 
     @Test
+    void rangesAcrossAnIntervalChangeAreAttachedBackWithTheirOwnBounds() throws Exception {
+        config.inboxPartitionInterval(Duration.ofMinutes(30))
+                .inboxRetention(Duration.ofHours(1))
+                .inboxPremake(Duration.ofHours(1));
+        start();
+        var minutes = DateTimeFormatter.ofPattern("yyyyMMddHHmm").withZone(ZoneOffset.UTC);
+        if (highest() % HOUR == 0) { // the top on a half hour, so the 1h ranges after it start on one
+            long from = highest();
+            try (var c = TestDb.connect()) {
+                PartitionDdl.createAndAttach(c, table(), table() + "_t" + minutes.format(Instant.ofEpochMilli(from)),
+                        bound(from), bound(from + HOUR / 2), PartitionDdl.CREATE_LOCK_TIMEOUT);
+            }
+        }
+        long top = highest();
+        inbox.close();
+        config.inboxPartitionInterval(Duration.ofHours(1))
+                .inboxRetention(Duration.ofHours(2))
+                .inboxPremake(Duration.ofHours(3));
+        var restarted = new SimpleMeterRegistry(); // the closed inbox's gauge stays registered in the other
+        inbox = new PgInbox(db, config, new OutboxMetrics(restarted));
+        inbox.runMaintenance();
+        var old = rangeOf(top - 1); // a 30m range, under the 1h interval now
+        var next = rangeOf(top); // a 1h range that starts on a half hour
+        assertThat(millis(next.to()) - millis(next.from())).isEqualTo(HOUR);
+        assertThat(next.name()).isEqualTo(table() + "_t" + minutes.format(Instant.ofEpochMilli(top)));
+        try (var c = TestDb.connect()) { // an operator's detach of both
+            execute(c, "alter table " + table() + " detach partition " + old.name());
+            execute(c, "alter table " + table() + " detach partition " + next.name());
+        }
+
+        try (var err = new CapturedStderr()) {
+            inbox.runMaintenance();
+
+            assertThat(err.text()).doesNotContain("that is not attached");
+        }
+        assertThat(ranges()).contains(old, next);
+        assertThat(restarted.get("outbox.inbox.partitions.orphaned").gauge().value()).isZero();
+    }
+
+    @Test
     void orphanAwayFromTheAttachedRangesStaysWithItsError() throws Exception {
         start();
         var low = ranges().stream().sorted(Comparator.comparingLong(b -> millis(b.from()))).toList();
@@ -952,6 +992,9 @@ class PgInboxIT {
         var m = Duration.ofMinutes(1);
         rejected(config(Duration.ofSeconds(59), h.multipliedBy(2), h.multipliedBy(2), m),
                 "outbox.inbox.partitionInterval must be at least 1m");
+        // a range name holds its lower bound to the minute
+        rejected(config(Duration.ofSeconds(90), Duration.ofMinutes(3), Duration.ofMinutes(5), m),
+                "outbox.inbox.partitionInterval must be a whole number of minutes");
         // the guaranteed dedup span, retention - interval, is at least one interval
         rejected(config(h, Duration.ofMinutes(119), h.multipliedBy(3), m), "outbox.inbox.retention must be at least 2");
         // a whole range above the window's top margin

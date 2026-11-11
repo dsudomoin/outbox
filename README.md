@@ -2695,7 +2695,7 @@ Spring Boot — в [Настройке в `application.yml`](#настройка
 | Ключ | По умолчанию | Значение |
 |---|---|---|
 | `table` | `"inbox"` | Имя таблицы inbox, правила те же, что для `outbox.table`. Создаётся, только когда какой-то компонент использует `Inbox`. |
-| `partitionInterval` | `1h` | ≥ 1m. Длина одного диапазона inbox по времени UUIDv7. |
+| `partitionInterval` | `1h` | ≥ 1m, целое число минут. Длина одного диапазона inbox по времени UUIDv7. |
 | `premake` | `24h` | ≥ 2 × `partitionInterval`, и `premake − partitionInterval` должно превышать `outbox.partitions.maintenanceInterval`. Диапазоны поддерживаются до `now + premake`. |
 | `retention` | `24h` | ≥ 2 × `partitionInterval`. Диапазоны удаляются, когда становятся старше этого значения. Id возрастом до `retention − partitionInterval` дедуплицируются всегда, пока обслуживание inbox создаёт диапазоны впрок (`outbox.inbox.window.remaining`). `(retention + premake) / partitionInterval` ≤ 1000. |
 | `attachOrphans` | `true` | Диапазон, отсоединённый внутри окна дедупликации, обслуживание inbox присоединяет обратно по границам из его имени; `false` — только ERROR ([Осиротевшие партиции](#осиротевшие-партиции)). |
@@ -2995,7 +2995,8 @@ create table inbox (
   received_at timestamptz not null default now(),
   primary key (message_id, consumer)
 ) partition by range (message_id);
--- диапазоны: inbox_t<yyyyMMddHH> (inbox_t<yyyyMMddHHmm>, если partitionInterval не кратен часу), по времени UUIDv7, UTC
+-- диапазоны: inbox_t<yyyyMMddHH> (inbox_t<yyyyMMddHHmm>, если partitionInterval не кратен часу или диапазон
+-- начинается не с ровного часа, как после смены partitionInterval), по времени UUIDv7, UTC
 ```
 
 - Таблицы `<base>_x<цифры>`, `<base>_o<цифры>`, `<base>_tail_next` и `<base>_recovery` (промежуточная таблица
@@ -3701,6 +3702,14 @@ outbox. Блокировки ключей он сначала только пр�
 `outbox.inbox.partitions.orphaned`; ERROR говорит, что делать. Пока диапазон не присоединён, id из его временного
 диапазона не дедуплицируются, а если у inbox есть диапазоны по обе стороны от него, вставка такого id падает (SQLState
 23514) и валит транзакцию потребителя.
+
+Нижняя граница такого диапазона берётся из имени, верхняя — на `partitionInterval` выше или по началу следующего
+диапазона, если оно ближе. Поэтому на место встаёт и диапазон, созданный при прежнем, более коротком
+`partitionInterval`. Диапазону от прежнего, более длинного интервала эти границы малы: attach упадёт на строках выше
+новой верхней границы (SQLState 23514), а если строк там нет, пройдёт и оставит в окне дыру до конца старого
+диапазона, где вставки id падают, пока диапазон не истечёт. Поэтому после уменьшения `partitionInterval` не
+отсоединяйте вручную диапазоны, созданные до него. Если такой всё же отсоединён, выключите `attachOrphans` и
+присоедините его сами: нижняя граница из имени, верхняя на прежний `partitionInterval` выше.
 
 Отрепетировано: `OperationsUnderLoadIT` на Postgres 16, 8 параллельных писателей всё время теста (outbox: `send` по
 200 ключам, общим с возвращаемыми строками, работающий relay и обслуживание раз в 50 мс; бизнес-транзакция держит один
