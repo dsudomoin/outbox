@@ -867,7 +867,8 @@ public final class XidPartitions {
      * query that could still see the partition holds a lock on the parent, so a try that gets it waits for no snapshot,
      * and one that misses leaves nothing behind. Tried every millisecond for {@link #NOWAIT_WINDOW}; the drop's own
      * lock waits are cut at {@link #HOLD_LOCK_TIMEOUT} and the hold at {@link #DAY_HOLD}. False when no try got the
-     * lock, or a session holding the partition itself timed the drop out (55P03): nothing done, the caller finalizes.
+     * lock, or the drop failed (a session holding the partition itself timed it out, 55P03; a dependent object, 2BP01;
+     * another role's table, 42501): nothing done, the caller finalizes. A dead session (08xxx) throws.
      * Only for a partition whose rows may go: the caller has proven that.
      */
     static boolean dropPending(Connection c, String parent, String partition) throws SQLException {
@@ -889,8 +890,14 @@ public final class XidPartitions {
                         }
                     }));
         } catch (SQLException e) {
-            if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
+            if (e.getSQLState() != null && e.getSQLState().startsWith("08")) { // a dead session: nothing to finalize on
                 throw e;
+            }
+            if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
+                // a dependent view, FK or function (2BP01), another role's table (42501): FINALIZE still clears the
+                // pending state, which else blocks every other detach of the parent, and dropOrphans retries the drop
+                log.warn("outbox could not drop partition {} of {}, left detach-pending (SQLState {}), so its detach is"
+                        + " finalized instead: {}", partition, parent, e.getSQLState(), e.getMessage());
             }
             return false;
         }

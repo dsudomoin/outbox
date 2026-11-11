@@ -579,6 +579,38 @@ class PgInboxIT {
     }
 
     @Test
+    void expiredRangeLeftPendingWithADependentViewIsFinalizedSoOtherRangesStillDrop() throws Exception {
+        start();
+        long hour = lowest() + 2 * HOUR;
+        var expired = List.of(table() + "_old1", table() + "_old2");
+        var view = TestDb.uniqueTable();
+        try (var c = TestDb.connect(); var reader = TestDb.connect(); var err = new CapturedStderr()) {
+            attach(c, expired.get(0), hour - 6 * HOUR);
+            attach(c, expired.get(1), hour - 5 * HOUR);
+            reader.setAutoCommit(false);
+            queryLong(reader, "select count(*) from " + table());
+            assertThatThrownBy(() -> PartitionDdl.detach(c, table(), expired.get(1), Duration.ofMillis(300)))
+                    .isInstanceOf(SQLException.class);
+            reader.commit();
+            assertThat(PartitionDdl.pendingDetach(c, table())).isEqualTo(expired.get(1));
+            // an operator's view on the range: its drop fails with 2BP01, which must not keep the detach pending
+            execute(c, "create view " + view + " as select * from " + expired.get(1));
+
+            inbox.runMaintenance();
+
+            assertThat(PartitionDdl.pendingDetach(c, table())).as(err.text()).isNull();
+            assertThat(queryLong(c, "select count(*) from pg_class where relname = '" + expired.get(0) + "'"))
+                    .as(err.text())
+                    .isZero();
+            assertThat(err.text()).contains("2BP01");
+        } finally {
+            try (var c = TestDb.connect()) {
+                execute(c, "drop view if exists " + view);
+            }
+        }
+    }
+
+    @Test
     void rangeOrphanedBetweenDetachAndDropIsDroppedOnceExpired() throws Exception {
         start();
         long hour = lowest() + 2 * HOUR; // the hour init saw, wherever the clock is now

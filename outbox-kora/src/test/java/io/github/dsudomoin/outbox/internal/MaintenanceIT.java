@@ -990,6 +990,58 @@ class MaintenanceIT {
     }
 
     @Test
+    void relayedRangeLeftPendingWithADependentViewIsFinalizedSoOtherRangesStillDrop() throws Exception {
+        bootstrap();
+        var relay = relay(new RecordingHandler(), maintenance());
+        send(msg("t", "k", "a"));
+        TestDb.burnXids(3000);
+        relay.drain();
+        long xmin = horizonXmin();
+        var pending = ranges().stream()
+                .filter(b -> b.to() != null && Long.parseLong(b.to()) <= xmin)
+                .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
+                .orElseThrow();
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null), Duration.ofMillis(300));
+        try (var reader = TestDb.connect()) {
+            reader.setAutoCommit(false);
+            queryLong(reader, "select count(*) from " + names.base()); // the drop's detach times out waiting for it
+            assertThat(maintenance.runOnce()).isTrue();
+            reader.commit();
+        }
+        var view = TestDb.uniqueTable();
+        try (var c = TestDb.connect(); var err = new CapturedStderr()) {
+            assertThat(queryString(c, "select inhdetachpending::text from pg_inherits where inhrelid = to_regclass(?)",
+                            pending.name()))
+                    .isEqualTo("true");
+            // an operator's view on the range: its drop fails with 2BP01, which must not keep the detach pending
+            execute(c, "create view " + view + " as select * from " + pending.name());
+            TestDb.burnXids(3000);
+            relay.drain();
+            long horizon = horizonXmin();
+            var next = ranges().stream()
+                    .filter(b -> b.to() != null && Long.parseLong(b.to()) <= horizon && !b.equals(pending))
+                    .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
+                    .orElseThrow();
+
+            maintenance.runOnce();
+            maintenance.runOnce();
+
+            assertThat(PartitionDdl.pendingDetach(c, names.base())).as(err.text()).isNull();
+            assertThat(exists(pending.name())).isTrue(); // standalone, its drop left to dropOrphans
+            assertThat(exists(next.name())).as(err.text()).isFalse();
+            assertThat(err.text()).contains("2BP01");
+        } finally {
+            try (var c = TestDb.connect()) {
+                execute(c, "drop view if exists " + view);
+            }
+        }
+
+        assertThat(maintenance.runOnce()).isTrue(); // the view is gone: dropOrphans drops the range
+
+        assertThat(exists(pending.name())).isFalse();
+    }
+
+    @Test
     void someoneElsesPendingRangeIsFinalizedAndItsWaitNamesTheOldestSnapshots() throws Exception {
         bootstrap();
         var range = ranges().stream()
