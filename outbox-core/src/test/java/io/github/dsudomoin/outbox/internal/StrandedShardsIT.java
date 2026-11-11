@@ -509,10 +509,16 @@ class StrandedShardsIT {
         var before = sendMany(0, 1);
         await(() -> delivered.containsAll(before)); // on a round of a tick above restored + 1 000 000
         try (var c = direct.getConnection()) {
+            // a restore swaps the whole database at once: no relay step or tick of the running relay lands in between
+            // (steps hold LOCK_SWAP shared and skip while it is held, ticks are made under LOCK_TICK)
+            var locks = names.internalNamespace() + ", " + TableNames.LOCK_SWAP + "), pg_advisory_lock("
+                    + names.internalNamespace() + ", " + TableNames.LOCK_TICK;
+            execute(c, "select pg_advisory_lock(" + locks + ")");
             execute(c, "delete from " + names.tick() + " where id > " + restored);
             execute(c, "delete from " + names.cursor() + " where seq > " + cursorSeq);
             execute(c, "delete from " + names.checkpoint() + " where seq > " + checkpointSeq);
             execute(c, "select setval(pg_get_serial_sequence('" + names.tick() + "', 'id'), " + restored + ")");
+            execute(c, "select pg_advisory_unlock(" + locks.replace("pg_advisory_lock", "pg_advisory_unlock") + ")");
         }
 
         var after = new ArrayList<UUID>();
