@@ -159,6 +159,8 @@ public final class OutboxRelay implements AutoCloseable {
     private volatile ScheduledExecutorService scheduler;
     private volatile boolean started;
     private volatile boolean stopping;
+    /** {@link #start()} has run, whatever its outcome; guarded by {@code this}. */
+    private boolean startCalled;
 
     /**
      * Internal types, unstable: for the adapters of this repository. {@code deadLetters}: the pass this relay runs, and
@@ -212,8 +214,16 @@ public final class OutboxRelay implements AutoCloseable {
         return clock;
     }
 
-    /** Starts the workers, the dead-letter thread and maintenance, unless {@code relay.enabled} is false. */
-    public void start() {
+    /**
+     * Starts the workers, the dead-letter thread and maintenance, unless {@code relay.enabled} is false. Runs once:
+     * a second call, or one after {@link #close()}, throws {@link IllegalStateException}, since {@code close()} stops
+     * only the threads of one start.
+     */
+    public synchronized void start() {
+        if (startCalled || stopping) {
+            throw new IllegalStateException("OutboxRelay.start() has run already");
+        }
+        startCalled = true;
         try (var c = db.newConnection(); var bound = socket.on(c)) { // a send right after start has its time too
             clock.read(c);
         } catch (SQLException | RuntimeException e) {

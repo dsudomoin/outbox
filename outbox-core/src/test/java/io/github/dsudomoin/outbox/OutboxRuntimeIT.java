@@ -277,6 +277,38 @@ class OutboxRuntimeIT {
         }
     }
 
+    /** A second start of a started relay builds no second set of threads that close() would not stop. */
+    @Test
+    void aStartedRelayRefusesASecondStart() {
+        var transactions = new JdbcTransactions(TestDataSources.newDataSource());
+        var config = new TestOutboxConfig().maintenanceInterval(Duration.ofSeconds(1));
+        try (var runtime = OutboxRuntime.builder(config, transactions, new RecordingHandler()).build()) {
+            runtime.start();
+            assertThatThrownBy(() -> runtime.relay().start()).isInstanceOf(IllegalStateException.class)
+                    .hasMessage("OutboxRelay.start() has run already");
+        }
+    }
+
+    /** A start after close leaves no maintenance scheduler running that nothing stops any more. */
+    @Test
+    void aClosedRelayRefusesAStartAndLeavesNoMaintenanceRunning() {
+        var transactions = new JdbcTransactions(TestDataSources.newDataSource());
+        var config = new TestOutboxConfig().maintenanceInterval(Duration.ofSeconds(1));
+        var runtime = OutboxRuntime.builder(config, transactions, new RecordingHandler()).build();
+        runtime.start();
+        runtime.close();
+        var maintenanceBefore = maintenanceThreads();
+
+        assertThatThrownBy(() -> runtime.relay().start()).isInstanceOf(IllegalStateException.class)
+                .hasMessage("OutboxRelay.start() has run already");
+        assertThat(maintenanceThreads()).as("live outbox-maintenance threads").isEqualTo(maintenanceBefore);
+    }
+
+    private static long maintenanceThreads() {
+        return Thread.getAllStackTraces().keySet().stream()
+                .filter(t -> t.isAlive() && t.getName().equals("outbox-maintenance")).count();
+    }
+
     /** The headers stored for the message {@code id}. */
     private static List<OutboxHeader> headers(JdbcTransactions transactions, TestOutboxConfig config, UUID id) {
         return transactions.inTx(c -> {
