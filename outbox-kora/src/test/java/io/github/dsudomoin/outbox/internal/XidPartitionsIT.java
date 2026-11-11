@@ -5,6 +5,7 @@ import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRelay;
@@ -1536,6 +1537,64 @@ class XidPartitionsIT {
 
             assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(4);
             assertTailAboveLastRange(c, names);
+        }
+    }
+
+    /**
+     * A maintenance client that freezes or loses its connection while it holds the quiesce (the server sees an idle
+     * session holding {@code LOCK_SWAP}) loses it to Postgres within seconds, not after the maintenance session's 60 s
+     * {@code idle_session_timeout}, so relay steps on every instance take shards again.
+     */
+    @Test
+    void aClientFrozenUnderTheQuiesceLosesItWithinSeconds() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions());
+        TestDb.burnXids(2500);
+
+        try (var watch = TestDb.connect(); var c = TestDb.connect()) {
+            long lower = tail(c, names);
+            long offset = currentXid(c) % 1000;
+            if (offset > 900) { // ensurePremade's own DDL xids must not carry the counter into the next range
+                TestDb.burnXids((int) (1000 - offset) + 10);
+            }
+            execute(c, "set idle_session_timeout = '60s'"); // as maintenance sets it for its run
+            long pid = queryLong(c, "select pg_backend_pid()");
+            var stepSkipped = new AtomicBoolean();
+            var stepTakesItAgain = new AtomicBoolean();
+            partitions.beforeSwap = () -> { // the quiesce is granted: the client freezes until its session is ended
+                try {
+                    stepSkipped.set(!trySwapShared(watch, names));
+                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30); // below the session's 60 s
+                    while (queryLong(watch, "select count(*) from pg_stat_activity where pid = " + pid) > 0
+                            && System.nanoTime() < deadline) {
+                        Thread.sleep(100);
+                    }
+                    stepTakesItAgain.set(trySwapShared(watch, names));
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+            };
+
+            var failure = catchThrowable(() -> partitions.ensurePremade(c, Duration.ofMillis(300),
+                    Duration.ofSeconds(5)));
+
+            assertThat(stepSkipped).as("a relay step skips while the quiesce is held").isTrue();
+            assertThat(stepTakesItAgain).as("the frozen holder's session was ended, its lock with it").isTrue();
+            assertThat(failure).as("the run fails on its ended session").isInstanceOf(SQLException.class);
+            assertThat(tail(watch, names)).isEqualTo(lower);
+        }
+    }
+
+    /** A relay step's try for {@code LOCK_SWAP} shared, in a transaction of its own. */
+    private static boolean trySwapShared(Connection c, TableNames names) throws SQLException {
+        try (var ps = c.prepareStatement("select pg_try_advisory_xact_lock_shared(?, ?)")) {
+            ps.setInt(1, names.internalNamespace());
+            ps.setInt(2, TableNames.LOCK_SWAP);
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getBoolean(1);
+            }
         }
     }
 

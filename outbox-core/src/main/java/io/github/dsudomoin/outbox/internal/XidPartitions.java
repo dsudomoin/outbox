@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
@@ -61,6 +62,10 @@ public final class XidPartitions {
      * before and the tail is locked only through the parent, but by a session that reads it directly.
      */
     private static final Duration HOLD_LOCK_TIMEOUT = Duration.ofMillis(10);
+
+    /** {@code idle_session_timeout} across the quiesce: a client silent this long under it has frozen or gone. */
+    private static final Map<String, String> QUIESCE_IDLE = Map.of("idle_session_timeout", "'5s'");
+
     /**
      * The scan rate, bytes a second, a tail's attach back is given time for past its lock wait and
      * {@link PartitionDdl#DDL_MARGIN}: well below a cold sequential read, so a slow disk fits too. The scan holds no
@@ -732,9 +737,16 @@ public final class XidPartitions {
      * Runs {@code action} holding {@code LOCK_SWAP} exclusively, taken within {@code quiesceTimeout}: relay steps in
      * flight, which hold it shared, have ended, and new ones skip from the request on (Postgres grants no shared lock
      * past a queued exclusive request) until it is released, whatever fails. A step in flight past
-     * {@code quiesceTimeout} fails it with SQLState 55P03.
+     * {@code quiesceTimeout} fails it with SQLState 55P03. The span runs under {@link #QUIESCE_IDLE}, set before the
+     * quiesce and given back after its release: its statements follow each other within milliseconds, so a session
+     * idle longer holding the lock belongs to a client that froze or lost its connection, and Postgres ends it before
+     * it holds every relay step out for the 60 s of the maintenance session.
      */
     private <T> T quiesced(Connection c, Duration quiesceTimeout, SqlFunction0<T> action) throws SQLException {
+        return SessionSettings.with(c, QUIESCE_IDLE, () -> quiesce(c, quiesceTimeout, action));
+    }
+
+    private <T> T quiesce(Connection c, Duration quiesceTimeout, SqlFunction0<T> action) throws SQLException {
         Throwable failure = null;
         try {
             // inside the try: whatever fails once the lock is granted, even an Error, releases it below; a session

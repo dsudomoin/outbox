@@ -37,7 +37,8 @@ import org.slf4j.LoggerFactory;
  * ({@link PartitionDdl#backendChanges}) the run stops there, with an ERROR at most once a minute and
  * {@code outbox.maintenance.transaction_pooling} at 1 (0 otherwise). It runs on at most one instance at a time: it
  * holds the session lock {@code pg_try_advisory_lock(internalNs, LOCK_MAINTENANCE)} on one autocommit connection with
- * {@code idle_session_timeout = 60s}, so Postgres ends the session of a frozen holder and frees the lock; the setting
+ * {@code idle_session_timeout = 60s}, so Postgres ends the session of a frozen holder and frees the lock (5 s while the
+ * tail swap holds every relay step out, {@link XidPartitions}' quiesce); the setting
  * is given back and the lock released before the connection goes back to the pool. While halted the one step under the
  * lock is the recovery ({@link XidRecovery#autoRecover}), with {@code outbox.recovery.xidRegression = auto}; with
  * {@code halt} the run takes no lock. Otherwise the steps, each on its own (a failure is logged and the next step
