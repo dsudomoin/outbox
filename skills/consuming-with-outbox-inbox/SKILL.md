@@ -36,9 +36,10 @@ public void process(ConsumerRecords<String, byte[]> records) {
 
 | Rule | Why |
 |---|---|
-| Batch listener, one `tryAcceptAll` per `inTx` | Several accept calls in one transaction can deadlock with a concurrent consumer (40P01). Per-record `tryAccept` was ~8× slower in the benchmark; one `inTx` + one `tryAccept` per record is correct, only slow. |
+| Batch listener, one `tryAcceptAll` per `inTx` | Several accept calls in one transaction can deadlock with a concurrent consumer (40P01). Under REPEATABLE READ or SERIALIZABLE a duplicate a concurrent transaction committed first surfaces as 40001; retry the poll the same way. Per-record `tryAccept` was ~8× slower in the benchmark; one `inTx` + one `tryAccept` per record is correct, only slow. |
 | Accept and writes in one `inTx`, exceptions propagate | A rollback records no id, so the redelivered poll is applied. |
 | `inbox.scope("orders-projection")` and its own `group.id` per independent consumer | A shared scope shares ids: the second consumer skips what the first accepted. 1–64 chars of `A-Z a-z 0-9 _ . : -`; never rename it. |
+| Services sharing one `outbox.inbox.table` use the same `retention`, `partitionInterval` and `premake`; give each service its own table if they must differ | Otherwise the shortest `retention` wins for all, and while they differ the service with the longer one can fail a consumer transaction with 23514 on an id from a range the other just dropped, until its next maintenance. |
 | The consumer also sends outbox messages | All keyed sends of the transaction in one `sendAll` (using-outbox). |
 
 ## Spring Boot
@@ -100,7 +101,8 @@ again, and the partition stops for this consumer group.
 Ids younger than `outbox.inbox.retention − partitionInterval` (24 h − 1 h = 23 h) are always deduplicated while inbox
 maintenance makes ranges ahead (gauge `outbox.inbox.window.remaining`, the seconds left until the window's top); older
 ones are accepted again (WARN, counter `outbox.inbox.outside_window`). Set `retention` above the largest consumer lag or
-replay to cover; change it and `partitionInterval` on all instances at once.
+replay to cover; change it and `partitionInterval` on all instances at once. A forward step of X on the inbox
+database's clock lowers the always-deduplicated age by X: leave that margin in `retention`.
 
 ## Wiring and database
 

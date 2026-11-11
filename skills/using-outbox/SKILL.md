@@ -53,10 +53,11 @@ data (a record no running release reads waits; it is never lost or dead-lettered
 - `@OutboxContract(n)` on an event class is its payload version (none = 1). `TypedOutbox<T>` (Kora injects it; by
   hand `new TypedOutbox<>(outbox, serializer, OrderCreated.class)`) and `KafkaOutboxPublisher` (last argument the
   value class) stamp it in the `outbox-contract` header; `ProtobufOutbox` and `Outbox.send` send headers as given.
-- Additive change: a new field nullable or with a default, old readers skipping unknown fields; no version bump. The
-  new field must be a nullable reference type: `@Nullable` in Kora `@Json`, a boxed type or `Optional` in Jackson. A
-  primitive, or a field that is not `@Nullable` in Kora, is a breaking change: Kora always rejects the payload as
-  missing the field, Jackson 3 too (Jackson 2 reads 0), and old records go to dead letters.
+- Additive change: a new nullable field, old readers skipping unknown fields; no version bump. The new field must be
+  a nullable reference type: in Kora `@Json`, `T?` in Kotlin and `@Nullable` in Java (Kora ignores a default value: it
+  does not make the field nullable); a boxed type or `Optional` in Jackson. A primitive, or a field that is not
+  nullable in Kora, is a breaking change: Kora always rejects the payload as missing the field, Jackson 3 too
+  (Jackson 2 reads 0), and old records go to dead letters.
 - **Breaking change** (a field the handler needs, a changed meaning): mandatory two releases.
   1. Release N writes v1 with the old class and reads v1 and v2 with the new one:
 
@@ -316,8 +317,7 @@ for ops:
    `ALTER TABLE ... OWNER TO <owner>` from [config-reference.md](config-reference.md), `outbox.schema`. Never
    `REASSIGN OWNED BY`: it moves everything the role owns in the database, the app's own tables included.
    `pg_read_all_stats` recommended for the role that runs maintenance; no role `statement_timeout` of
-   seconds, nor a short role `transaction_timeout` (PG 17+): a relay step that moves a large parked key into retry
-   can run for tens of seconds.
+   seconds.
 3. **Connections**: direct or session-mode pooler for whatever runs startup and maintenance. Behind transaction pooling
    only the app's own `DataSource` may go, with `prepareThreshold=0`, the `search_path` set on the role or a
    schema-qualified `outbox.table`, and a direct owner database (the split above).

@@ -160,6 +160,8 @@ public final class KafkaOutboxSender implements AutoCloseable {
      * it physically and abort its queued batches. A factory that shares or caches producers, such as spring-kafka's
      * {@code DefaultKafkaProducerFactory} (its {@code CloseSafeProducer} ignores {@code close}), does not fit; with
      * spring-kafka use {@code props -> new KafkaProducer<>(props)}, with interceptors in {@code interceptor.classes}.
+     * The sender closes and replaces a producer after failures, so whatever the factory attaches to one (metrics bound
+     * to it, say) must be released by that producer's {@code close}.
      */
     public KafkaOutboxSender(KafkaOutboxConfig config,
             Function<Map<String, Object>, Producer<byte[], byte[]>> producers) {

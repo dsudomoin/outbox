@@ -42,8 +42,9 @@ import org.slf4j.LoggerFactory;
 /**
  * {@link OutboxAdmin} on Postgres. A bulk call acts on the letters dead when it began: it first reads the highest id
  * and the time, then claims chunks of {@link #CHUNK} letters matching it with an id up to that one and a
- * {@code failed_at} up to that time (a redriven letter dying again comes back with a new, higher id; an older message
- * dying meanwhile, with a later {@code failed_at}), in id order, each above the last chunk's,
+ * {@code failed_at} up to that time (a redriven letter dying again comes back with a new, higher id; a letter dying in
+ * a relay step begun after the call has a later {@code failed_at}, while one dying in a step begun before it gets that
+ * step's start as {@code failed_at} and may be included), in id order, each above the last chunk's,
  * {@code for update skip locked}, in a read-committed transaction of its own. A redrive chunk then tries their key
  * locks without waiting ({@link DeadLetters#tryKeyLocks}) and redrives the ready ones as the dead-letter pass does
  * ({@link DeadLetters#redrive}), so no writer waits for one of its key locks; a key found held stays skipped in the
