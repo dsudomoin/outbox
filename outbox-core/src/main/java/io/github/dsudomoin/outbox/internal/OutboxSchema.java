@@ -1102,41 +1102,62 @@ public final class OutboxSchema implements AutoCloseable {
      * sequence.
      */
     static void raiseRewoundSequences(Connection c, TableNames n) throws SQLException {
-        try (var ps = c.prepareStatement("with q as materialized (select t, s, coalesce(pg_sequence_last_value(s), 0)"
-                + " last, held from (values (?::text, pg_get_serial_sequence(?, 'id')::regclass, greatest("
+        // the outbox itself is named only in the second statement: a query naming it locks it (and every range) at
+        // plan time, run or not, and would queue behind any ACCESS EXCLUSIVE request on it, a swap's say
+        var rows = new ArrayList<String[]>(); // table, sequence, last value, held id
+        try (var ps = c.prepareStatement("select t, s::text, coalesce(pg_sequence_last_value(s), 0), held from (values"
+                + " (?::text, pg_get_serial_sequence(?, 'id')::regclass, greatest("
                 + "(select max(max_id) from " + n.tick() + "), (select max(last_id) from " + n.cursor() + "),"
                 + " (select max(id) from " + n.retry() + "), (select max(id) from " + n.parked() + "),"
                 + " (select max(id) from " + n.dead() + "))),"
                 + " (?::text, pg_get_serial_sequence(?, 'id')::regclass, (select max(id) from " + n.tick() + ")),"
                 + " (?::text, pg_get_serial_sequence(?, 'seq')::regclass, (select max(seq) from " + n.cursor() + ")))"
-                + " v(t, s, held)),"
-                // the source's last rows, written after its newest tick, lie above every value above: read the
-                // ranges that tick may not cover, only when a sequence is behind (CASE runs the scan only then)
-                + " r as materialized (select t, s, last, case when t = ? and exists (select from q where held > last)"
-                + " then greatest(held, (select max(id) from " + n.base() + " where xid >= coalesce((select"
-                + " pg_snapshot_xmin(snapshot) from " + n.tick() + " order by id desc limit 1), '0'::xid8))) else held"
-                + " end held from q) select string_agg(format('%s of %s from %s to %s', s, t, last, held), ', '),"
-                + " count(setval(s, held)) from r where held > last")) {
+                + " v(t, s, held)")) {
             ps.setString(1, n.base());
             ps.setString(2, n.base());
             ps.setString(3, n.tick());
             ps.setString(4, n.tick());
             ps.setString(5, n.cursor());
             ps.setString(6, n.cursor());
-            ps.setString(7, n.base());
             try (var rs = ps.executeQuery()) {
-                rs.next();
-                var raised = rs.getString(1);
-                if (raised != null) {
-                    log.error("outbox identity sequences of {} were behind ids their rows already hold, and were moved"
-                            + " past them: {}. Logical replication and AWS DMS copy rows but not sequence values, so a"
-                            + " cutover onto another cluster leaves them at their start; without the move no new tick"
-                            + " would be seen, new cursor rows would be ignored and new outbox ids would collide with"
-                            + " retry, parked and dead rows. Sync the sequences as part of the cutover (README,"
-                            + " «Восстановление после регрессии xid»)", n.base(), raised);
+                while (rs.next()) {
+                    rows.add(new String[] {rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4)});
                 }
             }
         }
+        if (rows.stream().noneMatch(r -> r[3] != null && Long.parseLong(r[3]) > Long.parseLong(r[2]))) {
+            return;
+        }
+        var raised = new ArrayList<String>();
+        for (var b : rows) {
+            long held = b[3] == null ? 0 : Long.parseLong(b[3]);
+            if (b[0].equals(n.base())) {
+                // the source's last rows, written after its newest tick, lie above every value above: the ranges that
+                // tick may not cover, the top ones alone
+                try (var ps = c.prepareStatement("select max(id) from " + n.base() + " where xid >= coalesce((select"
+                        + " pg_snapshot_xmin(snapshot) from " + n.tick() + " order by id desc limit 1), '0'::xid8)");
+                        var rs = ps.executeQuery()) {
+                    if (rs.next() && rs.getLong(1) > held) {
+                        held = rs.getLong(1);
+                    }
+                }
+            }
+            if (held <= Long.parseLong(b[2])) {
+                continue;
+            }
+            try (var ps = c.prepareStatement("select setval(?::regclass, ?)")) {
+                ps.setString(1, b[1]);
+                ps.setLong(2, held);
+                ps.execute();
+            }
+            raised.add(b[1] + " of " + b[0] + " from " + b[2] + " to " + held);
+        }
+        log.error("outbox identity sequences of {} were behind ids their rows already hold, and were moved"
+                + " past them: {}. Logical replication and AWS DMS copy rows but not sequence values, so a"
+                + " cutover onto another cluster leaves them at their start; without the move no new tick"
+                + " would be seen, new cursor rows would be ignored and new outbox ids would collide with"
+                + " retry, parked and dead rows. Sync the sequences as part of the cutover (README,"
+                + " «Восстановление после регрессии xid»)", n.base(), String.join(", ", raised));
     }
 
     /**
