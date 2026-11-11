@@ -220,6 +220,64 @@ class OutboxRelayIT {
         await(Duration.ofSeconds(5), () -> handler.delivered().size() == total);
     }
 
+    /**
+     * A backlog keeps a pass going; the pass still hands its connection back to the pool every bound, so the pool can
+     * retire it at maxLifetime and its leak detection sees no borrow longer than the bound and a step.
+     */
+    @Test
+    void aPassThroughABacklogReturnsItsConnectionEveryBound() throws Exception {
+        config.shards(1).workers(1).batchSize(10).minTickInterval(Duration.ofMillis(50));
+        bootstrap();
+        send(outbox(() -> {}), IntStream.range(0, 400).mapToObj(i -> msg("t", "k", "m" + i))
+                .toArray(OutboxMessage[]::new));
+        var longest = new AtomicLong();
+        var borrows = new AtomicInteger();
+        var handler = new RecordingHandler().delay(Duration.ofMillis(50)); // 40 batches: 2 s or more
+        var relay = relay(new JdbcConnectionFactory() {
+            @Override
+            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
+                return db.withConnection(callback);
+            }
+
+            @Override
+            public Connection currentConnection() {
+                return db.currentConnection();
+            }
+
+            @Override
+            public Connection newConnection() {
+                var c = db.newConnection();
+                if (!Thread.currentThread().getName().startsWith("outbox-relay-")) {
+                    return c;
+                }
+                borrows.incrementAndGet();
+                long borrowed = System.nanoTime();
+                return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
+                        new Class<?>[] {Connection.class}, (proxy, method, args) -> {
+                            if (method.getName().equals("close")) {
+                                longest.accumulateAndGet(System.nanoTime() - borrowed, Math::max);
+                            }
+                            return invoke(method, c, args);
+                        });
+            }
+
+            @Override
+            public DataBaseTelemetry telemetry() {
+                return db.telemetry();
+            }
+        }, handler);
+        relay.passBound = TimeUnit.MILLISECONDS.toNanos(200);
+        relay.start();
+
+        await(Duration.ofSeconds(30), () -> handler.delivered().size() == 400);
+        relay.close();
+
+        assertThat(borrows.get()).as("a pass per bound").isGreaterThan(5);
+        assertThat(Duration.ofNanos(longest.get())).as("the longest borrow: the bound and a step")
+                .isLessThan(Duration.ofSeconds(1));
+        assertIdOrderPerKey(handler.delivered());
+    }
+
     @Test
     void maintenanceRunsRightAfterStartOnlyWhenEnabled() throws Exception {
         bootstrap(); // maintenanceInterval is 1 h

@@ -70,6 +70,12 @@ public final class OutboxRelay implements AutoCloseable {
     private static final long INTERRUPT_GRACE = TimeUnit.SECONDS.toNanos(1);
     /** The most shards one step takes: a group's statements bind arrays of this size. */
     private static final int MAX_GROUP = 256;
+    /**
+     * How long a pass keeps its pooled connection before it hands it back and the worker starts the next pass with
+     * another: a backlog would hold one for its whole length, past the pool's maxLifetime and its leak detection.
+     */
+    // ponytail: fixed 60 s, no config key; make it one if a pool's maxLifetime or leak threshold must sit below it
+    private static final long PASS_BOUND = TimeUnit.SECONDS.toNanos(60);
 
     private final OutboxTransactions db;
     private final OutboxConfig config;
@@ -85,6 +91,8 @@ public final class OutboxRelay implements AutoCloseable {
     private final DatabaseClock clock;
     private final long idleNanos;
     private final long minTickNanos;
+    /** {@link #PASS_BOUND}, a shorter one only in tests; set before {@link #start()}. */
+    long passBound = PASS_BOUND;
     private final SocketBound socket;
     /**
      * An idle tick attempt inserts only when the newest tick, any instance's, is older than this: so a cluster makes
@@ -867,7 +875,8 @@ public final class OutboxRelay implements AutoCloseable {
 
         /**
          * Steps groups of the current round until it has none left (one cursor read per latest tick, see
-         * {@link #readRound}); returns whether a step did work (progress or a pause).
+         * {@link #readRound}) or {@link #passBound} has passed; returns whether a step did work (progress or a pause),
+         * or true at the bound, so the worker goes on with another pass and another connection.
          */
         private boolean pass(long seen) throws Exception {
             try (var c = db.newConnection(); var bound = socket.on(c)) {
@@ -880,7 +889,11 @@ public final class OutboxRelay implements AutoCloseable {
             tickIfDue(c, seen);
             readRound(c);
             boolean worked = false;
+            long started = System.nanoTime();
             while (!stopping && !maintenance.halted()) {
+                if (System.nanoTime() - started > passBound) {
+                    return true; // before a take: no group is left taken, and the next pass comes right away
+                }
                 // the tick attempts of a long pass (a backlog keeps its round from running out), each followed by
                 // a look at the latest tick: without them ticks would wait for the pass, and each would hold ever
                 // more rows, read again in full by every chunk of a batch
