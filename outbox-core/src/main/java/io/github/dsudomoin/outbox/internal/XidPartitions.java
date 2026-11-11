@@ -700,13 +700,8 @@ public final class XidPartitions {
     /** Creates the ranges from {@code from} until {@code target} standalone, each skipped when it exists; their top. */
     private long precreate(Connection c, long from, long target) throws SQLException {
         for (; from < target; from += size) {
+            // with the indexes: the swap's attach then builds none; one made before the parent changed is made again
             var range = names.partitionPrefix() + from;
-            // one made before the parent's columns changed would fail every attach: made again while empty
-            if (PartitionDdl.attachment(c, names.base(), range) == Attachment.STANDALONE
-                    && !PartitionDdl.sameColumns(c, names.base(), range) && !PartitionDdl.hasRows(c, range)) {
-                PartitionDdl.drop(c, range, PartitionDdl.CREATE_LOCK_TIMEOUT);
-            }
-            // with the indexes: the swap's attach then builds none
             PartitionDdl.create(c, names.base(), range, PartitionDdl.CREATE_LOCK_TIMEOUT, true);
         }
         return from;

@@ -79,8 +79,10 @@ public final class PartitionDdl {
     }
 
     /**
-     * Creates {@code table} standalone, {@code like parent including defaults}, unless it exists (an earlier run that
-     * failed before its attach left it). {@code LIKE} takes ACCESS SHARE on the parent, which no writer waits for.
+     * Creates {@code table} standalone, {@code like parent} with its defaults, CHECK constraints and generated columns
+     * (an attach requires the last two), unless it exists (an earlier run that failed before its attach left it). One
+     * left empty and standalone before the parent changed ({@link #sameShape}) would fail every attach: dropped and
+     * made again. {@code LIKE} takes ACCESS SHARE on the parent, which no writer waits for.
      */
     static void create(Connection c, String parent, String table, Duration lockTimeout) throws SQLException {
         create(c, parent, table, lockTimeout, false);
@@ -92,11 +94,15 @@ public final class PartitionDdl {
      */
     static void create(Connection c, String parent, String table, Duration lockTimeout, boolean indexes)
             throws SQLException {
+        if (exists(c, table) && attachment(c, parent, table) == Attachment.STANDALONE && !sameShape(c, parent, table)
+                && !hasRows(c, table)) {
+            drop(c, table, lockTimeout);
+        }
         if (!exists(c, table)) {
             var owner = foreignOwner(c, parent, table);
             // one statement batch, one implicit transaction: no table is left behind under the creating role
             execute(c, lockTimeout, "create table " + name(table) + " (like " + name(parent) + " including defaults"
-                    + (indexes ? " including indexes)" : ")")
+                    + " including constraints including generated" + (indexes ? " including indexes)" : ")")
                     + (owner == null ? "" : "; alter table " + name(table) + " owner to " + owner));
             log.info("created table {} like {}", table, parent);
         }
@@ -179,13 +185,23 @@ public final class PartitionDdl {
         drop(c, partition, lockTimeout);
     }
 
-    /** Whether {@code table} has {@code parent}'s columns: the same names and types in the same order. */
-    static boolean sameColumns(Connection c, String parent, String table) throws SQLException {
-        String columns = "(select array_agg(attname::text || ' ' || atttypid::regtype::text order by attnum)"
-                + " from pg_attribute where attrelid = to_regclass(?) and attnum > 0 and not attisdropped)";
-        try (var ps = c.prepareStatement("select " + columns + " is not distinct from " + columns)) {
+    /**
+     * Whether {@code table} has what an attach to {@code parent} requires of it: the same column names, types, NOT
+     * NULLs and generation expressions in the same order, and the same CHECK constraints.
+     */
+    static boolean sameShape(Connection c, String parent, String table) throws SQLException {
+        String shape = "(select array_agg(attname::text || ' ' || atttypid::regtype::text || ' ' || attnotnull::text"
+                + " || ' ' || attgenerated::text || ' ' || coalesce(pg_get_expr(d.adbin, d.adrelid), '')"
+                + " order by attnum)"
+                + " from pg_attribute left join pg_attrdef d on d.adrelid = attrelid and d.adnum = attnum"
+                + " and attgenerated <> '' where attrelid = to_regclass(?) and attnum > 0 and not attisdropped)"
+                + " || (select array_agg(conname::text || ' ' || pg_get_constraintdef(oid) order by conname)"
+                + " from pg_constraint where conrelid = to_regclass(?) and contype = 'c')";
+        try (var ps = c.prepareStatement("select " + shape + " is not distinct from " + shape)) {
             ps.setString(1, parent);
-            ps.setString(2, table);
+            ps.setString(2, parent);
+            ps.setString(3, table);
+            ps.setString(4, table);
             try (var rs = ps.executeQuery()) {
                 rs.next();
                 return rs.getBoolean(1);

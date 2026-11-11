@@ -137,6 +137,37 @@ class SchemaValidationIT {
         assertThat(status.maintenanceSinceSuccessSeconds()).isLessThan(10.0);
     }
 
+    /** The owner's CHECK and generated column on the parents: every range and tail the library makes carries them. */
+    @Test
+    void checksAndGeneratedColumnsOnTheParentsStartDeliverAndMaintain() throws Exception {
+        sql(OutboxSql.outbox(config, null));
+        sql(OutboxSql.inbox(config, null));
+        sql("alter table " + names.base() + " add constraint payload_small check (octet_length(payload) < 1000000)");
+        sql("alter table " + names.base() + " add column plen int generated always as (octet_length(payload)) stored");
+        sql("alter table " + config.inbox().table() + " add constraint consumer_short check (length(consumer) < 200)");
+        var handler = new RecordingHandler();
+        var transactions = new JdbcTransactions(TestDataSources.newDataSource());
+        var runtime = OutboxRuntime.builder(config, transactions, handler).build();
+        runtimes.add(runtime);
+        long started = System.nanoTime();
+        runtime.start();
+        var inbox = InboxRuntime.builder(config, new JdbcTransactions(TestDataSources.newDataSource())).build();
+        runtimes.add(inbox);
+        inbox.start();
+
+        var id = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", "k", "p".getBytes(UTF_8))));
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (handler.delivered().isEmpty() && System.nanoTime() < deadline) {
+            Thread.sleep(5);
+        }
+        assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactly(id);
+        while (!maintainedSince(runtime, started) && System.nanoTime() < deadline) {
+            Thread.sleep(5);
+        }
+        assertThat(runtime.maintenance().runOnce()).isTrue();
+        assertThat(runtime.admin().status().premade()).isGreaterThanOrEqualTo(config.partitions().premake());
+    }
+
     @Test
     void bootstrappedDatabaseValidates() throws Exception {
         var bootstrapped = new TestOutboxConfig().table(config.table()).schemaBootstrap(true);

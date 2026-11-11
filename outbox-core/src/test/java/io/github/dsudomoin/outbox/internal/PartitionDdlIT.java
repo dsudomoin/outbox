@@ -99,6 +99,51 @@ class PartitionDdlIT {
         }
     }
 
+    /** A CHECK and a generated column the owner's migration put on the parent: an attach requires both of a range. */
+    @Test
+    void aRangeTakesTheParentsChecksAndGeneratedColumns() throws Exception {
+        var parent = TestSql.uniqueTable();
+        try (var c = TestDataSources.newDataSource().getConnection()) {
+            TestSql.execute(c, "create table " + parent + " (xid xid8 not null, payload bytea not null)"
+                    + " partition by range (xid)");
+            TestSql.execute(c, "alter table " + parent + " add constraint payload_small"
+                    + " check (octet_length(payload) < 1000000)");
+            TestSql.execute(c, "alter table " + parent + " add column plen int"
+                    + " generated always as (octet_length(payload)) stored");
+
+            PartitionDdl.createAndAttach(c, parent, parent + "_a", "0", "100", Duration.ofSeconds(5));
+            PartitionDdl.create(c, parent, parent + "_b", Duration.ofSeconds(5), true);
+            PartitionDdl.attach(c, parent, parent + "_b", "100", "200", Duration.ofSeconds(5));
+
+            assertThat(PartitionDdl.listRanges(c, parent)).hasSize(2);
+        }
+    }
+
+    /**
+     * An empty range made before the parent gained a CHECK, a generated column or a NOT NULL would fail every attach:
+     * {@code create} makes it again.
+     */
+    @Test
+    void anEmptyRangeMadeBeforeTheParentChangedIsMadeAgain() throws Exception {
+        var parent = TestSql.uniqueTable();
+        try (var c = TestDataSources.newDataSource().getConnection()) {
+            TestSql.execute(c, "create table " + parent + " (xid xid8 not null, payload bytea, plen int)"
+                    + " partition by range (xid)");
+            for (var change : new String[] {
+                    "add constraint payload_small check (octet_length(payload) < 1000000)",
+                    "alter column payload set not null",
+                    "drop column plen, add column plen int generated always as (octet_length(payload)) stored"}) {
+                var range = parent + "_" + TestSql.uniqueTable();
+                PartitionDdl.create(c, parent, range, Duration.ofSeconds(5), true);
+                TestSql.execute(c, "alter table " + parent + " " + change);
+
+                PartitionDdl.create(c, parent, range, Duration.ofSeconds(5), true);
+                PartitionDdl.attach(c, parent, range, "0", "100", Duration.ofSeconds(5));
+                PartitionDdl.detachConcurrentlyAndDrop(c, parent, range, Duration.ofSeconds(5));
+            }
+        }
+    }
+
     /** Takes a lock on {@code table} in a transaction of {@code reader} and ends it 3 s later. */
     private static CompletableFuture<Void> holdFor3s(Connection reader, String table) throws Exception {
         reader.setAutoCommit(false);
