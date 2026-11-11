@@ -279,9 +279,9 @@ public final class Ticks {
      * Returns false without a tick when the tick lock stays taken for 1 s ({@code lock_timeout} on the lock statement,
      * SQLState 55P03). When the probing insert fails short of a broken connection, the tick is made without its shard
      * set and a WARN names the cause, at most once a minute: a lock it waited for longer than 50 ms (any partition held
-     * or awaited in ACCESS EXCLUSIVE mode), a role's {@code statement_timeout}, an unusable index. Runs its own
-     * read-committed transaction on an autocommit connection and restores autocommit; all settings are
-     * transaction-scoped.
+     * or awaited in ACCESS EXCLUSIVE mode), its own 2 s {@code statement_timeout} (which replaces the role's), an
+     * unusable index. Runs its own read-committed transaction on an autocommit connection and restores autocommit;
+     * all settings are transaction-scoped.
      */
     public boolean make(Connection autocommit, Duration minInterval) throws SQLException {
         return tick(autocommit, minInterval) == Made.INSERTED;
@@ -459,10 +459,13 @@ public final class Ticks {
             // read committed whatever the session default: under repeatable read the lock statement would fix the
             // snapshot before the lock is granted, so the tick would miss commits made while it waited. A generic
             // plan: no parameter of the probe helps plan-time pruning, and a custom plan of it over every partition
-            // takes about 1.5 ms to make, against 0.02 ms to reuse the cached generic one
+            // takes about 1.5 ms to make, against 0.02 ms to reuse the cached generic one. A statement_timeout of
+            // its own above the lock_timeout: a role's shorter one would cancel the lock wait (57014) instead of
+            // the tick being skipped (55P03); the probe and the insert take milliseconds
             st.execute("set transaction isolation level read committed;"
                     + " set local idle_in_transaction_session_timeout = '5s'; set local lock_timeout = '1s';"
-                    + " set local plan_cache_mode = force_generic_plan" + noTransactionTimeout(c));
+                    + " set local statement_timeout = '2s'; set local plan_cache_mode = force_generic_plan"
+                    + noTransactionTimeout(c));
         }
         try (var ps = c.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {
             ps.setInt(1, names.internalNamespace());

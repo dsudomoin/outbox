@@ -235,6 +235,26 @@ class TicksIT {
         }
     }
 
+    /**
+     * A role's {@code statement_timeout} below the tick's 1 s {@code lock_timeout} does not turn a held tick lock into
+     * a cancelled statement (57014): the tick is skipped, as with any role.
+     */
+    @Test
+    void aShortRoleStatementTimeoutStillSkipsATickWhoseLockIsHeld() throws Exception {
+        var props = new Properties();
+        props.setProperty("options", "-c statement_timeout=500"); // a role or URL default
+        try (var holder = TestDb.connect(); var c = TestDb.connect(props)) {
+            holder.setAutoCommit(false);
+            ticks.lockForTest(holder);
+
+            assertThat(ticks.tick(c, Duration.ZERO)).isEqualTo(Ticks.Made.SKIPPED);
+            assertSessionRestored(c);
+            assertThat(queryString(c, "show statement_timeout")).as("the session's again").isEqualTo("500ms");
+            holder.rollback();
+            assertThat(ticks.tick(c, Duration.ZERO)).isEqualTo(Ticks.Made.INSERTED);
+        }
+    }
+
     @Test
     void tickIsMonotonicEvenWhenSessionDefaultsToRepeatableRead() throws Exception {
         var pool = Executors.newFixedThreadPool(2);
