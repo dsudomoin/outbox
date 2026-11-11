@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.internal;
 
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.dsudomoin.outbox.InboxRuntime;
@@ -12,6 +13,7 @@ import io.github.dsudomoin.outbox.testing.TestSql;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Locale;
 import java.util.function.Function;
 import org.junit.jupiter.api.Test;
 
@@ -121,6 +123,23 @@ class SchemaCheckIT {
             assertThatThrownBy(() -> SchemaCheck.requireSameDatabase(utc, moscow, table))
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("reaches another database than the application's");
+        }
+    }
+
+    @Test
+    void aKeywordTheGrammarRefusesAsAnUnquotedNameFailsTheResolve() throws Exception {
+        try (var c = TestDataSources.newDataSource().getConnection()) {
+            for (var name : new String[] {"user", "Left", "order.outbox"}) {
+                var keyword = name.contains(".") ? "order" : name.toLowerCase(Locale.ROOT);
+                assertThatThrownBy(() -> TableNames.of(name).resolve(c))
+                        .isInstanceOf(IllegalStateException.class)
+                        .hasMessageContaining("\"" + keyword + "\" is a reserved Postgres keyword")
+                        .hasMessageContaining("outbox.table or outbox.inbox.table");
+            }
+            // a keyword after the schema, and one the grammar takes as a table name, stay accepted
+            for (var name : new String[] {"public.user", "public.order", "between"}) {
+                assertThatCode(() -> TableNames.of(name).resolve(c)).doesNotThrowAnyException();
+            }
         }
     }
 

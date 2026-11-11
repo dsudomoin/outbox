@@ -48,16 +48,26 @@ public record TableNames(
      * These names with the lock namespaces of the table they denote on {@code c}, hashed from its canonical
      * {@code schema.name}, so every spelling of one table shares its locks. An unqualified name denotes the table in
      * {@code current_schema()}, where {@code CREATE TABLE} puts it; once the table exists, {@code to_regclass} must
-     * resolve the name to that same table. Not the oid: a dump and restore changes it.
+     * resolve the name to that same table. Not the oid: a dump and restore changes it. The schema, or an unqualified
+     * name, must not be a reserved or type/function-name keyword of this server: every statement interpolates the
+     * name unquoted, and the grammar takes any keyword only as the table part after a schema.
      */
     public TableNames resolve(Connection c) throws SQLException {
+        String head = base.substring(0, base.indexOf('.') < 0 ? base.length() : base.indexOf('.'));
         try (var ps = c.prepareStatement("select current_schema(), (select n.nspname || '.' || r.relname"
-                + " from pg_class r join pg_namespace n on n.oid = r.relnamespace where r.oid = to_regclass(?))")) {
+                + " from pg_class r join pg_namespace n on n.oid = r.relnamespace where r.oid = to_regclass(?)),"
+                + " exists (select 1 from pg_get_keywords() where word = ? and catcode in ('R', 'T'))")) {
             ps.setString(1, base);
+            ps.setString(2, head);
             try (var rs = ps.executeQuery()) {
                 rs.next();
                 String schema = rs.getString(1);
                 String existing = rs.getString(2);
+                if (rs.getBoolean(3)) {
+                    throw new IllegalStateException("table " + base + ": \"" + head + "\" is a reserved Postgres"
+                            + " keyword, which the library's unquoted SQL cannot take as a schema or an unqualified"
+                            + " table name; rename it in outbox.table or outbox.inbox.table");
+                }
                 if (base.indexOf('.') < 0 && schema == null) {
                     throw new IllegalStateException("table " + base + " is unqualified, but the search_path names"
                             + " no existing schema; qualify it as schema." + base);
