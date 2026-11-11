@@ -1885,7 +1885,8 @@ class ShardProcessorIT {
             assertThat(batches.get(batches.size() - 1)).as("the probe hands one row").hasSize(1);
             var retry = retryRows();
             assertThat(retry).as("one row diverted per probe").hasSize(probe);
-            assertThat(retry.get(probe - 1)).startsWith("k" + (probe - 1) + ":3:");
+            // k0, the row the failures began at, is charged them all; the next heads only their probe
+            assertThat(retry.get(probe - 1)).startsWith("k" + (probe - 1) + (probe == 1 ? ":3:" : ":1:"));
             var cursor = cursor();
             assertThat(cursor.failures()).isEqualTo(3 + probe);
             assertPausedFor(cursor, Backoff.delay(2 + probe, INITIAL, config.maxDelay()));
@@ -1893,6 +1894,38 @@ class ShardProcessorIT {
         }
         assertThat(deadRows()).isEmpty();
         assertThat(handler.delivered()).isEmpty();
+    }
+
+    @Test
+    void probedRowsAreChargedOnlyTheirOwnAttempts() throws Exception {
+        config.retry(INITIAL, config.maxDelay(), 3);
+        bootstrap();
+        var attempts = new HashMap<String, Integer>();
+        handler.failAlways(r -> {
+            synchronized (attempts) {
+                attempts.merge(new String(r.payload(), UTF_8), 1, Integer::sum);
+            }
+            return true;
+        }, () -> new RuntimeException("target down"));
+        send(IntStream.range(0, 5).mapToObj(i -> msg("t", "k" + i, "k" + i)).toArray(OutboxMessage[]::new));
+        tick();
+
+        // three paused steps: the 3-pair stop leaves k3 and k4 not attempted
+        for (int failures = 1; failures <= 3; failures++) {
+            assertThat(process()).isEqualTo(new ShardResult(PAUSED, 0, false));
+            now = cursor().pausedUntil();
+        }
+        for (int probe = 1; probe <= 4; probe++) { // k0, k1 and k2, at maxAttempts, go dead meanwhile
+            assertThat(process().status()).isEqualTo(PAUSED);
+            now = cursor().pausedUntil();
+        }
+        synchronized (attempts) {
+            assertThat(attempts).containsEntry("k3", 1);
+        }
+        // k3, never handed before its probe, is charged its one attempt, not the failures of k0..k2 before it: with
+        // the shard's failures it would be dead-lettered when due, without another call
+        assertThat(retryRows()).filteredOn(row -> row.startsWith("k3:")).singleElement().asString()
+                .startsWith("k3:1:");
     }
 
     @Test

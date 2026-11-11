@@ -104,7 +104,8 @@ public final class BatchClassifier {
      * head, every later row of that pair and every row of a {@code dbBlocked} pair a follower, Permanent rows
      * dead. Nothing delivered and 2+ {@linkplain #failingKeys failing} pairs → pause. Exactly one such pair
      * → pause until {@code priorFailures + 1 >= headFailuresBeforeDivert}, then per-key handling with this attempt
-     * counted {@code priorFailures + 1} times instead of once. No such pair at all → advance. Retry heads and
+     * counted {@code divertAttempts} times instead of once: the attempts the caller knows the diverted head made, from
+     * 1 (this one) to {@code priorFailures + 1}. No such pair at all → advance. Retry heads and
      * Permanent dead rows add this attempt to the record's {@code attempts}; NotAttempted heads always start at 0
      * attempts (never-attempted rows keep their {@code maxAttempts} budget). A head is due at
      * {@code max(now + backoff(max(attempts - 1, 0)), notBefore)}, with {@code notBefore} capped at {@code now + 24h}.
@@ -119,7 +120,8 @@ public final class BatchClassifier {
      * row. A {@code parked} row delivered is unparked; one not attempted stays parked (due no earlier than
      * {@code max(now + requeueDelay, notBefore)}) without blocking its key; any other outcome treats it as any row.
      */
-    public static Decision classify(List<Item> items, int priorFailures, int headFailuresBeforeDivert, Instant now,
+    public static Decision classify(List<Item> items, int priorFailures, int divertAttempts,
+            int headFailuresBeforeDivert, Instant now,
             Duration retryInitial, Duration retryMax, Duration requeueDelay, int maxRequeues, Duration waitDelay,
             Duration waitMax) {
         boolean anyDelivered = items.stream().anyMatch(item -> item.outcome() instanceof Outcome.Delivered);
@@ -129,7 +131,7 @@ public final class BatchClassifier {
             if (failing.size() > 1 || priorFailures + 1 < headFailuresBeforeDivert) {
                 return new Decision(true, List.of());
             }
-            attempts = priorFailures + 1;
+            attempts = divertAttempts;
         }
         var notAttemptedDue = now.plus(Backoff.delay(0, retryInitial, retryMax)); // attempts 0
         var requeueDue = now.plus(requeueDelay);

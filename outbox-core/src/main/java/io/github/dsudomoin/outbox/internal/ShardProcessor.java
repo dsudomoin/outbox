@@ -155,6 +155,13 @@ public final class ShardProcessor implements AutoCloseable {
      */
     private final AtomicIntegerArray solo;
     /**
+     * Per shard, the id of the first main-stream row that failed transiently in the step that began the cursor's failed
+     * attempts in a row, as this processor saw it (0: none). A divert charges its head all of those attempts only when
+     * the head is that row: a row read after a divert moved the position, or failures that began on another instance,
+     * get this attempt alone. Undercounting only delays a dead letter; overcounting loses deliveries to maxAttempts.
+     */
+    private final AtomicLongArray failedFirst;
+    /**
      * Per shard, the steps in a row that found no free handler thread of this processor (calls that outlived
      * {@code batchTimeout} hold them all), and until when (epoch microseconds of the callers' clock) this processor
      * skips the shard for it: {@code initialDelay} doubled that many times, up to {@code maxDelay}. A fact about this
@@ -201,6 +208,7 @@ public final class ShardProcessor implements AutoCloseable {
         this.fullChecked = new AtomicLongArray(config.shards());
         this.probing = new AtomicIntegerArray(config.shards());
         this.solo = new AtomicIntegerArray(config.shards());
+        this.failedFirst = new AtomicLongArray(config.shards());
         this.busyPauses = new AtomicIntegerArray(config.shards());
         this.busyUntil = new AtomicLongArray(config.shards());
         long created = System.nanoTime();
@@ -888,10 +896,12 @@ public final class ShardProcessor implements AutoCloseable {
         var chunk = items.subList(parkedCount, items.size());
         int read = busy ? 0 : read(chunk, items.subList(0, parkedCount).stream().anyMatch(this::leavesParked));
         items = items.subList(0, busy ? 0 : parkedCount + read);
-        // the shard's failures may stem from other rows than a probed head: it is diverted with divertAt attempts
-        var decision = BatchClassifier.classify(items, Math.min(cursor.failures(), divertAt - 1), divertAt, now,
-                retry.initialDelay(), retry.maxDelay(), requeue.delay(), requeue.maxRequeues(), waiting.delay(),
-                waiting.maxDelay());
+        // the shard's failures gate the divert; its head is charged them only when they all handed it (failedFirst)
+        int prior = Math.min(cursor.failures(), divertAt - 1);
+        long first = prior > 0 ? firstRetried(items, parkedCount) : 0;
+        int charge = first != 0 && first == failedFirst.get(shard) ? prior + 1 : 1;
+        var decision = BatchClassifier.classify(items, prior, charge, divertAt, now, retry.initialDelay(),
+                retry.maxDelay(), requeue.delay(), requeue.maxRequeues(), waiting.delay(), waiting.maxDelay());
         var next = s.next;
         if (!decision.pause() && !busy) {
             var parkedIds = new HashSet<Long>();
@@ -907,6 +917,9 @@ public final class ShardProcessor implements AutoCloseable {
             next = position(s, read);
         } // else no progress: a batch in progress keeps its target, a fresh one is not stored (lastId is still 0)
         if (failedAttempt(items)) { // paused, or a single failing key diverted: either way back off
+            if (cursor.failures() == 0) {
+                failedFirst.set(shard, firstRetried(items, parkedCount));
+            }
             limits.set(shard, Math.max(1, s.limit / 2));
             var backoff = Backoff.delay(cursor.failures(), retry.initialDelay(), retry.maxDelay());
             var until = now.plus(Duration.ofNanos(System.nanoTime() - started)).plus(backoff)
@@ -1007,6 +1020,19 @@ public final class ShardProcessor implements AutoCloseable {
                 return rs.getBoolean(1);
             }
         }
+    }
+
+    /**
+     * The id of the first main-stream row of {@code items} (those after its {@code parkedCount} parked rows, which a
+     * probe never merges) that failed transiently, 0 for none.
+     */
+    private static long firstRetried(List<Item> items, int parkedCount) {
+        for (int i = parkedCount; i < items.size(); i++) {
+            if (items.get(i).outcome() instanceof Outcome.Retry) {
+                return items.get(i).record().id();
+            }
+        }
+        return 0;
     }
 
     /**

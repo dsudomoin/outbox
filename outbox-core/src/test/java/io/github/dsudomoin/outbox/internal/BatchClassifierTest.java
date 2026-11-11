@@ -103,6 +103,16 @@ class BatchClassifierTest {
     }
 
     @Test
+    void divertGateIsThePriorFailuresAndTheChargeIsWhatTheCallerKnows() {
+        var k1 = record("t", "k1");
+
+        // the failures before were of other rows: the divert is due all the same, the head charged its one attempt
+        assertThat(classify(2, 1, 0, retry(k1))).isEqualTo(advance(
+                new Head(k1, 1, NOW.plus(INITIAL), DOWN.toString())));
+        assertThat(classify(1, 1, 0, retry(k1))).as("the gate does not follow the charge").isEqualTo(PAUSE);
+    }
+
+    @Test
     void singleKeyDivertOfNotAttemptedKeyKeepsAttemptBudget() {
         var k1a = record("t", "k1");
         var k1b = record("t", "k1");
@@ -477,8 +487,12 @@ class BatchClassifierTest {
     }
 
     private static Decision classify(int priorFailures, int maxRequeues, Item... items) {
-        return BatchClassifier.classify(List.of(items), priorFailures, THRESHOLD, NOW, INITIAL, MAX, DELAY,
-                maxRequeues, WAIT, WAIT_MAX);
+        return classify(priorFailures, priorFailures + 1, maxRequeues, items);
+    }
+
+    private static Decision classify(int priorFailures, int divertAttempts, int maxRequeues, Item... items) {
+        return BatchClassifier.classify(List.of(items), priorFailures, divertAttempts, THRESHOLD, NOW, INITIAL, MAX,
+                DELAY, maxRequeues, WAIT, WAIT_MAX);
     }
 
     private static Decision advance(Action... actions) {
