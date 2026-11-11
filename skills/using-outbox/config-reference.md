@@ -42,7 +42,7 @@ outbox {
 
 | Key | Default | Rule and meaning |
 |---|---|---|
-| `initialDelay` | `1s` | > 0. First backoff of a failed key and of a paused shard; doubles per failure. |
+| `initialDelay` | `1s` | > 0. First backoff of a failed key, of a paused shard and of a shard whose step fails alone a second time in a row; doubles per failure. |
 | `maxDelay` | `5m` | ≥ `initialDelay`. Backoff ceiling. With Kafka keep it under 10 min: a record kept for an unbatched resend is forgotten after 10 min, and a later retry goes back into a shared batch (below, «Oversized records»). |
 | `maxAttempts` | `0` | ≥ 0. After this many failed attempts a record moves to `<table>_dead`. `0` = retry forever. `NotAttempted` does not count. Lowering it moves records that already carry that many attempts to dead when next due, without another call; waiting heads are exempt. Global, Kafka included: a dead-lettered record lets the later records of its key go on, so with ordered topics keep 0 and bound a slow route in its handler (`record.attempts()`, writing-outbox-handlers). |
 

@@ -110,6 +110,13 @@ public final class OutboxRelay implements AutoCloseable {
      */
     private final AtomicIntegerArray isolated;
     /**
+     * Per shard, the steps of it alone that failed in a row, cleared with {@link #isolated}; from the second on it is
+     * not a candidate of this relay until {@link #retryAfter} ({@code nanoTime}): {@code relay.retry} delays, so a
+     * fault that fails the step after its handler call re-sends the chunk once per delay, not once per tick.
+     */
+    private final AtomicIntegerArray failedAlone;
+    private final AtomicLongArray retryAfter;
+    /**
      * Per shard, the rows its next step is expected to read: {@code batchSize} while its batch is unfinished and after
      * a step that left it untouched (unread behind a cut, or not attempted); else the rows its last batch delivered (0
      * before it delivered any). A group
@@ -186,6 +193,8 @@ public final class OutboxRelay implements AutoCloseable {
         this.lastTickAttempt = System.nanoTime() - idleNanos; // the first pass ticks
         this.stepStarted = new AtomicLongArray(config.shards());
         this.isolated = new AtomicIntegerArray(config.shards());
+        this.failedAlone = new AtomicIntegerArray(config.shards());
+        this.retryAfter = new AtomicLongArray(config.shards());
         this.expected = new AtomicIntegerArray(config.shards());
         this.batchRows = new AtomicIntegerArray(config.shards());
         this.inFlight = new AtomicIntegerArray(config.shards());
@@ -660,6 +669,11 @@ public final class OutboxRelay implements AutoCloseable {
         }
     }
 
+    /** Failed alone twice or more in a row and its {@link #retryAfter} not reached yet. */
+    private boolean backingOff(int shard, long nanos) {
+        return failedAlone.get(shard) > 1 && retryAfter.get(shard) - nanos > 0;
+    }
+
     /**
      * The candidates of one read of every shard's cursor for the latest tick {@link #latest}, shared by the workers of
      * this relay whose pass sees that tick: each takes the next group of shards in candidate order
@@ -699,13 +713,18 @@ public final class OutboxRelay implements AutoCloseable {
          * ends. A shard another worker steps is passed over and {@link #wanted}: that step puts it into the round
          * current then. A shard a sibling stepped after the read at this round's tick or a newer one is skipped: its
          * candidacy is stale, and that step put it back if it left work. A shard {@link #isolated} is a group of its
-         * own.
+         * own; one {@link #backingOff} is dropped.
          */
         synchronized List<Integer> take() {
             var group = new ArrayList<Integer>(Math.min(groupSize, queue.size()));
             long rows = 0;
+            long now = System.nanoTime();
             while (group.size() < groupSize && !queue.isEmpty()) {
                 int shard = queue.peekFirst();
+                if (backingOff(shard, now)) { // failed after this round was read
+                    drop(shard);
+                    continue;
+                }
                 if (inFlight.get(shard) == 1) {
                     wanted.set(shard, 1); // a want left over when the step ended meanwhile costs one spare put-back
                     if (inFlight.get(shard) == 1) { // else its step ended meanwhile, maybe without seeing wanted
@@ -892,8 +911,9 @@ public final class OutboxRelay implements AutoCloseable {
                 for (var shard : group) {
                     inFlight.set(shard, 0);
                 }
+                long now = System.nanoTime();
                 for (var shard : group) { // after inFlight: a take that saw it in flight set wanted before
-                    if (wanted.getAndSet(shard, 0) == 1 && !back.contains(shard)) {
+                    if (wanted.getAndSet(shard, 0) == 1 && !back.contains(shard) && !backingOff(shard, now)) {
                         back.add(shard);
                     }
                 }
@@ -910,7 +930,8 @@ public final class OutboxRelay implements AutoCloseable {
          * of several shards that fails rolls back for all of them, so every shard of the group is stepped again and the
          * records its handler call delivered are delivered again (at least once, as after any rolled-back step); it is
          * redone at once with each shard alone, so a shard that keeps failing holds up no neighbour. One that fails
-         * alone is {@link #isolated}, logged, and retried in a later pass. A failure of the connection ends the pass,
+         * alone is {@link #isolated}, logged, and retried in a later pass, from its second failure in a row after a
+         * {@code relay.retry} delay ({@link #failedAlone}). A failure of the connection ends the pass,
          * as a failure outside a step does.
          */
         private boolean stepHeld(Connection c, Round r, List<Integer> group, List<Integer> back) throws Exception {
@@ -932,7 +953,13 @@ public final class OutboxRelay implements AutoCloseable {
                     throw e;
                 }
                 if (group.size() == 1) {
-                    isolated.set(group.get(0), 1);
+                    int shard = group.get(0);
+                    isolated.set(shard, 1);
+                    int failures = failedAlone.incrementAndGet(shard);
+                    if (failures > 1) { // the first is retried at the next tick (a deadlock, a lock timeout)
+                        var delay = Backoff.delay(failures - 2, relay.retry().initialDelay(), relay.retry().maxDelay());
+                        retryAfter.set(shard, System.nanoTime() + delay.toNanos());
+                    }
                     warn("outbox shard " + group.get(0) + " step failed, retried in a later pass", e);
                     telemetry.relayFailed(e);
                     return false;
@@ -953,6 +980,7 @@ public final class OutboxRelay implements AutoCloseable {
                 worked |= did;
                 if (group.size() == 1 && did) {
                     isolated.set(group.get(0), 0);
+                    failedAlone.set(group.get(0), 0);
                 }
                 if (result.status() == ShardStatus.PROGRESS && !result.caughtUp()) {
                     (untouched(result) ? back : progressed).add(group.get(i));
@@ -971,7 +999,9 @@ public final class OutboxRelay implements AutoCloseable {
         private List<Integer> candidates(List<Position> all, Instant now) {
             int shards = config.shards();
             int offset = ThreadLocalRandom.current().nextInt(shards);
+            long nanos = System.nanoTime();
             return all.stream()
+                    .filter(p -> !backingOff(p.cursor().shard(), nanos))
                     .filter(p -> p.behind() || p.cursor().targetTickId() != null
                             || due(p.cursor().retryDueAt(), now) || due(p.cursor().parkedDueAt(), now))
                     .filter(p -> p.cursor().pausedUntil() == null || !p.cursor().pausedUntil().isAfter(now))

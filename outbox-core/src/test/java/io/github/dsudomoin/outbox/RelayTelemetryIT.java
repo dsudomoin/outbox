@@ -107,6 +107,60 @@ class RelayTelemetryIT {
     }
 
     @Test
+    void aShardThatKeepsFailingAloneBacksOffWhileTicksKeepComing() throws Exception {
+        // ticks at minTickInterval from commits elsewhere; retry delays from 1 s: the shard's calls come at about 0 s,
+        // the next tick, 1 s and 3 s later, not once per tick
+        var config = new TestOutboxConfig().workers(1).minTickInterval(Duration.ofMillis(50))
+                .idlePollInterval(Duration.ofMillis(200)).retry(Duration.ofSeconds(1), Duration.ofMinutes(5), 0);
+        int goodShard = shard("good");
+        String bad = "bad";
+        for (int i = 0; shard(bad) == goodShard; i++) {
+            bad = "bad" + i;
+        }
+        int badShard = shard(bad);
+        var handler = new RecordingHandler();
+        var outbox = start(config, handler);
+        var function = config.table() + "_fail";
+        var cursor = config.table() + "_cursor";
+        try (var c = transactions.newConnection()) {
+            TestSql.execute(c, "create function " + function + "() returns trigger language plpgsql as $$ begin"
+                    + " if new.shard = " + badShard + " then raise exception 'shard down'; end if; return new; end $$");
+            TestSql.execute(c, "create trigger fail before insert on " + cursor
+                    + " for each row execute function " + function + "()");
+        }
+        var badMessages = new ArrayList<OutboxMessage>();
+        for (int i = 0; i < 5; i++) {
+            badMessages.add(OutboxMessage.of("orders", bad, bytes("b" + i)));
+        }
+        var badIds = transactions.inTx(c -> outbox.sendAll(badMessages));
+        await(Duration.ofSeconds(30), () -> telemetry.failedAlone(badShard) >= 1); // isolated: stepped alone from here
+
+        var goodIds = new ArrayList<UUID>();
+        long until = System.nanoTime() + Duration.ofSeconds(6).toNanos();
+        int i = 0;
+        while (System.nanoTime() < until) {
+            var message = OutboxMessage.of("orders", "good", bytes("g" + i++));
+            goodIds.add(transactions.inTx(c -> outbox.send(message)));
+            Thread.sleep(100);
+        }
+        var handed = handler.delivered().stream().filter(r -> badIds.contains(r.messageId())).toList();
+        assertThat(badIds).allSatisfy(id -> assertThat(handed).filteredOn(r -> r.messageId().equals(id))
+                .as("calls of a record of the failing shard in 6 s").hasSizeBetween(1, 4));
+        assertThat(telemetry.failedAlone(badShard)).isLessThanOrEqualTo(4);
+
+        try (var c = transactions.newConnection()) {
+            TestSql.execute(c, "drop trigger fail on " + cursor);
+        }
+        await(Duration.ofSeconds(30), () -> delivered(handler).containsAll(badIds) && telemetry.steps.stream()
+                .anyMatch(s -> s.shards.equals(List.of(badShard)) && s.finished.get() > 0));
+        await(Duration.ofSeconds(10), () -> delivered(handler).containsAll(goodIds));
+        runtime.close(); // no step in flight from here
+
+        assertThat(delivered(handler)).filteredOn(goodIds::contains).as("the other shard, delivered once each")
+                .doesNotHaveDuplicates().hasSameSizeAs(goodIds);
+    }
+
+    @Test
     void stoppingIsNotARelayFailure() throws Exception {
         var called = new CountDownLatch(1);
         OutboxHandler sleeping = record -> {
