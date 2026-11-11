@@ -279,6 +279,28 @@ class KafkaOutboxSenderTest {
         assertThat(lookups).containsExactly(TOPIC, "missing-1", TOPIC, "missing-2");
     }
 
+    /** What a producer resolved expires on the monotonic timer: a step of the wall clock does not keep it trusted. */
+    @Test
+    void resolvedTopicsIgnoreWallClockSteps() {
+        var clock = new TestClock();
+        var sender = sender(() -> new TestProducer(true, r -> null) {
+            @Override
+            public synchronized List<PartitionInfo> partitionsFor(String topic) {
+                if (topic.startsWith("missing")) {
+                    throw new TimeoutException("Topic " + topic + " not present in metadata after 5000 ms.");
+                }
+                return super.partitionsFor(topic);
+            }
+        }, DELIVERY_TIMEOUT, clock);
+        assertThat(sender.send(List.of(recordTo(TOPIC, 1, "a")))).containsExactly(Outcome.delivered());
+
+        clock.step(Duration.ofHours(-1));
+        clock.advance(Duration.ofMinutes(5));
+        assertThat(sender.send(List.of(recordTo("missing-1", 2, "k"), recordTo(TOPIC, 3, "a")))).satisfiesExactly(
+                o -> assertThat(o).isInstanceOf(Outcome.Retry.class),
+                o -> assertThat(o).as("unused for 5 min on the monotonic timer").isEqualTo(Outcome.notAttempted()));
+    }
+
     /** A call that already waited for metadata once does not lease a topic it will not look up. */
     @Test
     void noTopicLeaseAfterTheMetadataWait() {
@@ -613,6 +635,24 @@ class KafkaOutboxSenderTest {
         var first = sendAsync(sender, List.of(remembered));
         awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
         first.get(5, SECONDS);
+        clock.advance(Duration.ofMinutes(10));
+
+        var second = sendAsync(sender, List.of(remembered));
+        awaitSent(1, 1).completeNext();
+        assertThat(second.get(5, SECONDS)).containsExactly(Outcome.delivered());
+        assertThat(unbatched).isEmpty();
+    }
+
+    /** The 10 minutes are measured on the monotonic timer: a wall clock stepped back does not keep a record longer. */
+    @Test
+    void rememberedRecordsIgnoreWallClockSteps() throws Exception {
+        var clock = new TestClock();
+        var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
+        var remembered = record(1, keyOnPartition(0, "a"));
+        var first = sendAsync(sender, List.of(remembered));
+        awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
+        first.get(5, SECONDS);
+        clock.step(Duration.ofHours(-1));
         clock.advance(Duration.ofMinutes(10));
 
         var second = sendAsync(sender, List.of(remembered));

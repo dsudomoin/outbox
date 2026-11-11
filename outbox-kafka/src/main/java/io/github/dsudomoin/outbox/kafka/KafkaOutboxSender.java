@@ -2,6 +2,7 @@ package io.github.dsudomoin.outbox.kafka;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.apache.kafka.clients.producer.ProducerConfig.ACKS_CONFIG;
 import static org.apache.kafka.clients.producer.ProducerConfig.BATCH_SIZE_CONFIG;
 import static org.apache.kafka.clients.producer.ProducerConfig.BOOTSTRAP_SERVERS_CONFIG;
@@ -134,14 +135,14 @@ public final class KafkaOutboxSender implements AutoCloseable {
     private final Duration wait;
     private final Duration longestCall;
     private final Clock clock;
-    private final LongSupplier nanos; // measures the cooldowns; clock only dates their ends
+    private final LongSupplier nanos; // measures the cooldowns and the memories; clock only dates cooldown ends
     private final Deque<Pooled> pool = new ConcurrentLinkedDeque<>();
     private final Deque<Pooled> unbatchedPool = new ConcurrentLinkedDeque<>();
     private final Cooldown<TopicPartition> cooldown;
     private final Cooldown<String> topicCooldown;
-    /** The remembered records (see the class javadoc), by message id: when each was remembered. */
-    private final Map<UUID, Instant> expired = new ConcurrentHashMap<>();
-    private volatile Instant nextPurge = Instant.MIN;
+    /** The remembered records (see the class javadoc), by message id: when each was remembered, on {@code nanos}. */
+    private final Map<UUID, Long> expired = new ConcurrentHashMap<>();
+    private volatile long nextPurge; // on nanos
     private volatile boolean released;
 
     public KafkaOutboxSender(KafkaOutboxConfig config) {
@@ -191,8 +192,9 @@ public final class KafkaOutboxSender implements AutoCloseable {
     }
 
     /**
-     * For tests: {@code nanos} (the {@link System#nanoTime} scale) measures the cooldowns and {@code clock} dates their
-     * ends; {@code factory} makes the producers of both pools.
+     * For tests: {@code nanos} (the {@link System#nanoTime} scale) measures the cooldowns, the remembered records and
+     * the resolved topics, and {@code clock} dates the cooldowns' ends; {@code factory} makes the producers of both
+     * pools.
      */
     KafkaOutboxSender(Supplier<Producer<byte[], byte[]>> factory, Duration deliveryTimeout, Clock clock,
             LongSupplier nanos) {
@@ -212,6 +214,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
         this.unbatchedFactory = unbatched;
         this.clock = clock;
         this.nanos = nanos;
+        this.nextPurge = nanos.getAsLong();
         this.wait = deliveryTimeout.plus(WAIT_SLACK);
         this.longestCall = wait.plus(maxBlock); // a send or metadata wait may still block at the deadline
         this.cooldown = new Cooldown<>(deliveryTimeout); // a probe resolves within delivery.timeout.ms
@@ -317,11 +320,11 @@ public final class KafkaOutboxSender implements AutoCloseable {
         if (expired.isEmpty()) {
             return false;
         }
-        var now = clock.instant();
-        if (!now.isBefore(nextPurge)) {
-            nextPurge = now.plusSeconds(1);
-            var oldest = now.minus(REMEMBERED_FOR);
-            expired.values().removeIf(at -> !at.isAfter(oldest));
+        long now = nanos.getAsLong();
+        if (now - nextPurge >= 0) { // differences: safe across the overflow of nanoTime
+            nextPurge = now + SECONDS.toNanos(1);
+            long rememberedFor = REMEMBERED_FOR.toNanos();
+            expired.values().removeIf(at -> now - at - rememberedFor >= 0);
             if (expired.isEmpty()) {
                 drain(unbatchedPool);
             }
@@ -379,7 +382,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
                     continue;
                 }
                 if (call.metadataTimedOut && !partitionInfos.containsKey(topic)
-                        && !pooled.resolved(topic, clock.instant())) {
+                        && !pooled.resolved(topic, nanos.getAsLong())) {
                     // one metadata wait per call; before the cooldown lookup, which would lease the topic to us
                     var until = notBefore(topicCooldown.peek(topic, nanos.getAsLong()));
                     call.complete(i, until.isPresent() ? Outcome.notAttempted(until.get()) : Outcome.notAttempted(),
@@ -404,7 +407,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
                         continue;
                     }
                     partitionInfos.put(topic, infos);
-                    pooled.used(topic, clock.instant());
+                    pooled.used(topic, nanos.getAsLong());
                     if (System.nanoTime() >= deadline) { // a slow lookup: send() could block max.block.ms again
                         call.complete(i, Outcome.notAttempted(), false);
                         break;
@@ -510,7 +513,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
 
     /** Steps 5–6. */
     private List<Outcome> outcomes(Call call, List<OutboxRecord> records, TopicPartition[] partitions) {
-        var now = clock.instant();
+        long now = nanos.getAsLong();
         var result = new ArrayList<Outcome>(partitions.length);
         var failed = new HashSet<TopicPartition>();
         var failedTopics = new HashSet<String>();
@@ -641,14 +644,14 @@ public final class KafkaOutboxSender implements AutoCloseable {
      * one call at a time.
      */
     private static final class Pooled {
-        private static final Duration IDLE = Duration.ofMinutes(5);
+        private static final long IDLE = Duration.ofMinutes(5).toNanos();
         private static final int MAX_TOPICS = 10_000;
 
         final Producer<byte[], byte[]> producer;
         final Deque<Pooled> home; // the pool it goes back to
-        private final Map<String, Instant> lastUse = new LinkedHashMap<>() { // least recently used first
+        private final Map<String, Long> lastUse = new LinkedHashMap<>() { // least recently used first, on nanos
             @Override
-            protected boolean removeEldestEntry(Map.Entry<String, Instant> eldest) {
+            protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
                 return size() > MAX_TOPICS;
             }
         };
@@ -658,16 +661,16 @@ public final class KafkaOutboxSender implements AutoCloseable {
             this.home = home;
         }
 
-        boolean resolved(String topic, Instant now) {
+        boolean resolved(String topic, long now) {
             var used = lastUse.get(topic);
-            if (used != null && now.isBefore(used.plus(IDLE))) {
+            if (used != null && now - used < IDLE) {
                 return true;
             }
             lastUse.remove(topic);
             return false;
         }
 
-        void used(String topic, Instant now) {
+        void used(String topic, long now) {
             lastUse.remove(topic); // re-inserted last
             lastUse.put(topic, now);
         }
