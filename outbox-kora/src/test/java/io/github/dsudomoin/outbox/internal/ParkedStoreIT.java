@@ -19,7 +19,11 @@ import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import jakarta.annotation.Nullable;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
@@ -29,6 +33,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
@@ -242,8 +247,11 @@ class ParkedStoreIT {
         var newerHead = record(3_000, "t", "k", 1, 0);
         retries.apply(c, 0, List.of(new Head(newerHead, 1, NOW, "e")), NOW);
 
-        store.toRetry(c, 0, record(500, "t", "k", 0, 1), 2, LATER, "e500", null);
+        var executions = new AtomicInteger();
 
+        store.toRetry(counting(c, executions), 0, record(500, "t", "k", 0, 1), 2, LATER, "e500", null);
+
+        assertThat(executions).as("2,001 newer rows, at most 1,000 a statement").hasValue(3);
         assertThat(parkedIds()).as("the rows below it stay").hasSize(499).last().isEqualTo(499L);
         assertThat(retryRows()).hasSize(2_003)
                 .startsWith("500:0:2:1:" + LATER + ":e500", "501:0:0:1:null:null")
@@ -447,6 +455,32 @@ class ParkedStoreIT {
         assertThat(store.minDue(c, 0)).isEqualTo(NOW.plusSeconds(10));
         assertThat(store.minDue(c, 1)).isEqualTo(NOW);
         assertThat(store.size(c)).isEqualTo(3);
+    }
+
+    /** {@code c}, counting in {@code executions} each execution of a statement it prepares. */
+    private static Connection counting(Connection c, AtomicInteger executions) {
+        return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[] {Connection.class},
+                (proxy, method, args) -> {
+                    var result = invoke(c, method, args);
+                    if (!(result instanceof PreparedStatement ps)) {
+                        return result;
+                    }
+                    return Proxy.newProxyInstance(PreparedStatement.class.getClassLoader(),
+                            new Class<?>[] {PreparedStatement.class}, (p, m, a) -> {
+                                if (m.getName().startsWith("execute")) {
+                                    executions.incrementAndGet();
+                                }
+                                return invoke(ps, m, a);
+                            });
+                });
+    }
+
+    private static Object invoke(Object target, Method method, Object[] args) throws Throwable {
+        try {
+            return method.invoke(target, args);
+        } catch (InvocationTargetException e) {
+            throw e.getCause();
+        }
     }
 
     /** Rows 1..{@code rows} of key {@code k} of topic {@code t} on shard 0, requeued once and due now. */
