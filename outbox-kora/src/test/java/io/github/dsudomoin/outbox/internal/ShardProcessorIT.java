@@ -3199,6 +3199,25 @@ class ShardProcessorIT {
         assertThat(parkedRows()).singleElement().satisfies(row -> assertThat(row).startsWith("k#1:"));
     }
 
+    /** The parked row ahead of it left, but the retry head that answered requeue stays: its key is not pulled. */
+    @Test
+    void aRetryHeadRequeuedBehindADeliveredParkedRowKeepsItsDelay() throws Exception {
+        keyInRetryAboveAParkedRow();
+        script = answering(Map.of("k#2", Outcome.requeue()));
+
+        process();
+
+        assertThat(delivered()).contains("k#1", "k#3");
+        assertThat(retryRows()).isEmpty();
+        assertThat(parkedRows()).containsExactly("k#2:1:" + now.plus(REQUEUE_DELAY));
+        assertThat(cursor().parkedDueAt()).isAfter(now);
+        calls.clear();
+
+        process();
+
+        assertThat(calls).as("not handed again before its delay").isEmpty();
+    }
+
     @Test
     void aParkedRowThatFailsAheadOfItsRetryHeadTakesItsPlace() throws Exception {
         keyInRetryAboveAParkedRow();

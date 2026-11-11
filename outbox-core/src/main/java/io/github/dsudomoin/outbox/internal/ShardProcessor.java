@@ -1125,7 +1125,13 @@ public final class ShardProcessor implements AutoCloseable {
             pass.wroteParked |= !writes.isEmpty();
             pass.requeued |= writes.stream().anyMatch(Park.class::isInstance);
             var answered = offered.values().stream().filter(row -> pass.answered.contains(row.id())).toList();
-            pass.wroteParked |= parked.pullNext(c, shard, writes, answered, now);
+            var stays = writes; // and a retry row parked by its requeue stays as a re-park does
+            if (!pass.retryParks.isEmpty()) {
+                stays = new ArrayList<>(writes);
+                stays.addAll(pass.retryParks);
+                pass.retryParks.clear();
+            }
+            pass.wroteParked |= parked.pullNext(c, shard, stays, answered, now);
             if (probe && !pass.failed && !pass.busy) {
                 probing.set(shard, 0); // no call of the probe failed as a whole: batch again
             }
@@ -1218,6 +1224,8 @@ public final class ShardProcessor implements AutoCloseable {
         boolean wroteParked;
         /** Re-parks, keeps and unparks of handed parked rows, written as JDBC batches when the round ends. */
         final List<Action> parkedWrites = new ArrayList<>();
+        /** The retry rows of the round parked by {@link ParkedStore#fromRetry}, for {@link ParkedStore#pullNext} only. */
+        final List<Action> retryParks = new ArrayList<>();
 
         Pass(long deadline) {
             this.deadline = deadline;
@@ -1375,7 +1383,9 @@ public final class ShardProcessor implements AutoCloseable {
                 if (BatchClassifier.requeueLimitReached(row, requeue.maxRequeues())) {
                     dead(c, pass, row, row.attempts(), BatchClassifier.REQUEUE_LIMIT);
                 } else {
-                    parked.fromRetry(c, row, row.requeues() + 1, requeueDue(q.notBefore(), now));
+                    var due = requeueDue(q.notBefore(), now);
+                    parked.fromRetry(c, row, row.requeues() + 1, due);
+                    pass.retryParks.add(new Park(row, row.requeues() + 1, due));
                     telemetry.requeued(row.topic());
                     pass.fromRetry = true;
                     pass.requeued = true;
