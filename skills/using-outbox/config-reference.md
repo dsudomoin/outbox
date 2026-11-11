@@ -135,7 +135,20 @@ must not have `CREATE` on any schema of the owner's `search_path` (startup WARNs
 is given to the parent table's owner: an owner source that is only a member of that role needs the `SET` option on
 PG 16+, and the owner role needs `CREATE` on the schema; otherwise the partition stays the creating role's and a
 WARN, at most hourly, names the `GRANT`. Partitions a member made before the handoff existed are given to the owner
-by that member's next start or maintenance run (`REASSIGN OWNED BY <member> TO <owner>` for a retired member).
+by that member's next start or maintenance run. For a retired member, run this in `psql` as it (or a superuser),
+with `<base>` and `<inbox>` the values of `outbox.table` and `outbox.inbox.table`: it builds one
+`ALTER TABLE ... OWNER TO` per partition of either parent (found through `pg_inherits`) and per standalone tail,
+`<base>_tail_next` or detached range (found by name), and `\gexec` runs them. Not `REASSIGN OWNED BY`: that moves
+everything the role owns in the database, the app's own tables and sequences included.
+
+```sql
+select format('alter table %s owner to %I;', c.oid::regclass, '<owner>')
+from (values ('<base>', '_(tail|tail_next|[xo][0-9]+)'), ('<inbox>', '_t[0-9]{10}([0-9]{2})?')) v (parent, suffix)
+join pg_class p on p.oid = to_regclass(v.parent)
+join pg_class c on c.oid in (select inhrelid from pg_inherits where inhparent = p.oid)
+    or c.relnamespace = p.relnamespace and c.relname ~ ('^' || p.relname || v.suffix || '$')
+where c.relowner = '<member>'::regrole \gexec
+```
 
 ## Shard count and the emergency reshard
 
