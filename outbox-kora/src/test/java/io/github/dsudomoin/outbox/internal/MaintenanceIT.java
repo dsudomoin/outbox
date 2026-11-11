@@ -1046,6 +1046,27 @@ class MaintenanceIT {
                 .satisfies(tail -> assertThat(tail.name()).isEqualTo(names.tail()));
     }
 
+    /**
+     * A hot tail over maxTailScan that cannot be converted (here no tailConversion window) fails the run: no success is
+     * recorded, so {@code outbox.maintenance.since_success} grows and pages, while the other steps still run.
+     */
+    @Test
+    void anOversizedTailThatCannotBeConvertedRecordsNoSuccess() throws Exception {
+        config.maxTailScan(64 * 1024).tailConversion("", Duration.ofSeconds(1));
+        bootstrap();
+        var maintenance = maintenance();
+        assertThat(maintenance.runOnce()).isTrue();
+        String succeeded = lastSuccess();
+        try (var c = TestDb.connect()) {
+            XidPartitionsIT.overflowTail(c, names, 10_000);
+        }
+
+        assertThat(maintenance.runOnce()).isTrue();
+        assertThat(maintenance.runOnce()).isTrue();
+
+        assertThat(lastSuccess()).as("a run leaving the tail stuck is no success").isEqualTo(succeeded);
+    }
+
     /** An attach back that the server cut mid-scan gets an ERROR saying so, with its size and the statement to run. */
     @Test
     void anAttachBackCutMidScanSaysSoAndHowToAttachByHand() throws Exception {

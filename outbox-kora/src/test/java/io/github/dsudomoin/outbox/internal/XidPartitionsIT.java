@@ -1261,6 +1261,63 @@ class XidPartitionsIT {
         }
     }
 
+    /**
+     * A tail over maxTailScan is stuck ({@link XidPartitions#tailStuck}, which fails the maintenance run) once a whole
+     * tailConversion window has passed without converting it: the window it was first seen in does not count, as it
+     * may have been mostly over. It stops being stuck once it is no longer over maxTailScan.
+     */
+    @Test
+    void anOversizedTailIsStuckOnceAWholeWindowPassesWithoutAConversion() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(0)
+                .tailConversion("03:00-05:00", Duration.ofMillis(1));
+        var names = bootstrap(config);
+        var outside = new XidPartitions(names, config.partitions());
+        var inside = new XidPartitions(names, config.partitions());
+
+        try (var c = TestDb.connect()) {
+            overflowTail(c, names, 600_000);
+            outside.clock = at(1, 0);
+            ensurePremadeAsMaintenance(outside, c);
+            assertThat(outside.tailStuck()).as("before its first window").isFalse();
+            inside.clock = at(4, 0);
+            ensurePremadeAsMaintenance(inside, c);
+            assertThat(inside.oversizedAttempts).as("cut by maxStall").hasValue(1);
+            outside.clock = at(4, 10);
+            ensurePremadeAsMaintenance(outside, c);
+            assertThat(outside.tailStuck()).as("inside its first window").isFalse();
+
+            outside.clock = at(5, 10);
+            ensurePremadeAsMaintenance(outside, c);
+            inside.clock = at(5, 10);
+            ensurePremadeAsMaintenance(inside, c);
+
+            assertThat(outside.tailStuck()).as("a whole window without a conversion").isTrue();
+            assertThat(inside.tailStuck()).as("first seen inside the window: that one does not count").isFalse();
+            inside.clock = Clock.offset(at(5, 10), Duration.ofDays(1));
+            ensurePremadeAsMaintenance(inside, c);
+            assertThat(inside.tailStuck()).as("the next night's window passed too").isTrue();
+            execute(c, "truncate " + names.tail());
+            ensurePremadeAsMaintenance(outside, c);
+            assertThat(outside.tailStuck()).as("no longer over maxTailScan").isFalse();
+        }
+    }
+
+    /** With no tailConversion window a tail over maxTailScan can never be converted: it is stuck at once. */
+    @Test
+    void anOversizedTailIsStuckAtOnceWithoutAWindow() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(64 * 1024)
+                .tailConversion("", Duration.ofSeconds(1));
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions());
+
+        try (var c = TestDb.connect()) {
+            overflowTail(c, names, 10_000);
+            ensurePremadeAsMaintenance(partitions, c);
+
+            assertThat(partitions.tailStuck()).isTrue();
+        }
+    }
+
     @Test
     void bootstrapSaysTheTailConversionWindowAndItsZone() throws Exception {
         var config = new TestOutboxConfig().tailConversion("02:00-04:30", Duration.ofMillis(800))
@@ -1850,7 +1907,7 @@ class XidPartitionsIT {
     }
 
     /** Rows in the tail, as after maintenance fell behind: the current xid past the tail's lower bound, returned. */
-    private static long overflowTail(Connection c, TableNames names, int rows) throws SQLException {
+    static long overflowTail(Connection c, TableNames names, int rows) throws SQLException {
         long lower = tail(c, names);
         TestDb.burnXids((int) Math.max(0, lower - currentXid(c)) + 10);
         for (int done = 0; done < rows; done += 10_000) {

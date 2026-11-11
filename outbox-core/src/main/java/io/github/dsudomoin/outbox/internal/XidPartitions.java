@@ -192,6 +192,12 @@ public final class XidPartitions {
     @Nullable
     private volatile ZonedDateTime cutUntil;
     private volatile long cutBytes;
+    /**
+     * When the hot tail over maxTailScan this instance sees is stuck ({@link #tailStuck}): the end of the first whole
+     * window after it was first seen, then at once when there is no window; null while there is no such tail.
+     */
+    @Nullable
+    private volatile ZonedDateTime stuckAt;
     private final AtomicLong stallLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final String quiesce;
     private final String unquiesce;
@@ -333,6 +339,7 @@ public final class XidPartitions {
             if (!due && !(s.ahead < premake && PartitionDdl.attachment(c, names.base(),
                     names.partitionPrefix() + s.tailLower) == Attachment.STANDALONE)) {
                 overflow = false;
+                stuckAt = null;
                 return;
             }
             boolean rows = PartitionDdl.hasRows(c, names.tail());
@@ -344,6 +351,7 @@ public final class XidPartitions {
             String blocker;
             try {
                 if (!rows && s.current + size <= s.tailLower) {
+                    stuckAt = null;
                     blocker = extend(c, s, target, quiesceTimeout);
                 } else if (!bootstrap) { // rows may reach the tail any moment: it becomes a range, holding them
                     blocker = heal(c, s, floor + 2 * size, quiesceTimeout);
@@ -366,6 +374,7 @@ public final class XidPartitions {
             return;
         }
         overflow = false;
+        stuckAt = null;
         // the first ranges start at the oldest running transaction's: it holds an xid already, and may send once they
         // exist, as a request on an instance that started earlier would when another makes the table
         long from = s.upper == null ? Math.floorDiv(s.oldest, size) * size : s.upper;
@@ -423,6 +432,12 @@ public final class XidPartitions {
         windowEnded(now);
         long bytes = relationSize(c, names.tail());
         boolean oversized = bytes > maxTailScan;
+        if (!oversized) {
+            stuckAt = null;
+        } else if (stuckAt == null) { // the window it is first seen in may be mostly over: the next whole one
+            stuckAt = window == null ? now
+                    : window.contains(now.toLocalTime()) ? window.endAfter(window.endAfter(now)) : window.endAfter(now);
+        }
         if (oversized && !oversizedNow(now)) {
             if (cutUntil == null && due(largeLogged, STUCK_LOG_INTERVAL)) { // in a window that did not fit: said
                 var until = window == null
@@ -433,10 +448,11 @@ public final class XidPartitions {
                 log.error("outbox partition tail {} holds {} MB, over outbox.partitions.maxTailScan {} MB: turning it"
                         + " into a range scans it under ACCESS EXCLUSIVE on {}, writers waiting for the scan, so"
                         + " maintenance leaves it hot {}. Writes go on into it and nothing is lost; the disk grows"
-                        + " until it is converted. If conversions keep timing out (WARN \"did not fit\"), raise"
-                        + " maxStall, keeping it below the writers' own lock_timeout and statement_timeout. This ERROR"
-                        + " repeats at most once an hour", names.tail(), mb(bytes), mb(maxTailScan), names.base(),
-                        until);
+                        + " until it is converted. Once it has gone a whole window unconverted (at once without one),"
+                        + " maintenance runs count as failed, so outbox.maintenance.since_success grows. If conversions"
+                        + " keep timing out (WARN \"did not fit\"), raise maxStall, keeping it below the writers' own"
+                        + " lock_timeout and statement_timeout. This ERROR repeats at most once an hour", names.tail(),
+                        mb(bytes), mb(maxTailScan), names.base(), until);
             }
             return null;
         }
@@ -474,6 +490,7 @@ public final class XidPartitions {
             if (reason == null) {
                 overflow = false;
                 cutUntil = null;
+                stuckAt = null;
             }
             return reason == null || reason.isEmpty() ? null : reason;
         } catch (SQLException e) {
@@ -913,6 +930,16 @@ public final class XidPartitions {
      */
     public boolean overflow() {
         return overflow;
+    }
+
+    /**
+     * True once the hot tail over maxTailScan has gone a whole {@code tailConversion.window} without a conversion, at
+     * once without a window: nothing will convert it, so maintenance counts the run as failed, which makes
+     * {@code outbox.maintenance.since_success} grow.
+     */
+    boolean tailStuck() {
+        var at = stuckAt;
+        return at != null && !ZonedDateTime.now(clock).isBefore(at);
     }
 
     /**

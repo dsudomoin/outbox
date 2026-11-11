@@ -624,6 +624,9 @@ public final class Maintenance {
         });
         step("partition extension", () -> {
             partitions.ensurePremade(c, detachLockTimeout, quiesceTimeout);
+            if (partitions.tailStuck()) { // its ERROR said why: no success while nothing will convert it
+                stepFailed = true;
+            }
             return null;
         });
         var read = step("cursor read", () -> read(c));
