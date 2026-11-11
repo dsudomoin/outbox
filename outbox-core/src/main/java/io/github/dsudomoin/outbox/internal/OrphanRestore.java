@@ -9,6 +9,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.regex.Pattern;
 import io.github.dsudomoin.outbox.internal.Sql.SqlConsumer;
+import io.github.dsudomoin.outbox.internal.Sql.SqlRunnable;
 
 /**
  * Moves the rows of a standalone outbox range back into the outbox, then drops the range. Moved rows are new messages
@@ -39,6 +40,22 @@ public final class OrphanRestore {
     Duration margin = PartitionDdl.DDL_MARGIN;
     /** Replaces {@link XidPartitions#ATTACH_SCAN_RATE}, for tests. */
     long scanRate = XidPartitions.ATTACH_SCAN_RATE;
+    /** Times its {@link #scanRate} time the next call's scan gets: doubled by each cut of it, 1 after a success. */
+    volatile int scanSlowdown = 1;
+
+    /**
+     * The server cut the index build or a chunk's read at the scan bound it was given (57014); {@code capped} when
+     * that bound already was {@link XidPartitions#ATTACH_SLOWDOWN_CAP} times the first, so calling again is cut the
+     * same way.
+     */
+    static final class ScanCut extends SQLException {
+        final boolean capped;
+
+        ScanCut(String reason, boolean capped, SQLException cause) {
+            super(reason, "57014", cause);
+            this.capped = capped;
+        }
+    }
 
     /**
      * {@code keyLockTimeout} bounds each lock wait of a chunk's insert (key locks are only tried, never waited for), so
@@ -60,8 +77,10 @@ public final class OrphanRestore {
      * <b>its rows below {@code fromXid} go with the table</b>. First its size, its lock waited for at most
      * {@code lockTimeout}; then {@code create index if not exists <table>_id},
      * which, as each chunk's read before its key locks, may take {@code lockTimeout} + 60 s + a second per
-     * {@link XidPartitions#ATTACH_SCAN_RATE} bytes of the table (a cut one fails the call with 57014 and says what to
-     * run by hand); then chunks of {@link #CHUNK} rows in id order, each one read-committed transaction that holds
+     * {@link XidPartitions#ATTACH_SCAN_RATE} bytes of the table, times the slowdown earlier cuts of them showed (a cut
+     * one fails the call with a {@link ScanCut} that says what to run by hand, and doubles the next call's time for
+     * them, up to {@link XidPartitions#ATTACH_SLOWDOWN_CAP} times; a call that gets through gives the first again);
+     * then chunks of {@link #CHUNK} rows in id order, each one read-committed transaction that holds
      * ACCESS EXCLUSIVE on {@code table} alone, never on the outbox, waited for at most {@code lockTimeout}, idle in it
      * at most
      * {@code lockTimeout} + 30 s ({@code idle_in_transaction_session_timeout}): it inserts the rows and
@@ -104,31 +123,56 @@ public final class OrphanRestore {
         long bytes = PartitionDdl.withTimeouts(autocommit, lockTimeout, lockTimeout.plus(margin),
                 () -> XidPartitions.relationSize(autocommit, table));
         // the index build and the first chunk's walk past the rows below fromXid each read the whole table: time for
-        // that at scanRate. Neither holds a writer back (ACCESS EXCLUSIVE on the standalone table alone, no key lock)
-        var scan = lockTimeout.plus(margin).plusMillis(bytes * 1000 / scanRate);
+        // that at scanRate, times the slowdown earlier cuts showed, so a disk slower than the rate still gets it back.
+        // Neither holds a writer back (ACCESS EXCLUSIVE on the standalone table alone, no key lock)
+        int slowdown = scanSlowdown;
+        var scan = lockTimeout.plus(margin).plusMillis(bytes * 1000 / scanRate * slowdown);
         String index = "create index if not exists " + names.unqualified(table) + "_id on " + table + " (id)";
+        long moved;
         try {
-            return SocketBound.atLeast(autocommit, scan,
+            moved = SocketBound.atLeast(autocommit, scan,
                     () -> move(autocommit, table, fromXid, lockTimeout, scan, index));
+        } catch (ScanCut e) {
+            scanSlowdown = Math.min(XidPartitions.ATTACH_SLOWDOWN_CAP, slowdown * 2);
+            boolean capped = slowdown >= XidPartitions.ATTACH_SLOWDOWN_CAP;
+            var cut = (SQLException) e.getCause();
+            throw new ScanCut("restoring " + table + " reads all its " + XidPartitions.mb(bytes) + " MB to build its"
+                    + " id index and to find the rows at or above xid " + fromXid + ", and the server cut that at the "
+                    + scan.toMillis() / 1000.0 + " s it was given (" + cut.getMessage() + "). Rows moved so far stay"
+                    + " moved. " + (capped
+                            ? "It already gets " + XidPartitions.ATTACH_SLOWDOWN_CAP + " times the first time, so"
+                                    + " calling again is cut the same way: in"
+                            : "The next call gives that read twice the time, up to " + XidPartitions.ATTACH_SLOWDOWN_CAP
+                                    + " times the first; or, in")
+                    + " a session without a statement_timeout, which blocks no writer, run " + index + ", then call"
+                    + " again; if it is still cut, move the rest by hand: insert into " + names.base() + " (shard,"
+                    + " message_id, topic, key, payload, headers) select shard, message_id, topic, key, payload,"
+                    + " headers from " + table + " where xid >= '" + fromXid + "'::xid8 order by id, then drop table "
+                    + table, capped, cut);
+        }
+        scanSlowdown = 1;
+        return moved;
+    }
+
+    /**
+     * Runs {@code body}, a statement that reads the whole table under the bound {@code scan}: a cut of it at that bound
+     * is rethrown as a {@link ScanCut}. A 57014 that came sooner is a cancel (pg_cancel_backend), rethrown as it is.
+     */
+    private static void scanning(Duration scan, SqlRunnable body) throws SQLException {
+        long start = System.nanoTime();
+        try {
+            body.run();
         } catch (SQLException e) {
-            if (!"57014".equals(e.getSQLState())) {
-                throw e;
+            if ("57014".equals(e.getSQLState()) && System.nanoTime() - start >= scan.toNanos()) {
+                throw new ScanCut(e.getMessage(), false, e);
             }
-            throw new SQLException("restoring " + table + " reads all its " + XidPartitions.mb(bytes) + " MB to"
-                    + " build its id index and to find the rows at or above xid " + fromXid + ", and the server cut a"
-                    + " statement of it at the " + scan.toMillis() / 1000.0 + " s it was given (" + e.getMessage()
-                    + "): every call is given the same, so calling again is cut the same way. Rows moved so far stay"
-                    + " moved. In a session without a statement_timeout, which blocks no writer, run " + index
-                    + ", then call again; if it is still cut, move the rest by hand: insert into " + names.base()
-                    + " (shard, message_id, topic, key, payload, headers) select shard, message_id, topic, key,"
-                    + " payload, headers from " + table + " where xid >= '" + fromXid + "'::xid8, then drop table "
-                    + table, "57014", e);
+            throw e;
         }
     }
 
     private long move(Connection autocommit, String table, long fromXid, Duration lockTimeout, Duration scan,
             String index) throws SQLException {
-        PartitionDdl.execute(autocommit, lockTimeout, scan, index);
+        scanning(scan, () -> PartitionDdl.execute(autocommit, lockTimeout, scan, index));
         String chunk = "select id, topic, key from " + table
                 + " where xid >= ?::text::xid8 and id > ? order by id limit " + CHUNK;
         long moved = 0;
@@ -158,12 +202,14 @@ public final class OrphanRestore {
                 try (var ps = c.prepareStatement(chunk)) {
                     ps.setString(1, Long.toString(fromXid));
                     ps.setLong(2, after);
-                    try (var rs = ps.executeQuery()) {
-                        while (rs.next()) {
-                            ids.add(rs.getLong(1));
-                            rows.add(new Resender.Source(rs.getLong(1), rs.getString(2), rs.getBytes(3)));
+                    scanning(scan, () -> {
+                        try (var rs = ps.executeQuery()) {
+                            while (rs.next()) {
+                                ids.add(rs.getLong(1));
+                                rows.add(new Resender.Source(rs.getLong(1), rs.getString(2), rs.getBytes(3)));
+                            }
                         }
-                    }
+                    });
                 }
                 read = rows.size();
                 if (!ids.isEmpty()) {

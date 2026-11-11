@@ -139,7 +139,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         this.cursors = new Cursors(names, shards);
         this.resender = new Resender(names, config);
         this.keyLockWait = XidPartitions.lockWait(config.partitions());
-        this.orphanRestore = new OrphanRestore(names, resender, keyLockWait);
+        this.orphanRestore = maintenance.orphanRestore; // one scan slowdown per instance
         this.dead = names.dead();
         this.shardWait = Maintenance.quiesceTimeout(config);
         // the rows of a chunk's waiting heads: each head by id (in the retry table), and every row of its key
@@ -316,8 +316,8 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             boolean refused = e instanceof IllegalArgumentException
                     || e instanceof IllegalStateException && !restoring.get();
             if (!refused) {
-                // a statement cut at its bound would be cut the same way: the exception says what to run by hand
-                var again = e instanceof SQLException s && "57014".equals(s.getSQLState()) ? ""
+                // a scan cut at the most time it gets would be cut the same way: the exception says what to run by hand
+                var again = e instanceof OrphanRestore.ScanCut cut && cut.capped ? ""
                         : ", and calling again goes on";
                 log.warn("outbox admin {} on {} failed; rows moved so far stay moved{}: {}", call, names.base(),
                         again, printable(e.toString()));

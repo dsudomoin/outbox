@@ -559,9 +559,9 @@ class OutboxAdminIT {
         assertThat(exists(orphan)).as("dropped").isFalse();
     }
 
-    /** A statement cut all the same says so, with the table's size and what to run by hand, and keeps every row. */
+    /** A scan cut all the same says so, with the table's size and what to run by hand, and keeps every row. */
     @Test
-    void restoreOrphanCutByTheServerSaysCallingAgainIsCutTheSameWay() throws Exception {
+    void restoreOrphanCutByTheServerSaysWhatToRunByHand() throws Exception {
         var orphan = largeOrphan();
         admin.orphanRestore.margin = Duration.ZERO;
         admin.orphanRestore.scanRate = Long.MAX_VALUE; // no time for the scan
@@ -569,12 +569,90 @@ class OutboxAdminIT {
         try (var c = TestDb.connect()) {
             assertThatThrownBy(() -> admin.orphanRestore.restore(c, orphan, 0, Duration.ofMillis(20)))
                     .isInstanceOfSatisfying(SQLException.class, e -> assertThat(e.getSQLState()).isEqualTo("57014"))
-                    .hasMessageContaining(" MB").hasMessageContaining("cut the same way")
+                    .hasMessageContaining(" MB").hasMessageContaining("The next call gives that read twice the time")
                     .hasMessageContaining("create index if not exists " + orphan + "_id on " + orphan + " (id)")
+                    .hasMessageContaining(" from " + orphan + " where xid >= '0'::xid8 order by id, then drop table")
                     .hasMessageNotContaining("goes on");
         }
 
         assertThat(count(orphan)).isEqualTo(LARGE_ROWS);
+        assertThat(outboxMessageIds()).isEmpty();
+    }
+
+    /**
+     * Each cut of the scan at its bound doubles the time the next call gives it, up to 16 times the first, so a disk
+     * slower than the assumed rate still gets the orphan back; one that gets through gives the next the first again.
+     */
+    @Test
+    void restoreOrphanCutByTheServerGivesTheNextCallTwiceTheTimeUpTo16Times() throws Exception {
+        var orphan = foreignOrphan();
+        orphanRow(orphan, 1, 10, "row");
+        var lockTimeout = Duration.ofSeconds(10);
+        // a lock wait the statement_timeout ends stands in for a scan too slow for its bound: 50 ms past the size read,
+        // the lock_timeout of 10 s never reached, then 100 ms for the scan
+        admin.orphanRestore.margin = Duration.ofMillis(50).minus(lockTimeout);
+        try (var c = TestDb.connect(); var holder = TestDb.connect()) {
+            admin.orphanRestore.scanRate = queryLong(c, "select pg_relation_size('" + orphan + "')") * 10;
+            holder.setAutoCommit(false);
+            TestSql.execute(holder, "lock table " + orphan + " in exclusive mode"); // not the size read's ACCESS SHARE
+            for (var given : List.of("0.15", "0.25", "0.45", "0.85")) {
+                assertThatThrownBy(() -> admin.orphanRestore.restore(c, orphan, 0, lockTimeout)).as(given)
+                        .isInstanceOfSatisfying(SQLException.class, e -> assertThat(e.getSQLState()).isEqualTo("57014"))
+                        .hasMessageContaining("at the " + given + " s it was given")
+                        .hasMessageContaining("The next call gives that read twice the time, up to 16 times the first")
+                        .hasMessageNotContaining("cut the same way");
+            }
+            for (int i = 0; i < 2; i++) {
+                assertThatThrownBy(() -> admin.orphanRestore.restore(c, orphan, 0, lockTimeout))
+                        .isInstanceOfSatisfying(SQLException.class, e -> assertThat(e.getSQLState()).isEqualTo("57014"))
+                        .hasMessageContaining("at the 1.65 s it was given").hasMessageContaining("cut the same way")
+                        .hasMessageNotContaining("twice");
+            }
+            holder.rollback();
+            admin.orphanRestore.margin = PartitionDdl.DDL_MARGIN;
+
+            assertThat(admin.orphanRestore.restore(c, orphan, 0, lockTimeout)).isOne();
+        }
+
+        assertThat(admin.orphanRestore.scanSlowdown).as("the first time again").isOne();
+        assertThat(exists(orphan)).as("dropped").isFalse();
+    }
+
+    /**
+     * Only the index build or a chunk's read cut at its scan bound is a scan cut: a DBA's cancel, or a cut of a later
+     * statement of a chunk, fails the call as it is, its time not raised, and calling again goes on.
+     */
+    @Test
+    void restoreOrphanCancelledOrCutPastItsReadsIsNoScanCut() throws Exception {
+        var orphan = foreignOrphan();
+        orphanRow(orphan, 1, 10, "row");
+        var lockTimeout = Duration.ofSeconds(10);
+        try (var c = TestDb.connect(); var holder = TestDb.connect(); var observer = TestDb.connect()) {
+            long pid = queryLong(c, "select pg_backend_pid()");
+            holder.setAutoCommit(false);
+            TestSql.execute(holder, "lock table " + orphan + " in exclusive mode");
+            var call = pool.submit(() -> admin.orphanRestore.restore(c, orphan, 0, lockTimeout));
+            awaitLockWait(observer, pid); // the index build
+            TestSql.execute(observer, "select pg_cancel_backend(" + pid + ")");
+
+            assertThatThrownBy(() -> call.get(10, SECONDS)).as("a cancel of the index build").satisfies(e -> {
+                assertThat(e.getCause()).isInstanceOfSatisfying(SQLException.class,
+                        s -> assertThat(s.getSQLState()).isEqualTo("57014"));
+                assertThat(e.getCause().getMessage()).contains("user request").doesNotContain("by hand");
+            });
+            holder.rollback();
+
+            // a chunk's insert waits for the outbox past the 50 ms its statements get after the read
+            TestSql.execute(holder, "lock table " + names.base() + " in exclusive mode");
+            admin.orphanRestore.margin = Duration.ofMillis(50).minus(lockTimeout);
+            assertThatThrownBy(() -> admin.orphanRestore.restore(c, orphan, 0, lockTimeout)).as("a cut of the insert")
+                    .isInstanceOfSatisfying(SQLException.class, e -> assertThat(e.getSQLState()).isEqualTo("57014"))
+                    .hasMessageContaining("statement timeout").hasMessageNotContaining("by hand");
+            holder.rollback();
+        }
+
+        assertThat(admin.orphanRestore.scanSlowdown).isOne();
+        assertThat(count(orphan)).isOne();
         assertThat(outboxMessageIds()).isEmpty();
     }
 
@@ -1432,6 +1510,14 @@ class OutboxAdminIT {
             PartitionDdl.create(c, names.base(), orphan, Duration.ofSeconds(5));
         }
         return orphan;
+    }
+
+    private static void awaitLockWait(Connection observer, long pid) throws Exception {
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (queryLong(observer, "select count(*) from pg_locks where not granted and pid = " + pid) == 0) {
+            assertThat(System.nanoTime()).as("pid %d waits for a lock", pid).isLessThan(deadline);
+            Thread.sleep(1);
+        }
     }
 
     private static final int LARGE_ROWS = 200_000;
