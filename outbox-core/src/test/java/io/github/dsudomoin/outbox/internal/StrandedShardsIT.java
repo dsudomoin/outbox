@@ -494,31 +494,36 @@ class StrandedShardsIT {
     @Test
     void aRunningRelayDeliversAfterTheTickTableAndItsSequenceAreRewoundBelowItsRound() throws Exception {
         startRelay();
-        long restored;
-        long cursorSeq;
-        long checkpointSeq;
-        try (var c = direct.getConnection()) {
-            restored = new Ticks(names, SHARDS).latest(c).id();
-            cursorSeq = queryLong(c, "select coalesce(max(seq), 0) from " + names.cursor());
-            checkpointSeq = queryLong(c, "select coalesce(max(seq), 0) from " + names.checkpoint());
+        // a backup and a restore each see the whole database at one point: no maintenance run, relay step or tick of
+        // the running relay spans either (maintenance runs under LOCK_MAINTENANCE, steps hold LOCK_SWAP shared and skip
+        // while it is held, ticks are made under LOCK_TICK), and the restore brings the tables back whole, with the
+        // rows cleanup deleted since (the superseded cursor rows, the older ticks)
+        var ns = names.internalNamespace();
+        var lock = "select pg_advisory_lock(" + ns + ", " + TableNames.LOCK_MAINTENANCE + "), pg_advisory_lock(" + ns
+                + ", " + TableNames.LOCK_SWAP + "), pg_advisory_lock(" + ns + ", " + TableNames.LOCK_TICK + ")";
+        var unlock = lock.replace("pg_advisory_lock", "pg_advisory_unlock");
+        var tables = List.of(names.tick(), names.cursor(), names.checkpoint());
+        var tickSequence = "pg_get_serial_sequence('" + names.tick() + "', 'id')";
+        try (var c = direct.getConnection()) { // its session keeps the backup's temporary tables
+            execute(c, lock);
+            long restored = new Ticks(names, SHARDS).latest(c).id();
+            for (int i = 0; i < tables.size(); i++) {
+                execute(c, "create temporary table backup_" + i + " as select * from " + tables.get(i));
+            }
+            execute(c, unlock);
             // the ticks of the hour the restore takes back, in one jump
-            execute(c, "select setval(pg_get_serial_sequence('" + names.tick() + "', 'id'), " + (restored + 1_000_000)
-                    + ")");
-        }
-        makeATick();
-        var before = sendMany(0, 1);
-        await(() -> delivered.containsAll(before)); // on a round of a tick above restored + 1 000 000
-        try (var c = direct.getConnection()) {
-            // a restore swaps the whole database at once: no relay step or tick of the running relay lands in between
-            // (steps hold LOCK_SWAP shared and skip while it is held, ticks are made under LOCK_TICK)
-            var locks = names.internalNamespace() + ", " + TableNames.LOCK_SWAP + "), pg_advisory_lock("
-                    + names.internalNamespace() + ", " + TableNames.LOCK_TICK;
-            execute(c, "select pg_advisory_lock(" + locks + ")");
-            execute(c, "delete from " + names.tick() + " where id > " + restored);
-            execute(c, "delete from " + names.cursor() + " where seq > " + cursorSeq);
-            execute(c, "delete from " + names.checkpoint() + " where seq > " + checkpointSeq);
-            execute(c, "select setval(pg_get_serial_sequence('" + names.tick() + "', 'id'), " + restored + ")");
-            execute(c, "select pg_advisory_unlock(" + locks.replace("pg_advisory_lock", "pg_advisory_unlock") + ")");
+            execute(c, "select setval(" + tickSequence + ", " + (restored + 1_000_000) + ")");
+            makeATick();
+            var before = sendMany(0, 1);
+            await(() -> delivered.containsAll(before)); // on a round of a tick above restored + 1 000 000
+
+            execute(c, lock);
+            for (int i = 0; i < tables.size(); i++) {
+                execute(c, "delete from " + tables.get(i));
+                execute(c, "insert into " + tables.get(i) + " overriding system value select * from backup_" + i);
+            }
+            execute(c, "select setval(" + tickSequence + ", " + restored + ")");
+            execute(c, unlock);
         }
 
         var after = new ArrayList<UUID>();
