@@ -113,7 +113,8 @@ public final class Maintenance {
     static final int CLEANUP_BLOCKS = 1024;
     /**
      * The {@code statement_timeout} of one such statement: far above what its blocks take, and below
-     * {@code outbox.networkTimeout} by the server's answer margin, so the cleanup never lengthens the socket bound.
+     * {@code outbox.networkTimeout} by the server's answer margin (at least 1 s), so with a {@code networkTimeout}
+     * of 6 s or more the cleanup never lengthens the socket bound; a shorter one is raised to 6 s for the statement.
      */
     static final Duration CLEANUP_TIMEOUT = Duration.ofSeconds(30);
 
@@ -480,7 +481,7 @@ public final class Maintenance {
                     + " outbox.partitions.maintenanceInterval: a step failed in every run, and its WARN \"outbox"
                     + " maintenance step '<name>' failed\" names it. Partitions stall only behind 'finish pending"
                     + " detach', 'partition extension', 'cursor read', 'checkpoint' or 'partition drop', and ticks pile"
-                    + " up behind the last three or 'tick cleanup'; any other step leaves both going. If runs never"
+                    + " up only behind 'cursor read', 'checkpoint' or 'tick cleanup'; any other step leaves both going. If runs never"
                     + " start, a session holds the maintenance lock: select pid from pg_locks where locktype ="
                     + " 'advisory' and classid"
                     + " = {} and objid = {} and objsubid = 2", names.base(), Math.round(age), STALE_INTERVALS,
