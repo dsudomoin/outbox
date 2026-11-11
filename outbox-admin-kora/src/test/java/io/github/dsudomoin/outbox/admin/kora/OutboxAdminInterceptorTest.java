@@ -277,7 +277,8 @@ class OutboxAdminInterceptorTest {
 
     /**
      * Kora reads a JSON body whatever its {@code Content-Type}, and a page elsewhere can post {@code text/plain}
-     * without asking the server first: a body route takes {@code application/json} only, as Spring MVC's does.
+     * without asking the server first: a body route takes {@code application/json} only, as Spring MVC's does. Also
+     * with a trailing {@code /}, which reaches the same route under {@code ignoreTrailingSlash}.
      */
     @ParameterizedTest
     @CsvSource({"text/plain,415", "application/x-www-form-urlencoded,415", "multipart/form-data; boundary=x,415",
@@ -289,7 +290,8 @@ class OutboxAdminInterceptorTest {
 
         try (var stderr = new CapturedStderr()) {
             for (var path : List.of("dead-letters/discard", "dead-letters/redrive", "keys/abandon",
-                    "waiting/abandon")) {
+                    "waiting/abandon", "dead-letters/discard/", "dead-letters/redrive/", "keys/abandon/",
+                    "waiting/abandon/")) {
                 var response = interceptor.intercept(Context.current(), request("POST",
                         "/kora-outbox/admin/v1/" + path, type == null ? HttpHeaders.of()
                                 : HttpHeaders.of("content-type", type)), (context, request) -> {

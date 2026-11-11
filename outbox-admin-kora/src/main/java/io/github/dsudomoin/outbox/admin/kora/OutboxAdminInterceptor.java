@@ -177,7 +177,11 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
 
     private static CompletionStage<HttpServerResponse> process(Context context, HttpServerRequest request,
             InterceptChain chain) {
-        if (BODY_ROUTES.contains(request.path())) {
+        var path = request.path();
+        if (path.length() > 1 && path.endsWith("/")) { // ignoreTrailingSlash routes ".../discard/" to the same handler
+            path = path.substring(0, path.length() - 1);
+        }
+        if (BODY_ROUTES.contains(path)) {
             var type = request.headers().getFirst("content-type");
             if (type == null) {
                 return CompletableFuture.failedFuture(HttpServerResponseException.of(400,
