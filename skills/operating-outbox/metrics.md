@@ -34,6 +34,7 @@ README «Наблюдаемость» → «Контракт по этапам»
 | `outbox.handler.threads.free` | gauge | | Free handler threads of this instance, of `max(4, 2 × relay.workers)`. 0 for longer than `batchTimeout`: calls hung past it hold them all and this instance delivers nothing, while its heartbeat and `relay.running()` stay fine. |
 | `outbox.shard.lag` | gauge, seconds | | How far the slowest shard's tick is behind the latest tick. |
 | `outbox.retry.size`, `outbox.parked.size`, `outbox.dead.size` | gauges | | Rows in `<table>_retry`, `<table>_parked` (requeued records waiting) and `<table>_dead` (every status). |
+| `outbox.retry.oldest` | gauge, seconds | | Since `created_at` of the oldest retry head that retries, not waits; 0 when none. Counts from the send, not the first failure. Shard lag does not see such heads. Alert above N × `relay.retry.maxDelay` (operating-outbox SKILL.md). |
 | `outbox.waiting.size` | gauge | | Retry heads waiting for an instance able to handle them; they and their keys' later records also count in `outbox.retry.size`. |
 | `outbox.waiting.oldest` | gauge, seconds | | Since the oldest of them first waited; 0 when none. Alert above `outbox.relay.waiting.alertAfter` (15 min). |
 | `outbox.dead.pending` | gauge | | Dead letters waiting for the hook's decision (`pending`); 0 without an active hook. |

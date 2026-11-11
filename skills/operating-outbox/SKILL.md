@@ -16,6 +16,7 @@ against the library's tables**; run only the README's SQL, on a staging copy fir
 | Signal | Meaning | README section |
 |---|---|---|
 | `outbox.shard.lag` growing | Target down, slow handler, too few workers; ERROR «outbox shards [...] start from ticks [...] that no longer exist»: stranded shards, one `POST /recovery/stranded-shards` | «Обработка сбоев», «Застрявшие шарды» |
+| `outbox.retry.oldest` > N × `relay.retry.maxDelay` (e.g. 30 min at the 5 min default) | A retry head that will not clear: with `maxAttempts = 0` (default) its key retries for ever and its later records queue behind it. `outbox.shard.lag` does not see it (the shard moves on with other keys); the WARN «streams diverted to retry» fired once, at the divert. The age counts from the send, not the first failure: lag growing too means the target is down (row above). Fix the handler or target; clear the key now with `keys/abandon` ([admin-api.md](admin-api.md)) | «Алерты», «Ключ, который не проходит никогда» |
 | `outbox.maintenance.since_success` > 5 × `maintenanceInterval` | No maintenance anywhere; `transaction_pooling` = 1: a pooler | «Обслуживание работает там же, где relay» |
 | `outbox.inbox.window.remaining` < `outbox.inbox.premake` / 2 (43 200 s by default), or `outbox.inbox.outside_window` growing faster than usual | The instance's inbox stops deduplicating new ids soon (or did): no instance makes inbox ranges (ERROR «outbox inbox maintenance of ... failed», the cause in it), or this instance's schedule stopped (ERROR «... stopped by a fatal error»: restart). Normally between `premake − partitionInterval` and `premake`. The counter also counts non-v7 ids | «Алерты», «Потребление через inbox» |
 | `outbox.partitions.xids_left` not NaN | Tail detached: inserts fail at 0 | «Партиции» |
@@ -34,7 +35,7 @@ against the library's tables**; run only the README's SQL, on a staging copy fir
 | `outbox.partitions.orphaned` or `outbox.inbox.partitions.orphaned` > 0 | «Осиротевшие партиции» |
 | `outbox.partitions.overflow` = 1 past an extension, `premade` < 2 | «Переполнение хвоста (tail overflow)» |
 | ERROR «... has not run», «... over outbox.partitions.maxTailScan» | «Партиции» |
-| `outbox.parked.size` not back to its level, or a key failing for ever with `maxAttempts = 0` | «Алерты»; clear one key now with `keys/abandon` ([admin-api.md](admin-api.md)) |
+| `outbox.parked.size` not back to its level | «Алерты»; clear one key now with `keys/abandon` ([admin-api.md](admin-api.md)) |
 | `outbox.messages.route_unchecked` growing: a writer's heartbeat has not read the reports for over 3 × `maintenanceInterval` (WARN «outbox heartbeat of instance ... failed»), so the writer guard lets sends through by its last read. Nothing is lost (an unreadable record waits). The heartbeat's own pool (Kora default) does not depend on the app pool, so check the heartbeat source itself: WARN «outbox heartbeat connection source of ... failed, this beat uses the application's connections ...», ERROR «outbox heartbeat connection source reaches another database ...», the `hikaricp_*` meters with `pool="<db.poolName>-outbox-heartbeat"`, or `outbox.heartbeat.dedicatedConnection = false` (startup INFO «outbox heartbeat shares the application's connections ...»). A slow database or a transaction-mode pooler delays it even on its own pool | «Версии контрактов и откат» |
 
 Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dashboards/outbox.json`.
@@ -104,7 +105,7 @@ Metrics, alerts and procedures are the same. What differs:
 - **Rollback to 5fc60dd** («Обновление с предыдущего релиза»): set its `outbox.shards` to the cursors' count (256 if
   this release created it); then list the window's `kept` dead letters.
 - «Репликация, failover и PITR»: async failover may deliver events whose data is gone; PITR redelivers.
-- `relay.retry.maxAttempts = 0` (default): a key stuck on a broken target shows as lag only; `keys/abandon` clears it without a rollout.
+- `relay.retry.maxAttempts = 0` (default): a key stuck on a broken target does not show as shard lag, only as `outbox.retry.oldest` (plus a flat `outbox.retry.size` and `outbox.messages.failed{outcome="retry"}` growing); `keys/abandon` clears it without a rollout.
 - Kafka records slower for up to 10 min after a call expired or was cut, often with a `RecordTooLargeException` dead
   letter («Требования к Kafka»): on kafka-clients ≤ 4.1 an oversized record shared a producer batch, and the sender
   resends its batch-mates unbatched. Nothing is lost; fix the cause with `batch.size` ≤ the topic's

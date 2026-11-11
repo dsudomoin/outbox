@@ -67,7 +67,9 @@ import org.slf4j.LoggerFactory;
  * {@code <dead>_due} build when it is missing or invalid ({@link DeadIndexBuilder}: on its own thread, off the
  * maintenance lock; never a failed step; none with {@code outbox.schema.bootstrap = false}), gauges; when none
  * failed, the run is recorded as the last success. One long-lived instance per outbox table: it registers the gauges
- * {@code outbox.shard.lag}, {@code outbox.retry.size}, {@code outbox.waiting.size} (retry heads waiting for an
+ * {@code outbox.shard.lag}, {@code outbox.retry.size}, {@code outbox.retry.oldest} (seconds since the created_at of
+ * the oldest retry head that is retried and not waiting, 0 when none: the shard lag does not see such a head, its
+ * shard moves on), {@code outbox.waiting.size} (retry heads waiting for an
  * instance that can handle them), {@code outbox.waiting.oldest} (seconds since the oldest of them began to wait, 0
  * when none; while any waits, a WARN at most once a minute, an ERROR instead once that is over
  * {@code outbox.relay.waiting.alertAfter}), {@code outbox.dead.size}, {@code outbox.dead.pending}
@@ -126,6 +128,7 @@ public final class Maintenance {
     private final String deleteOldRedrives;
     private final String deadPending;
     private final String waiting;
+    private final String oldestRetried;
     private final Duration waitingAlertAfter;
     private final Duration staleAfter;
     private final AtomicLong poolingLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
@@ -157,6 +160,7 @@ public final class Maintenance {
 
     private volatile double lag = Double.NaN;
     private volatile double retrySize = Double.NaN;
+    private volatile double retryOldest = Double.NaN;
     private volatile double waitingSize = Double.NaN;
     private volatile double waitingOldest = Double.NaN;
     private volatile double deadSize = Double.NaN;
@@ -218,8 +222,12 @@ public final class Maintenance {
                 + " greatest(extract(epoch from now() - waiting_since), 0)::float8, topic, last_error from "
                 + names.retry() + " where waiting_since is not null order by waiting_since limit 1";
         this.waitingAlertAfter = config.relay().waiting().alertAfter();
+        // heads only, through the partial index <retry>_due; a key's later records have no next_attempt_at
+        this.oldestRetried = "select greatest(coalesce(extract(epoch from now() - min(created_at)), 0), 0)::float8 from "
+                + names.retry() + " where next_attempt_at is not null and waiting_since is null";
         telemetry.gauge(OutboxGauge.SHARD_LAG, () -> lag);
         telemetry.gauge(OutboxGauge.RETRY_SIZE, () -> retrySize);
+        telemetry.gauge(OutboxGauge.RETRY_OLDEST, () -> retryOldest);
         telemetry.gauge(OutboxGauge.WAITING_SIZE, () -> waitingSize);
         telemetry.gauge(OutboxGauge.WAITING_OLDEST, () -> waitingOldest);
         telemetry.gauge(OutboxGauge.DEAD_SIZE, () -> deadSize);
@@ -810,6 +818,10 @@ public final class Maintenance {
     private void refreshGauges(Connection c, @Nullable Read read) throws SQLException {
         lag = read == null ? Double.NaN : read.lagSeconds();
         retrySize = retries.size(c);
+        try (var st = c.createStatement(); var rs = st.executeQuery(oldestRetried)) {
+            rs.next();
+            retryOldest = rs.getDouble(1);
+        }
         refreshWaiting(c);
         deadSize = retries.deadSize(c);
         try (var st = c.createStatement(); var rs = st.executeQuery(deadPending)) {

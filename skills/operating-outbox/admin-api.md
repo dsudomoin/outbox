@@ -138,7 +138,8 @@ class ApiKeyAuthorizer implements OutboxAdminAuthorizer {
   The audit line carries topic, key, reason and dryRun. Later: redrive with `{"filter":{"topic":"orders",
   "error":"abandoned"}}` once a reading release runs, or discard. A reshard needs them gone first.
 - **A key that never gets through** («Ключ, который не проходит никогда»): a record that requeues for ever (`parkedSize`
-  stays up) or fails for ever with `maxAttempts = 0` (shard lag, its error in the WARN). No rollout: `keys/abandon`
+  stays up) or fails for ever with `maxAttempts = 0` (`outbox.retry.oldest` grows, shard lag does not; the WARN «streams diverted
+  to retry» with its error fires once, at the divert). No rollout: `keys/abandon`
   with `dryRun: true`, then without; body `{"topic", "key" | "messageId", "reason", "dryRun"?}`, `key` as UTF-8, `messageId`
   for an unkeyed record (`select message_id from <table>_retry where key is null`). Fix the handler, then redrive the
   letters with `{"filter":{"topic":"orders","error":"abandoned"}}`, or discard them.

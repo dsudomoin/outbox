@@ -1555,7 +1555,8 @@ class MaintenanceIT {
         var registry = new SimpleMeterRegistry();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
         assertThat(registry.getMeters()).extracting(m -> m.getId().getName()).containsExactlyInAnyOrder(
-                "outbox.shard.lag", "outbox.retry.size", "outbox.waiting.size", "outbox.waiting.oldest",
+                "outbox.shard.lag", "outbox.retry.size", "outbox.retry.oldest", "outbox.waiting.size",
+                "outbox.waiting.oldest",
                 "outbox.dead.size", "outbox.dead.pending", "outbox.dead.pending.oldest", "outbox.parked.size",
                 "outbox.partitions.premade",
                 "outbox.partitions.overflow", "outbox.partitions.xids_left",
@@ -1673,6 +1674,32 @@ class MaintenanceIT {
             assertThat(maintenance.runOnce()).isTrue();
             assertThat(waitingLog(err)).as("at most once a minute").isEmpty();
         }
+    }
+
+    @Test
+    void theOldestRetryHeadIsGaugedWhileShardLagDoesNotSeeIt() throws Exception {
+        config.shards(1).retry(Duration.ofHours(1), Duration.ofHours(1), 0); // maxAttempts 0: retried for ever
+        bootstrap();
+        var registry = new SimpleMeterRegistry();
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
+
+        assertThat(maintenance.runOnce()).isTrue();
+        assertThat(gauge(registry, "outbox.retry.oldest")).as("none").isZero();
+
+        try (var c = TestDb.connect()) { // a head failing for an hour, its follower, a waiting head older still
+            execute(c, "insert into " + names.retry() + " (id, shard, message_id, topic, created_at, attempts,"
+                    + " next_attempt_at, last_error, waiting_since) values"
+                    + " (1, 0, gen_random_uuid(), 'orders', now() - interval '1 hour', 12,"
+                    + " now() + interval '5 minutes', 'target down', null),"
+                    + " (2, 0, gen_random_uuid(), 'orders', now() - interval '2 hours', 0, null, null, null),"
+                    + " (3, 0, gen_random_uuid(), 'payments', now() - interval '3 hours', 0, now(),"
+                    + " 'waiting (no_route): no route', now())");
+        }
+        assertThat(maintenance.runOnce()).isTrue();
+
+        assertThat(gauge(registry, "outbox.retry.oldest")).as("seconds since the failing head's created_at")
+                .isBetween(3600.0, 3660.0);
+        assertThat(gauge(registry, "outbox.shard.lag")).as("the shard is not behind").isLessThan(1.0);
     }
 
     @Test

@@ -4,6 +4,7 @@ package io.github.dsudomoin.outbox;
 public enum OutboxGauge {
     SHARD_LAG("outbox.shard.lag"),
     RETRY_SIZE("outbox.retry.size"),
+    RETRY_OLDEST("outbox.retry.oldest"),
     WAITING_SIZE("outbox.waiting.size"),
     WAITING_OLDEST("outbox.waiting.oldest"),
     DEAD_SIZE("outbox.dead.size"),
