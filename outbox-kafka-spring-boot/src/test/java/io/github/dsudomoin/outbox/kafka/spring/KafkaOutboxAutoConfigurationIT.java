@@ -403,12 +403,14 @@ class KafkaOutboxAutoConfigurationIT {
                     Map.entry("max.block.ms", "1000"), Map.entry("linger.ms", "7"));
                 assertThat(properties.deadLetterTopic()).isNull();
                 assertThat(properties.fallback()).isTrue();
+                assertThat(properties.clientIdSuffix()).isTrue();
             });
     }
 
     @Test
     void toStringLeavesOutDriverValues() {
-        assertThat(new KafkaOutboxProperties(Map.of("sasl.jaas.config", "secret"), "{topic}.dlq", true).toString())
+        var properties = new KafkaOutboxProperties(Map.of("sasl.jaas.config", "secret"), "{topic}.dlq", true, true);
+        assertThat(properties.toString())
             .doesNotContain("secret").contains("sasl.jaas.config", "{topic}.dlq", "fallback=true");
     }
 
@@ -481,6 +483,26 @@ class KafkaOutboxAutoConfigurationIT {
             assertThat(err.text()).contains("ProducerConfig values", "acks = -1", "enable.idempotence = true",
                 "delivery.timeout.ms = 20000", "request.timeout.ms = 15000", "max.block.ms = 5000",
                 "key.serializer = class org.apache.kafka.common.serialization.ByteArraySerializer");
+        }
+    }
+
+    /** The producer's own log names it by the set client.id as it is with client-id-suffix=false, suffixed without. */
+    @Test
+    void clientIdSuffixOffKeepsTheClientId() {
+        var topic = TestKafka.createTopic(1);
+        for (var suffix : List.of(true, false)) {
+            try (var err = new CapturedStderr()) {
+                runner("outbox.enabled=false", "outbox.kafka.driver-properties.client.id=orders-svc",
+                    "outbox.kafka.client-id-suffix=" + suffix)
+                    .run(context -> {
+                        var record = new OutboxRecord(1, UUID.randomUUID(), topic, null, "v".getBytes(UTF_8),
+                            List.of(), Instant.now(), 0, 0);
+                        context.getBean(KafkaOutboxSender.class).send(List.of(record));
+                    });
+                assertThat(err.text()).contains("[Producer clientId=orders-svc");
+                assertThat(err.text().contains("[Producer clientId=orders-svc]")).as("client-id-suffix=" + suffix)
+                    .isEqualTo(!suffix);
+            }
         }
     }
 

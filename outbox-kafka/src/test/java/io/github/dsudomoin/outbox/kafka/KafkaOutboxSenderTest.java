@@ -674,6 +674,37 @@ class KafkaOutboxSenderTest {
         assertThat(ids.get(2)).matches("orders-svc-outbox-\\d+");
     }
 
+    /** {@code clientIdSuffix=false} hands every producer of both pools the set {@code client.id} as it is. */
+    @Test
+    void clientIdSuffixOffKeepsTheClientId() throws Exception {
+        var seen = new CopyOnWriteArrayList<Map<String, Object>>();
+        var config = new KafkaOutboxConfig() {
+            @Override
+            public Properties driverProperties() {
+                return props("bootstrap.servers", "localhost:9092", "client.id", "orders-svc");
+            }
+
+            @Override
+            public boolean clientIdSuffix() {
+                return false;
+            }
+        };
+        var sender = new KafkaOutboxSender(config, properties -> {
+            seen.add(properties);
+            var producer = new TestProducer(false, r -> null);
+            producers.add(producer);
+            return producer;
+        });
+        var remembered = record(1, keyOnPartition(0));
+        var first = sendAsync(sender, List.of(remembered));
+        awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
+        first.get(5, SECONDS);
+        assertThat(sender.send(List.of(remembered))).singleElement().isInstanceOf(Outcome.NotAttempted.class);
+
+        assertThat(seen).hasSize(2).allSatisfy(p -> assertThat(p.get("client.id")).isEqualTo("orders-svc"));
+        assertThat(seen.get(1)).containsEntry("batch.size", "0"); // the second one is the unbatched pool's
+    }
+
     /** A client-side refusal says nothing about the partition: its cooldown, here a probe's lease, stays. */
     @Test
     void clientSideRefusalLeavesThePartitionsCooldown() throws Exception {

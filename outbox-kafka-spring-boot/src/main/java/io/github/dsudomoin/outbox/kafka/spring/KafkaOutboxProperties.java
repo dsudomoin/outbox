@@ -18,12 +18,16 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  * @param fallback true: Kafka takes every topic no OutboxTopicHandler claims, and an application's own OutboxHandler
  *     bean fails the start. false: no Kafka fallback; the application's OutboxHandler takes those topics or, with none,
  *     a send to one of them is refused. Default true.
+ * @param clientIdSuffix true: a set client.id gets a suffix per pooled producer, <client.id>-outbox-<n> and
+ *     <client.id>-outbox-unbatched-<n>, so each has its own JMX metrics. false: every producer gets client.id as set,
+ *     and their JMX metrics collide. Default true.
  */
 @ConfigurationProperties("outbox.kafka")
 public record KafkaOutboxProperties(
     Map<String, String> driverProperties,
     @Nullable String deadLetterTopic,
-    @DefaultValue("true") boolean fallback
+    @DefaultValue("true") boolean fallback,
+    @DefaultValue("true") boolean clientIdSuffix
 ) {
 
     public KafkaOutboxProperties {
@@ -34,6 +38,6 @@ public record KafkaOutboxProperties(
     @Override
     public String toString() {
         return "KafkaOutboxProperties[driverProperties=" + driverProperties.keySet() + ", deadLetterTopic="
-            + deadLetterTopic + ", fallback=" + fallback + "]";
+            + deadLetterTopic + ", fallback=" + fallback + ", clientIdSuffix=" + clientIdSuffix + "]";
     }
 }

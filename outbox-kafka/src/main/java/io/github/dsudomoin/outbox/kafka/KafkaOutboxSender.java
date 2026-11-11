@@ -153,7 +153,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
      * ones set): the application's own Kafka client factory, e.g. one that adds its metrics or interceptors. It must
      * build each producer from the properties it receives: the sender passes {@code batch.size=0} for its second pool
      * (see the class javadoc), and a factory that builds from its own configuration silently loses that. A set
-     * {@code client.id} arrives with a per-producer suffix.
+     * {@code client.id} arrives with a per-producer suffix unless {@link KafkaOutboxConfig#clientIdSuffix} is false.
      *
      * <p>Each call must return a new producer that nobody else uses, and {@code close(Duration.ZERO)} on it must close
      * it physically and abort its queued batches. A factory that shares or caches producers, such as spring-kafka's
@@ -162,13 +162,13 @@ public final class KafkaOutboxSender implements AutoCloseable {
      */
     public KafkaOutboxSender(KafkaOutboxConfig config,
             Function<Map<String, Object>, Producer<byte[], byte[]>> producers) {
-        this(producerConfig(config.driverProperties()), producers);
+        this(producerConfig(config.driverProperties()), config.clientIdSuffix(), producers);
     }
 
-    private KafkaOutboxSender(ProducerConfig config,
+    private KafkaOutboxSender(ProducerConfig config, boolean suffix,
             Function<Map<String, Object>, Producer<byte[], byte[]>> producers) {
-        this(() -> producers.apply(properties(config, "-outbox-")), () -> {
-            var unbatched = properties(config, "-outbox-unbatched-");
+        this(() -> producers.apply(properties(config, suffix ? "-outbox-" : null)), () -> {
+            var unbatched = properties(config, suffix ? "-outbox-unbatched-" : null);
             unbatched.put(BATCH_SIZE_CONFIG, "0");
             return producers.apply(unbatched);
         }, Duration.ofMillis(config.getInt(DELIVERY_TIMEOUT_MS_CONFIG)),
@@ -178,11 +178,12 @@ public final class KafkaOutboxSender implements AutoCloseable {
     /**
      * A fresh copy of the properties for one producer. A set {@code client.id} becomes a prefix: Kafka registers a
      * producer's JMX metrics under its client id, so pooled producers sharing one would overwrite each other's metrics,
-     * and closing any of them would unregister the metrics of the rest.
+     * and closing any of them would unregister the metrics of the rest. A null {@code infix} leaves it as set.
      */
-    private static Map<String, Object> properties(ProducerConfig config, String infix) {
+    private static Map<String, Object> properties(ProducerConfig config, @Nullable String infix) {
         var properties = config.originals();
-        if (properties.containsKey(CLIENT_ID_CONFIG)) { // an unset one Kafka replaces with a unique producer-<n>
+        // an unset one Kafka replaces with a unique producer-<n>
+        if (infix != null && properties.containsKey(CLIENT_ID_CONFIG)) {
             properties.put(CLIENT_ID_CONFIG,
                     config.getString(CLIENT_ID_CONFIG) + infix + PRODUCERS_MADE.incrementAndGet());
         }

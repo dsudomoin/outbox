@@ -46,7 +46,17 @@ public final class KafkaOutboxAutoConfiguration {
     KafkaOutboxSender kafkaOutboxSender(KafkaOutboxProperties properties, ObjectProvider<OutboxConfig> outbox) {
         var driver = new Properties();
         driver.putAll(properties.driverProperties());
-        KafkaOutboxConfig config = () -> driver;
+        var config = new KafkaOutboxConfig() {
+            @Override
+            public Properties driverProperties() {
+                return driver;
+            }
+
+            @Override
+            public boolean clientIdSuffix() {
+                return properties.clientIdSuffix();
+            }
+        };
         var sender = new KafkaOutboxSender(config);
         outbox.ifAvailable(o -> sender.warnIfLongerThan("outbox.relay.batchTimeout", o.relay().batchTimeout(),
             "The relay interrupts a call at 80% of batchTimeout; the sender then stops at once, keeps acked records as"

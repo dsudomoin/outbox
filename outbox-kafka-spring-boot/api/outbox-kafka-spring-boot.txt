@@ -6,7 +6,8 @@ package io.github.dsudomoin.outbox.kafka.spring {
   }
 
   @org.springframework.boot.context.properties.ConfigurationProperties("outbox.kafka") public final class KafkaOutboxProperties {
-    ctor public KafkaOutboxProperties(java.util.Map<java.lang.String!,java.lang.String!>!, String?, @org.springframework.boot.context.properties.bind.DefaultValue("true") boolean);
+    ctor public KafkaOutboxProperties(java.util.Map<java.lang.String!,java.lang.String!>!, String?, @org.springframework.boot.context.properties.bind.DefaultValue("true") boolean, @org.springframework.boot.context.properties.bind.DefaultValue("true") boolean);
+    method public boolean clientIdSuffix();
     method public String? deadLetterTopic();
     method public java.util.Map<java.lang.String!,java.lang.String!>! driverProperties();
     method public boolean fallback();

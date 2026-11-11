@@ -224,6 +224,9 @@ In Kora as below; in Spring Boot `outbox.admin.check-origin`.
 the letter's topic, e.g. `"{topic}.dlq"`. Validated at startup: a Kafka topic name (up to 249 of `[a-zA-Z0-9._-]`),
 not `{topic}` alone. Behaviour and duplicates: writing-outbox-handlers, `dead-letter-hook.md`.
 
+`clientIdSuffix` (default `true`): a set `client.id` gets a suffix per producer, as below. `false`: every producer
+gets `client.id` unchanged, and their JMX metrics collide (see the end of this section).
+
 `driverProperties`: Kafka producer properties, validated at startup.
 
 | | Properties |
@@ -249,7 +252,10 @@ remains on ≤ 4.1: the first call waits for the expiry or the cut, and calls wi
 Producer client metrics are not bound to Micrometer; they are visible through JMX only. A set `client.id` is a
 prefix, since JMX tells producers apart by it: each producer gets `<client.id>-outbox-<n>`, one of the second pool
 `<client.id>-outbox-unbatched-<n>`. Broker quotas match the whole `client.id`, so a quota on the bare id does not
-cover the outbox producers: set it on the user principal. With no `client.id` Kafka names them `producer-<n>`.
+cover the outbox producers: set it on the user principal. If the quota must stay on `client.id`, set
+`clientIdSuffix = false`: every producer then gets `client.id` as it is, and they share their JMX metrics: each
+overwrites the others', and closing any of them unregisters the rest. With no `client.id` Kafka names them
+`producer-<n>`.
 
 ## Spring Boot
 

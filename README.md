@@ -2891,6 +2891,7 @@ xid](#восстановление-после-регрессии-xid-xid-regress
 |---|---|---|
 | `driverProperties` | — | Свойства продюсера Kafka. `bootstrap.servers` обязателен. Навязываемые, отвергаемые и задаваемые по умолчанию настройки: [Требования к Kafka](#требования-к-kafka). |
 | `deadLetterTopic` | — (выключено) | Шаблон топика для dead letters, `{topic}` — топик письма, например `"{topic}.dlq"`. Без ключа хук Kafka не активен, и письма остаются в dead-таблице. Проверяется при старте: имя топика Kafka (до 249 символов `[a-zA-Z0-9._-]`), не `{topic}` само по себе ([Kafka DLQ](#kafka-dlq)). |
+| `clientIdSuffix` | `true` | `true`: заданный `client.id` получает у каждого продюсера суффикс, `<client.id>-outbox-<n>` или `<client.id>-outbox-unbatched-<n>`, и JMX-метрики у продюсеров свои. `false`: все продюсеры получают `client.id` без изменений, и их JMX-метрики сталкиваются ([Требования к Kafka](#требования-к-kafka), «Метрики»). В Spring Boot — `outbox.kafka.client-id-suffix`. |
 
 В Spring Boot есть ещё `outbox.kafka.fallback` ([Kafka и `outbox.kafka.fallback`](#kafka-и-outboxkafkafallback)).
 
@@ -2983,7 +2984,10 @@ relay: на инстансе с `relay.enabled = false` оно не выполн
   JMX различает продюсеры по `client.id`, поэтому заданный `client.id` служит префиксом: каждый продюсер получает
   свой `<client.id>-outbox-<n>`, а продюсер второго пула — `<client.id>-outbox-unbatched-<n>`. Квоты брокера
   сравнивают `client.id` целиком, так что квота на голый `client.id` к продюсерам outbox не применится: квоту для них
-  задавайте на principal пользователя. Без `client.id` Kafka сама называет продюсеры `producer-<n>`.
+  задавайте на principal пользователя. Если квота нужна именно на `client.id`, выставьте
+  `outbox.kafka.clientIdSuffix = false` (в Spring Boot `outbox.kafka.client-id-suffix=false`), и все продюсеры
+  получат `client.id` как есть. Цена — общие JMX-метрики: продюсеры затирают метрики друг друга, а закрытие любого
+  из них снимает метрики остальных. Без `client.id` Kafka сама называет продюсеры `producer-<n>`.
 - Пул держит примерно по одному продюсеру на relay-воркер; каждый вызов берёт один из них. Вызовы с запомненными
   записями (см. выше) берут продюсеры из второго пула, без батчинга.
 

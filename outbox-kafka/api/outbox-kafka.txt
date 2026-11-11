@@ -11,6 +11,7 @@ package io.github.dsudomoin.outbox.kafka {
   }
 
   public interface KafkaOutboxConfig {
+    method public default boolean clientIdSuffix();
     method public default String? deadLetterTopic();
     method public java.util.Properties! driverProperties();
   }
