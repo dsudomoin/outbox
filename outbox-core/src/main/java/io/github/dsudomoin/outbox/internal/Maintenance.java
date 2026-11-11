@@ -122,8 +122,9 @@ public final class Maintenance {
     private final TableNames names;
     private final Duration detachLockTimeout;
     /**
-     * How long the tail swap waits for relay steps in flight, every shard paused meanwhile. No bound on a step: its
-     * retry pass may run about 2 × batchTimeout and its main pass's call another batchTimeout. A step running longer
+     * How long the tail swap waits for relay steps in flight, every shard paused meanwhile. No bound on a step: a
+     * shard's retry pass may run about 2 × batchTimeout, and in a step over several shards it may start just before the
+     * step has spent batchTimeout, then the main pass's call runs another batchTimeout. A step running longer
      * defers the swap to the next run, with premake / 2 ranges of xids left before rows reach the tail.
      */
     private final Duration quiesceTimeout;
@@ -290,12 +291,14 @@ public final class Maintenance {
     }
 
     /**
-     * How long {@code drain()} waits for a pending shard to move before it gives up: 3 × batchTimeout + 10 s, the
-     * longest a relay step legitimately runs without moving a cursor (its retry pass about 2 × batchTimeout, its main
-     * pass's call another batchTimeout, plus statements), and never under twice the tail swap's quiesce wait.
+     * How long {@code drain()} waits for a pending shard to move before it gives up: 4 × batchTimeout + 10 s, the
+     * longest a relay step legitimately runs without moving a cursor, plus statements. In a step over several shards a
+     * shard's retry pass starts until the step has spent batchTimeout: one that starts just before runs about
+     * 2 × batchTimeout, and the main pass's shared call another batchTimeout. Never under twice the tail swap's quiesce
+     * wait.
      */
     public static Duration stallTimeout(OutboxConfig config) {
-        return config.relay().batchTimeout().multipliedBy(3).plusSeconds(10);
+        return config.relay().batchTimeout().multipliedBy(4).plusSeconds(10);
     }
 
     /**

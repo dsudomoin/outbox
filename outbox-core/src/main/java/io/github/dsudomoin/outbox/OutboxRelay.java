@@ -383,8 +383,9 @@ public final class OutboxRelay implements AutoCloseable {
      * at a time: the pass runs once the shards' is closed, after the dead-letter thread's run in progress, if any.
      *
      * @throws IllegalStateException when no shard advanced and this call moved no row, delivered or answering requeue,
-     *     for {@code 3 × batchTimeout + 10 s}, longer than a relay step runs (its retry pass about 2 × batchTimeout,
-     *     its main pass's call another) and at least twice a tail swap's wait for steps in flight, while work remains (e.g.
+     *     for {@code 4 × batchTimeout + 10 s}, longer than a relay step runs (over several shards, a retry pass that
+     *     starts just before the step has spent batchTimeout runs about 2 × batchTimeout and the main pass's call
+     *     another) and at least twice a tail swap's wait for steps in flight, while work remains (e.g.
      *     a shard paused by a down target), or while maintenance has halted the relay (xid regression), or when a lock
      *     on the halt table kept the first xid check from reading for that long
      */

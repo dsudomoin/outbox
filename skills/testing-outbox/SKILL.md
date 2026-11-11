@@ -130,7 +130,7 @@ class OrderDeliveryTest {
   published; write the ten lines.
 - **Retry path**: failing keys, one or several, are each moved to `<table>_retry` after `headFailuresBeforeDivert`
   (3) pauses, one key per probe, and `drain()` then returns with a smaller count: assert that count. `drain()` throws
-  `IllegalStateException` only when no pending shard's position moves for 3 × `batchTimeout` + 10 s, for example
+  `IllegalStateException` only when no pending shard's position moves for 4 × `batchTimeout` + 10 s (the longest a relay step over several shards runs), for example
   when `headFailuresBeforeDivert(1000)` keeps every failing key paused in place and the pause backoff grows past that
   bound, or when the relay is halted. Lower `batchTimeout` only with a non-Kafka handler; with Kafka it must stay ≥
   `delivery.timeout.ms + 5 s + max.block.ms`.

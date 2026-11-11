@@ -670,7 +670,7 @@ public final class XidPartitions {
                         + " current xid: {}. The swap waits for the relay steps in flight to end, up to"
                         + " outbox.relay.batchTimeout + 5 s, and pauses new ones meanwhile; a step whose handler call"
                         + " is slow (a slow or unreachable Kafka, a slow handler, a retry pass) can run about"
-                        + " 3 × batchTimeout and time the wait out. Writers are not the cause. Writes go on and nothing"
+                        + " 4 × batchTimeout and time the wait out. Writers are not the cause. Writes go on and nothing"
                         + " is lost: once the ranges run out rows go to the tail, which becomes a range at the first"
                         + " swap that runs; the swap is tried again every run. Bring the handler's target back to"
                         + " health or make its calls end well within batchTimeout. This ERROR repeats at most once an"

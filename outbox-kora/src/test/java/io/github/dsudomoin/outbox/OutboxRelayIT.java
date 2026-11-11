@@ -1136,17 +1136,6 @@ class OutboxRelayIT {
                 }
                 return records.stream().map(r -> (Outcome) Outcome.delivered()).toList();
             }
-
-            private static void sleepThrough(Duration duration) {
-                long until = System.nanoTime() + duration.toNanos();
-                for (long left; (left = until - System.nanoTime()) > 0; ) {
-                    try {
-                        TimeUnit.NANOSECONDS.sleep(left);
-                    } catch (InterruptedException e) {
-                        // the wind-down's interrupt: this call does not notice it
-                    }
-                }
-            }
         };
         var drainer = relay(handler);
         var outbox = outbox(() -> {});
@@ -1169,6 +1158,94 @@ class OutboxRelayIT {
 
         drained.get(2, TimeUnit.MINUTES); // throws "made no progress" if the drain gives up on the step
         assertThat(rows(schema.names().retry())).isZero();
+    }
+
+    /**
+     * A worker's step over two shards that legitimately runs about 4 × batchTimeout: the first shard's retry pass
+     * calls just under batchTimeout, so the second shard's retry pass is not deferred and runs about 2 × (its call of
+     * two heads cut at batchTimeout, then a single-record call almost as long), and the main pass's shared call takes
+     * almost as long again. A drain on another instance sees no position change all that while and must not give up
+     * before the step commits.
+     */
+    @Test
+    @Tag("timing") // about 80 s of handler calls
+    void drainOutlastsAWorkersStepOverTwoShardsOfFourBatchTimeouts() throws Exception {
+        var batchTimeout = Duration.ofSeconds(20); // the step outgrows 3 × batchTimeout + 10 s by about 8 s
+        config.relayEnabled(false).shards(2).workers(1).batchTimeout(batchTimeout)
+                .retry(Duration.ofHours(1), Duration.ofHours(1), 0);
+        bootstrap();
+        var m = keyOnShard(0, "m");
+        var slow = new AtomicBoolean();
+        var stepping = new CountDownLatch(1);
+        var pairs = new AtomicInteger();
+        var single = new AtomicBoolean();
+        var main = new AtomicBoolean();
+        var almost = batchTimeout.minusMillis(500);
+        OutboxHandler handler = new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {
+            }
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                if (!slow.get()) { // the setup: the heads fail beside a delivered row of their shard, so are diverted
+                    return records.stream().map(r -> key(r).startsWith("w") ? Outcome.delivered()
+                            : (Outcome) Outcome.retry(new RuntimeException("target down"))).toList();
+                }
+                // calls blocked where the wind-down at 80 % does not reach them, as a slow target's I/O; the shards
+                // are stepped in either order, so the calls are told apart by their turn, not by their keys
+                boolean ofM = records.stream().anyMatch(r -> m.equals(key(r)));
+                if (records.size() == 2 && !ofM) { // a shard's retry pass, its two heads in one call
+                    int pair = pairs.incrementAndGet();
+                    if (pair == 1) { // the first shard's: just under batchTimeout
+                        stepping.countDown();
+                        sleepThrough(almost);
+                    } else if (pair == 2) { // the second shard's: cut at batchTimeout
+                        sleepThrough(batchTimeout.plusSeconds(1));
+                    }
+                } else if (records.size() == 1 && !ofM && single.compareAndSet(false, true)) {
+                    sleepThrough(almost); // the second shard's single call of a head
+                } else if (ofM && main.compareAndSet(false, true)) {
+                    sleepThrough(almost); // the main pass's shared call
+                }
+                return records.stream().map(r -> (Outcome) Outcome.delivered()).toList();
+            }
+        };
+        var drainer = relay(handler);
+        var outbox = outbox(() -> {});
+        send(outbox, msg("t", keyOnShard(0, "w"), "w0"), msg("t", keyOnShard(0, "a"), "a"),
+                msg("t", keyOnShard(0, "b"), "b"), msg("t", keyOnShard(1, "w"), "w1"), msg("t", keyOnShard(1, "k"), "k"),
+                msg("t", keyOnShard(1, "j"), "j"));
+        assertThat(drainer.drain()).isEqualTo(2); // the heads are due in an hour: the drain does not wait for them
+        assertThat(rows(schema.names().retry())).isEqualTo(4);
+        try (var c = TestDb.connect(); var st = c.createStatement()) {
+            st.execute("update " + schema.names().retry() + " set next_attempt_at = now() - interval '1 minute'"
+                    + " where next_attempt_at is not null");
+            st.execute("update " + schema.names().cursor() + " set retry_due_at = now() - interval '1 minute'"
+                    + " where retry_due_at is not null");
+        }
+        send(outbox, msg("t", m, "m"));
+        slow.set(true);
+
+        config.relayEnabled(true);
+        start(handler); // its worker steps both shards: the due heads of each, then m in the main pass
+        assertThat(stepping.await(10, TimeUnit.SECONDS)).isTrue();
+        var drained = CompletableFuture.supplyAsync(drainer::drain);
+
+        drained.get(3, TimeUnit.MINUTES); // throws "made no progress" if the drain gives up on the step
+        assertThat(main).isTrue();
+        assertThat(rows(schema.names().retry())).isZero();
+    }
+
+    private static void sleepThrough(Duration duration) {
+        long until = System.nanoTime() + duration.toNanos();
+        for (long left; (left = until - System.nanoTime()) > 0; ) {
+            try {
+                TimeUnit.NANOSECONDS.sleep(left);
+            } catch (InterruptedException e) {
+                // the wind-down's interrupt: this call does not notice it
+            }
+        }
     }
 
     @Test
