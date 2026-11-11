@@ -153,7 +153,7 @@ public final class XidRecovery {
         try (var st = c.createStatement()) {
             st.execute("set local statement_timeout = " + timeout.toMillis()
                     + "; set local idle_in_transaction_session_timeout = " + LOCK_TIMEOUT.toMillis()
-                    + Ticks.noTransactionTimeout(c));
+                    + Ticks.noTransactionTimeout(c) + Ticks.DURABLE_COMMIT); // it commits a tick
             long rows = queryLong(st, "select count(*) from (" + saved + ") s");
             c.commit();
             return rows;
@@ -303,7 +303,7 @@ public final class XidRecovery {
             st.execute("set transaction isolation level read committed"); // first: before any statement of the tx
             st.execute("set local lock_timeout = " + LOCK_TIMEOUT.toMillis()
                     + "; set local idle_in_transaction_session_timeout = " + LOCK_TIMEOUT.toMillis()
-                    + Ticks.noTransactionTimeout(c));
+                    + Ticks.noTransactionTimeout(c) + Ticks.DURABLE_COMMIT); // it commits a tick
             timeLeft(st, deadline);
             st.execute("lock table " + names.cursor() + ", " + names.checkpoint() + ", " + names.tick()
                     + " in access exclusive mode");

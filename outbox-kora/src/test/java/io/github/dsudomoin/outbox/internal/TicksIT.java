@@ -300,6 +300,38 @@ class TicksIT {
         }
     }
 
+    /**
+     * A tick commit the relay reads is the gate for every writer commit it covers, so it is flushed even when the
+     * role or database says {@code synchronous_commit = off} (a session default stands in for those here); a stronger
+     * setting is left as it is, so a tick never waits for a standby the role chose not to wait for, and never stops
+     * waiting for one it did.
+     */
+    @Test
+    void aTickCommitsDurablyWhenTheSessionDefaultIsSynchronousCommitOff() throws Exception {
+        try (var maker = TestDb.connect(); var observer = TestDb.connect()) {
+            execute(observer, "create table sc_probe (n serial, v text); create function sc_probe() returns trigger"
+                    + " language plpgsql as $$ begin insert into sc_probe (v)"
+                    + " values (current_setting('synchronous_commit')); return new; end $$;"
+                    + " create trigger sc_probe before insert on " + names.tick()
+                    + " for each row execute function sc_probe()");
+            for (var setting : List.of("off", "on", "remote_apply")) {
+                execute(observer, "update " + names.tick() + " set created_at = created_at - interval '1 hour'");
+                execute(maker, "set synchronous_commit = " + setting);
+
+                assertThat(ticks.make(maker, Duration.ZERO)).isTrue();
+                assertThat(queryString(maker, "show synchronous_commit")).as("transaction-scoped").isEqualTo(setting);
+            }
+            try (var rs = observer.createStatement().executeQuery("select v from sc_probe order by n")) {
+                var seen = new ArrayList<String>();
+                while (rs.next()) {
+                    seen.add(rs.getString(1));
+                }
+                assertThat(seen).as("the tick transaction's synchronous_commit")
+                        .containsExactly("local", "on", "remote_apply");
+            }
+        }
+    }
+
     @Test
     void readsAndDeletesTicks() throws Exception {
         try (var c = TestDb.connect()) {

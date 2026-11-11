@@ -26,6 +26,9 @@ import org.slf4j.LoggerFactory;
  * advisory lock {@code (internalNs, LOCK_TICK)} held to commit, with the snapshot taken in a statement after the lock
  * statement, so tick ids, snapshots and commits are monotonic. The lock-holding transaction runs with a 5 s
  * {@code idle_in_transaction_session_timeout}, so Postgres terminates a frozen holder's session and frees the lock.
+ * Its commit is flushed to the local WAL even under a role's {@code synchronous_commit = off} (see
+ * {@link #DURABLE_COMMIT}): a Postgres crash that loses writers' last asynchronous commits loses the ticks covering
+ * them too, so no message of a lost commit is delivered.
  * A tick also records the outbox id sequence's high-water mark, which sizes batches by data volume.
  *
  * <p>A tick C also records in {@code dirty} the shards that gained rows since the newest tick P before it, as a bitmap
@@ -461,11 +464,12 @@ public final class Ticks {
             // plan: no parameter of the probe helps plan-time pruning, and a custom plan of it over every partition
             // takes about 1.5 ms to make, against 0.02 ms to reuse the cached generic one. A statement_timeout of
             // its own above the lock_timeout: a role's shorter one would cancel the lock wait (57014) instead of
-            // the tick being skipped (55P03); the probe and the insert take milliseconds
+            // the tick being skipped (55P03); the probe and the insert take milliseconds. A durable commit: see
+            // DURABLE_COMMIT
             st.execute("set transaction isolation level read committed;"
                     + " set local idle_in_transaction_session_timeout = '5s'; set local lock_timeout = '1s';"
                     + " set local statement_timeout = '2s'; set local plan_cache_mode = force_generic_plan"
-                    + noTransactionTimeout(c));
+                    + noTransactionTimeout(c) + DURABLE_COMMIT);
         }
         try (var ps = c.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {
             ps.setInt(1, names.internalNamespace());
@@ -479,6 +483,18 @@ public final class Ticks {
         }
         return true;
     }
+
+    /**
+     * A further statement for a tick transaction's settings: a role's or database's {@code synchronous_commit = off}
+     * raised to {@code local}, so the tick's commit is flushed to the local WAL before it is visible. A batch reads
+     * only rows visible in a committed tick, and the commit record of every writer a tick covers comes before the
+     * tick's in the WAL, so a Postgres crash that loses a writer's commit loses every tick that covers it too, and the
+     * relay never sends a row of a lost commit. Only {@code off} is raised: {@code local} would not be made to wait
+     * for a synchronous standby the role chose not to wait for (a hung standby would stall every tick with the tick
+     * lock held), and {@code on} or {@code remote_*} are kept.
+     */
+    static final String DURABLE_COMMIT = "; select set_config('synchronous_commit', 'local', true)"
+            + " where current_setting('synchronous_commit') = 'off'";
 
     /**
      * A further {@code SET LOCAL} that switches off a role's or database's {@code transaction_timeout} for the library's
