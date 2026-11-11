@@ -23,6 +23,8 @@ import java.sql.SQLException;
 import java.time.Duration;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.postgresql.ds.PGSimpleDataSource;
 import org.springframework.beans.factory.NoUniqueBeanDefinitionException;
 import org.springframework.boot.LazyInitializationBeanFactoryPostProcessor;
@@ -108,6 +110,30 @@ class OutboxAutoConfigurationIT {
             assertThat(first).isTrue();
             assertThat(again).isFalse();
         });
+    }
+
+    /** The switch decides as the binder binds it, whatever the spelling. */
+    @ParameterizedTest
+    @ValueSource(strings = {"0", "off", "no", "FALSE"})
+    void enabledOffInAnySpellingKeepsInbox(String off) {
+        runner("outbox.enabled=" + off).run(context -> {
+            assertThat(context).hasNotFailed().doesNotHaveBean(Outbox.class).doesNotHaveBean(OutboxLifecycle.class)
+                .doesNotHaveBean(OutboxAdmin.class).hasSingleBean(Inbox.class);
+            assertThat(context.getBean(OutboxProperties.class).enabled()).isFalse();
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1", "on", "yes", "TRUE"})
+    void enabledOnInAnySpellingStartsTheRuntime(String on) {
+        runner("outbox.enabled=" + on).withUserConfiguration(WithRoute.class).run(context ->
+            assertThat(context).hasNotFailed().hasSingleBean(Outbox.class).hasSingleBean(OutboxLifecycle.class));
+    }
+
+    @Test
+    void enabledUnparseableFailsTheStart() {
+        runner("outbox.enabled=flase").withUserConfiguration(WithRoute.class).run(context ->
+            assertThat(context).hasFailed().getFailure().rootCause().hasMessageContaining("flase"));
     }
 
     /** A bean that uses the inbox. */

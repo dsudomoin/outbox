@@ -1477,6 +1477,10 @@ kebab-case (`outbox.relay.batch-timeout`), camelCase тоже привязыва
 | `outbox.json.mapper` | `auto` | Маппер типизированных сообщений: `auto`, `jackson2`, `jackson3` ([ниже](#типизированные-сообщения-и-обработчики-бины)). |
 | `outbox.kafka.fallback` | `true` | Берёт ли Kafka топики, не забранные маршрутами ([Kafka и `outbox.kafka.fallback`](#kafka-и-outboxkafkafallback)). |
 
+`outbox.enabled` и `outbox.kafka.fallback` понимают всё, что Spring считает булевым значением: выключают их `false`,
+`off`, `no` и `0` в любом регистре, включают `true`, `on`, `yes` и `1`. С любым другим значением приложение не
+стартует.
+
 `outbox.heartbeat.dedicated-connection` работает как `dedicatedConnection` в Kora ([Соединения
 heartbeat](#соединения-heartbeat)).
 

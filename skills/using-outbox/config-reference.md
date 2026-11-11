@@ -240,6 +240,9 @@ with or without brackets: `outbox.kafka.driver-properties.max.block.ms=3000`. Th
 | `outbox.json.mapper` | `auto` | `auto`: Jackson 2's `ObjectMapper` bean if any, else Jackson 3's `JsonMapper`; `jackson2`, `jackson3`: that one, the start failing when absent |
 | `outbox.kafka.fallback` | `true` | `true`: Kafka takes every topic no route claims, and an app's own `OutboxHandler` bean fails the start. `false`: that bean takes them or, with none, a send to such a topic is refused before writing |
 
+`outbox.enabled` and `outbox.kafka.fallback` take every boolean Spring binds: `false`, `off`, `no`, `0` turn them off,
+`true`, `on`, `yes`, `1` on, in any case; any other value fails the start.
+
 `outbox.heartbeat.dedicated-connection` is `dedicatedConnection` above: a copy of the `HikariDataSource` behind the
 outbox, named `<pool>-outbox-heartbeat`, or `outbox-heartbeat` while the app's pool has no name, so set
 `spring.datasource.hikari.pool-name`. A `DataSource` bean with `@OutboxHeartbeat` replaces it whatever the key says. An

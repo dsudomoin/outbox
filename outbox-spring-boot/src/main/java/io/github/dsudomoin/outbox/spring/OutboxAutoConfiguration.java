@@ -37,17 +37,21 @@ import org.springframework.beans.factory.config.ConfigurableBeanFactory;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.SpringBootCondition;
+import org.springframework.boot.autoconfigure.condition.ConditionOutcome;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.boot.sql.init.dependency.DependsOnDatabaseInitialization;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.ConditionContext;
+import org.springframework.context.annotation.Conditional;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Fallback;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.context.annotation.Scope;
 import org.springframework.core.ResolvableType;
 import org.springframework.core.env.Environment;
+import org.springframework.core.type.AnnotatedTypeMetadata;
 
 /**
  * The outbox over the application's {@code DataSource} (the {@code @Primary} one of several), joining its
@@ -148,8 +152,22 @@ public final class OutboxAutoConfiguration {
     @EnableConfigurationProperties(OutboxProperties.class)
     static class PropertiesConfiguration {}
 
+    /**
+     * {@code outbox.enabled} read as the binder reads it: {@code @ConditionalOnProperty} matches anything but
+     * {@code false}, so {@code 0}, {@code off} or {@code no} would start the runtime while the property says it is
+     * off. A value that is no boolean fails the start.
+     */
+    static final class EnabledCondition extends SpringBootCondition {
+
+        @Override
+        public ConditionOutcome getMatchOutcome(ConditionContext context, AnnotatedTypeMetadata metadata) {
+            boolean enabled = Binder.get(context.getEnvironment()).bind("outbox.enabled", Boolean.class).orElse(true);
+            return new ConditionOutcome(enabled, "outbox.enabled=" + enabled);
+        }
+    }
+
     @Configuration(proxyBeanMethods = false)
-    @ConditionalOnProperty(prefix = "outbox", name = "enabled", matchIfMissing = true)
+    @Conditional(EnabledCondition.class)
     static class RuntimeConfiguration {
 
         /** Eager under global lazy init: nothing else would start the relay; stopped on a failed refresh too. */

@@ -11,11 +11,17 @@ import io.github.dsudomoin.outbox.kafka.KafkaOutboxSender;
 import java.util.Properties;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionOutcome;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.SpringBootCondition;
+import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.ConditionContext;
+import org.springframework.context.annotation.Conditional;
 import org.springframework.context.annotation.Lazy;
+import org.springframework.core.type.AnnotatedTypeMetadata;
 
 /**
  * Relays the outbox to Kafka, settings under {@code outbox.kafka.*}: a {@link KafkaOutboxSender}, a
@@ -48,9 +54,24 @@ public final class KafkaOutboxAutoConfiguration {
         return sender;
     }
 
+    /**
+     * {@code outbox.kafka.fallback} read as the binder reads it: {@code @ConditionalOnProperty} matches anything but
+     * {@code false}, so {@code 0}, {@code off} or {@code no} would keep Kafka's handler while the property says it is
+     * off. A value that is no boolean fails the start.
+     */
+    static final class FallbackCondition extends SpringBootCondition {
+
+        @Override
+        public ConditionOutcome getMatchOutcome(ConditionContext context, AnnotatedTypeMetadata metadata) {
+            boolean fallback = Binder.get(context.getEnvironment()).bind("outbox.kafka.fallback", Boolean.class)
+                .orElse(true);
+            return new ConditionOutcome(fallback, "outbox.kafka.fallback=" + fallback);
+        }
+    }
+
     @Bean
     @Lazy
-    @ConditionalOnProperty(prefix = "outbox.kafka", name = "fallback", matchIfMissing = true)
+    @Conditional(FallbackCondition.class)
     KafkaOutboxHandler outboxKafkaFallbackHandler(KafkaOutboxSender sender) {
         return sender.handler();
     }

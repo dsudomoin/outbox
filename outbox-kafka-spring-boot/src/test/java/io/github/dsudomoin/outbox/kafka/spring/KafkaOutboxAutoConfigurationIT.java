@@ -39,6 +39,8 @@ import java.util.stream.Stream;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.test.context.assertj.AssertableApplicationContext;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -275,6 +277,29 @@ class KafkaOutboxAutoConfigurationIT {
             await().atMost(WAIT).until(() -> !records.delivered().isEmpty());
             assertThat(records.delivered()).extracting(OutboxRecord::messageId).containsExactly(id);
         });
+    }
+
+    /** The switch decides as the binder binds it, whatever the spelling. */
+    @ParameterizedTest
+    @ValueSource(strings = {"0", "off", "no", "FALSE"})
+    void fallbackOffInAnySpellingUsesAppHandler(String off) {
+        withoutKafka("outbox.kafka.fallback=" + off).withUserConfiguration(WithAppHandler.class).run(context -> {
+            assertThat(context).hasNotFailed().doesNotHaveBean("outboxKafkaFallbackHandler");
+            assertThat(context.getBean(KafkaOutboxProperties.class).fallback()).isFalse();
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1", "on", "yes", "TRUE"})
+    void fallbackOnInAnySpellingKeepsKafka(String on) {
+        withoutKafka("outbox.kafka.fallback=" + on).withUserConfiguration(WithAppHandler.class)
+            .run(context -> assertNamesTheConflict(failure(context)));
+    }
+
+    @Test
+    void fallbackUnparseableFailsTheStart() {
+        withoutKafka("outbox.kafka.fallback=flase").withUserConfiguration(WithAppHandler.class).run(context ->
+            assertThat(context).hasFailed().getFailure().rootCause().hasMessageContaining("flase"));
     }
 
     /** Nothing uses Kafka here: no Kafka settings are needed. */
