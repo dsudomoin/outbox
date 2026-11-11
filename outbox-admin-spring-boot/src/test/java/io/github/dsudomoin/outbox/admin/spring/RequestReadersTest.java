@@ -55,6 +55,17 @@ class RequestReadersTest {
         }
     }
 
+    /** The parser would keep the last value, so {@code "error":null} after {@code "error":"x"} would drop it. */
+    @Test
+    void bothRefuseARepeatedField() {
+        for (var tree : trees()) {
+            for (var body : List.of("{\"a\":1,\"a\":2}", "{\"f\":{\"error\":\"x\",\"error\":null}}")) {
+                assertThatThrownBy(() -> tree.apply(bytes(body))).as(body).isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageStartingWith("Duplicate ");
+            }
+        }
+    }
+
     @Test
     void readsOnEitherMajorAlone() throws Exception {
         for (var absent : List.of(JACKSON2, JACKSON3)) {

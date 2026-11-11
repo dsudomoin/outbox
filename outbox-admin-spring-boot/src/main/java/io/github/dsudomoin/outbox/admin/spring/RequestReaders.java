@@ -34,7 +34,8 @@ import org.springframework.web.servlet.mvc.method.annotation.RequestBodyAdviceAd
  * request. A String deserializer of the app's, which also serves Jackson's untyped Map, could read {@code "  "} or any
  * other value as absent, and an absent field widens a bulk call to every letter the rest of the filter matches; so can
  * the lenient rest of a mapper: an unknown field skipped (a typo such as {@code eror}), a value coerced
- * ({@code "dryRun":""} to false, {@code [1.5]} to letter 1), a misspelt status read as none. MVC still runs the app's
+ * ({@code "dryRun":""} to false, {@code [1.5]} to letter 1), a misspelt status read as none, a repeated field read by
+ * its last value ({@code "error":"x","error":null}), which this mapper refuses. MVC still runs the app's
  * converter, whose result is dropped; if it throws, the call answers 400. As the Kora adapter, this takes a blank
  * {@code topic} or {@code error} of a filter as an error, and an empty {@code key} as the empty key. Bodies stop at
  * {@link #MAX_BODY}, as each is held in memory and parsed twice.

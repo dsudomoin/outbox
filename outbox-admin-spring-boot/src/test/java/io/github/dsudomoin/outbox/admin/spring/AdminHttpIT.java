@@ -399,6 +399,35 @@ class AdminHttpIT {
         assertThat(retryCount()).isEqualTo(4);
     }
 
+    /** A repeated field must never widen a call: the last {@code "error":null} kept would discard the whole topic. */
+    @Test
+    void duplicateFieldRefused() {
+        app(() -> {
+            long x = letter(1, "t", "k", "x", T0, KEPT);
+            long y = letter(2, "t", "k", "y", T0, KEPT);
+            seedWaiting();
+
+            for (var operation : List.of("redrive", "discard")) {
+                for (var body : List.of("{\"filter\":{\"topic\":\"t\",\"error\":\"x\",\"error\":null}}",
+                    "{\"ids\":[" + x + "],\"ids\":null,\"filter\":{\"topic\":\"t\"}}")) {
+                    var response = call("POST", "/dead-letters/" + operation, body);
+
+                    assertJson(response, 400);
+                    assertThat(response.body).as(operation + " " + body).startsWith("{\"message\":\"Duplicate ");
+                }
+            }
+            for (var path : List.of("/waiting/abandon", "/keys/abandon")) {
+                var response = call("POST", path, "{\"topic\":\"t\",\"key\":\"k\",\"key\":null,\"reason\":\"r\"}");
+
+                assertJson(response, 400);
+                assertThat(response.body).as(path).startsWith("{\"message\":\"Duplicate ").contains("key");
+            }
+            assertThat(deadIds()).containsExactly(x, y);
+            assertThat(outboxMessageIds()).isEmpty();
+            assertThat(retryCount()).isEqualTo(4);
+        });
+    }
+
     /**
      * Values Boot's mappers would coerce: {@code "failedTo":""} read as absent would widen a discard, {@code [1.5]}
      * would discard letter 1, {@code "dryRun":""} would move what a dry run should only count.

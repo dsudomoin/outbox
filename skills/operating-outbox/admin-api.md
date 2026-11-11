@@ -56,7 +56,7 @@ curl -s -H "$KEY" -H "$JSON" -d '{"topic":"orders","key":"order-42","reason":"ha
 ```
 
 - 200 with JSON (changing calls: `{"count": N}`; `waiting/abandon`, `keys/abandon`: `{"keys": N, "records": M}`); 400 rejected input
-  (unknown field, so a mistyped `key` never widens an abandon; over 1 000 `ids`, empty filter, not an orphan, blank
+  (unknown or repeated field, so a mistyped `key` or a second `"key": null` never widens an abandon; over 1 000 `ids`, empty filter, not an orphan, blank
   `topic` or `reason`; in `keys/abandon` not exactly one of `key` and `messageId`, or the `messageId` of a keyed record, or a body with no `Content-Type`); 401 / 403 from the authorizer; 415 a body that is not `application/json`; 409 not now (maintenance running, or a relay step holding the
   shard past `batchTimeout` + 5 s: retry; no xid regression); 500 otherwise. Every error body is `{"message": "..."}`.
 - Decide by a credential sent on purpose (a header), not a cookie. A non-GET/HEAD call gets 403 before the authorizer

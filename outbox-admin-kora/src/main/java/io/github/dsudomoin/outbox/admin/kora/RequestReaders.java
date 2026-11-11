@@ -11,13 +11,15 @@ import io.github.dsudomoin.outbox.admin.kora.model.Selection;
 import jakarta.annotation.Nullable;
 import java.io.IOException;
 import java.time.OffsetDateTime;
+import java.util.HashSet;
 import java.util.List;
 import java.util.UUID;
 import ru.tinkoff.kora.json.common.JsonReader;
 
 /**
  * The request bodies' readers, which refuse a field the contract does not name: the generated ones skip it, so a typo
- * such as {@code eror} would widen a discard to every letter the rest of the filter matches.
+ * such as {@code eror} would widen a discard to every letter the rest of the filter matches. They refuse a repeated
+ * field too: the parser keeps the last value, so {@code "error":"x","error":null} would drop the error from the filter.
  */
 final class RequestReaders {
 
@@ -30,7 +32,11 @@ final class RequestReaders {
             }
             List<Long> idList = null;
             Filter where = null;
+            var seen = new HashSet<String>();
             for (var field = parser.nextFieldName(); field != null; field = parser.nextFieldName()) {
+                if (!seen.add(field)) {
+                    throw new JsonParseException(parser, "duplicate field '" + field + "' in Selection");
+                }
                 var isNull = parser.nextToken() == JsonToken.VALUE_NULL;
                 switch (field) {
                     case "ids" -> idList = isNull ? null : ids.read(parser);
@@ -53,7 +59,11 @@ final class RequestReaders {
             OffsetDateTime failedFrom = null;
             OffsetDateTime failedTo = null;
             DeadLetterStatus status = null;
+            var seen = new HashSet<String>();
             for (var field = parser.nextFieldName(); field != null; field = parser.nextFieldName()) {
+                if (!seen.add(field)) {
+                    throw new JsonParseException(parser, "duplicate field '" + field + "' in Filter");
+                }
                 var isNull = parser.nextToken() == JsonToken.VALUE_NULL;
                 switch (field) {
                     case "topic" -> topic = string(parser, field);
@@ -80,7 +90,11 @@ final class RequestReaders {
             UUID messageId = null;
             String reason = null;
             Boolean dryRun = null;
+            var seen = new HashSet<String>();
             for (var field = parser.nextFieldName(); field != null; field = parser.nextFieldName()) {
+                if (!seen.add(field)) {
+                    throw new JsonParseException(parser, "duplicate field '" + field + "' in AbandonKey");
+                }
                 parser.nextToken();
                 switch (field) {
                     case "topic" -> topic = string(parser, field);
@@ -120,7 +134,11 @@ final class RequestReaders {
             String key = null;
             String reason = null;
             Boolean dryRun = null;
+            var seen = new HashSet<String>();
             for (var field = parser.nextFieldName(); field != null; field = parser.nextFieldName()) {
+                if (!seen.add(field)) {
+                    throw new JsonParseException(parser, "duplicate field '" + field + "' in AbandonWaiting");
+                }
                 parser.nextToken();
                 switch (field) {
                     case "topic" -> topic = string(parser, field);

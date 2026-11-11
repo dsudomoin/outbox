@@ -296,6 +296,32 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         assertThat(outboxMessageIds()).isEmpty();
     }
 
+    /** A repeated field must never widen a call: the last {@code "error":null} kept would discard the whole topic. */
+    @Test
+    void duplicateFieldsAreRefused() throws Exception {
+        long x = letter(1, "t", "k", "x", T0, KEPT);
+        long y = letter(2, "t", "k", "y", T0, KEPT);
+        seedWaiting();
+
+        for (var operation : List.of("redrive", "discard")) {
+            for (var body : List.of("{\"filter\":{\"topic\":\"t\",\"error\":\"x\",\"error\":null}}",
+                    "{\"ids\":[" + x + "],\"ids\":null,\"filter\":{\"topic\":\"t\"}}")) {
+                var response = call("POST", "/dead-letters/" + operation, body);
+
+                assertJson(response, 400);
+                assertThat(response.body()).as(operation + " " + body).startsWith("{\"message\":\"duplicate field '");
+            }
+        }
+        for (var path : List.of("/waiting/abandon", "/keys/abandon")) {
+            var response = call("POST", path, "{\"topic\":\"t\",\"key\":\"k\",\"key\":null,\"reason\":\"r\"}");
+
+            assertJson(response, 400);
+            assertThat(response.body()).as(path).startsWith("{\"message\":\"duplicate field 'key' in Abandon");
+        }
+        assertThat(deadIds()).containsExactly(x, y);
+        assertThat(outboxMessageIds()).isEmpty();
+    }
+
     @Test
     void idsAreCappedAt1000() throws Exception {
         long id = letter(1, "t", "k", "boom", T0, KEPT);
