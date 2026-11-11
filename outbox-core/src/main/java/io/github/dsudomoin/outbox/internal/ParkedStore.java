@@ -43,6 +43,11 @@ import java.util.TreeMap;
 public final class ParkedStore {
 
     private static final int PULLED_KEYS = 1024;
+    /**
+     * Most newer parked rows one statement of {@link #toRetry} moves: a key of millions of parked rows moves in many
+     * short statements of one transaction, so none of them meets a role's {@code statement_timeout}.
+     */
+    private static final int CARRIED = 1000;
 
     private final Duration delay;
     private final int batch;
@@ -51,6 +56,7 @@ public final class ParkedStore {
     private final String keep;
     private final String delete;
     private final String toRetry;
+    private final String carry;
     private final String toDead;
     private final String fromRetry;
     private final String selectDue;
@@ -90,8 +96,10 @@ public final class ParkedStore {
         keep = "update " + parked + " set due_at = greatest(due_at, ?) where id = ?";
         delete = "delete from " + parked + " where id = any(?)";
         // every part sees the tables as before the statement; key = null matches nothing, so an unkeyed row moves alone
-        toRetry = "with moved as (delete from " + parked + " where id = ? or (shard = ? and topic = ? and key = ?"
-                + " and id > ?) returning " + COLUMNS + ", attempts, requeues),"
+        var newerOfKey = "id = any(array(select id from " + parked + " where shard = ? and topic = ? and key = ?"
+                + " and id > ? order by id limit " + CARRIED + "))";
+        toRetry = "with moved as (delete from " + parked + " where id = ? or " + newerOfKey
+                + " returning " + COLUMNS + ", attempts, requeues),"
                 + " demoted as (update " + retry + " set next_attempt_at = null, waiting_since = null where shard = ?"
                 + " and topic = ? and key = ? and id > ? and next_attempt_at is not null),"
                 + " head as (insert into " + retry + " (" + COLUMNS + ", attempts, next_attempt_at, last_error,"
@@ -99,7 +107,10 @@ public final class ParkedStore {
                 + " where id = ? returning id),"
                 + " followers as (insert into " + retry + " (" + COLUMNS + ", attempts, requeues)"
                 + " select " + COLUMNS + ", attempts, requeues from moved where id <> ?)"
-                + " select count(*) from head";
+                + " select (select count(*) from head), count(*), max(id) from moved where id <> ?";
+        carry = "with moved as (delete from " + parked + " where " + newerOfKey + " returning " + COLUMNS
+                + ", attempts, requeues), followers as (insert into " + retry + " (" + COLUMNS + ", attempts, requeues)"
+                + " select " + COLUMNS + ", attempts, requeues from moved) select count(*), max(id) from moved";
         toDead = retries.toDead("delete from " + parked + " where id = ? returning " + COLUMNS, "?", "?");
         fromRetry = "with moved as (delete from " + retry + " where id = ? returning " + COLUMNS + ", attempts)"
                 + " insert into " + parked + " (" + COLUMNS + ", attempts, requeues, due_at)"
@@ -290,9 +301,12 @@ public final class ParkedStore {
      * {@code requeues} and waiting since {@code waitingSince} (null: not waiting): the key's retry heads with a higher
      * id become followers, which do not wait, and its parked rows with a higher id follow it, keeping their
      * {@code attempts} and {@code requeues}, so nothing newer of the key overtakes it. An unkeyed row moves alone.
+     * The parked rows move {@link #CARRIED} per statement, all of them before this returns.
      */
     public void toRetry(Connection c, int shard, OutboxRecord row, int attempts, Instant nextAttemptAt, String error,
             @Nullable Instant waitingSince) throws SQLException {
+        int carried;
+        long last;
         try (var ps = c.prepareStatement(toRetry)) {
             ps.setLong(1, row.id());
             bindNewerOfKey(ps, 2, shard, row); // parked rows
@@ -303,10 +317,29 @@ public final class ParkedStore {
             ps.setObject(13, waitingSince == null ? null : timestamp(waitingSince));
             ps.setLong(14, row.id());
             ps.setLong(15, row.id());
+            ps.setLong(16, row.id());
             try (var rs = ps.executeQuery()) {
                 rs.next();
                 requireOneRow(rs.getInt(1), "parked", row);
+                carried = rs.getInt(2);
+                last = rs.getLong(3);
             }
+            if (carried < CARRIED) {
+                return;
+            }
+        }
+        try (var ps = c.prepareStatement(carry)) {
+            ps.setShort(1, (short) shard);
+            ps.setString(2, row.topic());
+            ps.setBytes(3, row.key());
+            do {
+                ps.setLong(4, last);
+                try (var rs = ps.executeQuery()) {
+                    rs.next();
+                    carried = rs.getInt(1);
+                    last = rs.getLong(2);
+                }
+            } while (carried == CARRIED);
         }
     }
 

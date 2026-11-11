@@ -31,6 +31,7 @@ import java.util.Set;
 import java.util.UUID;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 class ParkedStoreIT {
@@ -236,6 +237,40 @@ class ParkedStoreIT {
     }
 
     @Test
+    void toRetryCarriesEveryNewerParkedRowOfAKeyLargerThanOneStatementMoves() throws SQLException {
+        seedParked(2_501);
+        var newerHead = record(3_000, "t", "k", 1, 0);
+        retries.apply(c, 0, List.of(new Head(newerHead, 1, NOW, "e")), NOW);
+
+        store.toRetry(c, 0, record(500, "t", "k", 0, 1), 2, LATER, "e500", null);
+
+        assertThat(parkedIds()).as("the rows below it stay").hasSize(499).last().isEqualTo(499L);
+        assertThat(retryRows()).hasSize(2_003)
+                .startsWith("500:0:2:1:" + LATER + ":e500", "501:0:0:1:null:null")
+                .endsWith("2501:0:0:1:null:null", "3000:0:1:0:null:e");
+        assertThat(waits()).allMatch(w -> w.endsWith(":null"));
+    }
+
+    @Test
+    @Tag("timing") // a moving statement must fit the timeout: a starved CI runner may miss it
+    void toRetryOfALowRowOfALargeParkedKeyFinishesUnderAStatementTimeout() throws SQLException {
+        seedParked(200_000);
+        try (var st = c.createStatement()) {
+            st.execute("set statement_timeout = '300ms'");
+        }
+
+        store.toRetry(c, 0, record(1, "t", "k", 0, 1), 1, LATER, "e", null);
+
+        try (var st = c.createStatement(); var rs = st.executeQuery("select (select count(*) from " + names.parked()
+                + "), count(*), count(next_attempt_at), min(id) filter (where next_attempt_at is not null) from "
+                + names.retry())) {
+            rs.next();
+            assertThat(List.of(rs.getLong(1), rs.getLong(2), rs.getLong(3), rs.getLong(4)))
+                    .containsExactly(0L, 200_000L, 1L, 1L);
+        }
+    }
+
+    @Test
     void toRetryOfAMissingRowFails() throws SQLException {
         var parked = record("t", "k");
         var gone = record("t", "k");
@@ -412,6 +447,15 @@ class ParkedStoreIT {
         assertThat(store.minDue(c, 0)).isEqualTo(NOW.plusSeconds(10));
         assertThat(store.minDue(c, 1)).isEqualTo(NOW);
         assertThat(store.size(c)).isEqualTo(3);
+    }
+
+    /** Rows 1..{@code rows} of key {@code k} of topic {@code t} on shard 0, requeued once and due now. */
+    private void seedParked(int rows) throws SQLException {
+        try (var st = c.createStatement()) {
+            st.execute("insert into " + names.parked() + " (id, shard, message_id, topic, key, payload, created_at,"
+                    + " attempts, requeues, due_at) select i, 0, gen_random_uuid(), 't', 'k'::bytea,"
+                    + " convert_to('k#' || i, 'UTF8'), now(), 0, 1, now() from generate_series(1, " + rows + ") i");
+        }
     }
 
     private void assertSameRecord(OutboxRecord actual, OutboxRecord expected, int attempts, int requeues) {
