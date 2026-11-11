@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import java.sql.Connection;
@@ -77,15 +78,7 @@ class DatabaseSettingsIT {
      */
     @Test
     void limitsOnTheRoleShorterThanAHandlerCallCutNothing() throws Exception {
-        var role = "lim_" + UUID.randomUUID().toString().substring(0, 8);
-        try (var c = superuser("test")) {
-            TestSql.execute(c, "create role " + role + " login password 'lim'");
-            TestSql.execute(c, "create schema " + role + " authorization " + role);
-            for (var setting : List.of("statement_timeout = '500ms'", "idle_in_transaction_session_timeout = '1s'",
-                    "transaction_timeout = '1s'", "lock_timeout = '200ms'", "idle_session_timeout = '3s'")) {
-                TestSql.execute(c, "alter role " + role + " set " + setting);
-            }
-        }
+        var role = limitedRole();
         var ds = pool("test", role, "lim", 12);
         var transactions = new JdbcTransactions(ds);
         var config = new TestOutboxConfig().table(role + ".outbox").inboxTable(role + ".inbox").shards(2)
@@ -145,6 +138,69 @@ class DatabaseSettingsIT {
         assertThat(status.halted()).isFalse();
         assertThat(status.maintenanceSinceSuccessSeconds()).as("maintenance succeeds").isLessThan(5);
         assertThat(status.instances()).singleElement().satisfies(i -> assertThat(i.live()).isTrue());
+    }
+
+    /**
+     * A start under the same role while another session holds the locks its bootstrap waits for, the outbox's schema
+     * lock and the inbox's maintenance lock (a sibling's bootstrap, a detach waiting in maintenance), for 3 s: longer
+     * than the role's 1 s {@code transaction_timeout}, shorter than the bootstrap's own lock wait. Both starts wait,
+     * and the session is not ended under them.
+     */
+    @Test
+    void aStartWaitsForASessionLockPastTheRoleTransactionTimeout() throws Exception {
+        var role = limitedRole();
+        var ds = pool("test", role, "lim", 12);
+        var transactions = new JdbcTransactions(ds);
+        var config = new TestOutboxConfig().table(role + ".outbox").inboxTable(role + ".inbox").shards(2);
+        var inbox = InboxRuntime.builder(config, transactions).build();
+        closing.add(inbox);
+        var runtime = OutboxRuntime.builder(config, transactions, record -> {}).build();
+        closing.add(runtime);
+        try (var holder = superuser("test")) {
+            TestSql.execute(holder, "select pg_advisory_lock(" + TableNames.of(config.table()).internalNamespace()
+                    + ", " + TableNames.LOCK_SCHEMA + "), pg_advisory_lock("
+                    + TableNames.of(config.inbox().table()).internalNamespace() + ", "
+                    + TableNames.LOCK_INBOX_MAINTENANCE + ")");
+            long started = System.nanoTime();
+            var release = CompletableFuture.runAsync(() -> {
+                try {
+                    Thread.sleep(3000);
+                    TestSql.execute(holder, "select pg_advisory_unlock_all()");
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+            });
+            var inboxStart = CompletableFuture.runAsync(() -> {
+                try {
+                    inbox.start();
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+            });
+            runtime.start();
+            inboxStart.get(30, TimeUnit.SECONDS);
+            release.get(30, TimeUnit.SECONDS);
+            assertThat(Duration.ofNanos(System.nanoTime() - started)).as("the starts waited for the locks")
+                    .isGreaterThan(Duration.ofMillis(2500));
+        }
+        assertThat(runtime.relay().running()).isTrue();
+    }
+
+    /**
+     * A role whose every limit is far shorter than the library's waits: a statement 500 ms, a transaction 1 s, a lock
+     * 200 ms, an idle session 3 s.
+     */
+    private static String limitedRole() throws SQLException {
+        var role = "lim_" + UUID.randomUUID().toString().substring(0, 8);
+        try (var c = superuser("test")) {
+            TestSql.execute(c, "create role " + role + " login password 'lim'");
+            TestSql.execute(c, "create schema " + role + " authorization " + role);
+            for (var setting : List.of("statement_timeout = '500ms'", "idle_in_transaction_session_timeout = '1s'",
+                    "transaction_timeout = '1s'", "lock_timeout = '200ms'", "idle_session_timeout = '3s'")) {
+                TestSql.execute(c, "alter role " + role + " set " + setting);
+            }
+        }
+        return role;
     }
 
     /**

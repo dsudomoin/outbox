@@ -150,7 +150,7 @@ public final class OrphanRestore {
                 st.execute("set local idle_in_transaction_session_timeout = "
                         + lockTimeout.plusSeconds(30).toMillis());
                 // the first chunk's read walks the rows below fromXid
-                st.execute("set local statement_timeout = " + scan.toMillis());
+                st.execute("set local statement_timeout = " + scan.toMillis() + Ticks.noTransactionTimeout(c));
                 st.execute("lock table " + table + " in access exclusive mode");
                 try (var ps = c.prepareStatement(chunk)) {
                     ps.setString(1, Long.toString(fromXid));
@@ -254,7 +254,8 @@ public final class OrphanRestore {
             st.execute("set transaction isolation level read committed");
             st.execute("set local lock_timeout = " + lockTimeout.toMillis());
             st.execute("set local idle_in_transaction_session_timeout = " + lockTimeout.plusSeconds(30).toMillis());
-            st.execute("set local statement_timeout = " + lockTimeout.plus(margin).toMillis());
+            st.execute("set local statement_timeout = " + lockTimeout.plus(margin).toMillis()
+                    + Ticks.noTransactionTimeout(c));
             st.execute("lock table " + table + " in access exclusive mode");
             st.execute("set local lock_timeout = " + keyLockTimeout.toMillis());
             try (var ps = c.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {

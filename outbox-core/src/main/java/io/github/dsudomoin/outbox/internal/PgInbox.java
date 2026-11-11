@@ -223,7 +223,9 @@ public final class PgInbox implements Inbox, AutoCloseable {
             // idle_session_timeout: a start the network cut off must not hold maintenance's lock for hours
             var settings = Map.of("lock_timeout", String.valueOf(LOCK_TIMEOUT.toMillis()),
                     "statement_timeout", String.valueOf(budget.toMillis()), "idle_session_timeout", "45000");
-            SocketBound.atLeast(c, budget, () -> SessionSettings.with(c, settings, () -> {
+            // transaction_timeout off: a shorter role default would end the session under the lock wait (25P04)
+            SocketBound.atLeast(c, budget, () -> SessionSettings.with(c, SessionSettings.noTransactionTimeout(c,
+                    settings), () -> {
                 bootstrap(c);
                 return null;
             }));

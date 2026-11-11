@@ -5,9 +5,29 @@ import static org.assertj.core.api.Assertions.assertThat;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
+import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
+import org.testcontainers.postgresql.PostgreSQLContainer;
 
 class PartitionDdlIT {
+
+    /** Postgres 17, the first with {@code transaction_timeout}; started by the first test that needs it. */
+    private static final class Pg17 {
+        static final PostgreSQLContainer INSTANCE =
+                new PostgreSQLContainer("postgres:17-alpine").withCommand("postgres", "-c", "fsync=off");
+
+        static {
+            INSTANCE.start();
+        }
+
+        static Connection connect() throws SQLException {
+            return DriverManager.getConnection(INSTANCE.getJdbcUrl(), INSTANCE.getUsername(), INSTANCE.getPassword());
+        }
+    }
 
     /**
      * A snapshot taken before another session dropped a range still lists it in {@code pg_inherits}, while
@@ -51,5 +71,46 @@ class PartitionDdlIT {
             assertThat(PartitionDdl.standalone(reader, parent, "_x[0-9]+")).containsExactly(parent + "_x2");
             reader.rollback();
         }
+    }
+
+    /**
+     * A drop of a detached range waits for a reader's lock for 3 s, under a session whose {@code transaction_timeout}
+     * (as a role or database default sets it) is 1 s: the drop waits its own lock timeout, the session is not ended.
+     */
+    @Test
+    void aDropWaitsForItsLockPastTheSessionTransactionTimeout() throws Exception {
+        var parent = TestSql.uniqueTable();
+        try (var c = Pg17.connect(); var reader = Pg17.connect()) {
+            TestSql.execute(c, "create table " + parent + " (xid xid8 not null) partition by range (xid)");
+            TestSql.execute(c, "create table " + parent + "_a (like " + parent + ")");
+            TestSql.execute(c, "create table " + parent + "_b (like " + parent + ")");
+            TestSql.execute(c, "set transaction_timeout = '1s'");
+
+            var held = holdFor3s(reader, parent + "_a");
+            assertThat(PartitionDdl.dropIfEmptyElseAttach(c, parent, parent + "_a", "0", "100",
+                    Duration.ofSeconds(5), Duration.ofSeconds(10))).isTrue();
+            held.get(30, TimeUnit.SECONDS);
+            held = holdFor3s(reader, parent + "_b");
+            assertThat(PartitionDdl.dropUnlessFound(c, parent + "_b", "select 1 from {table} limit 1", null,
+                    Duration.ofSeconds(5))).isTrue();
+            held.get(30, TimeUnit.SECONDS);
+            assertThat(TestSql.queryLong(c, "select count(*) from pg_class where relname like '" + parent + "\\_%'"))
+                    .as("both dropped").isZero();
+        }
+    }
+
+    /** Takes a lock on {@code table} in a transaction of {@code reader} and ends it 3 s later. */
+    private static CompletableFuture<Void> holdFor3s(Connection reader, String table) throws Exception {
+        reader.setAutoCommit(false);
+        TestSql.execute(reader, "lock table " + table + " in access share mode");
+        return CompletableFuture.runAsync(() -> {
+            try {
+                Thread.sleep(3000);
+                reader.commit();
+                reader.setAutoCommit(true);
+            } catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+        });
     }
 }

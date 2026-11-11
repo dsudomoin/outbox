@@ -47,6 +47,19 @@ final class SessionSettings {
         return session;
     }
 
+    /**
+     * {@code settings} with {@code transaction_timeout} off where the server has it (17+): for work that bounds its own
+     * waits, which a shorter role or database default would end with the session (FATAL 25P04), not a 55P03 or 57014.
+     */
+    static Map<String, String> noTransactionTimeout(Connection c, Map<String, String> settings) throws SQLException {
+        if (c.getMetaData().getDatabaseMajorVersion() < 17) {
+            return settings;
+        }
+        var off = new HashMap<>(settings);
+        off.put("transaction_timeout", "0");
+        return off;
+    }
+
     /** {@code body} under {@code settings} ({@link #set}), given back on every path. */
     static <T> T with(Connection c, Map<String, String> settings, SqlFunction0<T> body) throws SQLException {
         var session = set(c, settings);

@@ -308,7 +308,8 @@ public final class PartitionDdl {
         try (var st = c.createStatement()) {
             st.execute("set local lock_timeout = " + lockTimeout.toMillis());
             st.execute("set local statement_timeout = " + statementTimeout.toMillis());
-            st.execute("set local idle_in_transaction_session_timeout = " + lockTimeout.plusSeconds(30).toMillis());
+            st.execute("set local idle_in_transaction_session_timeout = " + lockTimeout.plusSeconds(30).toMillis()
+                    + Ticks.noTransactionTimeout(c));
             st.execute("lock table " + name(table) + " in access exclusive mode");
             try (var rs = st.executeQuery("select 1 from " + name(table) + " limit 1")) {
                 empty = !rs.next();
@@ -399,7 +400,8 @@ public final class PartitionDdl {
             st.execute("set transaction isolation level read committed");
             st.execute("set local lock_timeout = " + lockTimeout.toMillis());
             st.execute("set local statement_timeout = " + lockTimeout.plus(DDL_MARGIN).toMillis());
-            st.execute("set local idle_in_transaction_session_timeout = " + lockTimeout.plusSeconds(30).toMillis());
+            st.execute("set local idle_in_transaction_session_timeout = " + lockTimeout.plusSeconds(30).toMillis()
+                    + Ticks.noTransactionTimeout(c));
             found = finds(c, table, find, bound);
             if (!found) {
                 st.execute("lock table " + name(table) + " in access exclusive mode");

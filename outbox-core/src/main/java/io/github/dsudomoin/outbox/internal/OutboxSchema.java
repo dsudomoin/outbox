@@ -65,7 +65,9 @@ public final class OutboxSchema implements AutoCloseable {
      * Set on the bootstrap's session before the schema lock, so that wait is bounded too. {@code idle_session_timeout}
      * short of the minute other bootstraps wait for the schema lock, so Postgres ends the session of a start the network
      * cut off and frees its session locks in time for them; not a role's own value, which the reshard's tick wait must
-     * not be cut by ({@link #TICK_RECHECK}).
+     * not be cut by ({@link #TICK_RECHECK}). On Postgres 17+ also {@code transaction_timeout} off
+     * ({@link SessionSettings#noTransactionTimeout}): a role or database default shorter than these waits would end
+     * the session with FATAL 25P04, not the 55P03 the lock waits handle.
      */
     private static final Map<String, String> BOOTSTRAP_SETTINGS = Map.of(
             "lock_timeout", String.valueOf(LOCK_TIMEOUT.toMillis()),
@@ -409,7 +411,8 @@ public final class OutboxSchema implements AutoCloseable {
                 // first: behind a transaction-pooling proxy even the settings below would leak
                 PartitionDdl.requireSessionStable(c, "outbox bootstrap of " + spelled.base());
                 // a statement runs for as long as its timeout: silence only past that says the network dropped it
-                SocketBound.atLeast(c, STATEMENT_TIMEOUT, () -> SessionSettings.with(c, BOOTSTRAP_SETTINGS, () -> {
+                var settings = SessionSettings.noTransactionTimeout(c, BOOTSTRAP_SETTINGS);
+                SocketBound.atLeast(c, STATEMENT_TIMEOUT, () -> SessionSettings.with(c, settings, () -> {
                     // where the table is or will be created, so every spelling of it takes the same schema lock
                     var resolved = spelled.resolve(c);
                     if (heartbeat != null) { // before any DDL, and before the bootstrap writes the row
