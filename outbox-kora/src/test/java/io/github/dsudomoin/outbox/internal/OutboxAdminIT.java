@@ -648,6 +648,32 @@ class OutboxAdminIT {
         assertThat(wakes).hasValue(0);
     }
 
+    /**
+     * The orphan's size, read to bound its scan, waits for a lock another session holds on it at most the restore's
+     * lock timeout, as the rest of the restore does: the call holds the maintenance lock meanwhile.
+     */
+    @Test
+    void restoreOrphanSizeReadWaitsAtMostTheLockTimeout() throws Exception {
+        var orphan = foreignOrphan();
+        orphanRow(orphan, 1, 10, "row");
+        try (var holder = TestDb.connect(); var c = TestDb.connect()) {
+            holder.setAutoCommit(false);
+            TestSql.execute(holder, "lock table " + orphan + " in access exclusive mode");
+            pool.submit(() -> { // so a read without its bound ends, and fails the test instead of hanging it
+                Thread.sleep(3000);
+                holder.rollback();
+                return null;
+            });
+
+            assertThatThrownBy(() -> admin.orphanRestore.restore(c, orphan, 0, Duration.ofMillis(200)))
+                    .isInstanceOfSatisfying(SQLException.class, e -> assertThat(e.getSQLState()).isEqualTo("55P03"));
+            assertThat(queryString(c, "show lock_timeout")).as("given back").isEqualTo("0");
+        }
+
+        assertThat(count(orphan)).isOne();
+        assertThat(outboxMessageIds()).isEmpty();
+    }
+
     /** A read stuck behind a lock (or a slow scan) gives its pool connection back after readTimeout. */
     @Test
     void readsGiveUpAfterTheirTimeout() throws Exception {

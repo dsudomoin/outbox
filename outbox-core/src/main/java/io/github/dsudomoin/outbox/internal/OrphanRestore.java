@@ -57,7 +57,8 @@ public final class OrphanRestore {
 
     /**
      * Moves the rows of {@code table} with an xid at or above {@code fromXid} back into the outbox, then drops it:
-     * <b>its rows below {@code fromXid} go with the table</b>. First {@code create index if not exists <table>_id},
+     * <b>its rows below {@code fromXid} go with the table</b>. First its size, its lock waited for at most
+     * {@code lockTimeout}; then {@code create index if not exists <table>_id},
      * which, as each chunk's read before its key locks, may take {@code lockTimeout} + 60 s + a second per
      * {@link XidPartitions#ATTACH_SCAN_RATE} bytes of the table (a cut one fails the call with 57014 and says what to
      * run by hand); then chunks of {@link #CHUNK} rows in id order, each one read-committed transaction that holds
@@ -99,7 +100,9 @@ public final class OrphanRestore {
                     + ": a table " + names.partitionPrefix() + "<digits> or " + names.setAsidePrefix() + "<digits> in"
                     + " its schema and in no partition tree");
         }
-        long bytes = XidPartitions.relationSize(autocommit, table);
+        // its ACCESS SHARE waits for another session's lock on the table: at most lockTimeout, as the chunks' locks do
+        long bytes = PartitionDdl.withTimeouts(autocommit, lockTimeout, lockTimeout.plus(margin),
+                () -> XidPartitions.relationSize(autocommit, table));
         // the index build and the first chunk's walk past the rows below fromXid each read the whole table: time for
         // that at scanRate. Neither holds a writer back (ACCESS EXCLUSIVE on the standalone table alone, no key lock)
         var scan = lockTimeout.plus(margin).plusMillis(bytes * 1000 / scanRate);
