@@ -1785,7 +1785,17 @@ public final class ShardProcessor implements AutoCloseable {
             bugsSuppressed.incrementAndGet();
             return;
         }
-        log.error("{} ({} more since the previous report not logged)", what, bugsSuppressed.getAndSet(0), error);
+        long suppressed = bugsSuppressed.getAndSet(0);
+        try {
+            log.error("{} ({} more since the previous report not logged)", what, suppressed, error);
+        } catch (Throwable e) {
+            // the logger reads the error's message, which may throw: the step must still record the failure
+            if (e instanceof VirtualMachineError v && !(e instanceof StackOverflowError)) {
+                throw v;
+            }
+            log.error("{} ({} more since the previous report not logged): {}", what, suppressed,
+                    RetryStore.describe(error));
+        }
     }
 
     /** {@link OutboxHandler#windDownRequested()} without the interrupt flag: the call on this thread was cut. */

@@ -367,13 +367,17 @@ public final class RetryStore {
 
     /**
      * {@code error.toString()}, or its class name when that throws: a handler's exception may build its message from
-     * state it never set, and a throw here would roll back the step that records the failure, again on every pass.
-     * {@link StackOverflowError} is named as the relay rethrows any other {@link VirtualMachineError}.
+     * state it never set, or fail an assertion, or throw a checked exception undeclared, and a throw here would roll
+     * back the step that records the failure, again on every pass. Only a {@link VirtualMachineError} other than
+     * {@link StackOverflowError} is rethrown, as the relay rethrows it too.
      */
     static String describe(Throwable error) {
         try {
             return error.toString();
-        } catch (RuntimeException | LinkageError | StackOverflowError e) {
+        } catch (Throwable e) {
+            if (e instanceof VirtualMachineError v && !(e instanceof StackOverflowError)) {
+                throw v;
+            }
             return error.getClass().getName() + " (its toString() threw " + e.getClass().getName() + ")";
         }
     }

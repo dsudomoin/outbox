@@ -1755,6 +1755,42 @@ class ShardProcessorIT {
     }
 
     @Test
+    void errorWhoseMessageThrowsIsLoggedWithoutRollingTheStepBack() throws Exception {
+        bootstrap();
+        script = ((OutboxHandler) record -> {
+            if (payload("k#1").test(record)) {
+                throw new UnsetError();
+            }
+            handler.handle(record);
+        })::handleBatch;
+        send(msg("t", "a", "a#1"), msg("t", "k", "k#1"), msg("t", "b", "b#1"));
+        tick();
+        var described = UnsetError.class.getName() + " (its toString() threw " + NullPointerException.class.getName()
+                + ")";
+
+        try (var err = new CapturedStderr()) {
+            // the logger reads the message too: its throw must not roll back the step that records the failure
+            assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, true));
+            assertThat(err.text()).contains("ERROR " + ShardProcessor.class.getName()).contains(described);
+        }
+        assertThat(delivered()).containsExactly("a#1", "b#1");
+        assertThat(rows("select last_error from " + names.retry() + " where payload = 'k#1'::bytea",
+                rs -> rs.getString(1))).containsExactly(described);
+    }
+
+    /** An Error whose message reads a field it never set. */
+    private static final class UnsetError extends Error {
+
+        @Nullable
+        private Object detail;
+
+        @Override
+        public String getMessage() {
+            return "detail " + detail.hashCode();
+        }
+    }
+
+    @Test
     void maxAttemptsBoundsSingleKeyDivert() throws Exception {
         config.retry(INITIAL, Duration.ofMillis(500), 2); // below headFailuresBeforeDivert = 3
         bootstrap();

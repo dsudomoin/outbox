@@ -17,6 +17,7 @@ import io.github.dsudomoin.outbox.internal.BatchClassifier.Keep;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Park;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Unpark;
 import jakarta.annotation.Nullable;
+import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -155,6 +156,37 @@ class BatchClassifierTest {
                 .isEqualTo(advance(new Head(k1, THRESHOLD, NOW.plus(Duration.ofSeconds(4)), recursive)));
         assertThat(classify(0, new Item(k1, false, Outcome.permanent(new Lazy()))))
                 .isEqualTo(advance(new Dead(k1, 1, lazy)));
+        assertThat(classify(0, new Item(k1, false, Outcome.retry(new Asserting())), delivered(k2)))
+                .as("an AssertionError, as an assert does under -ea")
+                .isEqualTo(advance(new Head(k1, 1, NOW.plus(INITIAL), Asserting.class.getName()
+                        + " (its toString() threw " + AssertionError.class.getName() + ")")));
+        assertThat(classify(0, new Item(k1, false, Outcome.permanent(new Sneaky()))))
+                .as("a checked exception thrown sneakily, as a Kotlin getter may")
+                .isEqualTo(advance(new Dead(k1, 1, Sneaky.class.getName() + " (its toString() threw "
+                        + IOException.class.getName() + ")")));
+    }
+
+    /** An exception whose message getter fails an assertion. */
+    private static final class Asserting extends RuntimeException {
+
+        @Override
+        public String getMessage() {
+            throw new AssertionError("response read before it was set");
+        }
+    }
+
+    /** An exception whose message getter throws a checked exception without declaring it. */
+    private static final class Sneaky extends RuntimeException {
+
+        @Override
+        public String getMessage() {
+            return BatchClassifierTest.<RuntimeException>sneaky(new IOException("body not readable"));
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T extends Throwable> String sneaky(Throwable t) throws T {
+        throw (T) t;
     }
 
     /** An exception that builds its message from a field it never set. */
