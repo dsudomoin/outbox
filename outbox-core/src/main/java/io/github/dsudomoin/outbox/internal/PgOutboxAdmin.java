@@ -17,6 +17,7 @@ import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.sql.Types;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
@@ -502,8 +503,9 @@ public final class PgOutboxAdmin implements OutboxAdmin {
      * million; the outbox has no index on id, so reading them in id order per chunk would scan the shard each time.
      */
     private void recoverStranded(Connection c, int shard, long missing, AtomicLong moved) throws SQLException {
-        var latest = pinnedTick(c, shard, missing);
-        var pending = coveredRows(c, shard, latest, cursors.latest(c, shard).tick());
+        var current = cursors.latest(c, shard);
+        var latest = pinnedTick(c, shard, missing, current.cursor());
+        var pending = coveredRows(c, shard, latest, current.tick());
         try {
             Integer waitFor = null;
             for (int waits = 0; !pending.isEmpty(); waits++) {
@@ -551,20 +553,23 @@ public final class PgOutboxAdmin implements OutboxAdmin {
 
     /**
      * The tick the repair of {@code shard} goes to, committed on its own before any row moves: the one pinned in
-     * {@code <base>_stranded} while the shard is still stranded at {@code missing} with the same latest cursor row and
-     * that tick exists, else the latest tick, pinned now.
+     * {@code <base>_stranded} while the shard is still stranded at {@code missing} with its latest cursor row, {@code
+     * cursor}, on the same tick and target and that tick exists, else the latest tick, pinned now. A cursor row with
+     * other due times alone, as an abandon appends, keeps the pin: the shard is where it was.
      */
-    private Ticks.Tick pinnedTick(Connection c, int shard, long missing) throws SQLException {
+    private Ticks.Tick pinnedTick(Connection c, int shard, long missing, Cursors.Cursor cursor) throws SQLException {
         try (var ps = c.prepareStatement("insert into " + names.stranded() + " as p (shard, stranded_tick_id,"
-                + " cursor_seq, tick_id) select ?, ?, (select max(seq) from " + names.cursor() + " where shard = ?),"
-                + " (select max(id) from " + names.tick() + ") on conflict (shard) do update set"
-                + " stranded_tick_id = excluded.stranded_tick_id, cursor_seq = excluded.cursor_seq,"
+                + " cursor_tick_id, cursor_target_tick_id, tick_id) select ?, ?, ?, ?, (select max(id) from "
+                + names.tick() + ") on conflict (shard) do update set stranded_tick_id = excluded.stranded_tick_id,"
+                + " cursor_tick_id = excluded.cursor_tick_id, cursor_target_tick_id = excluded.cursor_target_tick_id,"
                 + " tick_id = excluded.tick_id where p.stranded_tick_id <> excluded.stranded_tick_id"
-                + " or p.cursor_seq <> excluded.cursor_seq"
+                + " or p.cursor_tick_id <> excluded.cursor_tick_id"
+                + " or p.cursor_target_tick_id is distinct from excluded.cursor_target_tick_id"
                 + " or not exists (select 1 from " + names.tick() + " t where t.id = p.tick_id)")) {
             ps.setShort(1, (short) shard);
             ps.setLong(2, missing);
-            ps.setShort(3, (short) shard);
+            ps.setLong(3, cursor.tickId());
+            ps.setObject(4, cursor.targetTickId(), Types.BIGINT);
             ps.executeUpdate();
         }
         try (var ps = c.prepareStatement("select tick_id from " + names.stranded() + " where shard = ?")) {

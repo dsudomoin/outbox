@@ -305,6 +305,64 @@ class StrandedShardsIT {
                 .isEqualTo(sent);
     }
 
+    /**
+     * An abandon between a call that failed midway and its repeat appends a cursor row with new due times alone: the
+     * shard is still stranded at the same tick, and the repeat goes on from the first call's tick.
+     */
+    @Test
+    void aCursorRowWithNewDueTimesAloneKeepsTheTickACallRepeatedAfterAFailureGoesTo() throws Exception {
+        leaveTheOtherShardsOnANewerTick();
+        var key = keyOfShard(1);
+        var sent = new ArrayList<UUID>();
+        for (int i = 0; i < 3; i++) { // over a chunk of 1 000 rows, one key
+            var messages = new ArrayList<OutboxMessage>();
+            for (int j = 0; j < 500; j++) {
+                messages.add(OutboxMessage.of(TOPIC, key, "p".getBytes(UTF_8)));
+            }
+            sent.addAll(transactions.inTx(c -> writer.outbox().sendAll(messages)));
+        }
+        // two keys in the retry table, after the key's rows: the first call's chunk is of that key alone
+        var abandoned = keyOfShard(1);
+        var waiting = keyOfShard(1);
+        var inRetry = List.of(send(abandoned), send(waiting));
+        try (var c = direct.getConnection()) {
+            var columns = "id, shard, message_id, topic, key, payload, headers, created_at";
+            for (var id : inRetry) {
+                execute(c, "insert into " + names.retry() + " (" + columns + ", attempts, next_attempt_at,"
+                        + " last_error) select " + columns + ", 1, now() + interval '1 hour', 'down' from "
+                        + names.base() + " where message_id = '" + id + "'");
+            }
+        }
+        makeATick();
+        deleteTheirTick();
+        startRelay();
+        var once = new AtomicBoolean();
+        admin().afterChunk = c -> {
+            if (once.compareAndSet(false, true)) {
+                throw new SQLException("connection lost after the first chunk", "08006");
+            }
+        };
+        assertThatThrownBy(() -> admin().recoverStrandedShards());
+        admin().afterChunk = null;
+        makeATick();
+        var seq = "select max(seq) from " + names.cursor() + " where shard = 1";
+        long before;
+        try (var c = direct.getConnection()) {
+            before = queryLong(c, seq);
+        }
+        assertThat(admin().abandonKey(TOPIC, abandoned.getBytes(UTF_8), "test", false).records()).isEqualTo(1);
+        try (var c = direct.getConnection()) {
+            assertThat(queryLong(c, seq)).as("a cursor row with the waiting key's due").isGreaterThan(before);
+        }
+
+        assertThat(admin().recoverStrandedShards()).as("only the rows the first call left").isEqualTo(500);
+
+        await(() -> delivered.containsAll(sent));
+        var mine = new HashSet<>(sent);
+        assertThat(order.stream().filter(mine::contains).distinct().toList()).as("the key in send order")
+                .isEqualTo(sent);
+    }
+
     @Test
     void aShardMidBatchWhoseTargetTickIsGoneIsStuckUntilTheCallAndGetsOnlyItsNewRowsBack() throws Exception {
         config.maintenanceInterval(Duration.ofMillis(100));

@@ -677,13 +677,14 @@ public final class OutboxSchema implements AutoCloseable {
                       tail_oversized_since timestamptz
                     )""");
             // PgOutboxAdmin#recoverStrandedShards: the tick each stranded shard's repair goes to, while it is stranded
-            // at stranded_tick_id with its latest cursor row at cursor_seq
+            // at stranded_tick_id with its latest cursor row on cursor_tick_id and cursor_target_tick_id
             st.execute("create table if not exists " + n.stranded() + """
                      (
-                      shard            smallint primary key,
-                      stranded_tick_id bigint not null,
-                      cursor_seq       bigint not null,
-                      tick_id          bigint not null
+                      shard                 smallint primary key,
+                      stranded_tick_id      bigint not null,
+                      cursor_tick_id        bigint not null,
+                      cursor_target_tick_id bigint,
+                      tick_id               bigint not null
                     )""");
             // XidPartitions: when any instance first saw the hot tail over maxTailScan, null while none is
             addColumn(c, n.maintenance(), "tail_oversized_since", "timestamptz"); // the previous release's table

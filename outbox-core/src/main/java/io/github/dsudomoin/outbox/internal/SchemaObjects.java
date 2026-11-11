@@ -130,7 +130,8 @@ public record SchemaObjects(List<Table> tables) {
                 plain(n.stranded(), List.of(
                         column("shard", "smallint", true),
                         column("stranded_tick_id", "bigint", true),
-                        column("cursor_seq", "bigint", true),
+                        column("cursor_tick_id", "bigint", true),
+                        column("cursor_target_tick_id", "bigint", false),
                         column("tick_id", "bigint", true)),
                         List.of("primary key (shard)"), List.of(), List.of()),
                 plain(n.dropping(), List.of(
