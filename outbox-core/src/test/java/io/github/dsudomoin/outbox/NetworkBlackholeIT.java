@@ -1086,6 +1086,38 @@ class NetworkBlackholeIT {
         }
     }
 
+    @Test
+    void aSilentCursorReadOnOneConnectionHoldsNoOtherWorker() throws Exception {
+        var armed = new AtomicBoolean();
+        var once = new AtomicBoolean();
+        var silent = new CountDownLatch(1);
+        Set<UUID> delivered = ConcurrentHashMap.newKeySet();
+        // one relay connection goes silent in its cursor read until its networkTimeout, the others stay healthy
+        var transactions = new JdbcTransactions(intercepting(DIRECT, (c, call, args) -> {
+            if (armed.get() && call.getName().equals("prepareStatement")
+                    && ((String) args[0]).startsWith("with c0 as (select c.* from generate_series")
+                    && Thread.currentThread().getName().startsWith("outbox-relay-") && once.compareAndSet(false, true)) {
+                silent.countDown();
+                Thread.sleep(30_000);
+            }
+        }));
+        var relay = OutboxRuntime.builder(new TestOutboxConfig().workers(4).shards(16), transactions,
+                record -> delivered.add(record.messageId())).build();
+        closing.add(relay);
+        relay.start();
+        var sent = new HashSet<UUID>();
+        sent.add(send(relay, transactions, "before"));
+        await(() -> delivered.containsAll(sent));
+
+        armed.set(true);
+        assertThat(silent.await(10, TimeUnit.SECONDS)).isTrue();
+        for (int i = 0; i < 10; i++) {
+            sent.add(send(relay, transactions, "k" + i));
+        }
+
+        await(Duration.ofSeconds(3), () -> delivered.containsAll(sent));
+    }
+
     private static UUID send(OutboxRuntime runtime, JdbcTransactions transactions, String key) {
         return transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", key, "p".getBytes(UTF_8))));
     }

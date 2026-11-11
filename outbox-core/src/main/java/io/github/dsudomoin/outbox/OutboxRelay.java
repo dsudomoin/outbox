@@ -91,6 +91,12 @@ public final class OutboxRelay implements AutoCloseable {
     private final DatabaseClock clock;
     private final long idleNanos;
     private final long minTickNanos;
+    /**
+     * How long a worker waits for a sibling's cursor read before reading them itself: {@code max(1 s, 5 ×
+     * idlePollInterval)}, far above a read's normal time, so one connection gone silent in it holds no other worker
+     * past this.
+     */
+    private final long roundWaitNanos;
     /** {@link #PASS_BOUND}, a shorter one only in tests; set before {@link #start()}. */
     long passBound = PASS_BOUND;
     private final SocketBound socket;
@@ -143,10 +149,14 @@ public final class OutboxRelay implements AutoCloseable {
     private final AtomicIntegerArray wanted;
     /** Per shard, the latest tick of the step of it that {@link #stepStarted} times. */
     private final AtomicLongArray steppedTick;
-    /** The candidates of the latest tick a worker read them for; replaced under {@link #roundLock}. */
+    /** The candidates of the latest tick a worker read them for; replaced under {@link #roundSwap}, never by an older. */
     @Nullable
     private volatile Round round;
+    private final Object roundSwap = new Object();
+    /** Held by the worker reading the cursors for a new tick, so the others wait for its round instead of reading too. */
     private final ReentrantLock roundLock = new ReentrantLock();
+    /** When the {@link #roundLock}'s holder took it ({@code nanoTime}). */
+    private volatile long roundReadSince;
     /** Incremented by every step that put shards back into a round; parked workers wake on it. */
     private final AtomicLong requeued = new AtomicLong();
     /** The workers parked in {@link Worker#awaitWork}: a put-back wakes one of them, not one blocked elsewhere. */
@@ -198,6 +208,8 @@ public final class OutboxRelay implements AutoCloseable {
         this.heartbeat = new Heartbeat(db, schema, config, relay.enabled() && deadLetters.active(), clock);
         this.idleNanos = relay.idlePollInterval().toNanos();
         this.minTickNanos = relay.minTickInterval().toNanos();
+        this.roundWaitNanos = Math.max(TimeUnit.SECONDS.toNanos(1), 5 * idleNanos);
+        this.roundReadSince = System.nanoTime() - roundWaitNanos;
         this.socket = new SocketBound(config.networkTimeout());
         this.idleTickAge = Duration.ofNanos(Math.max(minTickNanos, idleNanos - idleNanos / 4));
         this.lastTickAttempt = System.nanoTime() - idleNanos; // the first pass ticks
@@ -911,23 +923,44 @@ public final class OutboxRelay implements AutoCloseable {
         }
 
         /**
-         * Makes sure {@link #round} is of the latest tick: reads the latest tick and, when the round is of another, the
-         * cursors, under {@link #roundLock}, so the workers of this relay read the cursors once per tick and never
-         * replace a round with one of an older tick.
+         * Makes sure {@link #round} is of the latest tick or a newer one: reads the latest tick and, when the round is
+         * older, the cursors, under {@link #roundLock}, so the workers of this relay read the cursors once per tick. A
+         * worker waits for a sibling's read only until it is {@link #roundWaitNanos} old, then reads on its own
+         * connection without the lock: a sibling whose connection went silent in its read holds nobody else past that.
+         * A round is never replaced with one of an older tick, as such a sibling's read may land late.
          */
         private void readRound(Connection c) throws SQLException, InterruptedException {
-            roundLock.lockInterruptibly();
+            long latest = ticks.latest(c, clock).id();
+            if (current(latest)) {
+                return;
+            }
+            boolean locked = roundLock.tryLock()
+                    || roundLock.tryLock(roundWaitNanos - (System.nanoTime() - roundReadSince), TimeUnit.NANOSECONDS);
             try {
-                long latest = ticks.latest(c, clock).id();
-                var r = round;
-                if (r == null || r.latest != latest) {
-                    var selected = clock.now();
-                    long read = System.nanoTime();
-                    round = new Round(latest, read, candidates(cursors.positions(c, latest), selected));
+                if (locked) {
+                    roundReadSince = System.nanoTime();
+                }
+                if (current(latest)) { // a sibling read it meanwhile
+                    return;
+                }
+                var selected = clock.now();
+                long read = System.nanoTime();
+                var next = new Round(latest, read, candidates(cursors.positions(c, latest), selected));
+                synchronized (roundSwap) {
+                    if (!current(latest)) {
+                        round = next;
+                    }
                 }
             } finally {
-                roundLock.unlock();
+                if (locked) {
+                    roundLock.unlock();
+                }
             }
+        }
+
+        private boolean current(long latest) {
+            var r = round;
+            return r != null && r.latest >= latest;
         }
 
         /**
