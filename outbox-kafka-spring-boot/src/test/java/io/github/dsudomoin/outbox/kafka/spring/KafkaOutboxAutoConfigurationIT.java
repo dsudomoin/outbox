@@ -503,14 +503,18 @@ class KafkaOutboxAutoConfigurationIT {
     void deliversAfterRestart() {
         var topic = TestKafka.createTopic(1);
         runner().run(context -> {
-            send(context, topic);
+            var a = send(context, topic);
             TestKafka.consumeUntil(topic, WAIT, r -> r.size() == 1);
 
             context.stop();
             context.start();
 
-            send(context, topic);
-            TestKafka.consumeUntil(topic, WAIT, r -> r.size() == 2);
+            var b = send(context, topic);
+            var ids = TestKafka.consumeUntil(topic, WAIT,
+                r -> r.stream().map(KafkaOutboxHeaders::messageId).toList().contains(b))
+                .stream().map(KafkaOutboxHeaders::messageId).toList();
+            assertThat(ids).as("A before the restart, B after it").contains(a);
+            assertThat(ids.indexOf(a)).isLessThan(ids.indexOf(b));
         });
     }
 

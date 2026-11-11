@@ -226,13 +226,19 @@ class HeartbeatIT {
         });
     }
 
+    /** The build that checks the handlers fails in the bean method, before the start that derives the pool. */
     @Test
-    void aFailedBuildOrStartClosesThePool() {
-        TestApps.runner("spring.datasource.hikari.pool-name=" + pool).run(context ->
-            assertThat(context).as("no handler, no route").hasFailed().getFailure().rootCause()
-                .isInstanceOf(IllegalArgumentException.class));
-        await().atMost(WAIT).until(() -> !poolRuns());
+    void aFailedBuildDerivesNoPool() {
+        try (var log = new CapturedStderr()) {
+            TestApps.runner("spring.datasource.hikari.pool-name=" + pool).run(context ->
+                assertThat(context).as("no handler, no route").hasFailed().getFailure().rootCause()
+                    .isInstanceOf(IllegalArgumentException.class));
+            assertThat(log.text()).doesNotContain(derived() + " - Starting...");
+        }
+    }
 
+    @Test
+    void aFailedStartClosesThePool() {
         try (var log = new CapturedStderr()) {
             runner("outbox.table=s" + TestSql.uniqueTable() + ".outbox") // in a schema that does not exist
                 .run(context -> {
@@ -244,11 +250,13 @@ class HeartbeatIT {
         await().atMost(WAIT).until(() -> !poolRuns());
     }
 
-    /** A refresh that fails before the start, after the lifecycle's creation, leaves no pool behind. */
+    /** A refresh that fails before the start, after the lifecycle's creation, derives no pool. */
     @Test
-    void aRefreshThatFailsBeforeTheStartClosesThePool() {
-        runner().withBean(OutboxLifecycleIT.EarlySender.class).run(context -> assertThat(context).hasFailed());
-        await().atMost(WAIT).until(() -> !poolRuns());
+    void aRefreshThatFailsBeforeTheStartDerivesNoPool() {
+        try (var log = new CapturedStderr()) {
+            runner().withBean(OutboxLifecycleIT.EarlySender.class).run(context -> assertThat(context).hasFailed());
+            assertThat(log.text()).doesNotContain(derived() + " - Starting...");
+        }
     }
 
     @Test
