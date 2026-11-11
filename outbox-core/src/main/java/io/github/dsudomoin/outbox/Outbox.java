@@ -40,8 +40,9 @@ public interface Outbox {
     UUID send(Connection connection, OutboxMessage message);
 
     /**
-     * Bulk {@link #send(OutboxMessage)}: two statements whatever the size, ids in input order. Locks all its keys at
-     * once in a fixed order, so transactions that each take their outbox key locks in one {@code sendAll} cannot
+     * Bulk {@link #send(OutboxMessage)}: one statement that locks the keys, then one insert per 64 MB of keys,
+     * payloads and headers (one for most lists), ids in input order. Locks all its keys at once in a fixed order,
+     * before the first insert, so transactions that each take their outbox key locks in one {@code sendAll} cannot
      * deadlock on them. A transaction that already holds key locks, from an earlier {@code send} or {@code sendAll},
      * can deadlock with another that takes the same keys in a different order; Postgres then aborts one of them. The
      * safe rule: send all keyed messages of a transaction in one {@code sendAll}, with no other {@code send} in that

@@ -11,6 +11,9 @@ import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
+import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
@@ -18,8 +21,10 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 
@@ -135,6 +140,84 @@ class ResenderIT {
 
         assertThat(stored()).extracting(Stored::messageId).as("ids in commit order")
                 .containsExactly(aId, other.messageId(), same.messageId());
+    }
+
+    @Test
+    void insertsAListOverTheStatementBoundInConsecutiveStatementsInListOrder() throws Exception {
+        var rows = new ArrayList<Resender.Row>();
+        for (int i = 0; i < 51; i++) {
+            var payload = new byte[i == 25 ? 1_500_000 : 100_000]; // one row over the bound on its own
+            payload[0] = (byte) i;
+            rows.add(new Resender.Row(UUID.randomUUID(), "t", i % 2 == 0 ? null : bytes("k" + i % 7), payload, null));
+        }
+        var inserts = new AtomicInteger();
+        var locks = new AtomicInteger();
+
+        try (var c = TestDb.connect()) {
+            c.setAutoCommit(false);
+            var counted = counting(c, inserts, locks);
+            assertThat(new Resender(names, config.shards(), ShardGuard.NONE, 1 << 20).insertAll(counted, rows))
+                    .isEqualTo(rows.size());
+            c.commit();
+        }
+
+        // 10 rows of 100 KB fit 1 MB: 0-9, 10-19, 20-24, the 1.5 MB row alone, 26-35, 36-45, 46-50
+        assertThat(inserts).as("insert statements").hasValue(7);
+        assertThat(locks).as("every key locked once, before the first insert").hasValue(1);
+        var stored = stored();
+        assertThat(stored).extracting(Stored::messageId).as("ids in list order")
+                .containsExactlyElementsOf(rows.stream().map(Resender.Row::messageId).toList());
+        for (int i = 0; i < rows.size(); i++) {
+            assertThat(stored.get(i).payload()).isEqualTo(rows.get(i).payload());
+        }
+        try (var c = TestDb.connect()) {
+            assertThat(queryLong(c, "select count(distinct xmin::text) from " + names.base()))
+                    .as("one transaction").isEqualTo(1);
+        }
+    }
+
+    /**
+     * About 1.13 GB of payloads, over the 1 GB a Bind message may carry; the rows share one array, so only the
+     * driver's encoding of a statement's arrays takes heap, 64 MB a statement. As one statement the list would fail
+     * in the driver with "Bind message length ... too long", after encoding 1.13 GB in the heap.
+     */
+    @Test
+    @Tag("chaos")
+    void insertsAListOverTheBindMessageLimit() throws Exception {
+        var payload = new byte[1_100_000];
+        var rows = new ArrayList<Resender.Row>();
+        for (int i = 0; i < 1030; i++) {
+            rows.add(new Resender.Row(UUID.randomUUID(), "t", null, payload, null));
+        }
+
+        try (var c = TestDb.connect()) {
+            c.setAutoCommit(false);
+            assertThat(new Resender(names, config.shards()).insertAll(c, rows)).isEqualTo(rows.size());
+            c.commit();
+        }
+
+        try (var c = TestDb.connect()) {
+            assertThat(queryLong(c, "select count(*) from " + names.base())).isEqualTo(rows.size());
+        }
+    }
+
+    /** {@code c}, counting the insert and key-lock statements prepared on it. */
+    private static Connection counting(Connection c, AtomicInteger inserts, AtomicInteger locks) {
+        return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[] {Connection.class},
+                (proxy, method, args) -> {
+                    if (method.getName().equals("prepareStatement") && args[0] instanceof String sql) {
+                        if (sql.startsWith("insert ")) {
+                            inserts.incrementAndGet();
+                        } else if (sql.contains("pg_advisory_xact_lock")) {
+                            locks.incrementAndGet();
+                        }
+                    }
+                    try {
+                        return method.invoke(c, args);
+                    } catch (InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
     }
 
     private List<Stored> stored() throws SQLException {

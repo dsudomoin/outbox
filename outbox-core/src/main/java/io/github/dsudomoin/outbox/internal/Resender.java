@@ -33,6 +33,12 @@ public final class Resender {
     private static final String TRY_LOCKS = "select array_agg(h) filter (where not pg_try_advisory_xact_lock(?, h))"
             + " from unnest(?::int[]) h";
 
+    /**
+     * The bound on the key, payload and header bytes of one {@link #insertAll} statement: a Bind message, every array
+     * of the statement in it, may carry at most 1 GB, and the driver encodes the arrays in the heap first.
+     */
+    static final long STATEMENT_BYTES = 64L << 20;
+
     /** A row to insert; {@code headers} in the stored encoding ({@link HeaderCodec}). */
     public record Row(
             UUID messageId, String topic, @Nullable byte[] key, @Nullable byte[] payload, @Nullable byte[] headers) {}
@@ -45,6 +51,7 @@ public final class Resender {
     private final int shards;
     private final ShardGuard guard;
     private final String insertAll;
+    private final long statementBytes;
 
     /**
      * Without the instance's {@link ShardGuard}: for tests. Main code builds it from the resolved config
@@ -60,7 +67,13 @@ public final class Resender {
     }
 
     Resender(TableNames names, int shards, ShardGuard guard) {
+        this(names, shards, guard, STATEMENT_BYTES);
+    }
+
+    /** {@code statementBytes}: as {@link #STATEMENT_BYTES}, smaller in tests. */
+    Resender(TableNames names, int shards, ShardGuard guard, long statementBytes) {
         this.names = names;
+        this.statementBytes = statementBytes;
         this.guard = guard;
         this.keyNamespace = names.keyNamespace();
         this.shards = shards;
@@ -92,10 +105,11 @@ public final class Resender {
     }
 
     /**
-     * Locks the rows' distinct key hashes in one statement, then inserts them in one, ids in list order; unkeyed rows
-     * take no lock and land on a random shard. Every key lock is held until {@code inTx} ends, so callers bound the
-     * list. Returns the rows inserted. Throws {@link IllegalStateException} while the instance's {@link ShardGuard}
-     * finds the cursors on another shard count.
+     * Locks the rows' distinct key hashes in one statement, then inserts them, ids in list order: in one statement, or
+     * in consecutive ones of at most {@link #STATEMENT_BYTES} of keys, payloads and headers each when the list holds
+     * more (a row over it in one of its own). Unkeyed rows take no lock and land on a random shard. Every key lock is
+     * held until {@code inTx} ends, so callers bound the list. Returns the rows inserted. Throws
+     * {@link IllegalStateException} while the instance's {@link ShardGuard} finds the cursors on another shard count.
      */
     public int insertAll(Connection inTx, List<Row> rows) throws SQLException {
         guard.require(names, shards);
@@ -117,15 +131,36 @@ public final class Resender {
             headers[i] = r.headers();
         }
         var rowShards = lockKeys(inTx, topics, keys);
-        try (var ps = inTx.prepareStatement(insertAll)) {
-            ps.setArray(1, inTx.createArrayOf("int2", rowShards));
-            ps.setArray(2, inTx.createArrayOf("uuid", ids));
-            ps.setArray(3, inTx.createArrayOf("text", topics));
-            ps.setArray(4, inTx.createArrayOf("bytea", keys));
-            ps.setArray(5, inTx.createArrayOf("bytea", payloads));
-            ps.setArray(6, inTx.createArrayOf("bytea", headers));
-            return ps.executeUpdate();
+        int inserted = 0;
+        for (int from = 0, to; from < n; from = to) {
+            long bytes = 0;
+            for (to = from; to < n; to++) {
+                long size = length(keys[to]) + length(payloads[to]) + length(headers[to]);
+                if (to > from && bytes + size > statementBytes) {
+                    break;
+                }
+                bytes += size;
+            }
+            try (var ps = inTx.prepareStatement(insertAll)) {
+                ps.setArray(1, inTx.createArrayOf("int2", slice(rowShards, from, to)));
+                ps.setArray(2, inTx.createArrayOf("uuid", slice(ids, from, to)));
+                ps.setArray(3, inTx.createArrayOf("text", slice(topics, from, to)));
+                ps.setArray(4, inTx.createArrayOf("bytea", slice(keys, from, to)));
+                ps.setArray(5, inTx.createArrayOf("bytea", slice(payloads, from, to)));
+                ps.setArray(6, inTx.createArrayOf("bytea", slice(headers, from, to)));
+                inserted += ps.executeUpdate();
+            }
         }
+        return inserted;
+    }
+
+    private static long length(@Nullable byte[] bytes) {
+        return bytes == null ? 0 : bytes.length;
+    }
+
+    /** {@code a} itself when the range is all of it, the common case of a list under the bound. */
+    private static <T> T[] slice(T[] a, int from, int to) {
+        return from == 0 && to == a.length ? a : Arrays.copyOfRange(a, from, to);
     }
 
     /**
