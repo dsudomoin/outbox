@@ -110,6 +110,16 @@ public interface OutboxConfig {
             return Duration.ofSeconds(30);
         }
 
+        /**
+         * How long a relay worker starts steps on one pooled connection under a backlog before it hands it back and
+         * takes another, so the pool can retire it at its maxLifetime. A step started just before this ends runs on
+         * the same connection, up to 4 × {@link #batchTimeout()}: a pool's leak detection threshold must exceed
+         * connectionHold + 4 × batchTimeout.
+         */
+        default Duration connectionHold() {
+            return Duration.ofMinutes(1);
+        }
+
         default int headFailuresBeforeDivert() {
             return 3;
         }

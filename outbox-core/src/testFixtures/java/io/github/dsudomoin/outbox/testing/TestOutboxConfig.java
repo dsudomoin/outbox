@@ -25,6 +25,7 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     private Duration idlePollInterval = Duration.ofMillis(20);
     private Duration batchTimeout = Duration.ofSeconds(5);
     private Duration shutdownTimeout = Duration.ofSeconds(5);
+    private Duration connectionHold = Duration.ofMinutes(1);
     private Duration networkTimeout = Duration.ofMinutes(5);
     private int headFailuresBeforeDivert = 3;
     private Duration cursorAnchorInterval = Duration.ofHours(1);
@@ -247,6 +248,16 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
 
     public TestOutboxConfig shutdownTimeout(Duration shutdownTimeout) {
         this.shutdownTimeout = shutdownTimeout;
+        return this;
+    }
+
+    @Override
+    public Duration connectionHold() {
+        return connectionHold;
+    }
+
+    public TestOutboxConfig connectionHold(Duration connectionHold) {
+        this.connectionHold = connectionHold;
         return this;
     }
 

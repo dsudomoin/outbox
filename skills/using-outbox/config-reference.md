@@ -28,13 +28,14 @@ outbox {
 | Key | Default | Rule and meaning |
 |---|---|---|
 | `enabled` | `true` | `false`: no relay workers, no partition maintenance and no dead-letter pass on this instance (the hook then gets letters only from the pass at the end of `drain()`); `OutboxRelay.drain()` still works; the heartbeat still runs. Keep it on for at least one production instance. |
-| `workers` | `4` | ≥ 1. Relay threads per instance; each holds a DB connection while working, and under a backlog hands it back to the pool and takes another every minute, once the step in flight ends; a step can run up to 4 × `batchTimeout` (see `batchTimeout`), so a pool's `leakDetectionThreshold` must exceed 1 min + 4 × `batchTimeout`. |
+| `workers` | `4` | ≥ 1. Relay threads per instance; each holds a DB connection while working, and under a backlog hands it back to the pool and takes another every `connectionHold`, once the step in flight ends. |
 | `batchSize` | `1000` | ≥ 1. Rows per chunk read and per handler call, for every handler. A call may also carry the parked (requeued) records of the chunk's keys: up to 2 × `batchSize` records. A key with more parked records than `batchSize` brings none of them: it comes in portions, see `requeue.md`. |
 | `maxTicksPerBatch` | `100` | ≥ 1. |
 | `minTickInterval` | `50ms` | ≥ 0. Under load, at most one tick per interval. |
 | `idlePollInterval` | `200ms` | > 0. Idle tick rate; how fast a commit on another instance is noticed. |
 | `batchTimeout` | `30s` | > 0, ≤ 24 days. Bound of one handler call: wind-down at 80 %, abandoned (all records retried) at 100 %. With Kafka ≥ `delivery.timeout.ms + 5 s + max.block.ms`. `drain()` gives up after 4 × this + 10 s without progress, longer than a relay step runs: a step over several shards starts a shard's retry pass until it has spent `batchTimeout`, one started just before runs up to 2 × `batchTimeout`, and the main pass's shared call up to another `batchTimeout`. |
 | `shutdownTimeout` | `30s` | ≥ 0. Grace for in-flight batches at shutdown; then they are interrupted and redelivered later. `close()` spends up to about 8 s more: interrupted workers and the instance row's delete (a locked row or an exhausted pool is left to expire). |
+| `connectionHold` | `1m` | > 0. Under a backlog a relay worker starts steps on one pooled connection for this long, then hands it back and takes another, so the pool can retire it at `maxLifetime`. A step started just before the end runs on the same connection, up to 4 × `batchTimeout` (see `batchTimeout`), so a pool's `leakDetectionThreshold` must exceed `connectionHold` + 4 × `batchTimeout`; to keep leak detection below a minute lower both. |
 | `headFailuresBeforeDivert` | `3` | ≥ 1. Consecutive failures before a shard isolates a single failing key. |
 | `cursorAnchorInterval` | `1h` | > 0 and ≥ `partitions.maintenanceInterval`. Maintenance writes an idle shard one cursor row this often; ticks are kept about this long (at most about 10 000: a shard that far behind is anchored at the next run), so a rollback to the previous release resumes from these anchors. |
 

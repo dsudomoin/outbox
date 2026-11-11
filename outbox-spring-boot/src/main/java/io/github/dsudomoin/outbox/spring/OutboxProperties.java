@@ -74,6 +74,10 @@ public record OutboxProperties(
      *     (HTTP read timeouts, each byTopic route's own) must be well below it. Default 30 s, at most 24 days.
      * @param shutdownTimeout on stop, unfinished batches get this long, then their workers are interrupted and the
      *     batches are delivered again later. Default 30 s.
+     * @param connectionHold how long a relay worker starts steps on one pooled connection under a backlog before it
+     *     hands it back and takes another, so the pool can retire it at its max-lifetime. A step started just before
+     *     this ends runs on the same connection, up to 4 × batch-timeout: a pool's leak-detection-threshold must
+     *     exceed connection-hold + 4 × batch-timeout. Default 1 min.
      * @param headFailuresBeforeDivert failed attempts in a row after which a shard reads one head row and diverts the
      *     single failing key. Default 3.
      * @param cursorAnchorInterval how long an idle shard's latest cursor row may stay on a tick below its effective
@@ -93,6 +97,7 @@ public record OutboxProperties(
         @DefaultValue("200ms") Duration idlePollInterval,
         @DefaultValue("30s") Duration batchTimeout,
         @DefaultValue("30s") Duration shutdownTimeout,
+        @DefaultValue("1m") Duration connectionHold,
         @DefaultValue("3") int headFailuresBeforeDivert,
         @DefaultValue("1h") Duration cursorAnchorInterval,
         @DefaultValue Retry retry,

@@ -226,7 +226,8 @@ class OutboxRelayIT {
      */
     @Test
     void aPassThroughABacklogReturnsItsConnectionEveryBound() throws Exception {
-        config.shards(1).workers(1).batchSize(10).minTickInterval(Duration.ofMillis(50));
+        config.shards(1).workers(1).batchSize(10).minTickInterval(Duration.ofMillis(50))
+                .connectionHold(Duration.ofMillis(200));
         bootstrap();
         send(outbox(() -> {}), IntStream.range(0, 400).mapToObj(i -> msg("t", "k", "m" + i))
                 .toArray(OutboxMessage[]::new));
@@ -266,7 +267,6 @@ class OutboxRelayIT {
                 return db.telemetry();
             }
         }, handler);
-        relay.passBound = TimeUnit.MILLISECONDS.toNanos(200);
         relay.start();
 
         await(Duration.ofSeconds(30), () -> handler.delivered().size() == 400);

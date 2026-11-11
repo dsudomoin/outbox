@@ -70,12 +70,6 @@ public final class OutboxRelay implements AutoCloseable {
     private static final long INTERRUPT_GRACE = TimeUnit.SECONDS.toNanos(1);
     /** The most shards one step takes: a group's statements bind arrays of this size. */
     private static final int MAX_GROUP = 256;
-    /**
-     * How long a pass keeps its pooled connection before it hands it back and the worker starts the next pass with
-     * another: a backlog would hold one for its whole length, past the pool's maxLifetime and its leak detection.
-     */
-    // ponytail: fixed 60 s, no config key; make it one if a pool's maxLifetime or leak threshold must sit below it
-    private static final long PASS_BOUND = TimeUnit.SECONDS.toNanos(60);
 
     private final OutboxTransactions db;
     private final OutboxConfig config;
@@ -97,8 +91,12 @@ public final class OutboxRelay implements AutoCloseable {
      * past this.
      */
     private final long roundWaitNanos;
-    /** {@link #PASS_BOUND}, a shorter one only in tests; set before {@link #start()}. */
-    long passBound = PASS_BOUND;
+    /**
+     * {@code relay.connectionHold}: how long a pass keeps its pooled connection before it hands it back and the
+     * worker starts the next pass with another; a backlog would hold one for its whole length, past the pool's
+     * maxLifetime and its leak detection.
+     */
+    private final long passBound;
     private final SocketBound socket;
     /**
      * An idle tick attempt inserts only when the newest tick, any instance's, is older than this: so a cluster makes
@@ -210,6 +208,7 @@ public final class OutboxRelay implements AutoCloseable {
         this.heartbeat = new Heartbeat(db, schema, config, relay.enabled() && deadLetters.active(), clock);
         this.idleNanos = relay.idlePollInterval().toNanos();
         this.minTickNanos = relay.minTickInterval().toNanos();
+        this.passBound = relay.connectionHold().toNanos();
         this.roundWaitNanos = Math.max(TimeUnit.SECONDS.toNanos(1), 5 * idleNanos);
         this.roundReadSince = System.nanoTime() - roundWaitNanos;
         this.socket = new SocketBound(config.networkTimeout());

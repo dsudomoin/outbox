@@ -182,6 +182,13 @@ class OutboxConfigTest {
     }
 
     @Test
+    void connectionHoldIsReadAndValidated() {
+        assertThat(parse("outbox.relay.connectionHold = 20s").relay().connectionHold())
+                .isEqualTo(Duration.ofSeconds(20));
+        assertRejected("outbox.relay.connectionHold = 0s", "outbox.relay.connectionHold must be positive: PT0S");
+    }
+
+    @Test
     void requeueKeysAreReadAndValidated() {
         var requeue = parse("outbox.relay.requeue { delay = 250ms, maxRequeues = 5 }").relay().requeue();
 
@@ -277,6 +284,7 @@ class OutboxConfigTest {
         assertThat(relay.idlePollInterval()).isEqualTo(Duration.ofMillis(200));
         assertThat(relay.batchTimeout()).isEqualTo(Duration.ofSeconds(30));
         assertThat(relay.shutdownTimeout()).isEqualTo(Duration.ofSeconds(30));
+        assertThat(relay.connectionHold()).isEqualTo(Duration.ofMinutes(1));
         assertThat(relay.headFailuresBeforeDivert()).isEqualTo(3);
         assertThat(relay.retry().initialDelay()).isEqualTo(Duration.ofSeconds(1));
         assertThat(relay.retry().maxDelay()).isEqualTo(Duration.ofMinutes(5));

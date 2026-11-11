@@ -190,6 +190,7 @@ package io.github.dsudomoin.outbox {
   public static interface OutboxConfig.RelayConfig {
     method public default int batchSize();
     method public default java.time.Duration! batchTimeout();
+    method public default java.time.Duration! connectionHold();
     method public default java.time.Duration! cursorAnchorInterval();
     method public default boolean enabled();
     method public default int headFailuresBeforeDivert();
