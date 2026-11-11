@@ -383,14 +383,20 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                             + ": recover the xid regression first (OutboxAdmin.recoverXidRegression()); it rebuilds"
                             + " every cursor, so no shard stays stranded");
                 }
-                stranded.addAll(maintenance.strandedShards(c).keySet());
+                var missing = maintenance.strandedShards(c);
+                stranded.addAll(missing.keySet());
+                // the pins of shards repaired since, as by a previous release, which kept none
+                try (var ps = c.prepareStatement("delete from " + names.stranded() + " where shard <> all(?)")) {
+                    ps.setArray(1, c.createArrayOf("int4", stranded.toArray()));
+                    ps.executeUpdate();
+                }
                 if (stranded.isEmpty()) {
                     throw new IllegalStateException("no stranded shards in " + names.base() + ": every shard's"
                             + " effective tick exists");
                 }
                 recovering.set(true);
                 for (var shard : stranded) {
-                    recoverStranded(c, shard, moved);
+                    recoverStranded(c, shard, missing.get(shard), moved);
                 }
                 return null;
             });
@@ -410,7 +416,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     }
 
     /**
-     * Repairs one stranded shard: its rows the latest tick L covers are moved back into the outbox, then its cursor
+     * Repairs one stranded shard: its rows the tick L covers are moved back into the outbox, then its cursor
      * goes to L, due as its retry and parked tables say, with no batch in progress. When only its batch's target is
      * gone, those its effective tick sees stay: they went through the relay ({@link Cursors}). L is read first, so what its snapshot covers had committed
      * before the read of the rows, which so finds all of it. What it does not cover is the relay's from the new cursor
@@ -420,13 +426,17 @@ public final class PgOutboxAdmin implements OutboxAdmin {
      * Those of a key another transaction holds stay, in this pass's later chunks too, so that each key's rows go in id
      * order; each pass after the first waits for one such key, so a key held almost all the time gets through too,
      * and for at most {@link XidPartitions#lockWait}, only that key's writers waiting meanwhile. After
-     * {@link OrphanRestore#HELD_KEYS_WAITED} waits, or a wait that ran out, the call gives up.
+     * {@link OrphanRestore#HELD_KEYS_WAITED} waits, or a wait that ran out, the call gives up. L is the latest tick
+     * when the first call begins, pinned ({@link #pinnedTick}) until the cursor moves to it: a call repeated after one
+     * that failed midway goes on from the same L, so the rows that call moved, which L does not cover, stay the
+     * relay's from L on, delivered ahead of the rows the later call moves, and are not moved again behind their key's
+     * older rows.
      *
      * <p>ponytail: the ids and xids of a shard's rows sit in memory for the call, about 40 bytes a row, 40 MB per
      * million; the outbox has no index on id, so reading them in id order per chunk would scan the shard each time.
      */
-    private void recoverStranded(Connection c, int shard, AtomicLong moved) throws SQLException {
-        var latest = ticks.latest(c);
+    private void recoverStranded(Connection c, int shard, long missing, AtomicLong moved) throws SQLException {
+        var latest = pinnedTick(c, shard, missing);
         var pending = coveredRows(c, shard, latest, cursors.latest(c, shard).tick());
         try {
             Integer waitFor = null;
@@ -452,6 +462,10 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                 lockShard(tx, shard);
                 cursors.append(tx, new Cursors.Cursor(shard, latest.id(), null, 0, null, 0, retries.minDue(tx, shard),
                         parked.minDue(tx, shard)));
+                try (var ps = tx.prepareStatement("delete from " + names.stranded() + " where shard = ?")) {
+                    ps.setShort(1, (short) shard);
+                    ps.executeUpdate();
+                }
                 return null;
             });
         } catch (Throwable e) { // an inTx rolled back, and left the connection out of autocommit
@@ -466,6 +480,33 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                         + keyLockWait.toMillis() / 1e3 + " s", e);
             }
             throw e;
+        }
+    }
+
+    /**
+     * The tick the repair of {@code shard} goes to, committed on its own before any row moves: the one pinned in
+     * {@code <base>_stranded} while the shard is still stranded at {@code missing} with the same latest cursor row and
+     * that tick exists, else the latest tick, pinned now.
+     */
+    private Ticks.Tick pinnedTick(Connection c, int shard, long missing) throws SQLException {
+        try (var ps = c.prepareStatement("insert into " + names.stranded() + " as p (shard, stranded_tick_id,"
+                + " cursor_seq, tick_id) select ?, ?, (select max(seq) from " + names.cursor() + " where shard = ?),"
+                + " (select max(id) from " + names.tick() + ") on conflict (shard) do update set"
+                + " stranded_tick_id = excluded.stranded_tick_id, cursor_seq = excluded.cursor_seq,"
+                + " tick_id = excluded.tick_id where p.stranded_tick_id <> excluded.stranded_tick_id"
+                + " or p.cursor_seq <> excluded.cursor_seq"
+                + " or not exists (select 1 from " + names.tick() + " t where t.id = p.tick_id)")) {
+            ps.setShort(1, (short) shard);
+            ps.setLong(2, missing);
+            ps.setShort(3, (short) shard);
+            ps.executeUpdate();
+        }
+        try (var ps = c.prepareStatement("select tick_id from " + names.stranded() + " where shard = ?")) {
+            ps.setShort(1, (short) shard);
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                return ticks.get(c, rs.getLong(1));
+            }
         }
     }
 

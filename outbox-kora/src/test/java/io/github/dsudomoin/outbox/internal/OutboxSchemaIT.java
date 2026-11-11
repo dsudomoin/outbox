@@ -51,7 +51,8 @@ class OutboxSchemaIT {
 
         try (var c = TestDb.connect()) {
             for (var table : List.of(n.base(), n.tick(), n.cursor(), n.checkpoint(), n.retry(), n.dead(), n.halt(),
-                    n.tail(), n.maintenance(), n.parked(), n.parked() + "_key", n.parked() + "_due", n.redriven())) {
+                    n.tail(), n.maintenance(), n.parked(), n.parked() + "_key", n.parked() + "_due", n.redriven(),
+                    n.stranded())) {
                 assertThat(queryString(c, "select to_regclass(?)::text", table)).as(table).isEqualTo(table);
             }
             assertThat(queryString(c, "select pg_get_indexdef(to_regclass(?))", n.parked() + "_key"))

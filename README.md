@@ -3028,6 +3028,13 @@ create table outbox_maintenance (  -- одна строка: когда посл
   succeeded_at timestamptz not null
 );
 
+create table outbox_stranded (     -- тик, к которому идёт починка застрявшего шарда, пока шард застрял
+  shard            smallint primary key,
+  stranded_tick_id bigint not null,  -- потерянный тик, на котором шард застрял
+  cursor_seq       bigint not null,  -- seq последней строки курсора шарда при первом вызове
+  tick_id          bigint not null   -- тик, к которому идёт починка
+);
+
 create table outbox_dropping (     -- диапазоны, которые удаляет обслуживание: с момента перед detach до drop
   table_name text primary key,
   at timestamptz not null default now()
@@ -3150,7 +3157,9 @@ curl -s -X POST -H "$KEY" $API/recovery/stranded-shards    # {"count": N}: пе�
 блокировкой шага, поэтому воркеров внутри шарда нет. Строки шарда, что лежат в outbox и не лежат в retry-, parked- и
 dead-таблицах, становятся новыми сообщениями (новые id и xid, те же message id), причём старая строка удаляется в той же
 транзакции: оборванный вызов ничего не повторит. Затем курсор шарда встаёт на последний тик и получает сроки
-`retry_due_at` и `parked_due_at`. Строка INFO с результатом в логе, по HTTP — ещё и строка аудита.
+`retry_due_at` и `parked_due_at`. Этот тик первый вызов запоминает в `<base>_stranded`, и повторный вызов после
+оборванного идёт к тому же тику: строки, которые успел перенести первый, он не трогает, relay доставит их раньше
+перенесённых позже, так что порядок ключа сохраняется, а `count` считает только то, что перенёс сам этот вызов. Строка INFO с результатом в логе, по HTTP — ещё и строка аудита.
 
 Что учесть:
 

@@ -168,6 +168,15 @@ CREATE TABLE accounts.account_events_maintenance (
 );
 
 
+CREATE TABLE accounts.account_events_stranded (
+    shard smallint NOT NULL,
+    stranded_tick_id bigint NOT NULL,
+    cursor_seq bigint NOT NULL,
+    tick_id bigint NOT NULL,
+    PRIMARY KEY (shard)
+);
+
+
 CREATE TABLE accounts.account_events_dropping (
     table_name text NOT NULL,
     at timestamptz NOT NULL DEFAULT now(),

@@ -19,6 +19,7 @@ import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
+import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -59,6 +60,7 @@ class StrandedShardsIT {
     private final ExecutorService pool = Executors.newCachedThreadPool();
     private final Set<UUID> delivered = ConcurrentHashMap.newKeySet();
     private final Map<UUID, Integer> times = new ConcurrentHashMap<>();
+    private final Queue<UUID> order = new ConcurrentLinkedQueue<>();
     private final Map<Integer, Integer> nextKey = new HashMap<>();
     private OutboxRuntime writer;
     private OutboxRuntime relay;
@@ -254,11 +256,53 @@ class StrandedShardsIT {
         assertThat(idOf(free.get(0))).as("a free row went").isNotEqualTo(freeId);
         assertThat(idOf(heldRow)).as("the held key's stayed").isEqualTo(heldId);
         open.commit();
-        assertThat(admin().recoverStrandedShards()).as("the moved rows again, and the held key's").isGreaterThan(0);
+        assertThat(admin().recoverStrandedShards()).as("the held key's row alone: it goes on from the same tick")
+                .isEqualTo(1);
         var sent = new ArrayList<>(free);
         sent.add(heldRow);
         sent.add(open.id());
         await(() -> delivered.containsAll(sent));
+    }
+
+    /**
+     * A call that fails after a chunk, repeated after a newer tick, goes on from the first call's tick: the rows that
+     * call moved are not moved again behind the older rows of their key, which keeps the key's send order.
+     */
+    @Test
+    void aCallRepeatedAfterAFailureMidwayKeepsAKeysOrder() throws Exception {
+        leaveTheOtherShardsOnANewerTick();
+        var key = keyOfShard(1);
+        var sent = new ArrayList<UUID>();
+        for (int i = 0; i < 3; i++) { // over a chunk of 1 000 rows, one key
+            var messages = new ArrayList<OutboxMessage>();
+            for (int j = 0; j < 500; j++) {
+                messages.add(OutboxMessage.of(TOPIC, key, "p".getBytes(UTF_8)));
+            }
+            sent.addAll(transactions.inTx(c -> writer.outbox().sendAll(messages)));
+        }
+        makeATick();
+        deleteTheirTick();
+        startRelay();
+        var once = new AtomicBoolean();
+        admin().afterChunk = c -> {
+            if (once.compareAndSet(false, true)) {
+                throw new SQLException("connection lost after the first chunk", "08006");
+            }
+        };
+        assertThatThrownBy(() -> admin().recoverStrandedShards());
+        admin().afterChunk = null;
+        makeATick();
+
+        assertThat(admin().recoverStrandedShards()).as("only the rows the first call left").isEqualTo(500);
+        try (var c = direct.getConnection()) {
+            assertThat(queryLong(c, "select count(*) from " + names.stranded())).as("the pins, gone with the cursors'"
+                    + " move").isZero();
+        }
+
+        await(() -> delivered.containsAll(sent));
+        var mine = new HashSet<>(sent);
+        assertThat(order.stream().filter(mine::contains).distinct().toList()).as("the key in send order")
+                .isEqualTo(sent);
     }
 
     @Test
@@ -703,6 +747,7 @@ class StrandedShardsIT {
 
     private void deliver(OutboxRecord record) {
         times.merge(record.messageId(), 1, Integer::sum);
+        order.add(record.messageId());
         delivered.add(record.messageId());
     }
 

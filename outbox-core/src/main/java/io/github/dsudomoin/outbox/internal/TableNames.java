@@ -128,6 +128,14 @@ public record TableNames(
         return base + "_dropping";
     }
 
+    /**
+     * The tick each stranded shard's repair goes to, pinned by the first {@code recoverStrandedShards} call, so one
+     * repeated after a failure goes on from it ({@link PgOutboxAdmin}).
+     */
+    public String stranded() {
+        return base + "_stranded";
+    }
+
     /** How many times each message was redriven, kept for {@code outbox.deadLetters.redriveHistory}. */
     public String redriven() {
         return base + "_redriven";

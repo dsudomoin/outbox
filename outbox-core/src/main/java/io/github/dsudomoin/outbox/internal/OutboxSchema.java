@@ -662,6 +662,15 @@ public final class OutboxSchema implements AutoCloseable {
                       id           int primary key default 1 check (id = 1),
                       succeeded_at timestamptz not null
                     )""");
+            // PgOutboxAdmin#recoverStrandedShards: the tick each stranded shard's repair goes to, while it is stranded
+            // at stranded_tick_id with its latest cursor row at cursor_seq
+            st.execute("create table if not exists " + n.stranded() + """
+                     (
+                      shard            smallint primary key,
+                      stranded_tick_id bigint not null,
+                      cursor_seq       bigint not null,
+                      tick_id          bigint not null
+                    )""");
             // XidPartitions: the ranges it detaches as relayed, by unqualified name, until they are dropped
             st.execute("create table if not exists " + n.dropping() + """
                      (

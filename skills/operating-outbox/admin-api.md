@@ -145,7 +145,7 @@ class ApiKeyAuthorizer implements OutboxAdminAuthorizer {
   `<table>_halt` row.
 - **Stranded shards** («Застрявшие шарды»): one `POST /recovery/stranded-shards` on the running instances; stop
   nothing, the other shards keep flowing. 409: nothing is stranded, or something holds a lock (call again, what moved
-  stays moved), or an xid regression halt is recorded (recover that first). Consumers get those shards' rows again,
+  stays moved: the call goes on to the tick the first one pinned in `<table>_stranded`, so keys keep their order), or an xid regression halt is recorded (recover that first). Consumers get those shards' rows again,
   delivered ones too: all of them when the starting tick is gone, those it does not see when only the batch's target is.
   The call holds the maintenance lock throughout, so `since_success` grows and the pid the stale-maintenance WARN points
   at is the repair itself: leave it running (killing it loses nothing, the next call finishes the rest).

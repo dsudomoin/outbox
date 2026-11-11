@@ -126,6 +126,12 @@ public record SchemaObjects(List<Table> tables) {
                         column("id", "integer", true, "1"),
                         column("succeeded_at", TIMESTAMPTZ, true)),
                         List.of("primary key (id)", "check (id = 1)"), List.of(), List.of()),
+                plain(n.stranded(), List.of(
+                        column("shard", "smallint", true),
+                        column("stranded_tick_id", "bigint", true),
+                        column("cursor_seq", "bigint", true),
+                        column("tick_id", "bigint", true)),
+                        List.of("primary key (shard)"), List.of(), List.of()),
                 plain(n.dropping(), List.of(
                         column("table_name", "text", true),
                         column("at", TIMESTAMPTZ, true, "now()")),

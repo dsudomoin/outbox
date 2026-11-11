@@ -364,7 +364,8 @@ public final class XidRecovery {
             }
             timeLeft(st, deadline);
             st.execute("delete from " + names.tick() + "; delete from " + names.cursor() + "; delete from "
-                    + names.checkpoint() + "; delete from " + names.dropping() + "; delete from " + names.halt());
+                    + names.checkpoint() + "; delete from " + names.dropping() + "; delete from " + names.halt()
+                    + "; delete from " + names.stranded());
             timeLeft(st, deadline);
             makeRanges(c);
             timeLeft(st, deadline);
