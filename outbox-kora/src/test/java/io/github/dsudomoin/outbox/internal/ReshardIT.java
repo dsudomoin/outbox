@@ -374,14 +374,21 @@ class ReshardIT {
         var old = start(config(4));
         var writer = new PgOutbox(db, old.schema(), 8, () -> {}, TestTelemetry.kora());
         stopped();
-        try (var holder = TestDb.connect()) {
-            holder.setAutoCommit(false);
-            // holds the retry check, which runs under SHARE on the outbox
-            TestSql.execute(holder, "lock table " + names.retry() + " in access exclusive mode");
+        try (var holder = TestDb.connect(); var gate = TestDb.connect()) {
+            // the bootstrap reads the retry table before the reshard (its sequence check): the retry lock is taken
+            // only once the reshard waits for its tick lock, past that read
+            var tickLock = resolvedNames().internalNamespace() + ", " + TableNames.LOCK_TICK;
+            TestSql.execute(gate, "select pg_advisory_lock(" + tickLock + ")");
             var resharding = pool.submit(() -> {
                 schema(config(8)).start();
                 return null;
             });
+            await(() -> queryLong("select count(*) from pg_locks where locktype = 'advisory' and objid = "
+                    + TableNames.LOCK_TICK + " and not granted") == 1);
+            holder.setAutoCommit(false);
+            // holds the retry check, which runs under SHARE on the outbox
+            TestSql.execute(holder, "lock table " + names.retry() + " in access exclusive mode");
+            TestSql.execute(gate, "select pg_advisory_unlock(" + tickLock + ")");
             await(() -> queryLong("select count(*) from pg_locks where relation = '" + table + "'::regclass"
                     + " and mode = 'ShareLock' and granted") == 1);
             var writing = pool.submit(() -> send(writer, "k", "during"));
