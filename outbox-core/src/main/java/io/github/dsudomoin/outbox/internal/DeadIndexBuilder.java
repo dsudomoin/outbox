@@ -5,6 +5,7 @@ import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -197,11 +198,16 @@ final class DeadIndexBuilder {
         try (var c = db.newConnection(); var bound = socket.on(c)) {
             c.setAutoCommit(true);
             int pid = pid(c);
-            if (!advisory(c, "pg_try_advisory_lock")) {
-                return; // another instance builds it
-            }
+            // before the lock, so a backend whose client the network lost frees it once idle; the build itself is a
+            // running statement, which this never cuts
+            var session = SessionSettings.set(c, Map.of("idle_session_timeout", "'60s'"));
+            boolean locked = false;
             Exception failure = null;
             try {
+                locked = advisory(c, "pg_try_advisory_lock");
+                if (!locked) {
+                    return; // another instance builds it
+                }
                 var valid = state(c);
                 if (Boolean.TRUE.equals(valid)) {
                     return;
@@ -223,9 +229,12 @@ final class DeadIndexBuilder {
             } finally {
                 // past a close, its timeouts may still be set and a cancel may still come for its pid: the pool evicts
                 // it instead of reusing it
-                if (!(isClosed() && abort(c, failure))) { // an aborted session took its lock with it
+                if (!(isClosed() && abort(c, failure))) { // an aborted session took its lock and setting with it
                     try {
-                        advisory(c, "pg_advisory_unlock");
+                        if (locked) {
+                            advisory(c, "pg_advisory_unlock");
+                        }
+                        session.restore(c);
                     } catch (SQLException e) { // the session died, and its lock with it: keep the cause on top
                         if (failure == null) {
                             throw e;

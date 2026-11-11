@@ -669,6 +669,44 @@ class NetworkBlackholeIT {
     }
 
     @Test
+    void anIndexBuildHoldsItsLockUnderAnIdleSessionTimeoutAndGivesItBack() throws Exception {
+        // a backend whose client the network lost idles holding the lock; the timeout frees it, as for maintenance's
+        var config = new TestOutboxConfig().maintenanceInterval(Duration.ofMillis(100));
+        var bootstrap = OutboxRuntime.builder(config, new JdbcTransactions(DIRECT), record -> {}).build();
+        bootstrap.start();
+        bootstrap.close();
+        var names = bootstrap.schema().names();
+        var index = names.dead() + "_due";
+        var whileLocked = new AtomicReference<String>();
+        var atClose = new AtomicReference<String>();
+        var source = intercepting(DIRECT, (c, call, args) -> {
+            if (!Thread.currentThread().getName().equals("outbox-dead-index")) {
+                return;
+            }
+            if (call.getName().equals("prepareStatement") && args[0].toString().contains("pg_advisory_unlock")) {
+                whileLocked.set(TestSql.queryString(c, "select current_setting('idle_session_timeout')"));
+            } else if (call.getName().equals("close") && !c.isClosed()) {
+                atClose.set(TestSql.queryString(c, "select current_setting('idle_session_timeout')"));
+            }
+        });
+        try (var c = DIRECT.getConnection()) {
+            TestSql.execute(c, "drop index " + index);
+            TestSql.execute(c, "insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts)"
+                    + " values (1, 0, gen_random_uuid(), 't', now(), 1)"); // so maintenance builds it, not the start
+            var relay = OutboxRuntime.builder(new TestOutboxConfig().table(config.table())
+                    .maintenanceInterval(Duration.ofMillis(100)), new JdbcTransactions(source), record -> {}).build();
+            closing.add(relay);
+            relay.start();
+
+            await(() -> atClose.get() != null);
+            assertThat(TestSql.queryString(c, "select indisvalid::text from pg_index where indexrelid = to_regclass(?)",
+                    index)).isEqualTo("true");
+        }
+        assertThat(whileLocked.get()).as("while it holds the lock").isEqualTo("1min");
+        assertThat(atClose.get()).as("given back").isEqualTo("0");
+    }
+
+    @Test
     void aSocketTimeoutOfTheDataSourceDoesNotCutTheIndexBuild() throws Exception {
         var config = new TestOutboxConfig().maintenanceInterval(Duration.ofMillis(100));
         var bootstrap = OutboxRuntime.builder(config, new JdbcTransactions(DIRECT), record -> {}).build();
