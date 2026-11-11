@@ -799,6 +799,31 @@ class MaintenanceIT {
     }
 
     @Test
+    void lagIsNotNegativeAndWarnsWhenTheDatabaseClockWentBack() throws Exception {
+        bootstrap();
+        var registry = new SimpleMeterRegistry();
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
+        assertThat(maintenance.runOnce()).isTrue();
+        send(msg("t", "k", "a")); // not relayed: its shard stays busy on the checkpoint's tick
+        try (var c = TestDb.connect()) { // a newer tick, made after the database clock stepped back an hour
+            assertThat(new Ticks(names, config.shards()).make(c, Duration.ZERO)).isTrue();
+            execute(c, "update " + names.tick() + " set created_at = created_at - interval '1 hour' where id ="
+                    + " (select max(id) from " + names.tick() + ")");
+        }
+
+        try (var err = new CapturedStderr()) {
+            assertThat(maintenance.runOnce()).isTrue();
+
+            assertThat(gauge(registry, "outbox.shard.lag")).isZero();
+            assertThat(err.text()).contains("WARN").contains("database clock went back");
+        }
+        try (var c = TestDb.connect(); var err = new CapturedStderr()) { // within a minute: no second WARN
+            assertThat(maintenance.lagSeconds(c)).as("OutboxAdmin.status()").isZero();
+            assertThat(err.text()).doesNotContain("database clock went back");
+        }
+    }
+
+    @Test
     void runsExtendWhenHalfOfPremakeIsUsed() throws Exception {
         bootstrap();
         try (var c = TestDb.connect()) {

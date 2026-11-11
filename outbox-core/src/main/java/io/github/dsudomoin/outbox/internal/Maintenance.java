@@ -160,6 +160,7 @@ public final class Maintenance {
     private final SocketBound socket;
     private final AtomicLong premadeLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong retainedLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
+    private final AtomicLong clockBackLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     /**
      * Runs in a row with {@link #RETAINED_WARN} or more retained ranges above the latest tick's xmin; written by the
      * gauges step only.
@@ -509,9 +510,12 @@ public final class Maintenance {
     private record Read(Tick latest, List<Position> positions, @Nullable Tick slowest, Map<Integer, Long> stranded,
             Tick lagFrom, @Nullable Long ignoredCheckpointTick) {
 
-        /** {@code outbox.shard.lag}: from the slowest busy shard's effective tick to L, 0 when no shard is busy. */
+        /**
+         * {@code outbox.shard.lag}: from the slowest busy shard's effective tick to L, 0 when no shard is busy, and 0
+         * when L was made before it, as after the database clock stepped back (see {@link #read}).
+         */
         double lagSeconds() {
-            return Duration.between(lagFrom.createdAt(), latest.createdAt()).toNanos() / 1e9;
+            return Math.max(0, Duration.between(lagFrom.createdAt(), latest.createdAt()).toNanos() / 1e9);
         }
     }
 
@@ -541,8 +545,15 @@ public final class Maintenance {
         }
         long slowestId = Cursors.busyTick(positions, latest.id());
         var slowest = !stranded.isEmpty() ? null : slowestId == latest.id() ? latest : found.get(slowestId);
-        return new Read(latest, positions, slowest, stranded, slowest != null ? slowest : ticks.oldestAfter(c, 0),
-                cursors.ignoredCheckpointTick(c));
+        var lagFrom = slowest != null ? slowest : ticks.oldestAfter(c, 0);
+        if (latest.createdAt().isBefore(lagFrom.createdAt()) && due(clockBackLogged)) {
+            // time alone cannot give the true lag across a step: lagSeconds() reads 0 instead of a negative number
+            log.warn("outbox ticks of {} went back in time: the newest tick {} was made at {}, before tick {} at {}"
+                    + " that outbox.shard.lag counts from, so the database clock went back; the lag reads 0 and is"
+                    + " unreliable until new ticks pass that moment; this WARN repeats at most once a minute",
+                    names.base(), latest.id(), latest.createdAt(), lagFrom.id(), lagFrom.createdAt());
+        }
+        return new Read(latest, positions, slowest, stranded, lagFrom, cursors.ignoredCheckpointTick(c));
     }
 
     /**
