@@ -159,12 +159,24 @@ final class OutboxAdminGuard implements HandlerInterceptor {
             return !site.equals("same-origin") && !site.equals("none");
         }
         var origin = request.getHeader("Origin");
-        return origin != null && !sameHost(origin, request.getServerName(), request.getServerPort());
+        return origin != null && !sameHost(origin, request.getServerName(), port(request));
     }
 
     /**
-     * Whether {@code origin} names {@code host} and {@code port} (below 0 when the {@code Host} header had none: the
-     * default of the browser's scheme). Not the scheme: behind a proxy ending TLS the page had https, the server http.
+     * The port the browser named, below 0 for its scheme's default: a container fills a {@code Host} with no port in
+     * with the default of its own scheme, which behind a proxy ending TLS is 80 for a page on 443. Another port came
+     * from the {@code Host} or from forwarded headers the app takes, and is the one compared.
+     */
+    private static int port(HttpServletRequest request) {
+        var port = request.getServerPort();
+        var host = request.getHeader("Host");
+        var named = host != null && host.lastIndexOf(':') > host.lastIndexOf(']'); // an IPv6 literal has ':' inside
+        return !named && port == (request.isSecure() ? 443 : 80) ? -1 : port;
+    }
+
+    /**
+     * Whether {@code origin} names {@code host} and {@code port} (below 0: the default of the browser's scheme). Not
+     * the scheme: behind a proxy ending TLS the page had https, the server http.
      */
     private static boolean sameHost(String origin, String host, int port) {
         try {

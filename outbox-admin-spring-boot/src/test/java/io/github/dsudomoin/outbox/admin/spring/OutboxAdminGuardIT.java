@@ -327,6 +327,45 @@ class OutboxAdminGuardIT {
         }
     }
 
+    /**
+     * Behind a proxy ending TLS that passes {@code Host} on without a port, the page's {@code https://} origin has 443
+     * while the container took 80 from its own http: a {@code Host} with no port means the default of the browser's
+     * scheme. A port the {@code Host} names, or a forwarded one the app takes, is still compared.
+     */
+    @Test
+    void aPortlessOriginOfAPortlessHostReachesTheAuthorizerWhateverItsScheme() throws Exception {
+        try (var server = AdminServer.start(WithKeys.class, WithSpy.class)) {
+            for (var origin : List.of("https://localhost", "http://localhost")) {
+                assertThat(rawPost(server, "Host: localhost", "Origin: " + origin)).as(origin).contains("unknown key");
+            }
+            assertThat(server.bean(Keys.class).threads).hasSize(2);
+            assertThat(rawPost(server, "Host: localhost:80", "Origin: https://localhost"))
+                .contains("cross-site request refused");
+            assertThat(rawPost(server, "Host: localhost", "Origin: https://localhost:8443"))
+                .contains("cross-site request refused");
+        }
+        try (var server = AdminServer.start(List.of("server.forward-headers-strategy=native"), WithKeys.class,
+            WithSpy.class)) {
+            assertThat(rawPost(server, "Host: localhost", "X-Forwarded-Proto: https", "X-Forwarded-Port: 8443",
+                "Origin: https://localhost:8443")).contains("unknown key");
+            assertThat(rawPost(server, "Host: localhost", "X-Forwarded-Proto: https", "X-Forwarded-Port: 8443",
+                "Origin: https://localhost")).contains("cross-site request refused");
+        }
+    }
+
+    /** A POST to the xid-regression route with key "wrong" and {@code headers} as given; the whole response. */
+    private static String rawPost(AdminServer server, String... headers) throws IOException {
+        try (var socket = new java.net.Socket("localhost", server.port)) {
+            var request = new StringBuilder("POST " + API + "/recovery/xid-regression HTTP/1.1\r\n");
+            for (var header : headers) {
+                request.append(header).append("\r\n");
+            }
+            request.append(KEY).append(": wrong\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            socket.getOutputStream().write(request.toString().getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            return new String(socket.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        }
+    }
+
     /** Clients other than browsers send no such header; a GET changes nothing, so a link from another site works. */
     @ParameterizedTest
     @CsvSource({"POST,", "POST,same-origin", "POST,none", "GET,cross-site", "GET,same-site", "HEAD,cross-site"})

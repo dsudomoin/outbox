@@ -113,8 +113,9 @@ class ApiKeyAuthorizer implements OutboxAdminAuthorizer {
 - Decide by a credential sent on purpose (a header), not a cookie. A non-GET/HEAD call gets 403 before the authorizer
   when `Sec-Fetch-Site` is other than `same-origin`/`none`, or, with no `Sec-Fetch-Site` (browsers send none on plain
   HTTP to a non-localhost address), when `Origin` is `null` or another host:port than the server name and port the
-  container took from `Host`, or from proxy headers under `server.forward-headers-strategy` (the scheme aside). curl
-  and services send neither header.
+  container took from `Host`, or from proxy headers under `server.forward-headers-strategy` (the scheme aside). With
+  no port in either, the `Origin` port is checked against its own scheme's default, so `https://app` passes behind a
+  TLS-ending proxy although the server sees http on 80. curl and services send neither header.
 - Audit: logger `io.github.dsudomoin.outbox.admin.spring.OutboxAdminGuard` at INFO; keep it on. An allowed call's line
   comes just after its response is flushed.
 - Differs from Kora: a body over 1 MiB gets 400; blank `?limit=` and
