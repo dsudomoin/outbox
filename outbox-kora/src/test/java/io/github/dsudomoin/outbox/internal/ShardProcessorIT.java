@@ -725,6 +725,39 @@ class ShardProcessorIT {
     }
 
     @Test
+    void aLoweredMaxAttemptsStillHandsAWaitingHeadButDeadLettersARetryHeadPastIt() throws Exception {
+        config.retry(INITIAL, Duration.ofMillis(500), 3); // e.g. a rollback to a release with fewer attempts
+        bootstrap();
+        var since = now.minus(Duration.ofMinutes(1));
+        // both heads gathered 5 attempts under a larger maxAttempts; w#1 then started waiting, r#1 did not
+        try (var c = TestDb.connect(); var ps = c.prepareStatement("insert into " + names.retry() + " (id, shard,"
+                + " message_id, topic, key, payload, created_at, attempts, next_attempt_at, waiting_since) values"
+                + " (?, 0, gen_random_uuid(), 't', ?, ?, now(), 5, ?, ?)")) {
+            for (var row : List.of("w#1", "r#1")) {
+                ps.setLong(1, row.equals("w#1") ? 1 : 2);
+                ps.setBytes(2, row.substring(0, 1).getBytes(UTF_8));
+                ps.setBytes(3, row.getBytes(UTF_8));
+                ps.setObject(4, now.atOffset(ZoneOffset.UTC));
+                ps.setObject(5, row.equals("w#1") ? since.atOffset(ZoneOffset.UTC) : null);
+                ps.executeUpdate();
+            }
+        }
+        var handed = new CopyOnWriteArrayList<String>();
+        var answer = answering(Map.of("w#1", Outcome.waitFor("v2 not here")));
+        script = records -> {
+            handed.addAll(payloads(records));
+            return answer.apply(records);
+        };
+
+        process();
+
+        assertThat(handed).as("the waiting head is asked, the exhausted retry head is not").containsExactly("w#1");
+        assertThat(deadRows()).containsExactly("r#1:5");
+        assertThat(retryRows()).singleElement().asString().startsWith("w#1:5:");
+        assertThat(waiting()).containsExactly("w#1:" + since);
+    }
+
+    @Test
     void aWaitingHeadHoldsItsKeyInBothPassesWhileOtherKeysGoOn() throws Exception {
         bootstrap();
         var waits = new AtomicBoolean(true);

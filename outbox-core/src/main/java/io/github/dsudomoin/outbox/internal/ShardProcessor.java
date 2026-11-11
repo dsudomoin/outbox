@@ -1031,7 +1031,8 @@ public final class ShardProcessor implements AutoCloseable {
      * parked (past {@code maxRequeues}: dead, attempts kept); the first row that fails transiently (an attempt,
      * backoff) or is not attempted (attempts kept) becomes the head and the rows after it stay followers. A key whose
      * handed rows are all done promotes its next row, due now, to a further round of the pass, which hands retry heads
-     * only. A head that used up {@code maxAttempts} goes to dead without another attempt and its followers go on. A
+     * only. A head that used up {@code maxAttempts} and does not wait goes to dead without another attempt and its
+     * followers go on. A
      * row that waits becomes, or stays, the waiting head of its key, its attempts kept ({@link #resolve}), and its
      * followers follow through the promote once it is done. Parked rows are settled as {@link #resolveParked} says.
      * A call that fails as a whole charges no one, and no call starts once the pass has spent {@code batchTimeout}:
@@ -1065,7 +1066,8 @@ public final class ShardProcessor implements AutoCloseable {
                     continue;
                 }
                 var rows = new ArrayList<OutboxRecord>();
-                if (exhausted(head.attempts())) {
+                // a waiting head spends no attempts: it is asked even past a maxAttempts lowered since it failed
+                if (due.waitingSince() == null && exhausted(head.attempts())) {
                     dead(c, pass, head, head.attempts(), null);
                 } else {
                     rows.add(head);
