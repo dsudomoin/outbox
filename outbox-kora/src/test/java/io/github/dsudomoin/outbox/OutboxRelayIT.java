@@ -1535,7 +1535,7 @@ class OutboxRelayIT {
             assertThat(handler.delivered()).extracting(OutboxRecord::messageId)
                     .containsExactlyInAnyOrderElementsOf(ids);
             await(Duration.ofSeconds(5), () -> err.text().contains("outbox shard 0 step failed")); // see above
-            assertThat(err.text()).contains("tracer assertion (test)");
+            await(Duration.ofSeconds(5), () -> err.text().contains("tracer assertion (test)")); // in the trace, see above
             assertThat(relayThreads()).hasSize(config.workers());
         }
     }
