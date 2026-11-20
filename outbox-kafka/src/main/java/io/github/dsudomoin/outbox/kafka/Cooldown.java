@@ -11,15 +11,18 @@ import java.util.concurrent.ConcurrentHashMap;
  * 30 s; a success resets it. When a cooldown ends, one caller probes the key (half-open): it holds the key for
  * {@code lease} while everyone else still sees it cooling, until the probe's success resets it, its failure doubles it,
  * or the lease ends and the next caller probes. While a probe runs, the others are told to come back after as long as
- * the probe has run so far, at least 1 s and at most until the lease ends: a probe that succeeds in milliseconds frees
- * the key within about a second, while a probe of a dead key (which takes the whole lease) has the others re-check
- * about five times in a 20 s lease (after 1, 2, 4, 8, 16 s), not every second. A probe that sends nothing gives its
- * lease back ({@link #release}).
+ * the probe has run so far, at least 1 s, at most 10 s and at most until the lease ends: a probe that succeeds in
+ * milliseconds frees the key within about a second, while a probe of a dead key (which takes the whole lease, the
+ * sender's 120 s {@code delivery.timeout.ms} by default) has the others re-check after 1, 2, 4, 8 and 16 s and then
+ * every 10 s, not every second, and a key that comes back while it runs is found within about 10 s. A probe that sends
+ * nothing gives its lease back ({@link #release}).
  */
 final class Cooldown<K> {
 
     private static final Duration INITIAL = Duration.ofSeconds(1);
     private static final Duration MAX = Duration.ofSeconds(30);
+    /** The longest the others wait between looks while a probe runs. */
+    private static final Duration MAX_RECHECK = Duration.ofSeconds(10);
 
     /** {@code until} on the {@link System#nanoTime} scale: a step of the wall clock does not move it. */
     private record State(int failures, long until, boolean probing) {}
@@ -62,7 +65,7 @@ final class Cooldown<K> {
             return Duration.ofNanos(left);
         }
         long probed = now - (state.until() - lease); // since the lease was taken
-        return Duration.ofNanos(Math.min(Math.max(probed, INITIAL.toNanos()), left));
+        return Duration.ofNanos(Math.min(Math.min(Math.max(probed, INITIAL.toNanos()), MAX_RECHECK.toNanos()), left));
     }
 
     /**
