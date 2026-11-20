@@ -84,6 +84,7 @@ class OutboxConfigTest {
                   relay.workers = 8
                   relay.minTickInterval = 20ms
                   relay.retry.maxAttempts = 5
+                  relay.retry.holdPermanent = true
                   partitions.xidsPerPartition = 1000
                   partitions.restoreOrphans = false
                   inbox.retention = 2h
@@ -100,6 +101,7 @@ class OutboxConfigTest {
         assertThat(config.relay().workers()).isEqualTo(8);
         assertThat(config.relay().minTickInterval()).isEqualTo(Duration.ofMillis(20));
         assertThat(config.relay().retry().maxAttempts()).isEqualTo(5);
+        assertThat(config.relay().retry().holdPermanent()).isTrue();
         assertThat(config.partitions().xidsPerPartition()).isEqualTo(1000L);
         assertThat(config.partitions().restoreOrphans()).isFalse();
         assertThat(config.inbox().retention()).isEqualTo(Duration.ofHours(2));
@@ -297,6 +299,7 @@ class OutboxConfigTest {
         assertThat(relay.retry().initialDelay()).isEqualTo(Duration.ofSeconds(1));
         assertThat(relay.retry().maxDelay()).isEqualTo(Duration.ofMinutes(5));
         assertThat(relay.retry().maxAttempts()).isZero();
+        assertThat(relay.retry().holdPermanent()).isFalse();
         assertThat(relay.requeue().delay()).isEqualTo(Duration.ofSeconds(1));
         assertThat(relay.requeue().maxRequeues()).isZero();
         assertThat(relay.waiting().delay()).isEqualTo(Duration.ofSeconds(1));

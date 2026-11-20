@@ -75,6 +75,8 @@ class OutboxPropertiesTest {
         bind(p -> assertThat(p.shards()).isEqualTo(16), "outbox.shards=16");
         bind(p -> assertThat(p.networkTimeout()).isEqualTo(java.time.Duration.ofSeconds(7)),
             "outbox.network-timeout=7s");
+        bind(p -> assertThat(p.relay().retry().holdPermanent()).isTrue(), "outbox.relay.retry.hold-permanent=true");
+        bind(p -> assertThat(p.relay().retry().holdPermanent()).isTrue(), "outbox.relay.retry.holdPermanent=true");
     }
 
     @Test
@@ -119,6 +121,8 @@ class OutboxPropertiesTest {
         assertThat(String.valueOf(properties.get("outbox.relay.batch-size").get("defaultValue"))).isEqualTo("1000");
         assertThat(properties.get("outbox.relay.batch-timeout").get("defaultValue")).isEqualTo("130s");
         assertThat(properties.get("outbox.dead-letters.timeout").get("defaultValue")).isEqualTo("130s");
+        assertThat(String.valueOf(properties.get("outbox.relay.retry.hold-permanent").get("defaultValue")))
+            .isEqualTo("false");
         assertThat(String.valueOf(properties.get("outbox.heartbeat.dedicated-connection").get("defaultValue")))
             .isEqualTo("true");
         assertThat((String) properties.get("outbox.heartbeat.dedicated-connection").get("description")).isNotBlank();
