@@ -104,21 +104,22 @@ import org.slf4j.LoggerFactory;
  * nothing up.
  *
  * <p>Producer properties are {@code driverProperties} with byte-array serializers, {@code enable.idempotence=true} and
- * {@code acks=all} forced; {@code max.block.ms} defaults to 5000, {@code enable.metrics.push} to false,
- * {@code delivery.timeout.ms} to 20000 and then, if unset, {@code request.timeout.ms} to 15000 (Kafka requires
+ * {@code acks=all} forced; {@code max.block.ms} defaults to 5000, {@code enable.metrics.push} to false and
+ * {@code delivery.timeout.ms} to 120000, long enough to ride out a broker's restart without the retry by a new producer
+ * that the broker cannot deduplicate; {@code request.timeout.ms} is Kafka's own, 30 s (Kafka requires
  * {@code delivery.timeout.ms >= linger.ms + request.timeout.ms}). {@code transactional.id}, {@code partitioner.class}
  * and {@code partitioner.ignore.keys=true} are rejected: ordering and the cooldown need Kafka's per-key partitioning.
  *
  * <p>A call hands records over during its first 5 s, while Kafka can still answer them within
  * {@code delivery.timeout.ms} before the call's deadline; inside a relay call, also only while they could be answered
  * before the cut ahead of the relay's cancel (below), though never less than the relay call's first 5 s. It waits for
- * acks until {@code delivery.timeout.ms} + 5 s from entry (25 s by default). A {@code send()} that waited for buffer
+ * acks until {@code delivery.timeout.ms} + 5 s from entry (125 s by default). A {@code send()} that waited for buffer
  * space appends its record late, and Kafka's delivery timeout of the record starts there: the wait then runs
  * {@code delivery.timeout.ms} + 5 s from the last append, at most {@code delivery.timeout.ms} + 5 s +
- * {@code max.block.ms} from entry (30 s by default). Records not handed over in time are {@code NotAttempted}; the
- * relay reads them again in its next step. At 80 % of {@code batchTimeout} (24 s of 30 s by default) the relay asks its
- * handler call to wind down, with an interrupt: the sender stops handing records over, but keeps waiting for those in
- * flight and keeps the producer open, so they end with Kafka's own outcome. Inside a relay call it waits until 1 s
+ * {@code max.block.ms} from entry (130 s by default). Records not handed over in time are {@code NotAttempted}; the
+ * relay reads them again in its next step. At 80 % of {@code batchTimeout} (104 s of 130 s by default) the relay asks
+ * its handler call to wind down, with an interrupt: the sender stops handing records over, but keeps waiting for those
+ * in flight and keeps the producer open, so they end with Kafka's own outcome. Inside a relay call it waits until 1 s
  * before the relay cancels the call at {@code batchTimeout}, no longer. A call still waiting then is cut: the sender
  * closes the producer and returns acked records as {@code Delivered}, unacked ones as {@code Retry} (remembered, as
  * above) and the rest as {@code NotAttempted}. The call is cut the same way at once when the relay gives up on it: past
@@ -267,10 +268,10 @@ public final class KafkaOutboxSender implements AutoCloseable {
         properties.putIfAbsent(MAX_BLOCK_MS_CONFIG, "5000"); // metadata normally takes milliseconds
         // with push on, kafka-clients 3.9 logs an ERROR from the I/O thread after each close(Duration.ZERO)
         properties.putIfAbsent(ENABLE_METRICS_PUSH_CONFIG, "false");
-        if (!properties.containsKey(DELIVERY_TIMEOUT_MS_CONFIG)) {
-            properties.put(DELIVERY_TIMEOUT_MS_CONFIG, "20000");
-            properties.putIfAbsent(REQUEST_TIMEOUT_MS_CONFIG, "15000"); // Kafka's 30 s default exceeds 20 s
-        }
+        // Kafka's own request.timeout.ms (30 s) applies. A record still unanswered when delivery.timeout.ms ends is
+        // retried by a new producer, which the broker cannot tell from another writer: 120 s rides out a broker's
+        // outage of a minute without a duplicate, and leaves a frozen broker's InitProducerId time to answer
+        properties.putIfAbsent(DELIVERY_TIMEOUT_MS_CONFIG, "120000");
 
         var config = new ProducerConfig(properties); // Kafka's own validation, e.g. retries=0 with idempotence
         require(!config.getList(BOOTSTRAP_SERVERS_CONFIG).isEmpty(), BOOTSTRAP_SERVERS_CONFIG + " is required");
