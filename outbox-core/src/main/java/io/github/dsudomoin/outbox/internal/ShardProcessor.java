@@ -1825,7 +1825,7 @@ public final class ShardProcessor implements AutoCloseable {
             } finally {
                 telemetry.releaseThread(); // nothing leaks into the next batch on this thread
             }
-        }, System.nanoTime() + timeout); // the waits below start after the submit: the cancel comes no earlier
+        }, timeout); // from before the submit: the waits below start after it, so the cancel comes no earlier
         Future<List<Outcome>> call;
         try {
             call = executor.submit(task);
@@ -1845,12 +1845,12 @@ public final class ShardProcessor implements AutoCloseable {
                 outcomes = call.get(timeout - soft, TimeUnit.NANOSECONDS);
             }
         } catch (TimeoutException e) {
-            task.interrupt(); // its wind-down flag before the cancel: a handler may have swallowed both interrupts
+            task.cancel(); // its flags before the interrupt: a handler may have swallowed both interrupts
             call.cancel(true);
             return new FailedCall(records.size(),
                     new TimeoutException("outbox handler exceeded batchTimeout " + relay.batchTimeout()));
-        } catch (InterruptedException e) {
-            task.interrupt();
+        } catch (InterruptedException e) { // the step rolls back and lets the shard go: the call must not go on
+            task.cancel();
             call.cancel(true);
             throw e;
         } catch (ExecutionException e) {
@@ -2011,6 +2011,17 @@ public final class ShardProcessor implements AutoCloseable {
     }
 
     /**
+     * True once the relay gave up on the handler call running on this thread: it is past {@code batchTimeout}, or the
+     * step that made it was interrupted (the relay stopping, an interrupted {@code drain()}) and rolls back, so another
+     * worker may hand its records again. Unlike the wind-down, the call must stop at once and leave nothing in flight.
+     * {@link #windDownRequested()} is true then too. For the adapters of this repository.
+     */
+    public static boolean callCancelled() {
+        var call = CALL.get();
+        return call != null && call.cancelled;
+    }
+
+    /**
      * The {@link System#nanoTime()} at which the relay cancels the handler call running on this thread
      * ({@code batchTimeout} after its submit, see {@link #callHandler}), so that the call can return its real outcomes
      * before; empty outside a relay call. For the adapters of this repository.
@@ -2021,22 +2032,37 @@ public final class ShardProcessor implements AutoCloseable {
     }
 
     /**
+     * The {@link System#nanoTime()} at which the relay submitted the handler call running on this thread
+     * ({@link #callDeadline()} less {@code batchTimeout}); empty outside a relay call. For the adapters of this
+     * repository.
+     */
+    public static OptionalLong callStarted() {
+        var call = CALL.get();
+        return call == null ? OptionalLong.empty() : OptionalLong.of(call.started);
+    }
+
+    /**
      * A handler call that can be asked to wind down at the soft deadline without being cancelled, so its real outcomes
      * still come back. The request is a flag the call sees through {@link OutboxHandler#windDownRequested()} even when
-     * its handler swallows the interrupt that comes with it. The interrupt never reaches a later task of the pooled
-     * thread: the call drops its thread and clears the interrupt status under the lock that {@link #interrupt} holds.
+     * its handler swallows the interrupt that comes with it; so is a {@link #cancel}. The interrupt never reaches a
+     * later task of the pooled thread: the call drops its thread and clears the interrupt status under the lock that
+     * {@link #interrupt} holds.
      */
     static final class HandlerCall implements Callable<List<Outcome>> {
 
         private final Callable<List<Outcome>> body;
-        private final long deadline; // on System.nanoTime(): see callDeadline()
+        private final long started; // on System.nanoTime(): see callStarted()
+        private final long deadline; // started + batchTimeout: see callDeadline()
         @Nullable
         private Thread thread; // under this
         private volatile boolean windDown;
+        private volatile boolean cancelled;
 
-        HandlerCall(Callable<List<Outcome>> body, long deadline) {
+        /** {@code timeout}: the call's {@code batchTimeout}, in nanoseconds from now. */
+        HandlerCall(Callable<List<Outcome>> body, long timeout) {
             this.body = body;
-            this.deadline = deadline;
+            this.started = System.nanoTime();
+            this.deadline = started + timeout;
         }
 
         @Override
@@ -2062,6 +2088,15 @@ public final class ShardProcessor implements AutoCloseable {
             if (thread != null) {
                 thread.interrupt();
             }
+        }
+
+        /**
+         * Gives up on the call: sets both flags before the interrupt, so a handler that sees one interrupt for this and
+         * an earlier wind-down together can tell the cancel from the wind-down.
+         */
+        synchronized void cancel() {
+            cancelled = true;
+            interrupt();
         }
     }
 

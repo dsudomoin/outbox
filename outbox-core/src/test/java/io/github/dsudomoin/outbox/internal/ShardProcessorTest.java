@@ -63,7 +63,7 @@ class ShardProcessorTest {
         var call = new ShardProcessor.HandlerCall(() -> {
             self.get().interrupt(); // the soft deadline hits; the handler returns without looking
             return List.of();
-        }, System.nanoTime());
+        }, TimeUnit.SECONDS.toNanos(30));
         self.set(call);
         try {
             call.call();
@@ -77,7 +77,7 @@ class ShardProcessorTest {
     void softInterruptAimedAtAFinishedCallNeverReachesTheNextTaskOnItsThread() throws Exception {
         var pool = Executors.newSingleThreadExecutor();
         try {
-            var call = new ShardProcessor.HandlerCall(List::of, System.nanoTime());
+            var call = new ShardProcessor.HandlerCall(List::of, TimeUnit.SECONDS.toNanos(30));
             pool.submit(call).get();
             var started = new CountDownLatch(1);
             var interrupterDone = new CountDownLatch(1);
@@ -102,18 +102,47 @@ class ShardProcessorTest {
     }
 
     @Test
-    void theCallSeesItsOwnDeadline() throws Exception {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+    void theCallSeesItsOwnStartAndDeadline() throws Exception {
+        long timeout = TimeUnit.SECONDS.toNanos(30);
         var seen = new ArrayList<OptionalLong>();
+        long before = System.nanoTime();
         var call = new ShardProcessor.HandlerCall(() -> {
+            seen.add(ShardProcessor.callStarted());
             seen.add(ShardProcessor.callDeadline());
             return List.of();
-        }, deadline);
+        }, timeout);
+        long after = System.nanoTime();
 
         call.call();
 
-        assertThat(seen).containsExactly(OptionalLong.of(deadline));
+        long started = seen.get(0).orElseThrow();
+        assertThat(started - before).isNotNegative();
+        assertThat(after - started).isNotNegative();
+        assertThat(seen.get(1)).hasValue(started + timeout);
+        assertThat(ShardProcessor.callStarted()).as("outside a call").isEmpty();
         assertThat(ShardProcessor.callDeadline()).as("outside a call").isEmpty();
+    }
+
+    @Test
+    void aCancelSetsBothFlagsBeforeItsInterrupt() throws Exception {
+        var self = new AtomicReference<ShardProcessor.HandlerCall>();
+        var seen = new ArrayList<Boolean>();
+        var call = new ShardProcessor.HandlerCall(() -> {
+            seen.add(ShardProcessor.callCancelled());
+            self.get().interrupt(); // the soft deadline
+            seen.add(ShardProcessor.callCancelled());
+            self.get().cancel(); // the relay gives up
+            seen.add(Thread.currentThread().isInterrupted());
+            seen.add(ShardProcessor.windDownRequested());
+            seen.add(ShardProcessor.callCancelled());
+            return List.of();
+        }, TimeUnit.SECONDS.toNanos(30));
+        self.set(call);
+
+        call.call();
+
+        assertThat(seen).containsExactly(false, false, true, true, true);
+        assertThat(ShardProcessor.callCancelled()).as("outside a call").isFalse();
     }
 
     @Test
@@ -126,7 +155,7 @@ class ShardProcessorTest {
             Thread.interrupted(); // a client clears the flag and throws something else
             seen.add(OutboxHandler.windDownRequested());
             return List.of();
-        }, System.nanoTime());
+        }, TimeUnit.SECONDS.toNanos(30));
         self.set(call);
 
         call.call();
@@ -148,7 +177,7 @@ class ShardProcessorTest {
             }
         };
         var records = List.of(record(1, "a"), record(2, "b"), record(3, "c"), record(4, "d"));
-        var call = new ShardProcessor.HandlerCall(() -> handler.handleBatch(records), System.nanoTime());
+        var call = new ShardProcessor.HandlerCall(() -> handler.handleBatch(records), TimeUnit.SECONDS.toNanos(30));
         self.set(call);
 
         var outcomes = call.call();
