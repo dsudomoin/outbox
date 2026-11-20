@@ -246,10 +246,10 @@ class KafkaGuaranteesIT {
     }
 
     /**
-     * As {@link #aPoisonSmallerThanTheProducerBatchStillGoesToTheDeadLetterTopic}, but the relay cuts the call (at 80 %
-     * of a 10 s {@code batchTimeout}) before Kafka expires the batch ({@code delivery.timeout.ms} 20 s): the records the
-     * cut leaves unacknowledged are remembered as an expiry's are, so the next call sends the poison alone. Halving the
-     * read alone would take about six cuts.
+     * As {@link #aPoisonSmallerThanTheProducerBatchStillGoesToTheDeadLetterTopic}, but the call is cut (1 s before the
+     * relay would cancel it at a 10 s {@code batchTimeout}) before Kafka expires the batch ({@code delivery.timeout.ms}
+     * 20 s): the records the cut leaves unacknowledged are remembered as an expiry's are, so the next call sends the
+     * poison alone. Halving the read alone would take about six cuts.
      */
     @Test
     void aPoisonSmallerThanTheProducerBatchGoesToTheDeadLetterTopicWhenTheRelayCutsItsCall() throws Exception {

@@ -2603,7 +2603,7 @@ sequenceDiagram
     alt дальше
         W->>DB: сбойные и ждущие ключи в outbox_retry, Permanent в outbox_dead, Requeue в outbox_parked
     else пауза: ничего не доставлено
-        Note over W,DB: ни одна строка не отводится, курсор встаёт на паузу с backoff
+        Note over W,DB: ни одна строка не отводится, курсор встаёт на паузу с backoff<br/>или, если цель просила прийти позже, до её notBefore
     end
     W->>DB: новая строка курсора: прогресс или пауза
     W->>DB: COMMIT снимает блокировку шарда
