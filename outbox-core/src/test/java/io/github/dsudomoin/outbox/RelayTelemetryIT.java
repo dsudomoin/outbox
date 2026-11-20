@@ -329,6 +329,63 @@ class RelayTelemetryIT {
     }
 
     @Test
+    void aShardTheStepSkipsForTimeCountsNoRowOfItsMainRead() throws Exception {
+        // two keys of each of two shards fail in one call: no single failing key, so both shards pause and then probe
+        // their head alone in one step; the first probe outlives batchTimeout, so the step skips the other shard,
+        // whose head a later step reads and counts again
+        var byShard = new java.util.TreeMap<Integer, List<String>>();
+        for (int i = 0; byShard.values().stream().filter(keys -> keys.size() >= 2).count() < 2; i++) {
+            byShard.computeIfAbsent(shard("k" + i), x -> new ArrayList<>()).add("k" + i);
+        }
+        var messages = byShard.values().stream().filter(keys -> keys.size() >= 2).limit(2)
+                .flatMap(keys -> keys.stream().limit(2)).map(k -> OutboxMessage.of("orders", k, bytes(k))).toList();
+        var timeout = Duration.ofSeconds(1);
+        var config = new TestOutboxConfig().workers(1).batchTimeout(timeout).headFailuresBeforeDivert(1)
+                .retry(Duration.ofMillis(100), Duration.ofMillis(200), 100);
+        var events = new Events(transactions, config.table() + "_cursor");
+        var calls = new AtomicInteger();
+        var slowShard = new AtomicInteger(-1);
+        OutboxHandler handler = new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {}
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                int call = calls.incrementAndGet();
+                if (call == 1) {
+                    return java.util.Collections.nCopies(records.size(), Outcome.retry(new IllegalStateException("x")));
+                }
+                if (call == 2) {
+                    slowShard.set(records.get(0).shard());
+                    long end = System.nanoTime() + timeout.toNanos() + timeout.toNanos() / 5;
+                    while (System.nanoTime() < end) {
+                        try {
+                            Thread.sleep(10); // past the cancel at batchTimeout: no outcome of this call counts
+                        } catch (InterruptedException ignored) {
+                            // keeps the handler thread as a call stuck past its deadline does
+                        }
+                    }
+                }
+                return java.util.Collections.nCopies(records.size(), Outcome.delivered());
+            }
+        };
+        var outbox = start(config, handler, events);
+
+        transactions.inTx(c -> outbox.sendAll(messages));
+        await(Duration.ofSeconds(20), () -> calls.get() >= 4);
+        runtime.close();
+
+        assertThat(events.steps.get(0).handedTimes).as("both shards in one call").containsExactly(4);
+        int other = messages.stream().map(m -> shard(new String(m.key(), UTF_8))).filter(x -> x != slowShard.get())
+                .findFirst().orElseThrow();
+        var skipping = events.steps.get(1);
+        assertThat(skipping.handedTimes).as("the slow probe alone: the other shard is skipped").containsExactly(1);
+        assertThat(skipping.log).as("both shards in the step").anyMatch(e -> e.startsWith("fetched(" + other + ","));
+        assertThat(skipping.log).as("the other shard's head is counted in the step that offers it")
+                .contains("fetched(" + other + ",0)");
+    }
+
+    @Test
     void settledCountsTheRowsTheCommitMoves() throws Exception {
         var keys = sameShardKeys(3);
         var config = new TestOutboxConfig();

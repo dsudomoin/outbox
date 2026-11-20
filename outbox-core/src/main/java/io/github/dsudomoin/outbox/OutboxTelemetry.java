@@ -234,11 +234,14 @@ public interface OutboxTelemetry {
         /**
          * Once per shard of the step with work, after the step's reads of that shard and before its main handler call
          * (the calls of its due retry and parked rows come earlier): {@code records}, the records of the shard the step
-         * read and handed to the handler, or wrote without a call, each once: its due retry heads with their
+         * read and offered to the handler (in a call that came back with no free handler thread too), or wrote
+         * without a call, each once: its due retry heads with their
          * followers (those a later round of the retry pass promotes included), its due parked rows and the parked rows
          * offered with them, a retry head moved to the dead table out of attempts, its main read (the rows of keys in
          * the retry table and those held out of the call included) and the parked rows merged into that read's call.
-         * Rows read and left for a later step without being handed (a head the call has no room for) do not count.
+         * Rows read and left for a later step without being offered (a head the call has no room for, the main read of
+         * a shard called alone that the step skips once its time is spent) do not count; a shard called alone reports
+         * right before its call.
          */
         default void fetched(int shard, int records) {}
 

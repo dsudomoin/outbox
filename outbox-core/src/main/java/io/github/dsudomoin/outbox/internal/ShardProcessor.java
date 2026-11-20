@@ -703,7 +703,11 @@ public final class ShardProcessor implements AutoCloseable {
                 }
                 (byItself ? alone : shared).add(s);
             }
-            fetched(observed.step, work);
+            for (var s : work) {
+                if (!alone.contains(s)) {
+                    fetched(observed.step, s, true);
+                }
+            }
             boolean called = deliverBatch(observed.step, shared, now, parkedUntil);
             anyCall |= called;
             var handed = shared.stream().filter(Step::handed).toList();
@@ -723,11 +727,13 @@ public final class ShardProcessor implements AutoCloseable {
             for (var s : alone) {
                 if (anyCall && System.nanoTime() - started >= relay.batchTimeout().toNanos()) {
                     s.untouched = true; // the step's time is spent: called in a later step
+                    fetched(observed.step, s, false); // its rows are read again then
                     continue;
                 }
                 if (mainCalls) {
                     keepAlive(inTx); // a statement between two handler calls
                 }
+                fetched(observed.step, s, true);
                 boolean ran = deliverBatch(observed.step, List.of(s), now, parkedUntil);
                 anyCall |= ran;
                 mainCalls |= ran;
@@ -794,18 +800,26 @@ public final class ShardProcessor implements AutoCloseable {
     /**
      * {@link OutboxTelemetry.RelayStep#fetched} of each shard of the step with work, once its reads are done: the
      * distinct records its retry pass handed or recorded without a call ({@link Pass#fetched}), then those of its main
-     * read and the parked rows merged into its call.
+     * read and the parked rows merged into its call. A shard called alone reports right before its call; skipped,
+     * because the step's time is spent ({@code mainRead} false), its retry pass's records only: a later step reads the
+     * rest again.
      */
     private static void fetched(OutboxTelemetry.RelayStep step, List<Step> work) {
+        for (var s : work) {
+            fetched(step, s, true);
+        }
+    }
+
+    private static void fetched(OutboxTelemetry.RelayStep step, Step s, boolean mainRead) {
         if (step == OutboxTelemetry.RelayStep.NONE) {
             return;
         }
-        for (var s : work) {
-            var ids = s.pass == null || s.pass.fetched == null ? new HashSet<Long>() : s.pass.fetched;
+        var ids = s.pass == null || s.pass.fetched == null ? new HashSet<Long>() : s.pass.fetched;
+        if (mainRead) {
             s.rows.forEach(row -> ids.add(row.record().id()));
             s.parkedRows.forEach(row -> ids.add(row.id()));
-            step.fetched(s.shard, ids.size());
         }
+        step.fetched(s.shard, ids.size());
     }
 
     /** One shard's part of a step. */
