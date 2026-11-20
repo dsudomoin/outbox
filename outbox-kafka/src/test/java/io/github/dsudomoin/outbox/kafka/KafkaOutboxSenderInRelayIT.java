@@ -17,13 +17,16 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import org.apache.kafka.clients.producer.Callback;
+import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
@@ -67,41 +70,91 @@ class KafkaOutboxSenderInRelayIT {
         var handed = new ConcurrentHashMap<UUID, AtomicInteger>();
         var acked = ConcurrentHashMap.<UUID>newKeySet();
         var slowLookup = new AtomicBoolean(true);
-        var sender = new KafkaOutboxSender(() -> props(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092"),
-                properties -> new SlowBroker(slowLookup, handed, acked));
-        closing.add(sender);
-        var config = new TestOutboxConfig().shards(1).batchTimeout(BATCH_TIMEOUT);
-        var runtime = OutboxRuntime.builder(config, transactions, sender.handler()).build();
-        closing.add(runtime);
-        runtime.start();
-
-        var ids = transactions.inTx(c -> runtime.outbox().sendAll(List.of(
-                OutboxMessage.of(KafkaOutboxSenderTest.TOPIC, "a", bytes("a")),
-                OutboxMessage.of(KafkaOutboxSenderTest.TOPIC, "b", bytes("b")),
-                OutboxMessage.of(KafkaOutboxSenderTest.TOPIC, "c", bytes("c")))));
+        var runtime = start(properties -> new SlowBroker(slowLookup, ACK_AFTER, handed, acked));
+        var ids = sendThree(runtime);
 
         long deadline = System.nanoTime() + BATCH_TIMEOUT.multipliedBy(2).toNanos();
-        while (!acked.containsAll(ids) && handed.values().stream().allMatch(n -> n.get() == 1)
+        while (!drained(runtime) && handed.values().stream().allMatch(n -> n.get() == 1)
                 && System.nanoTime() < deadline) {
             Thread.sleep(20);
         }
         assertThat(handed).as("each message handed to send() once").containsOnlyKeys(ids)
                 .allSatisfy((id, sends) -> assertThat(sends).hasValue(1));
         assertThat(acked).as("delivered").containsExactlyInAnyOrderElementsOf(ids);
+        assertThat(drained(runtime)).as("the relay recorded the deliveries").isTrue();
     }
 
     /**
-     * Acknowledges each record {@link #ACK_AFTER} after {@code send()} returned; the first metadata lookup of the test
-     * takes {@link #FIRST_LOOKUP}; {@code close(Duration.ZERO)} fails what is pending, as Kafka's forced close does.
+     * The relay stops while a call waits for Kafka: its step is interrupted and rolls back, so the shard's records may
+     * go again through another worker's producer. The call must close its own producer at once and leave nothing in
+     * flight, or a record of it could still be written after a later one of its key.
+     */
+    @Test
+    void aRelayStoppingWhileACallWaitsForKafkaLeavesNothingInFlight() throws Exception {
+        var handed = new ConcurrentHashMap<UUID, AtomicInteger>();
+        var producers = new CopyOnWriteArrayList<SlowBroker>();
+        var runtime = start(properties -> {
+            var producer = new SlowBroker(new AtomicBoolean(), Duration.ofMinutes(1), handed,
+                    ConcurrentHashMap.newKeySet());
+            producers.add(producer);
+            return producer;
+        });
+        var ids = sendThree(runtime);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (!handed.keySet().containsAll(ids) && System.nanoTime() < deadline) {
+            Thread.sleep(20);
+        }
+        assertThat(handed).containsOnlyKeys(ids);
+
+        runtime.close(); // after its shutdownTimeout, it interrupts the worker, whose step is waiting for the call
+
+        deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (!producers.get(0).closed() && System.nanoTime() < deadline) {
+            Thread.sleep(20);
+        }
+        assertThat(producers).hasSize(1);
+        assertThat(producers.get(0).closed()).as("the call's producer, closed with its sends").isTrue();
+    }
+
+    private OutboxRuntime start(Function<Map<String, Object>, Producer<byte[], byte[]>> producers) {
+        var sender = new KafkaOutboxSender(() -> props(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092"),
+                producers);
+        closing.add(sender);
+        var config = new TestOutboxConfig().shards(1).batchTimeout(BATCH_TIMEOUT);
+        var runtime = OutboxRuntime.builder(config, transactions, sender.handler()).build();
+        closing.add(runtime);
+        runtime.start();
+        return runtime;
+    }
+
+    private List<UUID> sendThree(OutboxRuntime runtime) {
+        return transactions.inTx(c -> runtime.outbox().sendAll(List.of(
+                OutboxMessage.of(KafkaOutboxSenderTest.TOPIC, "a", bytes("a")),
+                OutboxMessage.of(KafkaOutboxSenderTest.TOPIC, "b", bytes("b")),
+                OutboxMessage.of(KafkaOutboxSenderTest.TOPIC, "c", bytes("c")))));
+    }
+
+    /** Nothing left to relay: every shard caught up, no retry or parked row. */
+    private static boolean drained(OutboxRuntime runtime) {
+        var status = runtime.admin().status();
+        return status.lagSeconds() == 0 && status.retrySize() == 0 && status.parkedSize() == 0;
+    }
+
+    /**
+     * Acknowledges each record {@code ackAfter} after {@code send()} returned; the first metadata lookup while
+     * {@code slowLookup} takes {@link #FIRST_LOOKUP}; {@code close(Duration.ZERO)} fails what is pending, as Kafka's
+     * forced close does.
      */
     private final class SlowBroker extends TestProducer {
         private final AtomicBoolean slowLookup;
+        private final Duration ackAfter;
         private final Map<UUID, AtomicInteger> handed;
         private final Set<UUID> acked;
 
-        SlowBroker(AtomicBoolean slowLookup, Map<UUID, AtomicInteger> handed, Set<UUID> acked) {
+        SlowBroker(AtomicBoolean slowLookup, Duration ackAfter, Map<UUID, AtomicInteger> handed, Set<UUID> acked) {
             super(false, r -> null);
             this.slowLookup = slowLookup;
+            this.ackAfter = ackAfter;
             this.handed = handed;
             this.acked = acked;
         }
@@ -129,7 +182,7 @@ class KafkaOutboxSenderInRelayIT {
                 }
                 callback.onCompletion(metadata, e);
             });
-            broker.schedule(() -> completeNext(), ACK_AFTER.toMillis(), TimeUnit.MILLISECONDS);
+            broker.schedule(() -> completeNext(), ackAfter.toMillis(), TimeUnit.MILLISECONDS);
             return sent;
         }
     }

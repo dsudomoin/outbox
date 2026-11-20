@@ -1370,6 +1370,47 @@ class KafkaOutboxSenderTest {
     }
 
     /**
+     * The relay gives up on a call (its step interrupted, or past {@code batchTimeout}) right after the wind-down, and
+     * the handler thread sees one interrupt for both: the call cuts at once, as the cancel's own flag says, and leaves
+     * nothing in flight for a step that has already let the shard go.
+     */
+    @Test
+    void aCancelSeenWithTheWindDownInOneInterruptCutsAtOnce() throws Exception {
+        var sender = sender(DELIVERY_TIMEOUT);
+        var call = inRelayCall(Duration.ofSeconds(30), () -> sender.send(List.of(record(1, "a"), record(2, "b"))));
+        var producer = awaitSent(0, 2);
+        producer.completeNext();
+
+        call.handler().cancel(); // both flags, one interrupt
+
+        assertThat(call.result().get(2, SECONDS)).satisfiesExactly(
+                o -> assertThat(o).isEqualTo(Outcome.delivered()),
+                o -> assertThat(o).isInstanceOf(Outcome.Retry.class));
+        assertThat(call.flagKept()).isTrue();
+        assertThat(producer.closed()).isTrue();
+    }
+
+    /** A call the relay gave up on while its interrupt went unseen hands nothing more over. */
+    @Test
+    void aCancelledCallHandsNothingOver() throws Exception {
+        var sender = sender(() -> new TestProducer(true, r -> null), DELIVERY_TIMEOUT);
+        var self = new AtomicReference<TestHandlerCall>();
+        var outcomes = new CompletableFuture<List<Outcome>>();
+        var handler = new TestHandlerCall(Duration.ofSeconds(30), () -> {
+            self.get().cancel();
+            Thread.interrupted(); // a client swallowed the interrupt
+            outcomes.complete(sender.send(List.of(record(1, "a"))));
+            return List.of();
+        });
+        self.set(handler);
+
+        handler.call();
+
+        assertThat(outcomes.get()).containsExactly(Outcome.notAttempted());
+        assertThat(producers.get(0).history()).isEmpty();
+    }
+
+    /**
      * A {@code batchTimeout} shorter than the call's own budget: after the wind-down the call awaits its records until
      * just before the relay would cancel it, then cuts, so the outcomes it has count and no record is retried for
      * nothing.
