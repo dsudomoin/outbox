@@ -270,7 +270,8 @@ public final class Ticks {
      * The tick from its probe's row (see {@link #probe}) and the commit, in one round trip: {@code lock_timeout} 50 ms
      * for the probe, then the tick row, or the xid-regression halt in its place (see {@link #insert}), then the commit.
      * Its one parameter is the bound of {@link #probe}; its row: the new tick's id (null when none was made), whether
-     * the halt was recorded, and whether the probe returned a row (false: the newest tick is younger than the bound).
+     * the halt was recorded, whether the probe returned a row (false: the newest tick is younger than the bound), and
+     * the database clock.
      */
     private String probedTick(Connection c) throws SQLException {
         var sql = probedTick;
@@ -281,14 +282,16 @@ public final class Ticks {
                     + " max_id, dirty from p where not regressed returning id),"
                     + " h as (" + XidRecovery.haltUpsert(names, "select newest_xmax::text::xid8 from p where regressed")
                     + " returning 1)"
-                    + " select (select id from t), exists (select 1 from h), exists (select 1 from p); commit";
+                    + " select (select id from t), exists (select 1 from h), exists (select 1 from p),"
+                    + " clock_timestamp(); commit";
         }
         return sql;
     }
 
     /**
      * The tick after a failed probe and the commit, in one round trip: the snapshot and the id high-water mark, no
-     * shard set (every shard). Its one parameter is the bound of {@link #probe}; its row: the new tick's id, or none.
+     * shard set (every shard). Its one parameter is the bound of {@link #probe}; its row: the new tick's id and the
+     * database clock, or none.
      */
     private String unprobedTick(Connection c) throws SQLException {
         var sql = unprobedTick;
@@ -301,7 +304,7 @@ public final class Ticks {
                     + " and t.created_at <= clock_timestamp()"
                     // the regression guard of the probing insert, without its halt: the next probe records that
                     + " or pg_snapshot_xmax(pg_current_snapshot()) < pg_snapshot_xmax(t.snapshot))"
-                    + " returning id; commit";
+                    + " returning id, clock_timestamp(); commit";
         }
         return sql;
     }
@@ -330,11 +333,17 @@ public final class Ticks {
 
     /** {@link #tick}, with the id of the tick inserted: its maker reads it from there, not from the table. */
     public Attempt attempt(Connection autocommit, Duration minInterval) throws SQLException {
+        return attempt(autocommit, minInterval, null);
+    }
+
+    /** {@link #attempt(Connection, Duration)}; {@code clock}, when given, gets a reading from the tick's statement. */
+    public Attempt attempt(Connection autocommit, Duration minInterval, @Nullable DatabaseClock clock)
+            throws SQLException {
         var c = autocommit;
         boolean autoCommit = c.getAutoCommit();
         c.setAutoCommit(false);
         try {
-            var made = lock(c) ? insert(c, minInterval) : null;
+            var made = lock(c) ? insert(c, minInterval, clock) : null;
             if (made == null) {
                 c.rollback();
                 made = new Attempt(Made.SKIPPED, 0);
@@ -373,7 +382,7 @@ public final class Ticks {
      * written since. The insert after a failed probe skips such a tick too and leaves the halt to the next probe.
      */
     @Nullable
-    private Attempt insert(Connection c, Duration minInterval) throws SQLException {
+    private Attempt insert(Connection c, Duration minInterval, @Nullable DatabaseClock clock) throws SQLException {
         long micros = TimeUnit.MICROSECONDS.convert(minInterval);
         try (var ps = c.prepareStatement(probedTick(c))) {
             ps.setLong(1, micros);
@@ -385,6 +394,9 @@ public final class Ticks {
                         long id = rs.getLong(1);
                         made = new Attempt(!rs.wasNull() ? Made.INSERTED : rs.getBoolean(2) ? Made.REGRESSED
                                 : Made.SKIPPED, id); // skipped: the newest tick is younger than the bound
+                        if (clock != null) {
+                            clock.read(rs.getObject(4, OffsetDateTime.class).toInstant());
+                        }
                     }
                 }
             }
@@ -408,6 +420,9 @@ public final class Ticks {
                         try (var rs = ps.getResultSet()) {
                             if (rs.next()) {
                                 made = new Attempt(Made.INSERTED, rs.getLong(1));
+                                if (clock != null) {
+                                    clock.read(rs.getObject(2, OffsetDateTime.class).toInstant());
+                                }
                             }
                         }
                     }
@@ -424,8 +439,9 @@ public final class Ticks {
             probeUnwarned.incrementAndGet();
             return;
         }
-        log.warn("outbox tick made without its shard set, so the relay steps every shard behind it: the shard probe"
-                + " failed with SQLState {}: {} ({} more since the previous report not logged)", e.getSQLState(),
+        log.warn("outbox tick made without its shard set, so the relay steps every shard behind it: the statement of"
+                + " its shard probe and its row failed with SQLState {}: {} ({} more since the previous report not"
+                + " logged)", e.getSQLState(),
                 e.getMessage(), probeUnwarned.getAndSet(0));
     }
 

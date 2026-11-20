@@ -140,11 +140,12 @@ public final class OutboxRelay implements AutoCloseable {
     private final AtomicLongArray retryAfter;
     /**
      * Per shard, the rows its next step is expected to read: {@code batchSize} while its batch is unfinished; else the
-     * rows its last batch delivered (0 before it delivered any), kept by a step that left it untouched (unread behind a
-     * cut, or not attempted). A group takes shards until their rows would pass {@code batchSize}, which a group's read
-     * and call share, so a shard with an unfinished batch is stepped alone (a cut read leaves the shards after it
-     * untouched and its own rest to be read again) while shards that finish their batches share steps. In memory, per
-     * relay instance; {@link #batchRows}: what the batch in progress delivered so far.
+     * rows its last batch delivered (0 before it delivered any), which a step that left it untouched (unread behind a
+     * cut, or not attempted) raises to the most rows a shard of that step delivered. A group takes shards while their
+     * rows stay below {@code batchSize}, which a group's read and call share, so a shard expected to fill a read is
+     * stepped alone (a cut read leaves the shards after it untouched and its own rest to be read again) while shards
+     * that finish their batches share steps. In memory, per relay instance; {@link #batchRows}: what the batch in
+     * progress delivered so far.
      */
     private final AtomicIntegerArray expected;
     private final AtomicIntegerArray batchRows;
@@ -565,8 +566,9 @@ public final class OutboxRelay implements AutoCloseable {
     }
 
     /**
-     * Its batch is unfinished, or it was left untouched with a batch in progress: it holds at least a {@code batchSize}
-     * read, so it steps alone. Every other shard is packed by its {@link #expected} rows: a group's read takes the
+     * Expected to fill a read ({@link #expected}): its batch is unfinished, it was left untouched with a batch in
+     * progress, or it was left untouched by a step in which a shard delivered {@code batchSize} rows; so it steps
+     * alone. Every other shard is packed by its {@link #expected} rows: a group's read takes the
      * shards in order and stops inside one shard at most, so only that one and the shards after it read again. A
      * lower bound for stepping alone (more than {@code batchSize / 16} rows, as before) kept the relay in a slow mode
      * under steady load: with every shard stepping alone, a cycle grew long enough for each to gather that many rows
@@ -1199,7 +1201,7 @@ public final class OutboxRelay implements AutoCloseable {
             lastTickAttempt = attempt = now;
             youngest = wakePending ? wakeTickAge : idleTickAge;
         }
-        var tick = ticks.attempt(c, youngest);
+        var tick = ticks.attempt(c, youngest, clock); // a reading, as its maker reads no latest tick after it
         var made = tick.made();
         if (made == Ticks.Made.REGRESSED) {
             maintenance.checkHalt(); // the halt it recorded: the workers stop now, not at the next maintenance run

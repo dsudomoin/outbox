@@ -76,6 +76,20 @@ class TicksIT {
     }
 
     /**
+     * The tick brings the database clock a reading, as the read of the latest tick its maker no longer runs did: a
+     * relay of one worker under steady commits makes the tick of every pass, and its clock would otherwise read only at
+     * the heartbeat, so a time made after a VM pause stayed off by the pause for that long.
+     */
+    @Test
+    void aTickBringsTheDatabaseClockAReading() throws Exception {
+        var clock = new DatabaseClock(java.time.InstantSource.fixed(java.time.Instant.EPOCH)); // a JVM clock far off
+        try (var c = TestDb.connect()) {
+            assertThat(ticks.attempt(c, Duration.ZERO, clock).made()).isEqualTo(Ticks.Made.INSERTED);
+        }
+        assertThat(Duration.between(clock.now(), java.time.Instant.now()).abs()).isLessThan(Duration.ofMinutes(1));
+    }
+
+    /**
      * The step's cursor read chooses each shard's ticks as {@link Ticks#fresh} and {@code chooseTarget} do, which it
      * replaces: on random tick logs (marking bitmaps of every kind, null bitmaps and {@code max_id}s, gaps in the ids)
      * and random cursors (fresh and mid-batch, below and at the latest tick), the same skipped-to tick and target.
