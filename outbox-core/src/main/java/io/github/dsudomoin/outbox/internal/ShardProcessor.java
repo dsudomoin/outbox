@@ -132,6 +132,16 @@ public final class ShardProcessor implements AutoCloseable {
      * of {@code batchSize} rows as large as the shards' largest recent one has room for both four times over.
      */
     private static final int PLAIN_READ_MARGIN = 4;
+    /**
+     * Ids per shard a new batch spans at most ({@link #batchIds}), unless {@code batchSize} is larger. Not
+     * {@code batchSize} per shard: {@code batchSize} bounds the rows of a read and a call, so shards whose batches are
+     * small share steps, while the span decides how much of the heap one batch of every shard covers. At about 1000
+     * ids a shard, a drain sweeps the heap roughly once in id order, each heap page (rows of several shards) read by
+     * its shards while it is still cached, and each shard's read sorts about a thousand rows. Measured on a backlog
+     * of 1 KB rows larger than {@code shared_buffers}: a span of {@code 10 000 × shards} drained at 75–117k msg/s,
+     * this one at 171k.
+     */
+    static final long SPAN_PER_SHARD = 1000;
     /** {@link #recentRowBytes} of a shard not read yet, or forgotten. */
     private static final long UNKNOWN = -1;
 
@@ -155,7 +165,10 @@ public final class ShardProcessor implements AutoCloseable {
     private final String targeted;
     /** Failed attempts that divert a single key: {@code headFailuresBeforeDivert}, at most {@code maxAttempts}. */
     private final int divertAt;
-    /** Ids a new batch may span, all shards together: {@code batchSize × shards}. */
+    /**
+     * Ids a new batch may span, all shards together: {@link #SPAN_PER_SHARD} × shards, at least {@code batchSize}, so a
+     * lone shard can still fill a read.
+     */
     private final long batchIds;
     /**
      * {@code batchBytes} as a budget ({@link RowBytes#budget}): wherever a call's rows are bounded by
@@ -244,7 +257,7 @@ public final class ShardProcessor implements AutoCloseable {
         this.divertAt = retry.maxAttempts() > 0
                 ? Math.min(relay.headFailuresBeforeDivert(), retry.maxAttempts())
                 : relay.headFailuresBeforeDivert();
-        this.batchIds = (long) relay.batchSize() * config.shards();
+        this.batchIds = Math.max(relay.batchSize(), SPAN_PER_SHARD * config.shards());
         this.targeted = cursors.latestWithTargetsSql(relay.maxTicksPerBatch(), batchIds);
         this.fullCheckInterval = config.partitions().maintenanceInterval().toNanos();
         this.fullChecked = new AtomicLongArray(config.shards());

@@ -210,7 +210,7 @@ kafka-topics.sh --bootstrap-server "$KAFKA" --create --topic imports --partition
 - 256 shards with the relay defaults of the time (`batchSize` 1000, now 10 000) delivered 288–289k msg/s at p50 0.40 s, p99 1.0–1.1 s and 196 %
   DB CPU (2 writers × 10 000 per transaction, payload 100 B, noop handler; RESULTS «Под нагрузкой после исправлений
   ревью (fix round 1)»). The Kafka handler adds producer work: re-check with `outbox.shard.lag`.
-- A relay batch covers about `batchSize × shards` ids.
+- A relay batch covers about 1000 ids per shard (`1000 × shards`, at least `batchSize`).
 - Bulk burns few xids per message, so a 16 777 216-xid default range can hold hours of rows. Measure the cluster xid
   rate (`select pg_current_xact_id()` twice, a minute apart), set `xidsPerPartition ≈ xid/s × 300` (≥ 1000), then
   size `premake` with the snapshot formula.

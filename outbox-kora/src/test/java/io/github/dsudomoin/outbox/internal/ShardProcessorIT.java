@@ -237,6 +237,60 @@ class ShardProcessorIT {
         assertThat(results).as("steps").allMatch(r -> r.delivered() <= 1000).hasSizeBetween(80, 82);
     }
 
+    /**
+     * A new batch spans about 1000 ids per shard however large {@code batchSize} is: a drain then sweeps the heap about
+     * once in id order, instead of each shard reading its rows spread over the whole backlog.
+     */
+    @Test
+    void aNewBatchSpansAThousandIdsPerShardWhateverTheBatchSize() throws Exception {
+        config.shards(32).batchSize(10_000);
+
+        assertFirstBatchSpans(32_000);
+    }
+
+    /** A new batch spans at least {@code batchSize} ids, so a read of a lone shard can still fill it. */
+    @Test
+    void aNewBatchSpansAtLeastBatchSizeIds() throws Exception {
+        config.shards(2).batchSize(10_000);
+
+        assertFirstBatchSpans(10_000);
+    }
+
+    /**
+     * Ten ticks of two rows of shard 0 each, about 5000 ids apart (the sequence moved on, as by other writers' rows),
+     * then a step cut after one row by the byte budget, so the cursor names its first batch's target: that tick's
+     * {@code max_id} lies within {@code span} of the cursor's tick, the next tick's past it.
+     */
+    private void assertFirstBatchSpans(long span) throws Exception {
+        config.batchBytes(1);
+        bootstrap();
+        String sequence;
+        try (var c = TestDb.connect()) {
+            sequence = queryString(c, "select pg_get_serial_sequence(?, 'id')", names.base());
+        }
+        var key = keyOnShard(0);
+        for (int t = 0; t < 10; t++) {
+            send(msg("t", key, "m" + t + "a"), msg("t", key, "m" + t + "b"));
+            try (var c = TestDb.connect()) {
+                execute(c, "select setval('" + sequence + "', (select last_value from " + sequence + ") + 5000)");
+            }
+            tick();
+        }
+        long from = cursor(0).tickId();
+
+        assertThat(process(processor, 0).delivered()).isOne();
+
+        var target = cursor(0).targetTickId();
+        assertThat(target).as("a batch in progress").isNotNull();
+        try (var c = TestDb.connect()) {
+            long base = queryLong(c, "select max_id from " + names.tick() + " where id = " + from);
+            long reached = queryLong(c, "select max_id from " + names.tick() + " where id = " + target) - base;
+            long next = queryLong(c, "select min(max_id) from " + names.tick() + " where id > " + target) - base;
+            assertThat(reached).as("the target's ids").isLessThanOrEqualTo(span);
+            assertThat(next).as("the next tick's ids").isGreaterThan(span);
+        }
+    }
+
     @Test
     void failingKeyIsDivertedOthersFlow() throws Exception {
         bootstrap();
@@ -5277,12 +5331,12 @@ class ShardProcessorIT {
 
     @Test
     void aChainCutByTheLimitInsideTheNextBatchGoesOnFromItsLastRow() throws Exception {
-        config.shards(2).batchSize(150); // a batch spans at most 300 ids
+        config.shards(2).batchSize(150); // a batch spans at most 2000 ids, 1000 a shard
         bootstrap();
         var keys = keysOnShard(0, 2);
-        lagTick(keys, "t1#", 20, 400);
+        lagTick(keys, "t1#", 20, 2100);
         long t1 = tick();
-        lagTick(keys, "t2#", 75, 400); // larger than the first: it does not fit in the rest, and is cut there
+        lagTick(keys, "t2#", 75, 2100); // larger than the first: it does not fit in the rest, and is cut there
         long t2 = tick();
 
         // 40 rows of the first batch, then 110 of the second's 150: the limit
