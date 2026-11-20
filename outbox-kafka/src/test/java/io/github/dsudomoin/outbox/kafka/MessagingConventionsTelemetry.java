@@ -20,10 +20,12 @@ import io.opentelemetry.context.propagation.TextMapPropagator;
 import jakarta.annotation.Nullable;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
@@ -35,12 +37,21 @@ import java.util.concurrent.atomic.LongAdder;
  * public {@link OutboxTelemetry} SPI and the OpenTelemetry API only, with no Micrometer and no framework classes.
  *
  * <p>Spans: {@code enqueue <topic>} (PRODUCER, one per message, child of the current span, its context stored in the
- * row and current during the message's own INSERT); {@code fetch <table>} (CLIENT, one per relay step with work);
+ * row and current during the message's own INSERT); {@code fetch <table>} (CLIENT, one per relay step with records);
  * {@code deliver <topic>} (CONSUMER, one per record and attempt, ending at the record's own outcome, child of the
  * stored context and linked to the fetch span, else a child of the fetch span); {@code settle <table>} (CLIENT, child
  * of the fetch span). Meters, kept in memory ({@link Meters}): messages enqueued once committed (a failed write with
  * {@code error.type}), delivery attempts, dead letters by {@code error.type}, the fetch batch size, and each shard's
  * pending count and oldest age.
+ *
+ * <p>The core also steps a shard that turns out to have nothing to hand (a tick landing while its step runs, a read
+ * of exactly {@code batchSize} rows followed by an empty one, a tick marking every shard). Such a step exports no
+ * {@code fetch} and no {@code settle} span, and records 0 in the fetch batch-size histogram: {@link #stepStarted}
+ * only notes the current context and the time, and the fetch span is created, with that parent and start, at the
+ * step's first handler call or its first shard with records. The trade-off: the fetch span exists only once the step
+ * knows it has records, so the spans of the step's first reads (a JDBC instrumentation's) are not its children, they
+ * run before it exists. An implementation that wants them as children starts the span eagerly and accepts fetch
+ * spans that count 0.
  */
 final class MessagingConventionsTelemetry implements OutboxTelemetry {
 
@@ -181,31 +192,45 @@ final class MessagingConventionsTelemetry implements OutboxTelemetry {
 
     @Override
     public RelayStep stepStarted(List<Integer> shards) {
-        return new Step(shards);
+        return new Step();
     }
 
-    /** A step's {@code fetch} span, on the relay thread from its start to its end. */
+    /**
+     * A step's {@code fetch} span, created on first need (see the class javadoc); used on the relay thread only, from
+     * the step's start to its end.
+     */
     private final class Step implements RelayStep {
 
-        final Span span;
-        private final List<Integer> shards;
+        private final Context parent = Context.current();
+        private final Instant start = Instant.now();
+        private final Set<Integer> shardsWithRecords = new HashSet<>();
+        @Nullable
+        private Span span;
         private long fetched;
         private boolean ended;
 
-        Step(List<Integer> shards) {
-            this.shards = List.copyOf(shards);
-            this.span = common(tracer.spanBuilder("fetch " + table), "fetch", "receive")
-                    .setSpanKind(SpanKind.CLIENT).setParent(Context.current()).startSpan();
+        /** The fetch span, created now if the step has none yet, with the step's parent and start. */
+        Span span() {
+            if (span == null) {
+                span = common(tracer.spanBuilder("fetch " + table), "fetch", "receive")
+                        .setSpanKind(SpanKind.CLIENT).setParent(parent).setStartTimestamp(start).startSpan();
+            }
+            return span;
         }
 
         @Override
         public void fetched(int shard, int records) {
-            fetched += records;
+            if (records > 0) {
+                fetched += records;
+                shardsWithRecords.add(shard);
+                span();
+            }
         }
 
+        /** No settle span for a step without a fetch span: one that had no records. */
         @Override
         public Settle settleStarted() {
-            return new SettleSpan(span);
+            return span == null ? Settle.NONE : new SettleSpan(span);
         }
 
         @Override
@@ -223,16 +248,21 @@ final class MessagingConventionsTelemetry implements OutboxTelemetry {
                 return;
             }
             ended = true;
+            if (error == null) { // every successful fetch, an empty one as 0
+                meters.record(FETCH_BATCH_SIZE, fetched);
+            }
+            if (span == null) {
+                return;
+            }
             span.setAttribute(BATCH_COUNT, fetched);
-            if (shards.size() == 1) {
-                span.setAttribute(PARTITION, Integer.toString(shards.get(0)));
+            if (shardsWithRecords.size() == 1) {
+                span.setAttribute(PARTITION, Integer.toString(shardsWithRecords.iterator().next()));
             }
             if (error != null) {
                 span.setAttribute(ERROR_TYPE, error.getClass().getName()).setStatus(StatusCode.ERROR)
                         .recordException(error);
             }
             span.end();
-            meters.record(FETCH_BATCH_SIZE, fetched);
         }
     }
 
@@ -275,7 +305,7 @@ final class MessagingConventionsTelemetry implements OutboxTelemetry {
 
     @Override
     public Delivery deliveryStarted(RelayStep step, List<OutboxRecord> records, Instant now) {
-        return new Call(step instanceof Step s ? s.span : null, records, now);
+        return new Call(step instanceof Step s ? s.span() : null, records, now);
     }
 
     @Override

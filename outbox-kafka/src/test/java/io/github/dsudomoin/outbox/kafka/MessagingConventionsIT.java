@@ -167,8 +167,9 @@ class MessagingConventionsIT {
                 .isEqualTo(1);
         assertThat(meters.count(DEAD_LETTERED, dest, topic, ERROR_TYPE.getKey(),
                 IllegalArgumentException.class.getName())).isEqualTo(1);
-        assertThat(meters.histogram(FETCH_BATCH_SIZE)).as("the steps with records").filteredOn(n -> n > 0)
-                .containsExactly(2L);
+        assertThat(meters.histogram(FETCH_BATCH_SIZE)).as("the steps with records").contains(2L)
+                .allMatch(n -> n == 2 || n == 0);
+        assertFetchSpansHaveRecords();
         await(() -> runtime.maintenance().runOnce() && meters.pending(0) == 0);
         assertThat(meters.oldestSeconds(0)).as("oldest age with none pending").isZero();
     }
@@ -297,7 +298,9 @@ class MessagingConventionsIT {
                         s -> s.getSpanId().equals(l.getSpanContext().getSpanId())).isEmpty()));
 
         assertThat(handler.calls.get(0)).as("the first call").containsExactlyElementsOf(ids);
+        assertFetchSpansHaveRecords();
         var first = span(s -> s.getName().startsWith("fetch ") && linkedFrom(s, ids.get(0)));
+        assertThat(first.getAttributes().get(BATCH_COUNT)).as("the first step's records").isEqualTo(3);
         for (var id : List.of(ids.get(0), ids.get(2))) {
             assertThat(deliver(id).getLinks()).extracting(l -> l.getSpanContext().getSpanId())
                     .containsExactly(first.getSpanId());
@@ -315,13 +318,41 @@ class MessagingConventionsIT {
         assertThat(retried.getAttributes().get(RESEND_COUNT)).isEqualTo(1);
         assertThat(retried.getLinks()).singleElement().satisfies(l -> {
             assertThat(l.getSpanContext().getSpanId()).isNotEqualTo(first.getSpanId());
-            assertThat(span(s -> s.getSpanId().equals(l.getSpanContext().getSpanId())).getName())
-                    .isEqualTo("fetch " + config.table());
+            var retryFetch = span(s -> s.getSpanId().equals(l.getSpanContext().getSpanId()));
+            assertThat(retryFetch.getName()).isEqualTo("fetch " + config.table());
+            assertThat(retryFetch.getAttributes().get(BATCH_COUNT)).as("the retry step's records").isEqualTo(1);
         });
         var enqueue = enqueue(b);
         assertThat(attempts).allSatisfy(s -> assertThat(s.getParentSpanId()).isEqualTo(enqueue.getSpanId()));
         assertThat(telemetry.meters().count(DELIVERED, dest, topic, ERROR_TYPE.getKey(), IOException.class.getName()))
                 .isEqualTo(1);
+    }
+
+    /**
+     * A read of exactly {@code batchSize} rows cannot tell whether more follow, so the relay steps the shard again and
+     * that step reads nothing: it records 0 in the fetch batch-size histogram and exports neither a fetch nor a settle
+     * span. Each exported fetch span has records and one settle child.
+     */
+    @Test
+    void emptyStepExportsNoSpan() throws Exception {
+        var topic = TestKafka.createTopic(1);
+        var config = config().shards(1).batchSize(2).relayEnabled(false);
+        var telemetry = telemetry(config);
+        var runtime = start(config, telemetry, new Handler());
+        transactions.inTx(c -> runtime.outbox().sendAll(Stream.of("a", "b")
+                .map(k -> OutboxMessage.of(topic, k, bytes(k))).toList()));
+
+        runtime.relay().drain();
+
+        var sizes = telemetry.meters().histogram(FETCH_BATCH_SIZE);
+        assertThat(sizes).as("an empty step after the full one").contains(0L);
+        var fetches = spans(s -> s.getName().startsWith("fetch "));
+        assertThat(fetches).as("a fetch span per step with records").hasSize((int) sizes.stream().filter(n -> n > 0)
+                .count());
+        assertFetchSpansHaveRecords();
+        assertThat(fetches).extracting(s -> s.getAttributes().get(BATCH_COUNT)).containsExactly(2L);
+        assertThat(spans(s -> s.getName().startsWith("settle "))).singleElement()
+                .satisfies(s -> assertThat(s.getParentSpanId()).isEqualTo(fetches.get(0).getSpanId()));
     }
 
     /**
@@ -511,12 +542,15 @@ class MessagingConventionsIT {
         return span(s -> s.getName().startsWith("deliver ") && id.toString().equals(s.getAttributes().get(RECORD_ID)));
     }
 
-    /**
-     * The one fetch span of {@code table} with records. The SPI also starts a step for a shard with a tick to advance
-     * to whose read then hands nothing: its fetch span counts 0 records.
-     */
+    /** The one fetch span of {@code table}. */
     private SpanData fetch(String table) {
-        return span(s -> s.getName().equals("fetch " + table) && s.getAttributes().get(BATCH_COUNT) > 0);
+        return span(s -> s.getName().equals("fetch " + table));
+    }
+
+    /** A step without records exports no fetch span: every one exported counts at least one record. */
+    private void assertFetchSpansHaveRecords() {
+        assertThat(spans(s -> s.getName().startsWith("fetch "))).isNotEmpty().allSatisfy(s -> assertThat(
+                s.getAttributes().get(BATCH_COUNT)).as("records of %s", s.getSpanId()).isGreaterThanOrEqualTo(1));
     }
 
     private List<SpanData> delivers() {
