@@ -76,7 +76,8 @@ public final class TestDb {
         return role;
     }
 
-    private static TestDatabase newDatabase(
+    /** {@link #newDatabase(String, String, String, int)} with pgjdbc connection properties. */
+    public static TestDatabase newDatabase(
             String jdbcUrl, String user, String password, int maxPoolSize, Properties dsProperties) {
         return new TestDatabase(config(jdbcUrl, user, password, maxPoolSize, dsProperties));
     }

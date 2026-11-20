@@ -43,6 +43,17 @@ public final class TestDataSources {
         return Pg.INSTANCE.getPassword();
     }
 
+    /** The container's address on its Docker network, where another container reaches it on port 5432. */
+    static String containerAddress() {
+        return Pg.INSTANCE.getContainerInfo().getNetworkSettings().getNetworks().values().iterator().next()
+                .getIpAddress();
+    }
+
+    /** The database name in {@link #jdbcUrl()}. */
+    static String databaseName() {
+        return Pg.INSTANCE.getDatabaseName();
+    }
+
     /** A new physical connection per {@code getConnection()}; one the server does not answer fails, not hangs the run. */
     public static DataSource newDataSource() {
         var ds = new PGSimpleDataSource();
