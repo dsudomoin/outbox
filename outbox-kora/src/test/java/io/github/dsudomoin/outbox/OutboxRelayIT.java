@@ -598,6 +598,66 @@ class OutboxRelayIT {
         await(Duration.ofSeconds(10), () -> tickSees(id, before));
     }
 
+    /**
+     * While another instance ticks often (a running relay), the ticker inserts none: one statement per run sees the
+     * young tick, without the tick lock or the probe.
+     */
+    @Test
+    void theTickerLeavesTheTicksToAnInstanceThatTicksOften() throws Exception {
+        config.relayEnabled(false).ticksWithoutRelay(Duration.ofSeconds(1));
+        bootstrap();
+        var other = new Ticks(schema.names(), config.shards());
+        var made = ConcurrentHashMap.<Long>newKeySet();
+        var stop = new AtomicBoolean();
+        var ticker = new Thread(() -> {
+            try (var c = TestDb.connect()) {
+                while (!stop.get()) {
+                    var tick = other.attempt(c, Duration.ZERO);
+                    if (tick.made() == Ticks.Made.INSERTED) {
+                        made.add(tick.id());
+                    }
+                    Thread.sleep(100);
+                }
+            } catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+        }, "another-instance");
+        var relay = relay(new RecordingHandler());
+        long before = ticksMade();
+        ticker.start();
+        int roundTrips;
+        long elapsed;
+        try (var counted = RoundTrips.onThreads("outbox-ticker")) {
+            long since = System.nanoTime();
+            relay.start();
+            var outbox = outbox(relay::wake);
+            while (System.nanoTime() - since < TimeUnit.SECONDS.toNanos(3)) {
+                send(outbox, msg("t", "k", "p"));
+                Thread.sleep(50);
+            }
+            Thread.sleep(500);
+            relay.close();
+            elapsed = System.nanoTime() - since;
+            roundTrips = counted.get();
+        } finally {
+            stop.set(true);
+            ticker.join();
+        }
+
+        try (var c = TestDb.connect()) {
+            var ids = new ArrayList<Long>();
+            try (var st = c.createStatement();
+                    var rs = st.executeQuery("select id from " + schema.names().tick() + " where id > " + before)) {
+                while (rs.next()) {
+                    ids.add(rs.getLong(1));
+                }
+            }
+            assertThat(ids).as("ticks above the start").isNotEmpty().allMatch(made::contains);
+        }
+        long runs = elapsed / TimeUnit.SECONDS.toNanos(1) + 1;
+        assertThat(roundTrips).as("round trips of %d runs at most", runs).isLessThanOrEqualTo((int) (2 * runs));
+    }
+
     /** A failure, an Error included, costs the ticker one run: the commit it missed is covered by a later one. */
     @Test
     void theTickerOutlivesAnErrorAndTicksOnItsNextRun() throws Exception {

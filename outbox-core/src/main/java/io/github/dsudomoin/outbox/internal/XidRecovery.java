@@ -108,14 +108,21 @@ public final class XidRecovery {
                 + " and p.message_id = o.message_id)"
                 + " and not exists (select 1 from " + names.dead() + " d where d.id = o.id"
                 + " and d.message_id = o.message_id)"; // each keeps the id and message id of its outbox row
-        // every tick, not just the newest: workers keep ticking after a regression, and their new ticks look fine; the
-        // highest xmax comes from the index <tick>_xmax, as ticks pile up while a paused shard holds cleanup back
-        this.xidCheck = "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint,"
+        this.xidCheck = "select " + checkColumns(names);
+        this.haltInsert = haltInsert(names);
+        this.holding = names.base() + "_recovery";
+    }
+
+    /**
+     * The columns of a {@link Check}, in its order. Every tick, not just the newest: workers keep ticking after a
+     * regression, and their new ticks look fine; the highest xmax comes from the index {@code <tick>_xmax}, as ticks
+     * pile up while a paused shard holds cleanup back.
+     */
+    static String checkColumns(TableNames names) {
+        return "pg_snapshot_xmax(pg_current_snapshot())::text::bigint,"
                 + " (select pg_snapshot_xmax(snapshot)::text::bigint from " + names.tick()
                 + " order by pg_snapshot_xmax(snapshot) desc limit 1),"
                 + " (select max_tick_xmax::text::bigint from " + names.halt() + ")";
-        this.haltInsert = haltInsert(names);
-        this.holding = names.base() + "_recovery";
     }
 
     Check check(Connection c) throws SQLException {

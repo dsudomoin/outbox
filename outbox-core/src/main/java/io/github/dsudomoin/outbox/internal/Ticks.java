@@ -94,6 +94,18 @@ public final class Ticks {
     /** What {@link #attempt} did, and the id of the tick it inserted (0 when it inserted none). */
     public record Attempt(Made made, long id) {}
 
+    /** What {@link #gate} found. */
+    public enum Gate {
+        /** The newest tick, any instance's, is younger than the bound: it stands for one of the caller's. */
+        YOUNG,
+        /** The xid check finds a regression, or a recorded halt that ticks have not repaired ({@link XidRecovery}). */
+        HALTED,
+        /** A lock on the tick or halt table kept the read waiting for 1 s: a recovery holds one for its run. */
+        LOCKED,
+        /** None of these: a tick attempt may follow. */
+        DUE
+    }
+
     /** What {@link #tick} did. */
     public enum Made {
         INSERTED,
@@ -151,6 +163,9 @@ public final class Ticks {
 
     private final TableNames names;
     private final int shards;
+    /** {@link #gate}'s statement, built on its first call: its settings depend on the server version. */
+    @Nullable
+    private volatile String gate;
     /** Built on the first {@link #make}: they name the id sequence, which only the catalog knows. */
     @Nullable
     private volatile String probe;
@@ -361,6 +376,66 @@ public final class Ticks {
             }
             throw e;
         }
+    }
+
+    /**
+     * Whether a tick of an instance without a running relay is due, read without the tick lock in one round trip: one
+     * read-committed transaction on an autocommit connection, which it restores, with a 1 s {@code lock_timeout} and a
+     * 2 s {@code statement_timeout} of its own. {@link Gate#YOUNG} when the newest tick is younger than
+     * {@code minInterval}, by the bound the probe's insert uses; else {@link Gate#HALTED} by the xid check of
+     * {@link XidRecovery} (the current xmax, the highest tick xmax through {@code <tick>_xmax}, the recorded halt);
+     * {@link Gate#LOCKED} when a lock kept the read waiting for its timeout (SQLState 55P03); else {@link Gate#DUE}.
+     * It reads only {@code <base>_tick} and {@code <base>_halt}, which the application role may read
+     * ({@code OutboxSql}), so it needs no owner connection.
+     */
+    public Gate gate(Connection autocommit, Duration minInterval) throws SQLException {
+        var c = autocommit;
+        boolean autoCommit = c.getAutoCommit();
+        c.setAutoCommit(false);
+        try {
+            var found = Gate.DUE;
+            try (var ps = c.prepareStatement(gateSql(c))) {
+                ps.setLong(1, TimeUnit.MICROSECONDS.convert(minInterval));
+                for (boolean rows = ps.execute(); rows || ps.getUpdateCount() != -1; rows = ps.getMoreResults()) {
+                    if (rows) {
+                        try (var rs = ps.getResultSet()) {
+                            rs.next();
+                            var check = new XidRecovery.Check(rs.getLong(2), rs.getLong(3),
+                                    rs.getObject(4, Long.class));
+                            found = rs.getBoolean(1) ? Gate.YOUNG : check.halted() ? Gate.HALTED : Gate.DUE;
+                        }
+                    }
+                }
+            }
+            c.commit(); // committed by the statement already: sends nothing
+            c.setAutoCommit(autoCommit);
+            return found;
+        } catch (SQLException e) {
+            try {
+                c.rollback();
+                c.setAutoCommit(autoCommit);
+            } catch (SQLException cleanup) { // a terminated session: keep its cause on top
+                e.addSuppressed(cleanup);
+                throw e;
+            }
+            if (LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
+                return Gate.LOCKED;
+            }
+            throw e;
+        }
+    }
+
+    private String gateSql(Connection c) throws SQLException {
+        var sql = gate;
+        if (sql == null) {
+            gate = sql = "set transaction isolation level read committed; set local lock_timeout = '1s';"
+                    + " set local statement_timeout = '2s'; set local idle_in_transaction_session_timeout = '5s'"
+                    + noTransactionTimeout(c) + "; select exists (select 1 from (select created_at from "
+                    + names.tick() + " order by id desc limit 1) t"
+                    + " where t.created_at > clock_timestamp() - ? * interval '1 microsecond'"
+                    + " and t.created_at <= clock_timestamp()), " + XidRecovery.checkColumns(names) + "; commit";
+        }
+        return sql;
     }
 
     /**

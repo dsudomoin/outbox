@@ -25,6 +25,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.postgresql.ds.PGPoolingDataSource;
@@ -118,6 +119,41 @@ class OwnerSourceIT {
         assertThatThrownBy(inbox::start).isInstanceOf(IllegalStateException.class)
                 .hasMessageNotContaining("reaches another database")
                 .hasMessageContaining("role " + app + " lacks USAGE on schema " + schema);
+    }
+
+    /**
+     * A writer with the relay disabled ticks on the application's connections: an owner connection per tick would be
+     * one more direct backend on every writer instance.
+     */
+    @Test
+    void aWriterWithTheRelayDisabledTicksWithoutOwnerConnections() throws Exception {
+        migrate();
+        config.relayEnabled(false).ticksWithoutRelay(Duration.ofMillis(100));
+        var started = new AtomicBoolean();
+        var ownerAfterStart = new AtomicInteger();
+        var transactions = new JdbcTransactions(as(app));
+        var runtime = runtime(OutboxRuntime.builder(config, transactions, record -> {}).ownerConnections(() -> {
+            if (started.get()) {
+                ownerAfterStart.incrementAndGet();
+            }
+            return as(owner).getConnection();
+        }).build());
+        runtime.start();
+        started.set(true);
+        long before;
+        try (var c = as(app).getConnection()) {
+            before = TestSql.queryLong(c, "select coalesce(max(id), 0) from " + names.tick());
+        }
+
+        transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", "k", "p".getBytes(UTF_8))));
+
+        await(Duration.ofSeconds(10), () -> {
+            try (var c = as(app).getConnection()) {
+                return TestSql.queryLong(c, "select count(*) from " + names.tick() + " where id > " + before) > 0;
+            }
+        });
+        Thread.sleep(500); // a few more runs, which see no new commit
+        assertThat(ownerAfterStart).as("owner connections after the start").hasValue(0);
     }
 
     @Test

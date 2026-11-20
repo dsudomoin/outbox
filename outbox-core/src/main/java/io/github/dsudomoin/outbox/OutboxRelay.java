@@ -868,15 +868,18 @@ public final class OutboxRelay implements AutoCloseable {
      * the daemon thread {@code outbox-ticker}: ticks cut the outbox into batches, and without them a backlog written
      * while no relay runs lands in one tick, which the relay draining it later reads again from the shard's start on
      * every chunk. A run does nothing unless {@link #wake()} came since the commits a tick is known to cover, so the
-     * ticker ticks only while this instance writes. Then it refreshes the xid-regression halt, as no maintenance runs
-     * here, and makes no tick while one is recorded: such a tick would move the recovery's T past the rows written
-     * since ({@link Ticks#insert}). Else {@link Ticks#attempt} with three quarters of the interval: a tick of another
-     * instance at most that old, a running relay's, stands for this one's, as {@link #wakeTickAge} does for a relay.
-     * An inserted tick covers the commits seen before the attempt; one skipped for a younger tick only those the
-     * previous run saw, as that tick came at least a quarter of the interval after that run, and the rest get the
-     * next run (a skip because the tick lock stayed taken counts the same, as for the relay's attempts). A failure
-     * costs the run: a WARN at most once a minute, the commits stay uncovered for the next run. The thread outlives
-     * everything but {@link #close()}, {@link Error}s included.
+     * ticker ticks only while this instance writes. Then one statement on an application connection,
+     * {@link Ticks#gate} with three quarters of the interval, without the tick lock and without an owner connection
+     * (maintenance's halt check would take one on every writer): a tick of any instance at most that old, a running
+     * relay's, stands for this one's, as {@link #wakeTickAge} does for a relay; while the xid check finds a regression
+     * or a recorded halt, no tick, as one would move the recovery's T past the rows written since
+     * ({@link Ticks#insert}); while a lock keeps the read waiting (a recovery's), none either. Else
+     * {@link Ticks#attempt} on the same connection, with the same bound; one that finds a regression records the halt,
+     * which the next run's gate sees. An inserted tick covers the commits seen before the attempt; a younger tick only
+     * those the previous run saw, as it came at least a quarter of the interval after that run, and the rest get the
+     * next run (an attempt skipped because the tick lock stayed taken counts the same, as for the relay's attempts). A
+     * failure costs the run: a WARN at most once a minute, the commits stay uncovered for the next run. The thread
+     * outlives everything but {@link #close()}, {@link Error}s included.
      */
     private final class Ticker implements Runnable {
 
@@ -925,17 +928,22 @@ public final class OutboxRelay implements AutoCloseable {
             long seen = wakeups.get();
             long before = previous;
             previous = seen;
-            if (seen == covered || maintenance.checkHalt()) {
+            if (seen == covered) {
                 return;
             }
-            Ticks.Made made;
             try (var c = db.newConnection(); var bound = socket.on(c)) {
-                made = ticks.attempt(c, young, clock).made();
-            }
-            switch (made) {
-                case INSERTED -> covered = seen;
-                case SKIPPED -> covered = Math.max(covered, before);
-                case REGRESSED -> maintenance.checkHalt(); // the halt it recorded holds from the next run on
+                switch (ticks.gate(c, young)) {
+                    case YOUNG -> covered = Math.max(covered, before);
+                    case HALTED -> { } // no tick while the halt holds; its commits wait for the run after it ends
+                    case LOCKED -> log.debug("outbox ticker skipped a run: a lock kept its tick check from reading");
+                    case DUE -> {
+                        switch (ticks.attempt(c, young, clock).made()) {
+                            case INSERTED -> covered = seen;
+                            case SKIPPED -> covered = Math.max(covered, before);
+                            case REGRESSED -> { } // it recorded the halt, which the next run's gate sees
+                        }
+                    }
+                }
             }
         }
 
