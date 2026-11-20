@@ -87,6 +87,7 @@ Postgres нужны `max_locks_per_transaction=256` и `max_connections=300` (co
 | `BENCH_TRACE_RATIO` | `bench.traceRatio`, доля сэмплирования корневых span; она же сэмплирует трассы, начатые HTTP-запросом, например `POST /orders` | 1.0 |
 | `BENCH_TELEMETRY` | `bench.telemetry`: `kora` (`KoraOutboxTelemetry` модуля), `observation` (`ObservationOutboxTelemetry`: наблюдения Micrometer Observation с таймерами `DefaultMeterObservationHandler` и span-ами через мост micrometer-tracing к трассировщику OpenTelemetry из Kora, с тем же сэмплером; доставки несэмплированных трасс не наблюдаются, как по умолчанию в библиотеке) или `observation-all` (то же с `observeUnsampled(true)`: наблюдается каждая доставка) | `kora` |
 | `OUTBOX_SHARDS` | `outbox.shards` | значение библиотеки по умолчанию: 256 для новой таблицы, существующая сохраняет своё число |
+| `OUTBOX_RELAY_ENABLED` | `outbox.relay.enabled`: `false` — инстанс только пишет, relay не запускается | значение библиотеки по умолчанию, `true` |
 | `OUTBOX_RELAY_WORKERS` | `outbox.relay.workers` | 8 |
 | `OUTBOX_RELAY_BATCH_SIZE` | `outbox.relay.batchSize` | 2000 |
 | `OUTBOX_TABLE` | `outbox.table` | значение библиотеки по умолчанию, `outbox` |
