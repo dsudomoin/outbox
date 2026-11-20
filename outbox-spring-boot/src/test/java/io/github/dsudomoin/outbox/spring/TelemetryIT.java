@@ -17,6 +17,7 @@ import io.github.dsudomoin.outbox.micrometer.DefaultOutboxEnqueueObservationConv
 import io.github.dsudomoin.outbox.micrometer.DefaultOutboxStepObservationConvention;
 import io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry;
 import io.github.dsudomoin.outbox.micrometer.OutboxDeliveryObservationConvention;
+import io.github.dsudomoin.outbox.micrometer.OutboxDeliveryTracingObservationHandler;
 import io.github.dsudomoin.outbox.micrometer.OutboxEnqueueObservationConvention;
 import io.github.dsudomoin.outbox.micrometer.OutboxStepObservationConvention;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
@@ -26,6 +27,8 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.micrometer.observation.Observation;
 import io.micrometer.observation.ObservationRegistry;
 import io.micrometer.tracing.Tracer;
+import io.micrometer.tracing.handler.PropagatingReceiverTracingObservationHandler;
+import io.micrometer.tracing.propagation.Propagator;
 import io.micrometer.tracing.otel.bridge.OtelBaggageManager;
 import io.micrometer.tracing.otel.bridge.OtelCurrentTraceContext;
 import io.micrometer.tracing.otel.bridge.OtelPropagator;
@@ -51,6 +54,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.ApplicationContext;
@@ -247,7 +251,7 @@ class TelemetryIT {
                 .observe(() -> send(context, "orders"));
 
             var delivery = awaitSpan(spans, "outbox deliver orders");
-            var enqueue = span(spans, "outbox enqueue");
+            var enqueue = span(spans, "outbox enqueue orders");
             var parent = span(spans, "test.parent");
             assertThat(enqueue.getParentSpanId()).isEqualTo(parent.getSpanId());
             assertThat(enqueue.getKind()).isEqualTo(SpanKind.PRODUCER);
@@ -255,6 +259,56 @@ class TelemetryIT {
             assertThat(delivery.getKind()).isEqualTo(SpanKind.CONSUMER);
             assertThat(delivery.getTraceId()).isEqualTo(parent.getTraceId());
         });
+    }
+
+    /**
+     * Ours goes ahead of Boot's receiver handler in its first-matching group, Boot's stays for every other receiver;
+     * the delivery keeps its stored parent and links to the step that delivered it.
+     */
+    @Test
+    void deliverySpanLinksToTheStepSpan() {
+        traced().withUserConfiguration(TestApps.WithRoute.class).run(context -> {
+            assertThat(context).hasNotFailed().hasSingleBean(OutboxDeliveryTracingObservationHandler.class);
+            assertThat(context.getBeansOfType(PropagatingReceiverTracingObservationHandler.class))
+                .as("Boot's own receiver handler beside ours").hasSize(2);
+            var spans = context.getBean(InMemorySpanExporter.class);
+
+            Observation.createNotStarted("test.parent", context.getBean(ObservationRegistry.class))
+                .observe(() -> send(context, "orders"));
+
+            var delivery = awaitSpan(spans, "outbox deliver orders");
+            assertThat(delivery.getParentSpanId()).isEqualTo(span(spans, "outbox enqueue orders").getSpanId());
+            var link = assertThat(delivery.getLinks()).singleElement().actual().getSpanContext();
+            // the step ends after its settle, so after the delivery
+            await().atMost(WAIT).until(() -> spans.getFinishedSpanItems().stream()
+                .anyMatch(s -> s.getSpanId().equals(link.getSpanId())));
+            assertThat(spans.getFinishedSpanItems()).filteredOn(s -> s.getSpanId().equals(link.getSpanId()))
+                .singleElement().satisfies(step -> {
+                    assertThat(step.getName()).isEqualTo("outbox relay step");
+                    assertThat(step.getKind()).isEqualTo(SpanKind.CLIENT);
+                    assertThat(step.getTraceId()).isNotEqualTo(delivery.getTraceId());
+                });
+        });
+    }
+
+    /** Boot 3.5's actuator configures OpenTelemetry's Tracer and Propagator itself; Boot 4.1 needs a module more. */
+    @Test
+    @EnabledIfSystemProperty(named = "outbox.test.boot", matches = "3\\.5")
+    void theDeliveryHandlerWithBootsOwnTracer() {
+        runner().withUserConfiguration(TestApps.WithRoute.class).run(context -> {
+            assertThat(context).hasNotFailed().doesNotHaveBean(Traced.class).hasSingleBean(Tracer.class)
+                .hasSingleBean(Propagator.class).hasSingleBean(OutboxDeliveryTracingObservationHandler.class);
+            assertThat(context.getBeansOfType(PropagatingReceiverTracingObservationHandler.class)).hasSize(2);
+        });
+    }
+
+    @Test
+    void theAppsOwnDeliveryHandlerWins() {
+        traced().withUserConfiguration(TestApps.WithRoute.class)
+            .withBean("ownDeliveryHandler", OutboxDeliveryTracingObservationHandler.class,
+                () -> new OutboxDeliveryTracingObservationHandler(Tracer.NOOP, Propagator.NOOP))
+            .run(context -> assertThat(context).hasNotFailed()
+                .hasSingleBean(OutboxDeliveryTracingObservationHandler.class).hasBean("ownDeliveryHandler"));
     }
 
     @Test
@@ -359,7 +413,8 @@ class TelemetryIT {
     void noRegistriesNoFailure() {
         bare().withUserConfiguration(TestApps.WithRoute.class).run(context -> {
             assertThat(context).hasNotFailed().hasBean("outboxTelemetry").doesNotHaveBean(MeterRegistry.class)
-                .doesNotHaveBean(ObservationRegistry.class).doesNotHaveBean(Tracer.class);
+                .doesNotHaveBean(ObservationRegistry.class).doesNotHaveBean(Tracer.class)
+                .doesNotHaveBean(OutboxDeliveryTracingObservationHandler.class);
 
             var id = send(context, "orders");
 
@@ -373,7 +428,8 @@ class TelemetryIT {
     void aTracerWithoutAPropagatorIsNoTracing() {
         bare().withUserConfiguration(TestApps.WithRoute.class).withBean(Tracer.class, () -> Tracer.NOOP)
             .run(context -> {
-                assertThat(context).hasNotFailed().hasBean("outboxTelemetry");
+                assertThat(context).hasNotFailed().hasBean("outboxTelemetry")
+                    .doesNotHaveBean(OutboxDeliveryTracingObservationHandler.class);
 
                 var id = send(context, "orders");
 

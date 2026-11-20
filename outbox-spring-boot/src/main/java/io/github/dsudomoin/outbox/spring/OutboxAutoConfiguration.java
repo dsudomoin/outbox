@@ -18,6 +18,7 @@ import io.github.dsudomoin.outbox.TypedOutbox;
 import io.github.dsudomoin.outbox.TypedOutboxTopicHandler;
 import io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry;
 import io.github.dsudomoin.outbox.micrometer.OutboxDeliveryObservationConvention;
+import io.github.dsudomoin.outbox.micrometer.OutboxDeliveryTracingObservationHandler;
 import io.github.dsudomoin.outbox.micrometer.OutboxEnqueueObservationConvention;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.micrometer.OutboxStepObservationConvention;
@@ -35,6 +36,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.config.AutowireCapableBeanFactory;
 import org.springframework.beans.factory.config.ConfigurableBeanFactory;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.SpringBootCondition;
@@ -50,6 +52,7 @@ import org.springframework.context.annotation.Fallback;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.context.annotation.Scope;
 import org.springframework.core.ResolvableType;
+import org.springframework.core.annotation.Order;
 import org.springframework.core.env.Environment;
 import org.springframework.core.type.AnnotatedTypeMetadata;
 
@@ -81,10 +84,15 @@ import org.springframework.core.type.AnnotatedTypeMetadata;
  * traced with its {@code Tracer} and {@code Propagator} if both exist, named by its
  * {@link OutboxEnqueueObservationConvention}, {@link OutboxDeliveryObservationConvention} and
  * {@link OutboxStepObservationConvention} beans, if any. An app's own {@link OutboxTelemetry} bean replaces it.
+ * With both tracing beans, an {@link OutboxDeliveryTracingObservationHandler} links each delivery span to its step's
+ * span; ordered ahead of Boot's receiver handler, which stays for every other receiver. An app's own one replaces it.
  */
 @AutoConfiguration(afterName = {
     "org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration", // Boot 3
-    "org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration" // Boot 4
+    "org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration", // Boot 4
+    // the Tracer and Propagator are defined by then, and Boot's receiver handler, which backs off for ours
+    "org.springframework.boot.actuate.autoconfigure.tracing.MicrometerTracingAutoConfiguration", // Boot 3
+    "org.springframework.boot.micrometer.tracing.autoconfigure.MicrometerTracingAutoConfiguration" // Boot 4
 })
 @ConditionalOnClass(DataSource.class)
 public final class OutboxAutoConfiguration {
@@ -140,6 +148,19 @@ public final class OutboxAutoConfiguration {
                     builder.tracing(t, p);
                 }
             };
+        }
+
+        /**
+         * Ahead of Boot's receiver handler ({@code @Order(1000)}) in Boot's first-matching group of tracing handlers,
+         * so that it, not Boot's, takes the deliveries.
+         */
+        @Bean
+        @ConditionalOnBean({io.micrometer.tracing.Tracer.class, io.micrometer.tracing.propagation.Propagator.class})
+        @ConditionalOnMissingBean(OutboxDeliveryTracingObservationHandler.class)
+        @Order(999)
+        OutboxDeliveryTracingObservationHandler outboxDeliveryTracingObservationHandler(
+                io.micrometer.tracing.Tracer tracer, io.micrometer.tracing.propagation.Propagator propagator) {
+            return new OutboxDeliveryTracingObservationHandler(tracer, propagator);
         }
     }
 

@@ -1,7 +1,7 @@
 // Signature format: 4.0
 package io.github.dsudomoin.outbox.spring {
 
-  @org.springframework.boot.autoconfigure.AutoConfiguration(afterName={"org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration", "org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration"}) @org.springframework.boot.autoconfigure.condition.ConditionalOnClass(DataSource.class) public final class OutboxAutoConfiguration {
+  @org.springframework.boot.autoconfigure.AutoConfiguration(afterName={"org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration", "org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration", "org.springframework.boot.actuate.autoconfigure.tracing.MicrometerTracingAutoConfiguration", "org.springframework.boot.micrometer.tracing.autoconfigure.MicrometerTracingAutoConfiguration"}) @org.springframework.boot.autoconfigure.condition.ConditionalOnClass(DataSource.class) public final class OutboxAutoConfiguration {
     ctor public OutboxAutoConfiguration();
   }
 
