@@ -90,7 +90,7 @@ class KafkaOutboxModuleTest {
             assertThat(sender.value().send(List.of(record))).containsExactly(Outcome.notAttempted());
             assertThat(Thread.interrupted()).isTrue();
             assertThat(err.text()).contains("ProducerConfig values", "acks = -1", "enable.idempotence = true",
-                    "delivery.timeout.ms = 120000", "request.timeout.ms = 30000", "max.block.ms = 5000",
+                    "delivery.timeout.ms = 120000", "request.timeout.ms = 15000", "max.block.ms = 5000",
                     "key.serializer = class " + ByteArraySerializer.class.getName());
         } finally {
             sender.release();

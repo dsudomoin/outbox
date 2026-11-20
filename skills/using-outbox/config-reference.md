@@ -236,7 +236,7 @@ gets `client.id` unchanged, and their JMX metrics collide (see the end of this s
 |---|---|
 | Forced | `enable.idempotence=true`, `acks=all`, byte-array key and value serializers |
 | Rejected | `transactional.id`; `partitioner.class`; `partitioner.ignore.keys=true`; `acks` other than `all`/`-1`; `enable.idempotence=false`; `max.in.flight.requests.per.connection` > 5; `delivery.timeout.ms` < `linger.ms + request.timeout.ms`; anything Kafka's `ProducerConfig` rejects |
-| Defaults when unset | `delivery.timeout.ms=120000`; `max.block.ms=5000`; `enable.metrics.push=false`; `request.timeout.ms` is Kafka's own, 30 s |
+| Defaults when unset | `delivery.timeout.ms=120000`; `max.block.ms=5000`; `enable.metrics.push=false`; then, if `delivery.timeout.ms` was unset too, `request.timeout.ms=15000` (half Kafka's own, so a request to a frozen broker moves on sooner) |
 
 **Outcomes.** `RecordTooLargeException`, `InvalidRecordException` (a null key on a compacted topic among them) and
 `InvalidTopicException` are permanent (dead letters); an `InvalidTopicException` sends every record of its topic in

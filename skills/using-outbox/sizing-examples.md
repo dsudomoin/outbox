@@ -164,7 +164,7 @@ kafka-topics.sh --bootstrap-server "$KAFKA" --create --topic orders --partitions
   per second at 0.110 s p99, so 6 workers with one instance down leave room.
 - 12 partitions = consumer threads. The tool's 5k msg/s ceiling in RESULTS «max» / «ramp» was the database commit
   rate (2 CPU), not the relay.
-- `linger.ms` 5 + the default `request.timeout.ms` 15 000 ≤ `delivery.timeout.ms` 20 000, as Kafka requires.
+- `linger.ms` 5 + the default `request.timeout.ms` 15 000 ≤ the default `delivery.timeout.ms` 120 000, as Kafka requires.
 
 ## 3. Bulk / high throughput
 

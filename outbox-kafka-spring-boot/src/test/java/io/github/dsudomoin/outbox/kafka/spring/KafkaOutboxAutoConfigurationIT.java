@@ -489,7 +489,7 @@ class KafkaOutboxAutoConfigurationIT {
                     context.getBean(KafkaOutboxSender.class).send(List.of(record));
                 });
             assertThat(err.text()).contains("ProducerConfig values", "acks = -1", "enable.idempotence = true",
-                "delivery.timeout.ms = 120000", "request.timeout.ms = 30000", "max.block.ms = 5000",
+                "delivery.timeout.ms = 120000", "request.timeout.ms = 15000", "max.block.ms = 5000",
                 "key.serializer = class org.apache.kafka.common.serialization.ByteArraySerializer");
         }
     }

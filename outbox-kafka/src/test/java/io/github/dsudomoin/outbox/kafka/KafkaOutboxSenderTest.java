@@ -1149,9 +1149,8 @@ class KafkaOutboxSenderTest {
                 .containsEntry(ProducerConfig.ACKS_CONFIG, "all")
                 .containsEntry(ProducerConfig.MAX_BLOCK_MS_CONFIG, "5000")
                 .containsEntry(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, "120000")
-                .doesNotContainKey(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG) // Kafka's own 30 s
+                .containsEntry(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, "15000")
                 .containsEntry("bootstrap.servers", "localhost:9092");
-        assertThat(config.getInt(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG)).isEqualTo(30000);
         assertThat(user).containsEntry("key.serializer", StringSerializer.class.getName()); // not mutated
         assertThatCode(() -> new KafkaProducer<byte[], byte[]>(config.originals()).close(Duration.ZERO))
                 .as("Kafka accepts the defaults (delivery.timeout.ms >= linger.ms + request.timeout.ms)")
@@ -1160,7 +1159,7 @@ class KafkaOutboxSenderTest {
         var explicit = KafkaOutboxSender.producerConfig(props("bootstrap.servers", "localhost:9092",
                 "delivery.timeout.ms", 60000, "max.block.ms", 3000));
         assertThat(explicit.getInt(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG)).isEqualTo(60000);
-        assertThat(explicit.getInt(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG)).isEqualTo(30000); // Kafka's default
+        assertThat(explicit.getInt(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG)).isEqualTo(30000); // Kafka's, as set
         assertThat(explicit.getLong(ProducerConfig.MAX_BLOCK_MS_CONFIG)).isEqualTo(3000);
 
         for (var bad : List.of(List.of("enable.idempotence", "false"), List.of("enable.idempotence", false),
@@ -1957,7 +1956,7 @@ class KafkaOutboxSenderTest {
                 .containsEntry("key.serializer", ByteArraySerializer.class.getName())
                 .containsEntry("value.serializer", ByteArraySerializer.class.getName())
                 .containsEntry("delivery.timeout.ms", "120000")
-                .doesNotContainKey("request.timeout.ms")
+                .containsEntry("request.timeout.ms", "15000")
                 .containsEntry("max.block.ms", "5000")
                 .containsEntry("enable.metrics.push", "false");
     }

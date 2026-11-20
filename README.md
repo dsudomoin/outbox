@@ -3002,7 +3002,7 @@ relay: на инстансе с `relay.enabled = false` оно не выполн
 |---|---|
 | Навязываются | `enable.idempotence=true`, `acks=all`, сериализаторы ключа и значения в byte array |
 | Отвергаются | `transactional.id`; `partitioner.class` (порядку и cooldown нужно хеширование ключей Kafka); `partitioner.ignore.keys=true`; `acks`, отличный от `all`/`-1`; `enable.idempotence=false`; `max.in.flight.requests.per.connection` > 5; `delivery.timeout.ms` < `linger.ms + request.timeout.ms`; всё, что отвергает собственный `ProducerConfig` Kafka (например, `retries=0` вместе с идемпотентностью) |
-| По умолчанию, если не заданы | `delivery.timeout.ms=120000`; `max.block.ms=5000`; `enable.metrics.push=false`. `request.timeout.ms` — значение самой Kafka, 30 с |
+| По умолчанию, если не заданы | `delivery.timeout.ms=120000`; затем, если `delivery.timeout.ms` тоже не был задан, `request.timeout.ms=15000` (вдвое меньше, чем в самой Kafka: запрос к замёрзшему брокеру раньше уходит к другому); `max.block.ms=5000`; `enable.metrics.push=false` |
 
 - Не добавляйте интерцепторы продюсера (`interceptor.classes`), которые меняют ключ или партицию записи: от них
   зависит порядок по ключу.

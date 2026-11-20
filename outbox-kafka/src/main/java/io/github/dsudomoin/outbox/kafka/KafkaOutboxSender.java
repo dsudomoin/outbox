@@ -116,7 +116,8 @@ import org.slf4j.LoggerFactory;
  * <p>Producer properties are {@code driverProperties} with byte-array serializers, {@code enable.idempotence=true} and
  * {@code acks=all} forced; {@code max.block.ms} defaults to 5000, {@code enable.metrics.push} to false and
  * {@code delivery.timeout.ms} to 120000, long enough to ride out a broker's restart without the retry by a new producer
- * that the broker cannot deduplicate; {@code request.timeout.ms} is Kafka's own, 30 s (Kafka requires
+ * that the broker cannot deduplicate, and then, if unset, {@code request.timeout.ms} to 15000, so that a request to a
+ * broker that froze goes to another one after 15 s, not Kafka's 30 s (Kafka requires
  * {@code delivery.timeout.ms >= linger.ms + request.timeout.ms}). {@code transactional.id}, {@code partitioner.class}
  * and {@code partitioner.ignore.keys=true} are rejected: ordering and the cooldown need Kafka's per-key partitioning.
  *
@@ -312,10 +313,15 @@ public final class KafkaOutboxSender implements AutoCloseable {
         properties.putIfAbsent(MAX_BLOCK_MS_CONFIG, "5000"); // metadata normally takes milliseconds
         // with push on, kafka-clients 3.9 logs an ERROR from the I/O thread after each close(Duration.ZERO)
         properties.putIfAbsent(ENABLE_METRICS_PUSH_CONFIG, "false");
-        // Kafka's own request.timeout.ms (30 s) applies. A record still unanswered when delivery.timeout.ms ends is
-        // retried by a new producer, which the broker cannot tell from another writer: 120 s rides out a broker's
-        // outage of a minute without a duplicate, and leaves a frozen broker's InitProducerId time to answer
-        properties.putIfAbsent(DELIVERY_TIMEOUT_MS_CONFIG, "120000");
+        // A record still unanswered when delivery.timeout.ms ends is retried by a new producer, which the broker cannot
+        // tell from another writer: 120 s rides out a broker's outage of a minute without a duplicate. A request to a
+        // broker that froze holds its records (and a new producer's InitProducerId) until request.timeout.ms, then goes
+        // to another broker: 15 s, half of Kafka's 30 s; an idempotent producer's retry of a slow request writes nothing
+        // twice
+        if (!properties.containsKey(DELIVERY_TIMEOUT_MS_CONFIG)) {
+            properties.put(DELIVERY_TIMEOUT_MS_CONFIG, "120000");
+            properties.putIfAbsent(REQUEST_TIMEOUT_MS_CONFIG, "15000");
+        }
 
         var config = new ProducerConfig(properties); // Kafka's own validation, e.g. retries=0 with idempotence
         require(!config.getList(BOOTSTRAP_SERVERS_CONFIG).isEmpty(), BOOTSTRAP_SERVERS_CONFIG + " is required");
