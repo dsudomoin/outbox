@@ -198,6 +198,15 @@ class OutboxConfigTest {
     }
 
     @Test
+    void ticksWithoutRelayIsReadAndValidated() {
+        assertThat(parse("outbox.relay.ticksWithoutRelay = 250ms").relay().ticksWithoutRelay())
+                .isEqualTo(Duration.ofMillis(250));
+        assertThat(parse("outbox.relay.ticksWithoutRelay = 0s").relay().ticksWithoutRelay()).isZero();
+        assertRejected("outbox.relay.ticksWithoutRelay = -1ms",
+                "outbox.relay.ticksWithoutRelay must not be negative: PT-0.001S");
+    }
+
+    @Test
     void requeueKeysAreReadAndValidated() {
         var requeue = parse("outbox.relay.requeue { delay = 250ms, maxRequeues = 5 }").relay().requeue();
 
@@ -295,6 +304,7 @@ class OutboxConfigTest {
         assertThat(relay.batchTimeout()).isEqualTo(Duration.ofSeconds(130));
         assertThat(relay.shutdownTimeout()).isEqualTo(Duration.ofSeconds(30));
         assertThat(relay.connectionHold()).isEqualTo(Duration.ofMinutes(1));
+        assertThat(relay.ticksWithoutRelay()).isEqualTo(Duration.ofSeconds(1));
         assertThat(relay.headFailuresBeforeDivert()).isEqualTo(3);
         assertThat(relay.retry().initialDelay()).isEqualTo(Duration.ofSeconds(1));
         assertThat(relay.retry().maxDelay()).isEqualTo(Duration.ofMinutes(5));

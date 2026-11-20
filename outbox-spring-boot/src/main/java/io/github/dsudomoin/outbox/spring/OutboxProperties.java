@@ -56,7 +56,8 @@ public record OutboxProperties(
      * The relay that hands the outbox's records to the handlers.
      *
      * @param enabled false: this instance runs no relay workers, dead-letter pass and partition maintenance;
-     *     OutboxRelay.drain() and the instance's heartbeat still work. Keep at least one instance with the relay on.
+     *     OutboxRelay.drain() and the instance's heartbeat still work, and while it writes it makes ticks
+     *     (ticks-without-relay). Keep at least one instance with the relay on.
      *     Default true.
      * @param workers relay threads per instance (outbox-relay-N), at least 1; each holds a database connection while it
      *     works. Default 4.
@@ -86,6 +87,12 @@ public record OutboxProperties(
      *     hands it back and takes another, so the pool can retire it at its max-lifetime. A step started just before
      *     this ends runs on the same connection, up to 4 × batch-timeout: a pool's leak-detection-threshold must
      *     exceed connection-hold + 4 × batch-timeout. Default 1 min.
+     * @param ticksWithoutRelay with enabled false, how often this instance makes a tick while it writes, so a backlog
+     *     written while no relay runs comes in batches instead of one tick that the relay draining it reads again on
+     *     every chunk. A run sees whether this instance committed since its last tick and ticks unless a tick of any
+     *     instance is at most three quarters of this old; none while an xid-regression halt is recorded. With every
+     *     relay down, the tick table grows by about one row per interval while someone writes, until a relay's first
+     *     maintenance run deletes them. 0: no ticks. Ignored while the relay runs. Default 1 s.
      * @param headFailuresBeforeDivert failed attempts in a row after which a shard reads one head row and diverts the
      *     single failing key. Default 3.
      * @param cursorAnchorInterval how long an idle shard's latest cursor row may stay on a tick below its effective
@@ -107,6 +114,7 @@ public record OutboxProperties(
         @DefaultValue("130s") Duration batchTimeout,
         @DefaultValue("30s") Duration shutdownTimeout,
         @DefaultValue("1m") Duration connectionHold,
+        @DefaultValue("1s") Duration ticksWithoutRelay,
         @DefaultValue("3") int headFailuresBeforeDivert,
         @DefaultValue("1h") Duration cursorAnchorInterval,
         @DefaultValue Retry retry,

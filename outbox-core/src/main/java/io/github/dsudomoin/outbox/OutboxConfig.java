@@ -143,6 +143,21 @@ public interface OutboxConfig {
             return Duration.ofMinutes(1);
         }
 
+        /**
+         * With {@link #enabled()} false, how often this instance makes a tick while it writes: ticks cut the outbox
+         * into batches, and a backlog written while no relay runs would otherwise land in one tick, which the relay
+         * that later drains it reads again from the shard's start on every chunk. A run every this long (fixed delay)
+         * that sees a commit of this instance since the last tick it covered makes a tick unless one of any instance is
+         * at most three quarters of this old; none while an xid-regression halt is recorded. A failed run logs a WARN
+         * at most once a minute and the next run tries again. Maintenance, which deletes old ticks, runs only where a
+         * relay runs: with every relay down while someone writes, the tick table grows by about one row per interval
+         * (about 86 400 a day at 1 s) until a relay's first maintenance run. Zero: no ticks. Ignored while the relay
+         * runs, which ticks itself.
+         */
+        default Duration ticksWithoutRelay() {
+            return Duration.ofSeconds(1);
+        }
+
         default int headFailuresBeforeDivert() {
             return 3;
         }

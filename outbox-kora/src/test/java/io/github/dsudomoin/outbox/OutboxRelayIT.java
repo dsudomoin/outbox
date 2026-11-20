@@ -525,6 +525,143 @@ class OutboxRelayIT {
         assertThat(relay.drain()).isZero();
     }
 
+    /**
+     * A writer whose relay is disabled ticks while it writes, so a backlog it leaves for a later relay comes in
+     * batches, not one tick: a tick made after the commit sees the message's transaction.
+     */
+    @Test
+    void aWriterWithTheRelayDisabledTicksAfterItsCommits() throws Exception {
+        config.relayEnabled(false).ticksWithoutRelay(Duration.ofMillis(200));
+        bootstrap();
+        var relay = relay(new RecordingHandler());
+        relay.start();
+        long before = ticksMade();
+
+        var id = send(outbox(relay::wake), msg("t", "k", "p")).get(0);
+
+        await(Duration.ofSeconds(10), () -> tickSees(id, before));
+        assertThat(relay.running()).isFalse();
+        assertThat(relayThreads()).isEmpty();
+    }
+
+    /** Without writes the ticker makes no tick, not even on its first run after the start. */
+    @Test
+    void aWriterWithTheRelayDisabledMakesNoTickWithoutWrites() throws Exception {
+        config.relayEnabled(false).ticksWithoutRelay(Duration.ofMillis(100));
+        bootstrap();
+        var relay = relay(new RecordingHandler());
+        long before = ticksMade();
+        relay.start();
+
+        assertThat(tickerThreads()).hasSize(1);
+        Thread.sleep(1000); // ten intervals
+        assertThat(ticksMade()).isEqualTo(before);
+    }
+
+    @Test
+    void ticksWithoutRelayOfZeroMakesNoTick() throws Exception {
+        config.relayEnabled(false).ticksWithoutRelay(Duration.ZERO);
+        bootstrap();
+        var relay = relay(new RecordingHandler());
+        relay.start();
+        long before = ticksMade();
+
+        send(outbox(relay::wake), msg("t", "k", "p"));
+
+        Thread.sleep(1000);
+        assertThat(ticksMade()).isEqualTo(before);
+        assertThat(tickerThreads()).isEmpty();
+    }
+
+    /**
+     * A tick made while an xid-regression halt is recorded would move the recovery's T past rows written since: the
+     * ticker skips its runs while the halt holds, and the commits it skipped get their tick once it is lifted.
+     */
+    @Test
+    void aWriterWithTheRelayDisabledMakesNoTickWhileHalted() throws Exception {
+        config.relayEnabled(false).ticksWithoutRelay(Duration.ofMillis(100));
+        bootstrap();
+        try (var c = TestDb.connect()) {
+            execute(c, "insert into " + schema.names().halt() + " (max_tick_xmax) values ('0')");
+        }
+        var relay = relay(new RecordingHandler());
+        relay.start();
+        long before = ticksMade();
+
+        var id = send(outbox(relay::wake), msg("t", "k", "p")).get(0);
+
+        Thread.sleep(1000);
+        assertThat(ticksMade()).as("no tick while halted").isEqualTo(before);
+        try (var c = TestDb.connect()) {
+            execute(c, "delete from " + schema.names().halt());
+        }
+        await(Duration.ofSeconds(10), () -> tickSees(id, before));
+    }
+
+    /** A failure, an Error included, costs the ticker one run: the commit it missed is covered by a later one. */
+    @Test
+    void theTickerOutlivesAnErrorAndTicksOnItsNextRun() throws Exception {
+        config.relayEnabled(false).ticksWithoutRelay(Duration.ofMillis(100));
+        bootstrap();
+        var failed = new AtomicInteger();
+        var failingOnce = new JdbcConnectionFactory() {
+            @Override
+            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
+                return db.withConnection(callback);
+            }
+
+            @Override
+            public Connection currentConnection() {
+                return db.currentConnection();
+            }
+
+            @Override
+            public Connection newConnection() {
+                if (Thread.currentThread().getName().equals("outbox-ticker") && failed.getAndIncrement() == 0) {
+                    throw new OutOfMemoryError("ticker out of memory (test)");
+                }
+                return db.newConnection();
+            }
+
+            @Override
+            public DataBaseTelemetry telemetry() {
+                return db.telemetry();
+            }
+        };
+        var relay = relay(failingOnce, new RecordingHandler());
+        relay.start();
+        long before = ticksMade();
+
+        var id = send(outbox(relay::wake), msg("t", "k", "p")).get(0);
+
+        await(Duration.ofSeconds(10), () -> tickSees(id, before));
+        assertThat(failed.get()).isGreaterThan(1);
+        assertThat(tickerThreads()).hasSize(1);
+    }
+
+    @Test
+    void closeStopsTheTicker() throws Exception {
+        config.relayEnabled(false).ticksWithoutRelay(Duration.ofMillis(100));
+        bootstrap();
+        var relay = relay(new RecordingHandler());
+        relay.start();
+        assertThat(tickerThreads()).hasSize(1);
+
+        relay.close();
+
+        await(Duration.ofSeconds(5), () -> tickerThreads().isEmpty());
+    }
+
+    @Test
+    void aRunningRelayStartsNoTicker() throws Exception {
+        config.ticksWithoutRelay(Duration.ofMillis(100));
+        bootstrap();
+        start(new RecordingHandler());
+
+        assertThat(relayThreads()).isNotEmpty();
+        assertThat(tickerThreads()).isEmpty();
+    }
+
     @Test
     void drainFailsWhenNothingAdvances() throws Exception {
         config.relayEnabled(false).batchTimeout(Duration.ofMillis(500)).headFailuresBeforeDivert(1000);
@@ -3090,6 +3227,21 @@ class OutboxRelayIT {
     private void awaitParked() throws Exception {
         await(Duration.ofSeconds(5), () -> relayThreads().size() == config.workers()
                 && relayThreads().stream().allMatch(t -> t.getState() == Thread.State.TIMED_WAITING));
+    }
+
+    /** Whether a tick above {@code afterTick} sees the transaction of message {@code id}. */
+    private boolean tickSees(UUID id, long afterTick) throws Exception {
+        try (var c = TestDb.connect()) {
+            return queryLong(c, "select count(*) from " + schema.names().tick() + " t, " + schema.names().base()
+                    + " o where t.id > " + afterTick + " and o.message_id = '" + id + "'"
+                    + " and pg_visible_in_snapshot(o.xid, t.snapshot)") > 0;
+        }
+    }
+
+    private static List<Thread> tickerThreads() {
+        return Thread.getAllStackTraces().keySet().stream()
+                .filter(t -> t.getName().equals("outbox-ticker") && t.isAlive())
+                .toList();
     }
 
     private static List<Thread> relayThreads() {

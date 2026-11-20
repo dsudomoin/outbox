@@ -91,7 +91,9 @@ public final class OutboxSchema implements AutoCloseable {
     private static final Duration MAX_PG_TIMEOUT = Duration.ofDays(24);
     /**
      * Added to twice the longer of {@code idlePollInterval} and {@code minTickInterval}: a reshard is refused while the
-     * newest tick is younger than that, as every running relay ticks at least that often, idle or not.
+     * newest tick is younger than that, as every running relay ticks at least that often, idle or not. A writer with
+     * the relay disabled ticks too ({@code relay.ticksWithoutRelay}), only while it writes; its live heartbeat row
+     * refuses the reshard before this guard, so its ticks do not change the outcome.
      */
     private static final Duration TICK_MARGIN = Duration.ofSeconds(5);
     /** How many of the latest ticks the reshard's tick guard looks at for the largest gap between two. */
@@ -209,6 +211,8 @@ public final class OutboxSchema implements AutoCloseable {
                 "outbox.relay.shutdownTimeout must not be negative: " + relay.shutdownTimeout());
         require(relay.connectionHold().compareTo(Duration.ZERO) > 0,
                 "outbox.relay.connectionHold must be positive: " + relay.connectionHold());
+        require(!relay.ticksWithoutRelay().isNegative(),
+                "outbox.relay.ticksWithoutRelay must not be negative: " + relay.ticksWithoutRelay());
         require(config.networkTimeout().isZero() || config.networkTimeout().compareTo(Duration.ofMillis(1)) >= 0
                 && config.networkTimeout().compareTo(Duration.ofMillis(Integer.MAX_VALUE)) <= 0,
                 "outbox.networkTimeout must be 0 or within 1 ms and 24 days: " + config.networkTimeout());
@@ -740,7 +744,9 @@ public final class OutboxSchema implements AutoCloseable {
      * progress, no committed row that its shard's effective tick ({@link Cursors}) does not see, no standalone range,
      * no xid regression. All pass: the cursors and checkpoints are replaced by one cursor per new shard at a new tick,
      * with an INFO; otherwise startup fails naming every failed check with its count. Dead letters keep their shard: a
-     * redrive computes it again.
+     * redrive computes it again. A writer with the relay disabled that ticks ({@code relay.ticksWithoutRelay}) has a
+     * live row of a count other than the new one (one with the new count reshards in its own bootstrap or does not
+     * start), which the first check already refuses before the tick guard.
      */
     private void reshard(Connection c, TableNames n, int from, int to) throws SQLException {
         var keep = " To keep the current count, start with outbox.shards = " + from + " or leave it unset.";

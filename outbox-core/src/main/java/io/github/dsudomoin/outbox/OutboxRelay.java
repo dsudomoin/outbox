@@ -59,13 +59,18 @@ import org.slf4j.LoggerFactory;
  * {@link DeadLetterPass} on the daemon thread {@code outbox-dead-letters} (also not started when the relay is disabled;
  * {@link #drain()} ends with one run of it): a run right after start, then after each committed step that moved a row
  * to the dead table, when the earliest letter is due, and at least every {@code maintenanceInterval}; so a slow or
- * failing hook never holds up a shard step.
+ * failing hook never holds up a shard step. With {@code relay.enabled} false and {@code relay.ticksWithoutRelay} above
+ * zero, the daemon thread {@code outbox-ticker} makes the ticks of this instance's commits instead ({@link Ticker}), so
+ * a backlog written while no relay runs comes in batches.
  */
 public final class OutboxRelay implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(OutboxRelay.class);
     private static final AtomicInteger THREADS = new AtomicInteger();
     private static final long WARN_INTERVAL = TimeUnit.SECONDS.toNanos(10);
+    /** The ticker's WARNs come at most this often: a run per {@code ticksWithoutRelay} fails alike until fixed. */
+    private static final long TICKER_WARN_INTERVAL = TimeUnit.MINUTES.toNanos(1);
+    private static final String INSUFFICIENT_PRIVILEGE = "42501";
     /** How long interrupted workers get to roll back after {@code shutdownTimeout}. */
     private static final long INTERRUPT_GRACE = TimeUnit.SECONDS.toNanos(1);
     /** The most shards one step takes: a group's statements bind arrays of this size. */
@@ -183,6 +188,7 @@ public final class OutboxRelay implements AutoCloseable {
     private volatile Thread[] workers = new Thread[0];
     @Nullable
     private volatile Thread deadLetterThread;
+    /** Maintenance's, or with the relay disabled the {@link Ticker}'s, if any. */
     @Nullable
     private volatile ScheduledExecutorService scheduler;
     private volatile boolean started;
@@ -249,7 +255,8 @@ public final class OutboxRelay implements AutoCloseable {
     }
 
     /**
-     * Starts the workers, the dead-letter thread and maintenance, unless {@code relay.enabled} is false. Runs once:
+     * Starts the workers, the dead-letter thread and maintenance, unless {@code relay.enabled} is false, which starts
+     * the {@link Ticker} instead when {@code relay.ticksWithoutRelay} is above zero. Runs once:
      * a second call, or one after {@link #close()}, throws {@link IllegalStateException}, since {@code close()} stops
      * only the threads of one start.
      */
@@ -265,7 +272,21 @@ public final class OutboxRelay implements AutoCloseable {
         }
         heartbeat.start(); // with the relay disabled too: the reshard guard counts writers
         if (!relay.enabled()) {
-            log.info("outbox relay disabled (outbox.relay.enabled = false); messages are delivered only by drain()");
+            var every = relay.ticksWithoutRelay();
+            if (every.isZero()) {
+                log.info("outbox relay disabled (outbox.relay.enabled = false); messages are delivered only by"
+                        + " drain(); this instance makes no ticks (outbox.relay.ticksWithoutRelay = 0)");
+                return;
+            }
+            var s = Executors.newSingleThreadScheduledExecutor(r -> {
+                var t = new Thread(r, "outbox-ticker");
+                t.setDaemon(true);
+                return t;
+            });
+            s.scheduleWithFixedDelay(new Ticker(every), 0, every.toNanos(), TimeUnit.NANOSECONDS);
+            scheduler = s; // close() stops it as it stops maintenance
+            log.info("outbox relay disabled (outbox.relay.enabled = false); messages are delivered only by drain();"
+                    + " this instance makes a tick every {} while it writes (outbox.relay.ticksWithoutRelay)", every);
             return;
         }
         try {
@@ -839,6 +860,106 @@ public final class OutboxRelay implements AutoCloseable {
                     queued.set(shard);
                 }
             }
+        }
+    }
+
+    /**
+     * The ticks of an instance whose relay is disabled, a run every {@code relay.ticksWithoutRelay} (fixed delay) on
+     * the daemon thread {@code outbox-ticker}: ticks cut the outbox into batches, and without them a backlog written
+     * while no relay runs lands in one tick, which the relay draining it later reads again from the shard's start on
+     * every chunk. A run does nothing unless {@link #wake()} came since the commits a tick is known to cover, so the
+     * ticker ticks only while this instance writes. Then it refreshes the xid-regression halt, as no maintenance runs
+     * here, and makes no tick while one is recorded: such a tick would move the recovery's T past the rows written
+     * since ({@link Ticks#insert}). Else {@link Ticks#attempt} with three quarters of the interval: a tick of another
+     * instance at most that old, a running relay's, stands for this one's, as {@link #wakeTickAge} does for a relay.
+     * An inserted tick covers the commits seen before the attempt; one skipped for a younger tick only those the
+     * previous run saw, as that tick came at least a quarter of the interval after that run, and the rest get the
+     * next run (a skip because the tick lock stayed taken counts the same, as for the relay's attempts). A failure
+     * costs the run: a WARN at most once a minute, the commits stay uncovered for the next run. The thread outlives
+     * everything but {@link #close()}, {@link Error}s included.
+     */
+    private final class Ticker implements Runnable {
+
+        private final Duration every;
+        private final Duration young;
+        /** The wake-ups a tick is known to come after; only this thread touches its fields. */
+        private long covered;
+        /** The wake-ups the previous run saw. */
+        private long previous;
+        private long lastWarn = System.nanoTime() - TICKER_WARN_INTERVAL;
+        private int suppressed;
+
+        Ticker(Duration every) {
+            this.every = every;
+            this.young = every.minus(every.dividedBy(4));
+        }
+
+        @Override
+        public void run() {
+            if (stopping) {
+                return;
+            }
+            try {
+                tick();
+            } catch (VirtualMachineError e) { // OutOfMemoryError, StackOverflowError: the next run tries again
+                try {
+                    warn(e);
+                } catch (VirtualMachineError again) {
+                    // nothing left to report with; the next failure is reported again
+                }
+            } catch (Throwable t) { // a throw would cancel every later run
+                if (stopping) {
+                    log.debug("outbox ticker failed while stopping", t);
+                    return;
+                }
+                Thread.interrupted(); // not stopping: a stray interrupt is one more failure
+                try {
+                    warn(t);
+                } catch (VirtualMachineError again) {
+                    // as above
+                }
+            }
+        }
+
+        private void tick() throws SQLException {
+            long seen = wakeups.get();
+            long before = previous;
+            previous = seen;
+            if (seen == covered || maintenance.checkHalt()) {
+                return;
+            }
+            Ticks.Made made;
+            try (var c = db.newConnection(); var bound = socket.on(c)) {
+                made = ticks.attempt(c, young, clock).made();
+            }
+            switch (made) {
+                case INSERTED -> covered = seen;
+                case SKIPPED -> covered = Math.max(covered, before);
+                case REGRESSED -> maintenance.checkHalt(); // the halt it recorded holds from the next run on
+            }
+        }
+
+        private void warn(Throwable t) {
+            long now = System.nanoTime();
+            if (now - lastWarn < TICKER_WARN_INTERVAL) {
+                suppressed++;
+                return;
+            }
+            var denied = denied(t) ? ": the role needs the grants OutboxSql.outbox(config, role) gives, or set"
+                    + " outbox.relay.ticksWithoutRelay = 0" : "";
+            log.warn("outbox tick of an instance with the relay disabled failed{}, tried again in {} ({} failures since"
+                    + " the previous report not logged)", denied, every, suppressed, t);
+            lastWarn = now;
+            suppressed = 0;
+        }
+
+        private static boolean denied(Throwable t) {
+            for (var cause = t; cause != null; cause = cause.getCause()) {
+                if (cause instanceof SQLException e && INSUFFICIENT_PRIVILEGE.equals(e.getSQLState())) {
+                    return true;
+                }
+            }
+            return false;
         }
     }
 

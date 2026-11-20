@@ -27,6 +27,8 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     private Duration batchTimeout = Duration.ofSeconds(5);
     private Duration shutdownTimeout = Duration.ofSeconds(5);
     private Duration connectionHold = Duration.ofMinutes(1);
+    /** Off: the tests that run with the relay disabled make their ticks themselves, at the moments they choose. */
+    private Duration ticksWithoutRelay = Duration.ZERO;
     private Duration networkTimeout = Duration.ofMinutes(5);
     private int headFailuresBeforeDivert = 3;
     private Duration cursorAnchorInterval = Duration.ofHours(1);
@@ -270,6 +272,16 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
 
     public TestOutboxConfig connectionHold(Duration connectionHold) {
         this.connectionHold = connectionHold;
+        return this;
+    }
+
+    @Override
+    public Duration ticksWithoutRelay() {
+        return ticksWithoutRelay;
+    }
+
+    public TestOutboxConfig ticksWithoutRelay(Duration ticksWithoutRelay) {
+        this.ticksWithoutRelay = ticksWithoutRelay;
         return this;
     }
 
