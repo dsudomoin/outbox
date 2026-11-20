@@ -36,6 +36,7 @@ import io.opentelemetry.api.baggage.propagation.W3CBaggagePropagator;
 import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
 import io.opentelemetry.context.propagation.ContextPropagators;
 import io.opentelemetry.context.propagation.TextMapPropagator;
+import io.opentelemetry.extension.trace.propagation.B3Propagator;
 import io.opentelemetry.sdk.testing.exporter.InMemorySpanExporter;
 import io.opentelemetry.sdk.trace.SdkTracerProvider;
 import io.opentelemetry.sdk.trace.data.SpanData;
@@ -167,6 +168,100 @@ class ObservationOutboxTelemetryTest {
 
         assertThat(message.headers(own)).isSameAs(own);
         message.inserted();
+    }
+
+    /**
+     * A message with only its own baggage has no parent of its own: it gets the injected trace headers, keeps its
+     * baggage, and stores no second header of that name.
+     */
+    @Test
+    void aMessageWithOnlyItsOwnBaggageGetsTheTraceHeaders() {
+        var registry = ObservationRegistry.create();
+        registry.observationConfig().observationHandler(new ObservationHandler.FirstMatchingCompositeObservationHandler(
+                new PropagatingSenderTracingObservationHandler<>(tracer, withBaggage()),
+                new DefaultTracingObservationHandler(tracer)));
+        var telemetry = ObservationOutboxTelemetry.builder(registry, new OutboxMetrics(meters)).build();
+        var own = List.of(header("a", "1"), header("baggage", "tenant=mine"));
+        List<OutboxHeader> stored;
+        List<OutboxHeader> bare;
+        try (var baggage = io.opentelemetry.api.baggage.Baggage.builder().put("tenant", "acme").build().makeCurrent()) {
+            var enqueue = telemetry.enqueueStarted();
+            var mine = enqueue.message(OutboxMessage.of("orders", "k", bytes("p")), UUID.randomUUID(), 0);
+            var plain = enqueue.message(OutboxMessage.of("orders", "j", bytes("p")), UUID.randomUUID(), 0);
+            stored = mine.headers(own);
+            bare = plain.headers(List.of());
+            mine.inserted();
+            plain.inserted();
+        }
+
+        assertThat(bare).extracting(OutboxHeader::name).as("the injected headers").contains("traceparent", "baggage");
+        assertThat(stored).extracting(OutboxHeader::name).containsOnlyOnce("a", "baggage", "traceparent");
+        assertThat(stored).filteredOn(h -> h.name().equals("baggage")).extracting(h -> new String(h.value(), UTF_8))
+                .containsExactly("tenant=mine");
+        var mineSpan = span(s -> s.getName().equals("outbox enqueue orders")
+                && traceparent(stored).contains(s.getSpanId()));
+        assertThat(traceparent(stored)).isEqualTo("00-" + mineSpan.getTraceId() + "-" + mineSpan.getSpanId() + "-"
+                + mineSpan.getSpanContext().getTraceFlags().asHex());
+    }
+
+    /** Records whose stored context the propagator cannot read have the step as parent, and no link to it. */
+    @Test
+    void noLinkForAMalformedTraceparent() {
+        var delivered = deliveredInAStep(propagator,
+                record(List.of(header("traceparent", "00-" + TRACE_ID + "-" + SPAN_ID + "-0"))),
+                record(List.of(header("traceparent", "00-" + TRACE_ID.toUpperCase() + "-" + SPAN_ID + "-01"))),
+                record(List.of(header("traceparent", ""))));
+
+        assertThat(delivered.records()).allSatisfy(r -> delivered.assertChildOfTheStepWithoutLink(r));
+    }
+
+    @Test
+    void noLinkForABaggageOrTracestateOnlyRecord() {
+        var delivered = deliveredInAStep(withBaggage(),
+                record(List.of(header("baggage", "tenant=acme"))),
+                record(List.of(header("tracestate", "vendor=1"))));
+
+        assertThat(delivered.records()).allSatisfy(r -> delivered.assertChildOfTheStepWithoutLink(r));
+    }
+
+    /** The getter reads the last header of a name: a repeated traceparent whose last value is null gives no parent. */
+    @Test
+    void noLinkWhenTheLastTraceparentIsNull() {
+        var delivered = deliveredInAStep(propagator,
+                record(List.of(header("traceparent", TRACEPARENT), new OutboxHeader("traceparent", null))));
+
+        assertThat(delivered.records()).allSatisfy(r -> delivered.assertChildOfTheStepWithoutLink(r));
+    }
+
+    @Test
+    void aLinkForAWellFormedTraceparent() {
+        var delivered = deliveredInAStep(withBaggage(),
+                record(List.of(header("traceparent", TRACEPARENT), header("baggage", "tenant=acme"))),
+                record(List.of(header("traceparent", UNSAMPLED + "-extra"), header("traceparent", TRACEPARENT))));
+
+        assertThat(delivered.records()).allSatisfy(r -> delivered.assertParentedByTheStoredContextAndLinked(r));
+    }
+
+    /** B3 extracts both formats whichever it injects: each counts when well formed, a bare sampling state does not. */
+    @Test
+    void b3HeadersLinkOnlyWhenWellFormed() {
+        var b3 = new OtelPropagator(ContextPropagators.create(B3Propagator.injectingSingleHeader()), otel);
+        var b3Trace = "463ac35c9f6413ad48485a3953bb6124";
+        var single = record(List.of(header("b3", b3Trace + "-" + SPAN_ID + "-1")));
+        var shortId = record(List.of(header("b3", b3Trace.substring(16) + "-" + SPAN_ID)));
+        var multi = record(List.of(header("X-B3-TraceId", b3Trace), header("X-B3-SpanId", SPAN_ID),
+                header("X-B3-Sampled", "1")));
+        var samplingOnly = record(List.of(header("b3", "1")));
+        var zeroSpan = record(List.of(header("b3", b3Trace + "-" + "0".repeat(16))));
+        var tooManyParts = record(List.of(header("b3", b3Trace + "-" + SPAN_ID + "-1-" + SPAN_ID + "-x")));
+        var delivered = deliveredInAStep(b3, single, shortId, multi, samplingOnly, zeroSpan, tooManyParts);
+
+        for (var linked : List.of(single, shortId, multi)) {
+            delivered.assertParentedByTheStoredContextAndLinked(linked);
+        }
+        for (var unlinked : List.of(samplingOnly, zeroSpan, tooManyParts)) {
+            delivered.assertChildOfTheStepWithoutLink(unlinked);
+        }
     }
 
     @Test
@@ -874,6 +969,68 @@ class ObservationOutboxTelemetryTest {
         return ObservationOutboxTelemetry.builder(observations, new OutboxMetrics(meters))
                 .tracing(tracer, propagator)
                 .build();
+    }
+
+    /** W3C trace context and baggage, as Spring Boot's default propagation. */
+    private Propagator withBaggage() {
+        return new OtelPropagator(ContextPropagators.create(TextMapPropagator.composite(
+                W3CTraceContextPropagator.getInstance(), W3CBaggagePropagator.getInstance())), otel);
+    }
+
+    /** {@code records} delivered in one call of a step, traced with {@code propagator} and the delivery handler. */
+    private Delivered deliveredInAStep(Propagator propagator, OutboxRecord... records) {
+        var registry = ObservationRegistry.create();
+        registry.observationConfig().observationHandler(new ObservationHandler.FirstMatchingCompositeObservationHandler(
+                new PropagatingSenderTracingObservationHandler<>(tracer, propagator),
+                new OutboxDeliveryTracingObservationHandler(tracer, propagator),
+                new DefaultTracingObservationHandler(tracer)));
+        var telemetry = ObservationOutboxTelemetry.builder(registry, new OutboxMetrics(meters))
+                .observeUnsampled(true).build();
+        var list = List.of(records);
+        var step = telemetry.stepStarted(List.of(1));
+        var delivery = telemetry.deliveryStarted(step, list, NOW);
+        delivery.handed(list);
+        delivery.finished(list.stream().map(r -> Outcome.delivered()).toList());
+        step.finished();
+        return new Delivered(list, finished("outbox relay step"));
+    }
+
+    private final class Delivered {
+
+        private final List<OutboxRecord> records;
+        private final SpanData step;
+
+        Delivered(List<OutboxRecord> records, SpanData step) {
+            this.records = records;
+            this.step = step;
+        }
+
+        List<OutboxRecord> records() {
+            return records;
+        }
+
+        void assertChildOfTheStepWithoutLink(OutboxRecord record) {
+            var span = delivery(record);
+            assertThat(span.getParentSpanId()).as(headersOf(record)).isEqualTo(step.getSpanId());
+            assertThat(span.getLinks()).as(headersOf(record)).isEmpty();
+        }
+
+        void assertParentedByTheStoredContextAndLinked(OutboxRecord record) {
+            var span = delivery(record);
+            assertThat(span.getParentSpanId()).as(headersOf(record)).isEqualTo(SPAN_ID);
+            assertThat(span.getLinks()).as(headersOf(record)).singleElement()
+                    .satisfies(l -> assertThat(l.getSpanContext().getSpanId()).isEqualTo(step.getSpanId()));
+        }
+
+        private SpanData delivery(OutboxRecord record) {
+            return span(s -> record.messageId().toString().equals(attribute(s, "outbox.message_id")));
+        }
+
+        private String headersOf(OutboxRecord record) {
+            return record.headers().stream()
+                    .map(h -> h.name() + "=" + (h.value() == null ? null : new String(h.value(), UTF_8))).toList()
+                    .toString();
+        }
     }
 
     /** The step contexts as they stop. */

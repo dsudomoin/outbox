@@ -168,50 +168,12 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
     }
 
     /**
-     * Whether the last {@code traceparent} header is a well-formed W3C trace context whose sampled flag (bit 0 of the
-     * trace flags) is clear: {@code version-traceid-parentid-flags} in lowercase hex, version not {@code ff}, ids not
-     * all zero, nothing after the flags in version {@code 00}. Reads the bytes in place.
+     * Whether the last {@code traceparent} header is a well-formed W3C trace context
+     * ({@link TraceHeaders#wellFormedTraceparent}) whose sampled flag (bit 0 of the trace flags) is clear.
      */
     private static boolean unsampled(List<OutboxHeader> headers) {
-        for (int i = headers.size() - 1; i >= 0; i--) {
-            var h = headers.get(i);
-            if (h.name().equals("traceparent")) {
-                var v = h.value();
-                if (v == null || v.length < 55 || v[2] != '-' || v[35] != '-' || v[52] != '-'
-                        || v.length > 55 && v[55] != '-') {
-                    return false;
-                }
-                int version = hexByte(v, 0);
-                int flags = hexByte(v, 53);
-                return version >= 0 && version != 0xff && (version != 0 || v.length == 55)
-                        && hexNotZero(v, 3, 35) && hexNotZero(v, 36, 52) && flags >= 0 && (flags & 1) == 0;
-            }
-        }
-        return false;
-    }
-
-    /** Two lowercase hex digits at {@code at}, or -1. */
-    private static int hexByte(byte[] v, int at) {
-        int hi = hexDigit(v[at]);
-        int lo = hexDigit(v[at + 1]);
-        return hi < 0 || lo < 0 ? -1 : hi << 4 | lo;
-    }
-
-    /** Lowercase hex digits in {@code [from, to)}, not all zero. */
-    private static boolean hexNotZero(byte[] v, int from, int to) {
-        boolean notZero = false;
-        for (int i = from; i < to; i++) {
-            int d = hexDigit(v[i]);
-            if (d < 0) {
-                return false;
-            }
-            notZero |= d != 0;
-        }
-        return notZero;
-    }
-
-    private static int hexDigit(byte b) {
-        return b >= '0' && b <= '9' ? b - '0' : b >= 'a' && b <= 'f' ? b - 'a' + 10 : -1;
+        var v = TraceHeaders.last(headers, TraceHeaders.TRACEPARENT);
+        return TraceHeaders.wellFormedTraceparent(v) && (TraceHeaders.traceFlags(v) & 1) == 0;
     }
 
     /**
@@ -400,22 +362,38 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
             this.injected = injected;
         }
 
+        /**
+         * {@code headers} as they are when the message has a trace header of its own that gives it a parent (any
+         * injected name but {@code baggage} and {@code tracestate}); else with the injected headers added, but for the
+         * names the message already has.
+         */
         @Override
         public List<OutboxHeader> headers(List<OutboxHeader> headers) {
             if (injected.isEmpty()) {
                 return headers;
             }
-            for (var h : headers) {
-                for (var i : injected) {
-                    if (h.name().equals(i.name())) {
-                        return headers;
-                    }
+            for (var i : injected) {
+                if (TraceHeaders.carriesParent(i.name()) && named(headers, i.name())) {
+                    return headers;
                 }
             }
             var all = new ArrayList<OutboxHeader>(headers.size() + injected.size());
             all.addAll(headers);
-            all.addAll(injected);
+            for (var i : injected) {
+                if (!named(headers, i.name())) {
+                    all.add(i);
+                }
+            }
             return all;
+        }
+
+        private static boolean named(List<OutboxHeader> headers, String name) {
+            for (var h : headers) {
+                if (h.name().equals(name)) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         /** The thread's previous scope is restored however it ends: see {@link #stepStarted}. */

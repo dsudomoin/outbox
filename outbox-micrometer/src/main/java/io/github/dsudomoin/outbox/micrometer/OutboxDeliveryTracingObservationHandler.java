@@ -8,23 +8,29 @@ import io.micrometer.tracing.Tracer;
 import io.micrometer.tracing.handler.PropagatingReceiverTracingObservationHandler;
 import io.micrometer.tracing.handler.TracingObservationHandler;
 import io.micrometer.tracing.propagation.Propagator;
-import java.util.Set;
 
 /**
  * The tracing handler of {@code outbox.deliver} observations: {@link PropagatingReceiverTracingObservationHandler},
  * whose span a record's stored trace context parents, plus a link to the span of the relay step that delivers the
- * record. A record stored without trace context has the step's span, current then, as its parent, and no link. A
- * record counts as stored with context when it has a header of one of the propagator's fields. Register it before a
- * plain receiver handler in a first-matching composite; it supports {@link OutboxDeliveryContext} only.
+ * record. A record without a stored context the propagator can read has the step's span, current then, as its parent,
+ * and no link. Readable means, as the getter reads the last header of a name: a well-formed W3C {@code traceparent}
+ * when the propagator reads W3C trace context, a well-formed B3 single header or B3 trace and span ids when it reads
+ * B3. {@code baggage} and {@code tracestate} alone carry no parent. A record stored in another format gets no link.
+ * Register it before a plain receiver handler in a first-matching composite; it supports
+ * {@link OutboxDeliveryContext} only.
  */
 public class OutboxDeliveryTracingObservationHandler
         extends PropagatingReceiverTracingObservationHandler<OutboxDeliveryContext> {
 
-    private final Set<String> fields;
+    private final boolean w3c;
+    /** A B3 propagator extracts the single and the multi header formats whichever it injects. */
+    private final boolean b3;
 
     public OutboxDeliveryTracingObservationHandler(Tracer tracer, Propagator propagator) {
         super(tracer, propagator);
-        this.fields = Set.copyOf(propagator.fields());
+        var fields = propagator.fields();
+        this.w3c = fields.contains(TraceHeaders.TRACEPARENT);
+        this.b3 = fields.stream().anyMatch(f -> f.equals(TraceHeaders.B3) || f.startsWith("X-B3-"));
     }
 
     @Override
@@ -44,12 +50,12 @@ public class OutboxDeliveryTracingObservationHandler
         return context instanceof OutboxDeliveryContext;
     }
 
+    /** Whether the propagator extracts a parent from the record's headers, see the class doc. */
     private boolean storesContext(OutboxRecord record) {
-        for (var h : record.headers()) {
-            if (h.value() != null && fields.contains(h.name())) {
-                return true;
-            }
-        }
-        return false;
+        var headers = record.headers();
+        return w3c && TraceHeaders.wellFormedTraceparent(TraceHeaders.last(headers, TraceHeaders.TRACEPARENT))
+                || b3 && (TraceHeaders.wellFormedB3(TraceHeaders.last(headers, TraceHeaders.B3))
+                        || TraceHeaders.wellFormedB3Ids(TraceHeaders.last(headers, TraceHeaders.B3_TRACE_ID),
+                                TraceHeaders.last(headers, TraceHeaders.B3_SPAN_ID)));
     }
 }
