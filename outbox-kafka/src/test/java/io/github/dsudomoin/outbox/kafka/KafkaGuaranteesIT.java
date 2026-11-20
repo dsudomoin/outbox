@@ -35,8 +35,13 @@ import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.AlterConfigOp;
+import org.apache.kafka.clients.admin.ConfigEntry;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.config.ConfigResource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -51,6 +56,9 @@ class KafkaGuaranteesIT {
     private static final Duration CONSUME_TIMEOUT = Duration.ofSeconds(60);
     /** The suite's {@code delivery.timeout.ms} ({@link TestKafka#shortTimeouts}). */
     private static final Duration DELIVERY_TIMEOUT = Duration.ofSeconds(20);
+    /** The producer setting {@code relay.retry.holdPermanent} needs: one request in flight per connection. */
+    private static final Map<String, String> HELD_IN_ORDER =
+            Map.of(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, "1");
 
     private final JdbcTransactions transactions = new JdbcTransactions(TestDataSources.newDataSource());
     private final List<AutoCloseable> closing = new ArrayList<>(); // senders and runtimes, closed last first
@@ -277,6 +285,104 @@ class KafkaGuaranteesIT {
         assertThat(main).extracting(KafkaOutboxHeaders::messageId).doesNotContain(poison);
         await(Duration.ofSeconds(10), () -> runtime.admin().countDeadLetters(DeadLetterFilter.any()) == 0);
         assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThanOrEqualTo(within);
+    }
+
+    /**
+     * As {@link #aPoisonMessageGoesToTheDeadLetterTopicAndItsKeyContinues}, with {@code relay.retry.holdPermanent}: the
+     * broker's refusal stops the key instead. Nothing is dead-lettered, the record after it stays out of the topic
+     * while the other key goes on, and once the topic takes larger messages the next retry delivers both, in order.
+     * The producer has one request in flight per connection, as holdPermanent needs: with more, the broker may write
+     * the record after the poison while it refuses the poison.
+     */
+    @Test
+    void aMessageTooLargeForItsTopicStopsItsKeyWhenPermanentFailuresAreHeld() throws Exception {
+        var topic = TestKafka.createTopic("t-" + UUID.randomUUID(), 1, Map.of("max.message.bytes", "1024"));
+        var dlq = TestKafka.createTopic(topic + ".dlq", 1, Map.of());
+        var sender = sender(HELD_IN_ORDER);
+        var runtime = start(OutboxRuntime.builder(config().holdPermanent(true), transactions, new Handler(sender))
+                .deadLetterHandler(new KafkaDeadLetterHandler(sender, "{topic}.dlq")));
+
+        var ids = sendAll(runtime, List.of(
+                OutboxMessage.of(topic, "k", bytes("before")),
+                OutboxMessage.of(topic, "k", new byte[20 * 1024]),
+                OutboxMessage.of(topic, "k", bytes("after")),
+                OutboxMessage.of(topic, "other", bytes("other"))));
+
+        assertHeld(runtime, topic, dlq, ids);
+
+        alterTopic(topic, "max.message.bytes", "1048588"); // Kafka's default
+        consumeCommitted(topic, r -> true); // all four, per key in send order
+        await(CONSUME_TIMEOUT, () -> count("select count(*) from " + runtime.schema().names().retry()) == 0);
+        assertNothingIn(dlq);
+    }
+
+    /**
+     * Kafka refuses the message before it sends it (larger than the producer's {@code max.request.size}), so the
+     * producer stays open: with {@code relay.retry.holdPermanent} the sender then skips the rest of the key in the
+     * call, as after a retriable failure, and the record after it stays out of the topic. A runtime whose producer
+     * takes the message delivers both, in order. One request in flight, as in
+     * {@link #aMessageTooLargeForItsTopicStopsItsKeyWhenPermanentFailuresAreHeld}.
+     */
+    @Test
+    void aMessageTheProducerRefusesStopsItsKeyWhenPermanentFailuresAreHeld() throws Exception {
+        var topic = TestKafka.createTopic("t-" + UUID.randomUUID(), 1, Map.of());
+        var dlq = TestKafka.createTopic(topic + ".dlq", 1, Map.of());
+        var config = config().holdPermanent(true);
+        var small = sender(Map.of(ProducerConfig.MAX_REQUEST_SIZE_CONFIG, "4096",
+                ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, "1"));
+        var runtime = start(OutboxRuntime.builder(config, transactions, new Handler(small))
+                .deadLetterHandler(new KafkaDeadLetterHandler(small, "{topic}.dlq")));
+
+        var ids = sendAll(runtime, List.of(
+                OutboxMessage.of(topic, "k", bytes("before")),
+                OutboxMessage.of(topic, "k", new byte[20 * 1024]),
+                OutboxMessage.of(topic, "k", bytes("after")),
+                OutboxMessage.of(topic, "other", bytes("other"))));
+
+        assertHeld(runtime, topic, dlq, ids);
+
+        runtime.close();
+        var sender = sender(HELD_IN_ORDER);
+        var next = start(OutboxRuntime.builder(sameTables(config).holdPermanent(true), transactions,
+                new Handler(sender)).deadLetterHandler(new KafkaDeadLetterHandler(sender, "{topic}.dlq")));
+        consumeCommitted(topic, r -> true);
+        await(CONSUME_TIMEOUT, () -> count("select count(*) from " + next.schema().names().retry()) == 0);
+        assertNothingIn(dlq);
+    }
+
+    /**
+     * {@code ids} are {@code before}, the poison, {@code after} of key k and one record of another key: the poison is
+     * the retry head of k, retried at least twice, {@code after} waits behind it, the other two are in the topic, and
+     * nothing went to the dead table or its dead-letter topic.
+     */
+    private void assertHeld(OutboxRuntime runtime, String topic, String dlq, List<UUID> ids) throws Exception {
+        var names = runtime.schema().names();
+        var poison = ids.get(1);
+        await(CONSUME_TIMEOUT, () -> count("select count(*) from " + names.retry() + " where message_id = '" + poison
+                + "' and next_attempt_at is not null and attempts >= 2") == 1);
+        assertThat(count("select count(*) from " + names.retry() + " where message_id = '" + ids.get(2)
+                + "' and next_attempt_at is null")).as("after, a follower").isEqualTo(1);
+        var main = TestKafka.consumeUntil(topic, CONSUME_TIMEOUT,
+                r -> byMessageId(r).keySet().containsAll(List.of(ids.get(0), ids.get(3))));
+        assertThat(main).extracting(KafkaOutboxHeaders::messageId).doesNotContain(poison, ids.get(2));
+        assertThat(count("select count(*) from " + names.dead())).isZero();
+        assertNothingIn(dlq);
+    }
+
+    /** {@code topic} stays empty for 3 s. */
+    private static void assertNothingIn(String topic) {
+        assertThatThrownBy(() -> TestKafka.consumeUntil(topic, Duration.ofSeconds(3), r -> !r.isEmpty()))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("got 0 records");
+    }
+
+    private static void alterTopic(String topic, String name, String value) throws Exception {
+        var bootstrap = TestKafka.bootstrapServers();
+        try (var admin = Admin.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap))) {
+            var resource = new ConfigResource(ConfigResource.Type.TOPIC, topic);
+            admin.incrementalAlterConfigs(Map.of(resource,
+                    List.of(new AlterConfigOp(new ConfigEntry(name, value), AlterConfigOp.OpType.SET))))
+                    .all().get(30, TimeUnit.SECONDS);
+        }
     }
 
     @Test
