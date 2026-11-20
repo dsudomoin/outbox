@@ -10,6 +10,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
+import io.github.dsudomoin.outbox.testing.RoundTrips;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
@@ -244,6 +245,28 @@ class PgOutboxIT {
                 assertThat(row.shard()).isEqualTo(Hashing.shard(Hashing.keyHash(m.topic(), m.key()), config.shards()));
             }
         }
+    }
+
+    /**
+     * A {@code sendAll} waits for the database once: the key locks and the insert go in one round trip, the insert a
+     * statement after the locks, so a bulk writer on a network pays one round trip of latency for its messages.
+     */
+    @Test
+    void sendAllTakesOneRoundTrip() throws Exception {
+        var messages = IntStream.range(0, 50).mapToObj(i -> OutboxMessage.of("t", "k" + i, bytes("p" + i))).toList();
+        db.inTx((SqlFunction0<List<UUID>>) () -> outbox.sendAll(messages)); // its statements built
+
+        var sent = db.inTx((SqlFunction0<RoundTrips.Counted<List<UUID>>>) () -> {
+            try {
+                return RoundTrips.count(() -> outbox.sendAll(messages));
+            } catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+        });
+
+        assertThat(sent.result()).hasSize(50);
+        assertThat(sent.roundTrips()).as("round trips of a sendAll").isEqualTo(1);
+        assertThat(count()).isEqualTo(100);
     }
 
     @Test

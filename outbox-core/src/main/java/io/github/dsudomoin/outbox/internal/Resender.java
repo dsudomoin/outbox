@@ -51,6 +51,8 @@ public final class Resender {
     private final int shards;
     private final ShardGuard guard;
     private final String insertAll;
+    /** {@link #LOCK_ALL}, then {@link #insertAll}: the key locks with the first insert of a {@link #insertAll}. */
+    private final String lockAndInsertAll;
     private final long statementBytes;
 
     /**
@@ -81,6 +83,7 @@ public final class Resender {
                 + " select u.shard, u.mid, u.topic, u.key, u.payload, u.headers"
                 + " from unnest(?::smallint[], ?::uuid[], ?::text[], ?::bytea[], ?::bytea[], ?::bytea[])"
                 + " with ordinality u(shard, mid, topic, key, payload, headers, ord) order by u.ord";
+        this.lockAndInsertAll = LOCK_ALL + "; " + insertAll;
     }
 
     /**
@@ -130,7 +133,8 @@ public final class Resender {
             payloads[i] = r.payload();
             headers[i] = r.headers();
         }
-        var rowShards = lockKeys(inTx, topics, keys);
+        var rowShards = new Short[n];
+        var hashes = keyHashes(topics, keys, rowShards);
         int inserted = 0;
         for (int from = 0, to; from < n; from = to) {
             long bytes = 0;
@@ -141,14 +145,26 @@ public final class Resender {
                 }
                 bytes += size;
             }
-            try (var ps = inTx.prepareStatement(insertAll)) {
-                ps.setArray(1, inTx.createArrayOf("int2", slice(rowShards, from, to)));
-                ps.setArray(2, inTx.createArrayOf("uuid", slice(ids, from, to)));
-                ps.setArray(3, inTx.createArrayOf("text", slice(topics, from, to)));
-                ps.setArray(4, inTx.createArrayOf("bytea", slice(keys, from, to)));
-                ps.setArray(5, inTx.createArrayOf("bytea", slice(payloads, from, to)));
-                ps.setArray(6, inTx.createArrayOf("bytea", slice(headers, from, to)));
-                inserted += ps.executeUpdate();
+            // the key locks go with the first insert, a statement after them, in one round trip
+            boolean lock = from == 0 && hashes.length > 0;
+            try (var ps = inTx.prepareStatement(lock ? lockAndInsertAll : insertAll)) {
+                int at = 0;
+                if (lock) { // distinct and sorted: no deadlock between bulk writers
+                    ps.setInt(1, keyNamespace);
+                    ps.setArray(2, inTx.createArrayOf("int4", hashes));
+                    at = 2;
+                }
+                ps.setArray(at + 1, inTx.createArrayOf("int2", slice(rowShards, from, to)));
+                ps.setArray(at + 2, inTx.createArrayOf("uuid", slice(ids, from, to)));
+                ps.setArray(at + 3, inTx.createArrayOf("text", slice(topics, from, to)));
+                ps.setArray(at + 4, inTx.createArrayOf("bytea", slice(keys, from, to)));
+                ps.setArray(at + 5, inTx.createArrayOf("bytea", slice(payloads, from, to)));
+                ps.setArray(at + 6, inTx.createArrayOf("bytea", slice(headers, from, to)));
+                for (boolean set = ps.execute(); set || ps.getUpdateCount() != -1; set = ps.getMoreResults()) {
+                    if (!set) {
+                        inserted += ps.getUpdateCount(); // the insert's; the lock statement returns a row
+                    }
+                }
             }
         }
         return inserted;
@@ -201,9 +217,23 @@ public final class Resender {
      * The shard of each row, recomputed for the current {@code outbox.shards}, a random one when it has no key; the
      * keyed rows' distinct key hashes locked in one statement, until {@code inTx} ends.
      */
+    /** Locks the rows' distinct key hashes in one statement; returns the shard of each row. */
     private Short[] lockKeys(Connection inTx, String[] topics, byte[][] keys) throws SQLException {
+        var rowShards = new Short[topics.length];
+        var hashes = keyHashes(topics, keys, rowShards);
+        if (hashes.length > 0) {
+            try (var ps = inTx.prepareStatement(LOCK_ALL)) { // distinct and sorted: no deadlock between bulk writers
+                ps.setInt(1, keyNamespace);
+                ps.setArray(2, inTx.createArrayOf("int4", hashes));
+                ps.execute();
+            }
+        }
+        return rowShards;
+    }
+
+    /** The key hash of each keyed row, in order; fills {@code rowShards} for every row (unkeyed: a random shard). */
+    private Integer[] keyHashes(String[] topics, byte[][] keys, Short[] rowShards) {
         int n = topics.length;
-        var rowShards = new Short[n];
         var hashes = new Integer[n];
         int keyed = 0;
         for (int i = 0; i < n; i++) {
@@ -215,13 +245,6 @@ public final class Resender {
                 rowShards[i] = (short) Hashing.shard(hash, shards);
             }
         }
-        if (keyed > 0) {
-            try (var ps = inTx.prepareStatement(LOCK_ALL)) { // distinct and sorted: no deadlock between bulk writers
-                ps.setInt(1, keyNamespace);
-                ps.setArray(2, inTx.createArrayOf("int4", Arrays.copyOf(hashes, keyed)));
-                ps.execute();
-            }
-        }
-        return rowShards;
+        return Arrays.copyOf(hashes, keyed);
     }
 }

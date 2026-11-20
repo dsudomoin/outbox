@@ -206,10 +206,12 @@ class ResenderIT {
         return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[] {Connection.class},
                 (proxy, method, args) -> {
                     if (method.getName().equals("prepareStatement") && args[0] instanceof String sql) {
-                        if (sql.startsWith("insert ")) {
-                            inserts.incrementAndGet();
-                        } else if (sql.contains("pg_advisory_xact_lock")) {
+                        // the key locks go with the first insert, ahead of it in one statement batch
+                        if (sql.contains("pg_advisory_xact_lock")) {
                             locks.incrementAndGet();
+                        }
+                        if (sql.startsWith("insert ") || sql.contains("; insert ")) {
+                            inserts.incrementAndGet();
                         }
                     }
                     try {
