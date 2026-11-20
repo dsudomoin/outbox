@@ -25,14 +25,14 @@ import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 
 /**
  * Draining a backlog: {@code bench.rows} messages are written with the relay off (4 writers, 1000 messages a
- * transaction, random keys, 300-byte payloads), then a relay on the library's defaults (but {@code bench.batchSize})
+ * transaction, random keys, {@code bench.payload}-byte payloads), then a relay on the library's defaults (but {@code bench.batchSize})
  * starts and delivers them to a handler that delivers at once. {@code bench.tickEveryMs} > 0 makes a tick that often
  * during the fill, as a running relay would; 0 leaves the whole backlog to the relay's first tick. Prints the fill and
  * drain rates.
  *
  * <p>Not part of the build: {@code ./gradlew :outbox-kora:test -Pbenchmark --tests '*DrainBenchmark'}; properties
  * {@code bench.rows} (2 000 000), {@code bench.shards} (256), {@code bench.batchSize} (the library's, 10 000),
- * {@code bench.workers} (4), {@code bench.tickEveryMs} (0).
+ * {@code bench.workers} (4), {@code bench.tickEveryMs} (0), {@code bench.payload} (300).
  */
 @Tag("benchmark")
 class DrainBenchmark {
@@ -43,6 +43,7 @@ class DrainBenchmark {
             new OutboxConfig.RelayConfig() {}.batchSize());
     private static final int WORKERS = Integer.getInteger("bench.workers", 4);
     private static final int TICK_EVERY_MS = Integer.getInteger("bench.tickEveryMs", 0);
+    private static final int PAYLOAD = Integer.getInteger("bench.payload", 300);
     private static final int WRITERS = 4;
     private static final int PER_TX = 1000;
 
@@ -66,7 +67,7 @@ class DrainBenchmark {
     void drain() throws Exception {
         var table = TestDb.uniqueTable();
         var writerConfig = config(table).relayEnabled(false);
-        var payload = new byte[300];
+        var payload = new byte[PAYLOAD];
         new Random(1).nextBytes(payload);
         var traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".getBytes(UTF_8);
         long fillStarted;
@@ -164,8 +165,8 @@ class DrainBenchmark {
                 }
             }
         }
-        System.out.printf(Locale.ROOT, "%nrows %d, shards %d, workers %d, batchSize %d, tick every %d ms during the"
-                        + " fill: filled at %.0f msg/s, drained in %.1f s at %.0f msg/s%n", rows, SHARDS, WORKERS,
+        System.out.printf(Locale.ROOT, "%npayload %d B, rows %d, shards %d, workers %d, batchSize %d, tick every %d ms during the"
+                        + " fill: filled at %.0f msg/s, drained in %.1f s at %.0f msg/s%n", PAYLOAD, rows, SHARDS, WORKERS,
                 BATCH, TICK_EVERY_MS, rows / (fillNanos / 1e9), drainNanos / 1e9, rows / (drainNanos / 1e9));
     }
 
