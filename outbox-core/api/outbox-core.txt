@@ -104,6 +104,7 @@ package io.github.dsudomoin.outbox {
   public final class JdbcTransactions implements io.github.dsudomoin.outbox.OutboxTransactions {
     ctor public JdbcTransactions(javax.sql.DataSource!);
     method public void afterCommit(Runnable!);
+    method public void afterCommitEach(Runnable!);
     method public java.sql.Connection? currentConnection();
     method public <T> T inTx(io.github.dsudomoin.outbox.JdbcTransactions.SqlCall<T>!);
     method public java.sql.Connection! newConnection() throws java.sql.SQLException;
@@ -265,6 +266,8 @@ package io.github.dsudomoin.outbox {
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge PARTITIONS_PREMADE;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge PARTITIONS_RETAINED;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge PARTITIONS_XIDS_LEFT;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge PENDING;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge PENDING_OLDEST;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge RETRY_OLDEST;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge RETRY_SIZE;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge SHARD_LAG;
@@ -278,6 +281,7 @@ package io.github.dsudomoin.outbox {
     method public default java.util.List<io.github.dsudomoin.outbox.Outcome!>! handleBatch(java.util.List<io.github.dsudomoin.outbox.OutboxRecord!>!);
     method public static boolean holdsPermanent();
     method public static <T> T inRecordScope(io.github.dsudomoin.outbox.OutboxRecord!, java.util.concurrent.Callable<T>!) throws java.lang.Exception;
+    method public static void recordFinished(io.github.dsudomoin.outbox.OutboxRecord!, io.github.dsudomoin.outbox.Outcome!);
     method public static boolean windDownRequested();
   }
 
@@ -432,13 +436,16 @@ package io.github.dsudomoin.outbox {
     method public default void contractRejected(String!, String!, int);
     method public default void deadLetterDecision(String!);
     method public default void deadLetterHookFailed();
+    method public default void deadLettered(io.github.dsudomoin.outbox.OutboxRecord!, String!);
     method public default void deadLettered(String!);
     method public default void delivered(String!, java.time.Duration!);
+    method public default io.github.dsudomoin.outbox.OutboxTelemetry.Delivery! deliveryStarted(io.github.dsudomoin.outbox.OutboxTelemetry.RelayStep!, java.util.List<io.github.dsudomoin.outbox.OutboxRecord!>!, java.time.Instant!);
     method public default io.github.dsudomoin.outbox.OutboxTelemetry.Delivery! deliveryStarted(java.util.List<io.github.dsudomoin.outbox.OutboxRecord!>!, java.time.Instant!);
     method public default io.github.dsudomoin.outbox.OutboxTelemetry.Enqueue! enqueueStarted();
     method public default void enqueued(String!);
     method public default void gauge(io.github.dsudomoin.outbox.OutboxGauge!, java.util.function.DoubleSupplier!);
     method public default void inboxOutsideWindow();
+    method public default void queueState(java.util.List<io.github.dsudomoin.outbox.OutboxTelemetry.ShardQueue!>!);
     method public default void relayFailed(Throwable!);
     method public default void releaseThread();
     method public default void requeued(String!);
@@ -457,6 +464,7 @@ package io.github.dsudomoin.outbox {
     method public default void finished(java.util.List<io.github.dsudomoin.outbox.Outcome!>!);
     method public default java.util.List<io.github.dsudomoin.outbox.OutboxRecord!>! handed(java.util.List<io.github.dsudomoin.outbox.OutboxRecord!>!);
     method public default <T> T inRecordScope(io.github.dsudomoin.outbox.OutboxRecord!, java.util.concurrent.Callable<T>!) throws java.lang.Exception;
+    method public default void recordFinished(io.github.dsudomoin.outbox.OutboxRecord!, io.github.dsudomoin.outbox.Outcome!);
     field public static final io.github.dsudomoin.outbox.OutboxTelemetry.Delivery! NONE;
   }
 
@@ -464,13 +472,38 @@ package io.github.dsudomoin.outbox {
     method public default void failed(Throwable!);
     method public default void finished();
     method public default java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>! headers(java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!);
+    method public default io.github.dsudomoin.outbox.OutboxTelemetry.Message! message(io.github.dsudomoin.outbox.OutboxMessage!, java.util.UUID!, int);
     field public static final io.github.dsudomoin.outbox.OutboxTelemetry.Enqueue! NONE;
+  }
+
+  public static interface OutboxTelemetry.Message {
+    method public default void failed(Throwable!);
+    method public default java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>! headers(java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!);
+    method public default <T> T inScope(java.util.concurrent.Callable<T>!) throws java.lang.Exception;
+    method public default void inserted();
+    field public static final io.github.dsudomoin.outbox.OutboxTelemetry.Message! NONE;
   }
 
   public static interface OutboxTelemetry.RelayStep {
     method public default void failed(Throwable!);
+    method public default void fetched(int, int);
     method public default void finished();
+    method public default io.github.dsudomoin.outbox.OutboxTelemetry.Settle! settleStarted();
     field public static final io.github.dsudomoin.outbox.OutboxTelemetry.RelayStep! NONE;
+  }
+
+  public static interface OutboxTelemetry.Settle {
+    method public default void committed(int);
+    method public default void failed(int, Throwable!);
+    field public static final io.github.dsudomoin.outbox.OutboxTelemetry.Settle! NONE;
+  }
+
+  public static final class OutboxTelemetry.ShardQueue {
+    ctor public OutboxTelemetry.ShardQueue(int, double, double, boolean);
+    method public boolean estimated();
+    method public double oldestSeconds();
+    method public double pending();
+    method public int shard();
   }
 
   public interface OutboxTopicHandler {
@@ -481,6 +514,7 @@ package io.github.dsudomoin.outbox {
 
   public interface OutboxTransactions extends io.github.dsudomoin.outbox.ConnectionSource {
     method public void afterCommit(Runnable!) throws java.sql.SQLException;
+    method public default void afterCommitEach(Runnable!) throws java.sql.SQLException;
     method public java.sql.Connection? currentConnection();
     method public String! transactionHint();
     method public default RuntimeException! translate(java.sql.SQLException!);
