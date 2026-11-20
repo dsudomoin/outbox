@@ -29,6 +29,7 @@ import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.micrometer.OutboxStepContext;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.RoundTrips;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -150,6 +151,32 @@ class ShardProcessorIT {
         assertThat(counter("outbox.messages.delivered", "topic", "t")).isEqualTo(3);
         assertThat(counter("outbox.messages.delivered", "topic", "u")).isEqualTo(1);
         assertThat(meters.find("outbox.batch.duration").timer().count()).isEqualTo(1);
+    }
+
+    /**
+     * A step in its own transaction, as a relay worker runs it, opens it, takes the shard, reads its cursor and
+     * commits in as few round trips as the statements' dependencies allow: the settings, the locks and the cursors in
+     * one, the new cursor rows with the commit in one.
+     */
+    @Test
+    void aStepInItsOwnTransactionTakesFiveRoundTrips() throws Exception {
+        bootstrap();
+        send(msg("t", "a", "a1"));
+        tick();
+        process(); // its statements built, this URL's tcp_user_timeout probed, the shard's full retry check done
+        send(msg("t", "a", "a2"));
+        long t = tick();
+
+        try (var c = TestDb.connect()) {
+            var stepped = RoundTrips.count(() -> processor.tryProcessCommitted(c, List.of(0), t, now, now));
+
+            assertThat(stepped.result()).extracting(ShardProcessorIT::withoutCaughtUp)
+                    .containsExactly(new ShardResult(PROGRESS, 1, true));
+            assertThat(stepped.roundTrips()).as("round trips of a step of one shard").isEqualTo(5);
+            assertThat(c.getAutoCommit()).as("autocommit restored").isTrue();
+        }
+        assertThat(cursor()).isEqualTo(new Cursor(0, t, null, 0, null, 0, null, null));
+        assertThat(delivered()).containsExactly("a1", "a2");
     }
 
     @Test

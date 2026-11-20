@@ -22,6 +22,9 @@ import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.internal.Ticks.Tick;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
@@ -283,17 +286,64 @@ public final class ShardProcessor implements AutoCloseable {
         var tcpUserTimeout = TCP_USER_TIMEOUT.get(url);
         try (var st = c.createStatement()) {
             long bound = batchTimeout.plusSeconds(30).toMillis();
-            st.execute("set transaction isolation level read committed;"
-                    + " set local idle_in_transaction_session_timeout = '" + bound + "ms';"
-                    + (Boolean.TRUE.equals(tcpUserTimeout) ? " set local tcp_user_timeout = '" + bound + "ms';" : "")
-                    + " set local lock_timeout = '5s'; set local plan_cache_mode = force_custom_plan"
-                    + Ticks.noTransactionTimeout(meta));
+            st.execute(settings(meta, bound, Boolean.TRUE.equals(tcpUserTimeout)));
             if (tcpUserTimeout == null) {
                 try (var rs = st.executeQuery("select set_config('tcp_user_timeout', '" + bound + "', true)")) {
                     rs.next();
                     TCP_USER_TIMEOUT.put(url, !"0".equals(rs.getString(1)));
                 }
             }
+        }
+    }
+
+    /**
+     * The statements of {@link #prepareTransaction} to send ahead of a step's first one, in the same round trip:
+     * autocommit is turned off here. Null when the connection URL's {@code tcp_user_timeout} is not known yet: then
+     * {@link #prepareTransaction} has run, the probe of it included, and nothing is left to send.
+     */
+    @Nullable
+    private String deferredSettings(Connection c) throws SQLException {
+        var meta = c.getMetaData();
+        var tcpUserTimeout = TCP_USER_TIMEOUT.get(Objects.requireNonNullElse(meta.getURL(), ""));
+        if (tcpUserTimeout == null) {
+            prepareTransaction(c, relay.batchTimeout());
+            return null;
+        }
+        c.setAutoCommit(false);
+        return settings(meta, relay.batchTimeout().plusSeconds(30).toMillis(), tcpUserTimeout);
+    }
+
+    /** The settings statements of a step's transaction, {@code bound} in milliseconds. */
+    private static String settings(DatabaseMetaData meta, long bound, boolean tcpUserTimeout) throws SQLException {
+        return "set transaction isolation level read committed;"
+                + " set local idle_in_transaction_session_timeout = '" + bound + "ms';"
+                + (tcpUserTimeout ? " set local tcp_user_timeout = '" + bound + "ms';" : "")
+                + " set local lock_timeout = '5s'; set local plan_cache_mode = force_custom_plan"
+                + Ticks.noTransactionTimeout(meta);
+    }
+
+    /**
+     * One step of {@code shards} in a transaction of its own on the autocommit connection {@code c}, committed: what
+     * {@link #prepareTransaction}, {@link #tryProcess(Connection, List, long, Instant, Instant)} and a commit do, with
+     * fewer round trips: the transaction's settings go with the locks and the cursor reads, and the new cursor rows
+     * with the commit. On failure the transaction is rolled back and the failure propagates. Leaves {@code c} in
+     * autocommit.
+     */
+    public List<ShardResult> tryProcessCommitted(Connection c, List<Integer> shards, long latestTickId, Instant now,
+            Instant parkedUntil) throws SQLException, InterruptedException {
+        try {
+            var results = tryProcess(c, shards, latestTickId, now, parkedUntil, deferredSettings(c), true);
+            c.commit(); // sends nothing when the new cursor rows went with the commit
+            c.setAutoCommit(true);
+            return results;
+        } catch (Throwable t) {
+            try {
+                c.rollback();
+                c.setAutoCommit(true); // a statement after it would open a transaction left to the pool
+            } catch (SQLException | RuntimeException e) {
+                t.addSuppressed(e);
+            }
+            throw t;
         }
     }
 
@@ -349,6 +399,17 @@ public final class ShardProcessor implements AutoCloseable {
      */
     public List<ShardResult> tryProcess(Connection inTx, List<Integer> shards, long latestTickId, Instant now,
             Instant parkedUntil) throws SQLException, InterruptedException {
+        return tryProcess(inTx, shards, latestTickId, now, parkedUntil, null, false);
+    }
+
+    /**
+     * {@link #tryProcess(Connection, List, long, Instant, Instant)}; {@code settings}: when not null, statements to
+     * send ahead of the locks, in their round trip, and then the cursors are read in that round trip too (for every
+     * shard it tries to lock, the ones not taken dropped), still in a statement after the locks; {@code commit}: the
+     * new cursor rows go with the transaction's commit.
+     */
+    private List<ShardResult> tryProcess(Connection inTx, List<Integer> shards, long latestTickId, Instant now,
+            Instant parkedUntil, @Nullable String settings, boolean commit) throws SQLException, InterruptedException {
         if (new HashSet<>(shards).size() != shards.size()) {
             throw new IllegalArgumentException("shards are not distinct: " + shards);
         }
@@ -364,7 +425,15 @@ public final class ShardProcessor implements AutoCloseable {
                 lockable.add(i);
             }
         }
-        var locked = tryLock(inTx, lockable.stream().map(shards::get).toList());
+        var lockShards = lockable.stream().map(shards::get).toList();
+        Map<Integer, Cursors.Current> currents = null;
+        boolean[] locked;
+        if (settings == null) {
+            locked = tryLock(inTx, lockShards);
+        } else {
+            currents = new HashMap<>();
+            locked = tryLockAndRead(inTx, settings, lockShards, currents);
+        }
         var lockedShards = new ArrayList<Integer>(lockable.size());
         for (int k = 0; k < lockable.size(); k++) {
             if (locked[k]) {
@@ -377,7 +446,7 @@ public final class ShardProcessor implements AutoCloseable {
         List<ShardResult> stepped;
         try {
             stepped = stepLocked(inTx, shards, lockable, lockedShards, results, latestTickId, now, parkedUntil, started,
-                    step);
+                    step, currents, commit);
         } catch (Throwable t) {
             step[0].failed(t);
             throw t;
@@ -390,13 +459,16 @@ public final class ShardProcessor implements AutoCloseable {
      * {@link #tryProcess(Connection, List, long, Instant)} past its locks: {@code lockable} are the positions in
      * {@code shards} it tried to lock, {@code lockedShards} the shards it holds, {@code results} has the rest. Starts
      * the step's telemetry into {@code step} at the first shard with work, the steps {@code stepFinished} measures.
+     * {@code read}: the locked shards' cursors when the locks' round trip read them, else null; {@code commit}: the new
+     * cursor rows go with the commit.
      */
     private List<ShardResult> stepLocked(Connection inTx, List<Integer> shards, List<Integer> lockable,
             List<Integer> lockedShards, ShardResult[] results, long latestTickId, Instant now, Instant parkedUntil,
-            long started, OutboxTelemetry.RelayStep[] step) throws SQLException, InterruptedException {
+            long started, OutboxTelemetry.RelayStep[] step, @Nullable Map<Integer, Cursors.Current> read,
+            boolean commit) throws SQLException, InterruptedException {
         var steps = new ArrayList<Step>(lockable.size());
         // a statement after the locks: sees the previous holders' commits
-        var currents = cursors.latest(inTx, lockedShards);
+        var currents = read != null ? read : cursors.latest(inTx, lockedShards);
         for (var i : lockable) {
             if (results[i] != null) {
                 continue;
@@ -619,7 +691,7 @@ public final class ShardProcessor implements AutoCloseable {
                     && !s.untouched && s.next.tickId() >= latestTickId && !due(s.next.retryDueAt(), now)
                     && !due(s.next.parkedDueAt(), now), s.requeued);
         }
-        cursors.appendAll(inTx, appends);
+        cursors.appendAll(inTx, appends, commit);
         if (!work.isEmpty()) {
             telemetry.stepFinished(Duration.ofNanos(System.nanoTime() - started));
         }
@@ -1163,21 +1235,76 @@ public final class ShardProcessor implements AutoCloseable {
         if (shards.isEmpty()) {
             return locked;
         }
-        try (var ps = c.prepareStatement("select pg_try_advisory_xact_lock_shared(?, ?), array(select"
-                + " pg_try_advisory_xact_lock(?, ? + u.s) from unnest(?::int[]) with ordinality u(s, i)"
-                + " order by u.i)")) {
-            ps.setInt(1, internalNamespace);
-            ps.setInt(2, TableNames.LOCK_SWAP);
-            ps.setInt(3, internalNamespace);
-            ps.setInt(4, TableNames.LOCK_SHARD_BASE);
-            ps.setArray(5, c.createArrayOf("int4", shards.toArray()));
+        try (var ps = c.prepareStatement(TRY_LOCK)) {
+            bindTryLock(ps, shards);
             try (var rs = ps.executeQuery()) {
-                rs.next();
-                boolean swap = rs.getBoolean(1);
-                var each = (Boolean[]) rs.getArray(2).getArray();
-                for (int i = 0; i < locked.length; i++) {
-                    locked[i] = swap && each[i];
+                readLocks(rs, locked);
+            }
+        }
+        return locked;
+    }
+
+    /** The statement of {@link #tryLock}; its parameters: {@link #bindTryLock}. */
+    private static final String TRY_LOCK = "select pg_try_advisory_xact_lock_shared(?, ?), array(select"
+            + " pg_try_advisory_xact_lock(?, ? + u.s) from unnest(?::int[]) with ordinality u(s, i) order by u.i)";
+
+    private void bindTryLock(PreparedStatement ps, List<Integer> shards) throws SQLException {
+        ps.setInt(1, internalNamespace);
+        ps.setInt(2, TableNames.LOCK_SWAP);
+        ps.setInt(3, internalNamespace);
+        ps.setInt(4, TableNames.LOCK_SHARD_BASE);
+        ps.setArray(5, ps.getConnection().createArrayOf("int4", shards.toArray()));
+    }
+
+    /** Each shard locked only with {@code LOCK_SWAP}: see {@link #tryLock}. */
+    private static void readLocks(ResultSet rs, boolean[] locked) throws SQLException {
+        rs.next();
+        boolean swap = rs.getBoolean(1);
+        var each = (Boolean[]) rs.getArray(2).getArray();
+        for (int i = 0; i < locked.length; i++) {
+            locked[i] = swap && each[i];
+        }
+    }
+
+    /**
+     * {@code settings}, {@link #tryLock} and {@link Cursors#latest(Connection, java.util.Collection)} of {@code shards}, in one
+     * round trip: each statement takes its own snapshot, so the cursors, read after the locks, see the previous
+     * holders' commits. Puts the cursor of each shard locked into {@code currents}.
+     */
+    private boolean[] tryLockAndRead(Connection c, String settings, List<Integer> shards,
+            Map<Integer, Cursors.Current> currents) throws SQLException {
+        var locked = new boolean[shards.size()];
+        if (shards.isEmpty()) {
+            try (var st = c.createStatement()) {
+                st.execute(settings);
+            }
+            return locked;
+        }
+        var read = new HashMap<Integer, Cursors.Current>();
+        try (var ps = c.prepareStatement(settings + "; " + TRY_LOCK + "; " + cursors.latestManySql())) {
+            bindTryLock(ps, shards);
+            ps.setArray(6, c.createArrayOf("int4", shards.toArray()));
+            int resultSets = 0;
+            for (boolean rows = ps.execute(); rows || ps.getUpdateCount() != -1; rows = ps.getMoreResults()) {
+                if (!rows) {
+                    continue; // a setting
                 }
+                try (var rs = ps.getResultSet()) {
+                    if (resultSets++ == 0) {
+                        readLocks(rs, locked);
+                    } else {
+                        read.putAll(Cursors.currents(rs));
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < locked.length; i++) {
+            if (locked[i]) {
+                var current = read.get(shards.get(i));
+                if (current == null) {
+                    throw new IllegalStateException("no cursor for shard " + shards.get(i));
+                }
+                currents.put(shards.get(i), current);
             }
         }
         return locked;

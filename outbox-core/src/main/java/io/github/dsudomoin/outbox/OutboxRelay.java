@@ -529,24 +529,16 @@ public final class OutboxRelay implements AutoCloseable {
      */
     private List<ShardResult> processInOwnTransaction(Connection c, List<Integer> shards, long latest, Instant now,
             Instant parkedUntil) throws SQLException, InterruptedException {
-        try {
-            ShardProcessor.prepareTransaction(c, relay.batchTimeout());
-            var results = processor.tryProcess(c, shards, latest, now, parkedUntil);
-            c.commit();
-            c.setAutoCommit(true);
-            // without a hook the letter is kept already
-            if (deadLetters.active() && results.stream().anyMatch(ShardResult::deadLettered)) {
-                deadLettered.incrementAndGet();
-                var dead = deadLetterThread;
-                if (dead != null) {
-                    LockSupport.unpark(dead);
-                }
+        var results = processor.tryProcessCommitted(c, shards, latest, now, parkedUntil);
+        // without a hook the letter is kept already
+        if (deadLetters.active() && results.stream().anyMatch(ShardResult::deadLettered)) {
+            deadLettered.incrementAndGet();
+            var dead = deadLetterThread;
+            if (dead != null) {
+                LockSupport.unpark(dead);
             }
-            return results;
-        } catch (Throwable t) {
-            rollback(c, t);
-            throw t;
         }
+        return results;
     }
 
     /** {@code shards} in groups of at most {@link #MAX_GROUP} whose {@link #expected} rows stay below {@code batchSize}. */
@@ -704,16 +696,6 @@ public final class OutboxRelay implements AutoCloseable {
             return c.isClosed() || !c.isValid(1);
         } catch (SQLException e) {
             return true;
-        }
-    }
-
-    /** Rolls back, and back into autocommit, as a statement after it would open a transaction left to the pool. */
-    private static void rollback(Connection c, Throwable cause) {
-        try {
-            c.rollback();
-            c.setAutoCommit(true);
-        } catch (SQLException | RuntimeException e) {
-            cause.addSuppressed(e);
         }
     }
 

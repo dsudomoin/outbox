@@ -163,6 +163,7 @@ public final class Cursors {
     private final String latest;
     private final String latestMany;
     private final String appendAll;
+    private final String appendAllCommit;
     private final String positions;
     private final String checkpoint;
     private final String anchors;
@@ -184,6 +185,7 @@ public final class Cursors {
                 + " where shard = s.shard order by seq desc limit 1) c" + withTick;
         this.appendAll = "insert into " + names.cursor() + " (" + COLUMNS + ") select * from unnest(?::smallint[],"
                 + " ?::int8[], ?::int8[], ?::int8[], ?::timestamptz[], ?::int[], ?::timestamptz[], ?::timestamptz[])";
+        this.appendAllCommit = appendAll + "; commit";
         var ones = "repeat('1', " + shards + ")::varbit";
         // one pass over the ticks after the lowest effective tick (not below the checkpoint's): for each tick, the
         // shards that any tick after it up to the latest may hold rows of (a window bit_or, newest first); each shard
@@ -422,6 +424,21 @@ public final class Cursors {
         return result;
     }
 
+    /** The statement of {@link #latest(Connection, Collection)}: one parameter, the shards ({@code int4[]}). */
+    String latestManySql() {
+        return latestMany;
+    }
+
+    /** The rows of {@link #latestManySql()}, keyed by shard. */
+    static Map<Integer, Current> currents(ResultSet rs) throws SQLException {
+        var result = new HashMap<Integer, Current>();
+        while (rs.next()) {
+            var current = current(rs);
+            result.put(current.cursor().shard(), current);
+        }
+        return result;
+    }
+
     private static Current current(ResultSet rs) throws SQLException {
         var snapshot = rs.getString(10);
         return new Current(cursor(rs), rs.getLong(9), snapshot == null ? null : new Tick(rs.getLong(9),
@@ -446,6 +463,14 @@ public final class Cursors {
 
     /** {@link #append} of each of {@code cursors}, in order, in one statement. */
     public void appendAll(Connection c, List<Cursor> cursors) throws SQLException {
+        appendAll(c, cursors, false);
+    }
+
+    /**
+     * {@link #appendAll(Connection, List)}; with {@code commit}, the transaction's commit goes with the rows, in their
+     * round trip (none without rows: the caller commits).
+     */
+    public void appendAll(Connection c, List<Cursor> cursors, boolean commit) throws SQLException {
         if (cursors.isEmpty()) {
             return;
         }
@@ -469,7 +494,7 @@ public final class Cursors {
             retryDue[i] = text(cursor.retryDueAt());
             parkedDue[i] = text(cursor.parkedDueAt());
         }
-        try (var ps = c.prepareStatement(appendAll)) {
+        try (var ps = c.prepareStatement(commit ? appendAllCommit : appendAll)) {
             ps.setArray(1, c.createArrayOf("int4", shard));
             ps.setArray(2, c.createArrayOf("int8", tickId));
             ps.setArray(3, c.createArrayOf("int8", target));
@@ -478,7 +503,7 @@ public final class Cursors {
             ps.setArray(6, c.createArrayOf("int4", failures));
             ps.setArray(7, c.createArrayOf("text", retryDue));
             ps.setArray(8, c.createArrayOf("text", parkedDue));
-            ps.executeUpdate();
+            ps.execute();
         }
     }
 
