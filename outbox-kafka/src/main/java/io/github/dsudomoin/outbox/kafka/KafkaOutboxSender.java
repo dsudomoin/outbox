@@ -583,7 +583,8 @@ public final class KafkaOutboxSender implements AutoCloseable {
      * The rest of the call skips the record's topic after a metadata failure (cooling the topic after a metadata
      * timeout or a {@link #topicFault}) or an {@link InvalidTopicException}, whose {@code Permanent} the skipped
      * records of the topic then share ({@link #outcomes}), otherwise its (topic, key); a client-side
-     * {@link RecordTooLargeException} is {@code Permanent} and skips nothing. Before the append a
+     * {@link RecordTooLargeException} is {@code Permanent} and skips nothing, unless the relay holds permanent
+     * failures ({@link ShardProcessor#holdsPermanent}): then it skips its (topic, key) too. Before the append a
      * {@link TimeoutException} is a metadata wait, unless it is a {@link BufferExhaustedException}; after one, the call
      * looks up no topic its producer has not resolved before, so it waits {@code max.block.ms} for metadata once, plus
      * once per topic wrongly taken as resolved ({@link Pooled}).
@@ -598,7 +599,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
             coolingUntil.put(topic, notBefore(topicCooldown.failed(topic, nanos.getAsLong())));
         } else if (metadata || e instanceof InvalidTopicException) {
             refused.add(topic);
-        } else if (!(e instanceof RecordTooLargeException)) {
+        } else if (!(e instanceof RecordTooLargeException) || ShardProcessor.holdsPermanent()) {
             refused.add(BatchClassifier.orderingKey(record));
         }
     }
