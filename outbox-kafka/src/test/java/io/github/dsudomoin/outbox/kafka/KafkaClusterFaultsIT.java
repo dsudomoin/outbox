@@ -250,6 +250,22 @@ class KafkaClusterFaultsIT {
         finish("c-frozen-leader", Long.MIN_VALUE);
     }
 
+    /**
+     * (c60) as (c), for 60 s, longer than the producer's {@code delivery.timeout.ms}: the partitions the frozen node
+     * leads take nothing, the others should keep their latency ({@code maxLatencyMsByPartition}).
+     */
+    @Test
+    @Timeout(value = 5, unit = TimeUnit.MINUTES)
+    void theLeaderOfMostPartitionsFreezesForAMinute() {
+        start();
+        int leader = cluster.leaderOfMostPartitions(topic);
+        System.out.println("c60: pausing node " + leader + ", leaders " + cluster.leaders(topic));
+        cluster.pause(leader);
+        hold(Duration.ofSeconds(60));
+        cluster.unpause(leader);
+        finish("c60-frozen-leader-60s", Long.MIN_VALUE);
+    }
+
     /** (d) every node unreachable from the clients for 25 s, the brokers still in touch with each other. */
     @Test
     void theWholeClusterIsUnreachable() {
@@ -357,11 +373,15 @@ class KafkaClusterFaultsIT {
         long maxLatency = expected.stream().filter(first::containsKey)
                 .mapToLong(id -> first.get(id).appendedAtMs() - committedAtMs.get(id)).max().orElse(0);
         var outOfOrder = keysOutOfOrder(read, expected);
+        var byPartition = new TreeMap<Integer, Long>();
+        expected.stream().filter(first::containsKey).forEach(id -> byPartition.merge(first.get(id).partition(),
+                first.get(id).appendedAtMs() - committedAtMs.get(id), Math::max));
         long goneWithTopic = notExpected.stream().filter(id -> !first.containsKey(id)).count();
 
         System.out.println(name + " sent=" + all.size() + " lost=" + lost.size() + " duplicates="
                 + (read.size() - first.size()) + " maxLatencyMs=" + maxLatency);
-        System.out.println(name + " details: drainMs=" + drainMs + " keysOutOfOrder=" + outOfOrder
+        System.out.println(name + " details: drainMs=" + drainMs + " maxLatencyMsByPartition=" + byPartition
+                + " keysOutOfOrder=" + outOfOrder
                 + " notExpected=" + notExpected.size() + " ofWhichAbsent=" + goneWithTopic + " dead=" + dead
                 + extraDetails.get() + " during=" + brief(duringFault) + " after=" + brief(settled) + " failures=" + new TreeMap<>(
                         failures.entrySet().stream().collect(Collectors.toMap(Map.Entry::getKey, e -> e.getValue().get()))));
