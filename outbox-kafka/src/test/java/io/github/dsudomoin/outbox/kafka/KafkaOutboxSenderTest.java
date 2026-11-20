@@ -35,6 +35,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
@@ -1412,28 +1413,67 @@ class KafkaOutboxSenderTest {
 
     /**
      * A {@code batchTimeout} shorter than the call's own budget: after the wind-down the call awaits its records until
-     * just before the relay would cancel it, then cuts, so the outcomes it has count and no record is retried for
-     * nothing.
+     * a second before the relay would cancel it, then cuts, so the outcomes it has reach the relay in time and no
+     * record is retried for nothing.
      */
     @Test
     void aWindDownNearTheRelaysCancelCutsBeforeIt() throws Exception {
         var sender = sender(DELIVERY_TIMEOUT);
-        var batchTimeout = Duration.ofSeconds(2);
+        var batchTimeout = Duration.ofSeconds(6);
         long started = System.nanoTime();
         var call = inRelayCall(batchTimeout, () -> sender.send(List.of(record(1, "a"), record(2, "b"))));
         var producer = awaitSent(0, 2);
         producer.completeNext();
-        Thread.sleep(Math.max(0, 1600 - NANOSECONDS.toMillis(System.nanoTime() - started))); // the soft deadline
+        Thread.sleep(Math.max(0, 4800 - NANOSECONDS.toMillis(System.nanoTime() - started))); // the soft deadline
         call.handler().windDown();
 
-        var outcomes = call.result().get(2, SECONDS);
-        assertThat(Duration.ofNanos(System.nanoTime() - started)).as("200 ms before the relay's cancel")
-                .isBetween(Duration.ofMillis(1750), Duration.ofMillis(1990));
+        var outcomes = call.result().get(3, SECONDS);
+        assertThat(Duration.ofNanos(System.nanoTime() - started)).as("1 s before the relay's cancel")
+                .isBetween(Duration.ofMillis(4950), Duration.ofMillis(5400));
         assertThat(outcomes).satisfiesExactly(
                 o -> assertThat(o).isEqualTo(Outcome.delivered()),
                 o -> assertThat(o).isInstanceOf(Outcome.Retry.class));
         assertThat(call.flagKept()).isTrue();
         assertThat(producer.closed()).isTrue();
+    }
+
+    /**
+     * A sender entered late in a relay call (a Kafka route after slower ones in one {@code byTopic} call) hands
+     * records over only while Kafka can answer them before the cut ahead of the relay's cancel: here until 8 s - 1 s
+     * - 2 s = 5 s into the call, not 5 s after its own entry at 3 s.
+     */
+    @Test
+    void aLateEntryInARelayCallStopsTheHandOverBeforeTheRelaysCut() throws Exception {
+        var handedAt = new CopyOnWriteArrayList<Duration>();
+        var started = new AtomicLong();
+        var sender = sender(() -> new TestProducer(true, r -> {
+            handedAt.add(Duration.ofNanos(System.nanoTime() - started.get()));
+            sleep(300);
+            return null;
+        }), Duration.ofSeconds(2));
+        started.set(System.nanoTime());
+        var call = inRelayCall(Duration.ofSeconds(8), () -> {
+            sleep(3000); // the routes before this one
+            return sender.send(IntStream.range(0, 20).mapToObj(i -> record(i, "k" + i)).toList());
+        });
+
+        var outcomes = call.result().get(10, SECONDS);
+
+        assertThat(handedAt).isNotEmpty().allSatisfy(at -> assertThat(at).isLessThan(Duration.ofMillis(5100)));
+        assertThat(outcomes.subList(10, 20)).as("handed from 6 s on, they could outlast the cut at 7 s")
+                .containsOnly(Outcome.notAttempted());
+    }
+
+    /**
+     * A relay call shorter than the sender's own budget (the startup WARN's case) cannot give Kafka its whole delivery
+     * timeout before the cut: the sender still hands records over for its first 5 s, or it would deliver nothing.
+     */
+    @Test
+    void aRelayCallShorterThanTheSendersBudgetStillHandsRecordsOver() throws Exception {
+        var sender = sender(() -> new TestProducer(true, r -> null), DELIVERY_TIMEOUT);
+        var call = inRelayCall(Duration.ofSeconds(3), () -> sender.send(List.of(record(1, "a"), record(2, "b"))));
+
+        assertThat(call.result().get(5, SECONDS)).containsOnly(Outcome.delivered());
     }
 
     /**
