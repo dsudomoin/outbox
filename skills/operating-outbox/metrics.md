@@ -7,11 +7,14 @@ name (`outbox_shard_lag`, `outbox_dead_size`).
 
 In Spring Boot they follow the context's `MeterRegistry` bean, with the observations below. Without a framework the same
 meters come from `OutboxMetrics` (`outbox-micrometer`) passed to
-`OutboxRuntime.builder(...).telemetry(...)`. `ObservationOutboxTelemetry` adds three Micrometer observations on top:
-`outbox.enqueue` per send call, `outbox.relay.step` per relay step that finds work, the steps
-`outbox.batch.duration` times (span `outbox relay step`, a trace root on a relay worker; high-cardinality
-`outbox.shards`) and `outbox.deliver` per observed record (span kind CONSUMER, parented by the stored trace;
-tags `messaging.destination.name`, `outbox.outcome`; high-cardinality `outbox.shard`). By default a record whose
+`OutboxRuntime.builder(...).telemetry(...)`. `ObservationOutboxTelemetry` adds four Micrometer observations on top:
+`outbox.enqueue` per message (span `outbox enqueue <topic>`, PRODUCER), `outbox.relay.step` per relay step that finds
+work, the steps `outbox.batch.duration` times (span `outbox relay step`, CLIENT, a trace root on a relay worker, ends
+after the step's commit; high-cardinality `outbox.shards`, `outbox.records`), `outbox.relay.settle` per step (CLIENT,
+child of the step, from the last handler call to the end of the commit) and `outbox.deliver` per observed record (span
+kind CONSUMER, parent = the stored trace, else the step, plus a link to the step's span; ends at the record's own report,
+for Kafka its broker ack; tags `messaging.system`, `messaging.destination.name`, `outbox.outcome`; high-cardinality
+`outbox.shard`). The Kora telemetry with a `Tracer` produces the same four spans. By default a record whose
 stored W3C trace is not sampled is not observed (`observeUnsampled(true)` observes every one), so with
 `DefaultMeterObservationHandler` the `outbox.deliver` timer counts only observed deliveries; the `outbox.*` meters
 below count every record. Rename them with an `Outbox*ObservationConvention`, rename meters with a `MeterFilter`;
@@ -19,7 +22,7 @@ README «Наблюдаемость» → «Контракт по этапам»
 
 | Meter | Type | Tags | Meaning |
 |---|---|---|---|
-| `outbox.messages.enqueued` | counter | `topic` | Counted in `send`, including sends whose transaction rolled back. Do not compute backlog as enqueued − delivered; use `outbox.shard.lag`. |
+| `outbox.messages.enqueued` | counter | `topic` | Counted per message after the business transaction commits; a rolled-back one is not counted (a `send(connection, ...)` on a connection that is not the binding's transaction counts right after the insert). Do not compute backlog as enqueued − delivered; use `outbox.shard.lag`. |
 | `outbox.messages.delivered` | counter | `topic` | Records the handler reported delivered. |
 | `outbox.messages.failed` | counter | `topic`, `outcome` = `retry` / `dead` | Records diverted to (or failing again in) the retry table, and records moved to dead letters. |
 | `outbox.messages.requeued` | counter | `topic` | Records the handler set aside with `Outcome.requeue()`, every requeue counted. Not a failure; the requeue past `relay.requeue.maxRequeues` counts as `failed{outcome="dead"}` instead. |
@@ -33,6 +36,8 @@ README «Наблюдаемость» → «Контракт по этапам»
 | `outbox.relay.failures` | counter | | Relay failures it logs at WARN: a pass failing outside a step (tick, cursor read, connection, a lost one included) and a rolled-back single-shard step. Not a multi-shard step redone shard by shard, not maintenance, heartbeat, the dead-letter pass or failures while stopping. |
 | `outbox.handler.threads.free` | gauge | | Free handler threads of this instance, of `max(4, 2 × relay.workers)`. 0 for longer than `batchTimeout`: calls hung past it hold them all and this instance delivers nothing, while its heartbeat and `relay.running()` stay fine. |
 | `outbox.shard.lag` | gauge, seconds | | How far the slowest shard's tick is behind the latest tick. |
+| `outbox.pending` | gauge | | Records not yet delivered: the main stream beyond each shard's position plus retry and parked rows, summed over the shards with a known value. Counted by maintenance in its own read-only repeatable-read transaction: exact when the count fits 250 ms, otherwise estimated from the ticks' `max_id`. No query when telemetry is off. Per-shard values reach only `OutboxTelemetry#queueState`. |
+| `outbox.pending.oldest` | gauge, seconds | | Age (database `now()` minus `created_at`) of the oldest such record, the maximum over shards; 0 when none. Unlike `outbox.shard.lag` it sees retry and parked rows too. |
 | `outbox.retry.size`, `outbox.parked.size`, `outbox.dead.size` | gauges | | Rows in `<table>_retry`, `<table>_parked` (requeued records waiting) and `<table>_dead` (every status). |
 | `outbox.retry.oldest` | gauge, seconds | | Since `created_at` of the oldest retry head that retries, not waits; 0 when none. Counts from the send, not the first failure. Shard lag does not see such heads. Alert above N × `relay.retry.maxDelay` (operating-outbox SKILL.md). |
 | `outbox.waiting.size` | gauge | | Retry heads waiting for an instance able to handle them; they and their keys' later records also count in `outbox.retry.size`. |
@@ -97,7 +102,9 @@ WARN «outbox tick made without its shard set» (at most once a minute): a parti
 an `ACCESS EXCLUSIVE` lock (`ALTER TABLE`, `VACUUM FULL`, `TRUNCATE`, a manual `LOCK`), so ticks step every shard and
 lag grows while it lasts.
 
-Tracing (with an OpenTelemetry `Tracer` in the graph): one `PRODUCER` span per delivery attempt,
-`outbox deliver <topic>`, child of the writer's trace, with attributes `messaging.destination.name`,
-`outbox.message_id`, `outbox.attempt`, `outbox.delay_ms`, `outbox.outcome` (`delivered`, `retry`, `permanent`,
-`not_attempted`, `requeued`, `waiting`).
+Tracing (with an OpenTelemetry `Tracer` in the graph): `outbox enqueue <topic>` (PRODUCER, one per message, parent =
+the current Kora context's span; its context is stored as `traceparent`), `outbox relay step` (CLIENT, until after the
+commit) with its child `outbox relay settle` (CLIENT), and one `outbox deliver <topic>` (CONSUMER) per delivery
+attempt: parent = the stored context, else the step, with a link to the step span. Delivery attributes
+`messaging.system`, `messaging.destination.name`, `outbox.message_id`, `outbox.shard`, `outbox.attempt`,
+`outbox.delay_ms`, `outbox.outcome` (`delivered`, `retry`, `permanent`, `not_attempted`, `requeued`, `waiting`).
