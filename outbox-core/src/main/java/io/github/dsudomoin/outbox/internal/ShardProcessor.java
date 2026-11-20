@@ -38,6 +38,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.OptionalLong;
 import java.util.RandomAccess;
 import java.util.Set;
 import java.util.TreeMap;
@@ -1794,13 +1795,15 @@ public final class ShardProcessor implements AutoCloseable {
      * At the soft deadline (80 % of {@code batchTimeout}) the call is asked to wind down (a flag the
      * handler sees through {@link OutboxHandler#windDownRequested()}, plus an interrupt), not cancelled: the default
      * handleBatch starts no further record, and the call's real outcomes count. A call still running at
-     * {@code batchTimeout} is cancelled: nothing is known about any of its records, each a transient failure. A call
-     * that finds no free handler thread does not run: each record {@link #BUSY}. A Retry or Permanent outcome whose
-     * error is an {@link OutboxWaitException} comes back as the {@link Outcome.Waiting} it means.
+     * {@code batchTimeout} is cancelled: nothing is known about any of its records, each a transient failure
+     * ({@link #callDeadline()} tells the call when). A call that finds no free handler thread does not run: each
+     * record {@link #BUSY}. A Retry or Permanent outcome whose error is an {@link OutboxWaitException} comes back as
+     * the {@link Outcome.Waiting} it means.
      */
     private List<Outcome> callHandler(List<OutboxRecord> records, OutboxTelemetry.Delivery delivery)
             throws InterruptedException {
         var readOnly = Collections.unmodifiableList(records);
+        long timeout = relay.batchTimeout().toNanos();
         var task = new HandlerCall(() -> {
             try {
                 return RecordScope.bound(delivery, () -> {
@@ -1811,7 +1814,7 @@ public final class ShardProcessor implements AutoCloseable {
             } finally {
                 telemetry.releaseThread(); // nothing leaks into the next batch on this thread
             }
-        });
+        }, System.nanoTime() + timeout); // the waits below start after the submit: the cancel comes no earlier
         Future<List<Outcome>> call;
         try {
             call = executor.submit(task);
@@ -1821,7 +1824,6 @@ public final class ShardProcessor implements AutoCloseable {
             }
             return Collections.nCopies(records.size(), BUSY);
         }
-        long timeout = relay.batchTimeout().toNanos();
         long soft = timeout - timeout / 5;
         List<Outcome> outcomes;
         try {
@@ -1998,6 +2000,16 @@ public final class ShardProcessor implements AutoCloseable {
     }
 
     /**
+     * The {@link System#nanoTime()} at which the relay cancels the handler call running on this thread
+     * ({@code batchTimeout} after its submit, see {@link #callHandler}), so that the call can return its real outcomes
+     * before; empty outside a relay call. For the adapters of this repository.
+     */
+    public static OptionalLong callDeadline() {
+        var call = CALL.get();
+        return call == null ? OptionalLong.empty() : OptionalLong.of(call.deadline);
+    }
+
+    /**
      * A handler call that can be asked to wind down at the soft deadline without being cancelled, so its real outcomes
      * still come back. The request is a flag the call sees through {@link OutboxHandler#windDownRequested()} even when
      * its handler swallows the interrupt that comes with it. The interrupt never reaches a later task of the pooled
@@ -2006,12 +2018,14 @@ public final class ShardProcessor implements AutoCloseable {
     static final class HandlerCall implements Callable<List<Outcome>> {
 
         private final Callable<List<Outcome>> body;
+        private final long deadline; // on System.nanoTime(): see callDeadline()
         @Nullable
         private Thread thread; // under this
         private volatile boolean windDown;
 
-        HandlerCall(Callable<List<Outcome>> body) {
+        HandlerCall(Callable<List<Outcome>> body, long deadline) {
             this.body = body;
+            this.deadline = deadline;
         }
 
         @Override

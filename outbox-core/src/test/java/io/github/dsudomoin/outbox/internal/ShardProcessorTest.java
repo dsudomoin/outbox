@@ -10,9 +10,11 @@ import jakarta.annotation.Nullable;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
@@ -61,7 +63,7 @@ class ShardProcessorTest {
         var call = new ShardProcessor.HandlerCall(() -> {
             self.get().interrupt(); // the soft deadline hits; the handler returns without looking
             return List.of();
-        });
+        }, System.nanoTime());
         self.set(call);
         try {
             call.call();
@@ -75,7 +77,7 @@ class ShardProcessorTest {
     void softInterruptAimedAtAFinishedCallNeverReachesTheNextTaskOnItsThread() throws Exception {
         var pool = Executors.newSingleThreadExecutor();
         try {
-            var call = new ShardProcessor.HandlerCall(List::of);
+            var call = new ShardProcessor.HandlerCall(List::of, System.nanoTime());
             pool.submit(call).get();
             var started = new CountDownLatch(1);
             var interrupterDone = new CountDownLatch(1);
@@ -100,6 +102,21 @@ class ShardProcessorTest {
     }
 
     @Test
+    void theCallSeesItsOwnDeadline() throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        var seen = new ArrayList<OptionalLong>();
+        var call = new ShardProcessor.HandlerCall(() -> {
+            seen.add(ShardProcessor.callDeadline());
+            return List.of();
+        }, deadline);
+
+        call.call();
+
+        assertThat(seen).containsExactly(OptionalLong.of(deadline));
+        assertThat(ShardProcessor.callDeadline()).as("outside a call").isEmpty();
+    }
+
+    @Test
     void windDownStaysVisibleToTheCallWhenItsClientSwallowsTheInterrupt() throws Exception {
         var self = new AtomicReference<ShardProcessor.HandlerCall>();
         var seen = new ArrayList<Boolean>();
@@ -109,7 +126,7 @@ class ShardProcessorTest {
             Thread.interrupted(); // a client clears the flag and throws something else
             seen.add(OutboxHandler.windDownRequested());
             return List.of();
-        });
+        }, System.nanoTime());
         self.set(call);
 
         call.call();
@@ -131,7 +148,7 @@ class ShardProcessorTest {
             }
         };
         var records = List.of(record(1, "a"), record(2, "b"), record(3, "c"), record(4, "d"));
-        var call = new ShardProcessor.HandlerCall(() -> handler.handleBatch(records));
+        var call = new ShardProcessor.HandlerCall(() -> handler.handleBatch(records), System.nanoTime());
         self.set(call);
 
         var outcomes = call.call();
