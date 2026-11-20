@@ -278,13 +278,22 @@ public final class OutboxRelay implements AutoCloseable {
                         + " drain(); this instance makes no ticks (outbox.relay.ticksWithoutRelay = 0)");
                 return;
             }
-            var s = Executors.newSingleThreadScheduledExecutor(r -> {
-                var t = new Thread(r, "outbox-ticker");
-                t.setDaemon(true);
-                return t;
-            });
-            s.scheduleWithFixedDelay(new Ticker(every), 0, every.toNanos(), TimeUnit.NANOSECONDS);
-            scheduler = s; // close() stops it as it stops maintenance
+            try {
+                var s = Executors.newSingleThreadScheduledExecutor(r -> {
+                    var t = new Thread(r, "outbox-ticker");
+                    t.setDaemon(true);
+                    return t;
+                });
+                scheduler = s; // close() stops it as it stops maintenance
+                s.scheduleWithFixedDelay(new Ticker(every), 0, every.toNanos(), TimeUnit.NANOSECONDS);
+            } catch (RuntimeException | Error e) {
+                var s = scheduler;
+                if (s != null) {
+                    s.shutdownNow();
+                }
+                heartbeat.stop(); // a failed start leaves no instance, as with the relay enabled
+                throw e;
+            }
             log.info("outbox relay disabled (outbox.relay.enabled = false); messages are delivered only by drain();"
                     + " this instance makes a tick every {} while it writes (outbox.relay.ticksWithoutRelay)", every);
             return;

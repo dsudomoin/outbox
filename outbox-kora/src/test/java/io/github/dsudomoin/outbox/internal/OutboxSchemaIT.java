@@ -486,6 +486,7 @@ class OutboxSchemaIT {
                 Map.entry("outbox.relay.shutdownTimeout", c -> c.shutdownTimeout(Duration.ofMillis(-1))),
                 Map.entry("outbox.relay.connectionHold", c -> c.connectionHold(Duration.ZERO)),
                 Map.entry("outbox.relay.ticksWithoutRelay", c -> c.ticksWithoutRelay(Duration.ofMillis(-1))),
+                Map.entry("outbox.relay.ticksWithoutRelay", c -> c.ticksWithoutRelay(Duration.ofDays(25))),
                 Map.entry("outbox.relay.headFailuresBeforeDivert", c -> c.headFailuresBeforeDivert(0)),
                 Map.entry("outbox.relay.cursorAnchorInterval", c -> c.cursorAnchorInterval(Duration.ZERO)),
                 Map.entry("outbox.relay.cursorAnchorInterval", c -> c.maintenanceInterval(Duration.ofMinutes(2))
@@ -532,6 +533,7 @@ class OutboxSchemaIT {
                 Map.entry("outbox.relay.shutdownTimeout", c -> c.shutdownTimeout(Duration.ofMillis(-1))),
                 Map.entry("outbox.relay.connectionHold", c -> c.connectionHold(Duration.ZERO)),
                 Map.entry("outbox.relay.ticksWithoutRelay", c -> c.ticksWithoutRelay(Duration.ofMillis(-1))),
+                Map.entry("outbox.relay.ticksWithoutRelay", c -> c.ticksWithoutRelay(Duration.ofDays(25))),
                 Map.entry("outbox.partitions.maintenanceInterval", c -> c.maintenanceInterval(Duration.ZERO)));
         for (var e : cases) {
             var invalid = new TestOutboxConfig();

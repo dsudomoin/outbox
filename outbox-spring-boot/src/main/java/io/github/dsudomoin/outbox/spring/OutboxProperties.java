@@ -92,7 +92,7 @@ public record OutboxProperties(
      *     every chunk. A run sees whether this instance committed since its last tick and ticks unless a tick of any
      *     instance is at most three quarters of this old; none while an xid-regression halt is recorded. With every
      *     relay down, the tick table grows by about one row per interval while someone writes, until a relay's first
-     *     maintenance run deletes them. 0: no ticks. Ignored while the relay runs. Default 1 s.
+     *     maintenance run deletes them. 0: no ticks, at most 24 days. Ignored while the relay runs. Default 1 s.
      * @param headFailuresBeforeDivert failed attempts in a row after which a shard reads one head row and diverts the
      *     single failing key. Default 3.
      * @param cursorAnchorInterval how long an idle shard's latest cursor row may stay on a tick below its effective

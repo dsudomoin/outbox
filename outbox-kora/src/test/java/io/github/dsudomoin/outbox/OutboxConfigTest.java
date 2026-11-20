@@ -204,6 +204,8 @@ class OutboxConfigTest {
         assertThat(parse("outbox.relay.ticksWithoutRelay = 0s").relay().ticksWithoutRelay()).isZero();
         assertRejected("outbox.relay.ticksWithoutRelay = -1ms",
                 "outbox.relay.ticksWithoutRelay must not be negative: PT-0.001S");
+        assertRejected("outbox.relay.ticksWithoutRelay = 25d",
+                "outbox.relay.ticksWithoutRelay must be at most 24d: PT600H");
     }
 
     @Test
