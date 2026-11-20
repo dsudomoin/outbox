@@ -103,6 +103,16 @@ import org.slf4j.LoggerFactory;
  * records per round trip; its producers are closed once nothing is remembered. With nothing remembered, a call looks
  * nothing up.
  *
+ * <p>A call of a relay that holds permanent failures ({@code relay.retry.holdPermanent}, see
+ * {@link ShardProcessor#holdsPermanent}) borrows from two more pools, batched and unbatched as above, whose producers
+ * get {@code max.in.flight.requests.per.connection=1} and otherwise the same properties (with a suffixed
+ * {@code client.id}, {@code <client.id>-outbox-held-<n>} and {@code <client.id>-outbox-held-unbatched-<n>}). With
+ * more requests in flight, a later record of a key may already be on its way when the broker refuses an earlier one,
+ * and the broker writes it: the held record would then be behind it. Such a call also skips the rest of a key after a
+ * client-side {@link RecordTooLargeException}. One request in flight means a call's records to one broker go one
+ * request at a time, so a large call is slower; with the user's own setting of 1 those calls use the two pools
+ * above.
+ *
  * <p>Producer properties are {@code driverProperties} with byte-array serializers, {@code enable.idempotence=true} and
  * {@code acks=all} forced; {@code max.block.ms} defaults to 5000, {@code enable.metrics.push} to false and
  * {@code delivery.timeout.ms} to 120000, long enough to ride out a broker's restart without the retry by a new producer
@@ -151,12 +161,20 @@ public final class KafkaOutboxSender implements AutoCloseable {
 
     private final Supplier<Producer<byte[], byte[]>> factory;
     private final Supplier<Producer<byte[], byte[]>> unbatchedFactory;
+    /**
+     * The producers of held calls ({@link ShardProcessor#holdsPermanent}), batched and unbatched: one request in
+     * flight per connection; {@link #factory} and {@link #unbatchedFactory} when the user's setting is 1 already.
+     */
+    private final Supplier<Producer<byte[], byte[]>> heldFactory;
+    private final Supplier<Producer<byte[], byte[]>> heldUnbatchedFactory;
     private final Duration wait;
     private final Duration longestCall;
     private final Clock clock;
     private final LongSupplier nanos; // measures the cooldowns and the memories; clock only dates cooldown ends
     private final Deque<Pooled> pool = new ConcurrentLinkedDeque<>();
     private final Deque<Pooled> unbatchedPool = new ConcurrentLinkedDeque<>();
+    private final Deque<Pooled> heldPool; // pool when heldFactory is factory
+    private final Deque<Pooled> heldUnbatchedPool; // unbatchedPool when heldUnbatchedFactory is unbatchedFactory
     private final Cooldown<TopicPartition> cooldown;
     private final Cooldown<String> topicCooldown;
     /** The remembered records (see the class javadoc), by message id: when each was remembered, on {@code nanos}. */
@@ -189,12 +207,26 @@ public final class KafkaOutboxSender implements AutoCloseable {
 
     private KafkaOutboxSender(ProducerConfig config, boolean suffix,
             Function<Map<String, Object>, Producer<byte[], byte[]>> producers) {
-        this(() -> producers.apply(properties(config, suffix ? "-outbox-" : null)), () -> {
-            var unbatched = properties(config, suffix ? "-outbox-unbatched-" : null);
-            unbatched.put(BATCH_SIZE_CONFIG, "0");
-            return producers.apply(unbatched);
-        }, Duration.ofMillis(config.getInt(DELIVERY_TIMEOUT_MS_CONFIG)),
+        this(() -> producers.apply(properties(config, suffix ? "-outbox-" : null)),
+                () -> producers.apply(unbatched(properties(config, suffix ? "-outbox-unbatched-" : null))),
+                config.getInt(MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION) == 1 ? null
+                        : () -> producers.apply(oneInFlight(properties(config, suffix ? "-outbox-held-" : null))),
+                config.getInt(MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION) == 1 ? null : () -> producers.apply(
+                        unbatched(oneInFlight(properties(config, suffix ? "-outbox-held-unbatched-" : null)))),
+                Duration.ofMillis(config.getInt(DELIVERY_TIMEOUT_MS_CONFIG)),
                 Duration.ofMillis(config.getLong(MAX_BLOCK_MS_CONFIG)), Clock.systemUTC(), System::nanoTime);
+    }
+
+    /** {@code properties} with {@code batch.size=0}: see the class javadoc. */
+    private static Map<String, Object> unbatched(Map<String, Object> properties) {
+        properties.put(BATCH_SIZE_CONFIG, "0");
+        return properties;
+    }
+
+    /** {@code properties} with one request in flight per connection, for held calls: see the class javadoc. */
+    private static Map<String, Object> oneInFlight(Map<String, Object> properties) {
+        properties.put(MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, "1");
+        return properties;
     }
 
     /**
@@ -228,12 +260,24 @@ public final class KafkaOutboxSender implements AutoCloseable {
         this(factory, unbatched, deliveryTimeout, Duration.ZERO, clock, nanos);
     }
 
-    /** For tests: {@code maxBlock} is the producers' {@code max.block.ms}. */
+    /** For tests: {@code maxBlock} is the producers' {@code max.block.ms}; held calls use the same two pools. */
     KafkaOutboxSender(Supplier<Producer<byte[], byte[]>> factory,
             Supplier<Producer<byte[], byte[]>> unbatched, Duration deliveryTimeout, Duration maxBlock, Clock clock,
             LongSupplier nanos) {
+        this(factory, unbatched, null, null, deliveryTimeout, maxBlock, clock, nanos);
+    }
+
+    /** Null {@code held} and {@code heldUnbatched}: held calls use the other two pools. */
+    private KafkaOutboxSender(Supplier<Producer<byte[], byte[]>> factory,
+            Supplier<Producer<byte[], byte[]>> unbatched, @Nullable Supplier<Producer<byte[], byte[]>> held,
+            @Nullable Supplier<Producer<byte[], byte[]>> heldUnbatched, Duration deliveryTimeout, Duration maxBlock,
+            Clock clock, LongSupplier nanos) {
         this.factory = factory;
         this.unbatchedFactory = unbatched;
+        this.heldFactory = held != null ? held : factory;
+        this.heldUnbatchedFactory = heldUnbatched != null ? heldUnbatched : unbatched;
+        this.heldPool = held != null ? new ConcurrentLinkedDeque<>() : pool;
+        this.heldUnbatchedPool = heldUnbatched != null ? new ConcurrentLinkedDeque<>() : unbatchedPool;
         this.clock = clock;
         this.nanos = nanos;
         this.nextPurge = nanos.getAsLong();
@@ -310,10 +354,12 @@ public final class KafkaOutboxSender implements AutoCloseable {
         }
         long entry = System.nanoTime();
         boolean unbatched = anyRemembered() && records.stream().anyMatch(r -> expired.containsKey(r.messageId()));
-        var home = unbatched ? unbatchedPool : pool;
+        boolean held = ShardProcessor.holdsPermanent();
+        var home = held ? (unbatched ? heldUnbatchedPool : heldPool) : (unbatched ? unbatchedPool : pool);
         var pooled = home.pollFirst();
         if (pooled == null) {
-            pooled = new Pooled((unbatched ? unbatchedFactory : factory).get(), home);
+            var made = held ? (unbatched ? heldUnbatchedFactory : heldFactory) : (unbatched ? unbatchedFactory : factory);
+            pooled = new Pooled(made.get(), home);
         }
         var call = new Call(pooled.producer, records.size(), unbatched, entry);
         try {
@@ -337,7 +383,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
                 giveBack(pooled);
             }
             if (unbatched && expired.isEmpty()) { // none is needed now, after a closed call too
-                drain(unbatchedPool);
+                drainUnbatched();
             }
         }
     }
@@ -394,7 +440,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
             long rememberedFor = REMEMBERED_FOR.toNanos();
             expired.values().removeIf(at -> now - at - rememberedFor >= 0);
             if (expired.isEmpty()) {
-                drain(unbatchedPool);
+                drainUnbatched();
             }
         }
         return !expired.isEmpty();
@@ -405,6 +451,12 @@ public final class KafkaOutboxSender implements AutoCloseable {
         if (released && pooled.home.remove(pooled)) { // close() has drained the pool already
             closeQuietly(pooled.producer, RELEASE_TIMEOUT);
         }
+    }
+
+    /** Both unbatched pools: none is needed while nothing is remembered. */
+    private void drainUnbatched() {
+        drain(unbatchedPool);
+        drain(heldUnbatchedPool);
     }
 
     private static void drain(Deque<Pooled> pool) {
@@ -722,6 +774,8 @@ public final class KafkaOutboxSender implements AutoCloseable {
         released = true;
         drain(pool);
         drain(unbatchedPool);
+        drain(heldPool);
+        drain(heldUnbatchedPool);
     }
 
     private static void closeQuietly(Producer<byte[], byte[]> producer, Duration timeout) {
