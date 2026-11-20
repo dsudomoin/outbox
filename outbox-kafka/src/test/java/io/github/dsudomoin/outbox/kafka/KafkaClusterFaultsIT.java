@@ -27,6 +27,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -77,6 +78,11 @@ class KafkaClusterFaultsIT {
     private static final Duration WRITE_PAUSE = Duration.ofMillis(40);
     private static final Duration WARMUP = Duration.ofSeconds(5);
     private static final Duration AFTER_HEAL = Duration.ofSeconds(5);
+    /**
+     * {@code -Doutbox.test.kafka.deliveryTimeoutMs} gives the producers that {@code delivery.timeout.ms} instead of the
+     * sender's default, and the relay a {@code batchTimeout} to match ({@link #config}).
+     */
+    private static final String DELIVERY_TIMEOUT = System.getProperty("outbox.test.kafka.deliveryTimeoutMs");
     /** From the writers' stop until every committed message is in the topic: longer is a stall. */
     private static final Duration DRAIN = Duration.ofSeconds(90);
 
@@ -94,6 +100,11 @@ class KafkaClusterFaultsIT {
     /** Failed outcomes whose cause chain holds NotEnoughReplicas(AfterAppend)Exception. */
     private final AtomicInteger notEnoughReplicasOutcomes = new AtomicInteger();
     private volatile Supplier<String> extraDetails = () -> "";
+    /** Per id, what each handler call that got it answered, for the report of a key out of order. */
+    private final Map<UUID, List<String>> history = new ConcurrentHashMap<>();
+    private final AtomicInteger callNumbers = new AtomicInteger();
+    private final long startedAt = System.nanoTime();
+    private final long startedAtMs = System.currentTimeMillis();
     private final AtomicBoolean writing = new AtomicBoolean();
     private final List<Future<?>> writers = new ArrayList<>();
     private ExecutorService pool;
@@ -355,6 +366,7 @@ class KafkaClusterFaultsIT {
                 + extraDetails.get() + " during=" + brief(duringFault) + " after=" + brief(settled) + " failures=" + new TreeMap<>(
                         failures.entrySet().stream().collect(Collectors.toMap(Map.Entry::getKey, e -> e.getValue().get()))));
 
+        outOfOrder.forEach(key -> report(key, read));
         assertThat(lost).as(name + ": committed messages missing from the topic %s after the writers stopped", DRAIN)
                 .isEmpty();
         assertThat(outOfOrder).as(name + ": keys whose first occurrences break send order").isEmpty();
@@ -380,6 +392,35 @@ class KafkaClusterFaultsIT {
     private static String brief(OutboxStatus s) {
         return s == null ? "-" : "{lag=" + s.lagSeconds() + " retry=" + s.retrySize() + " parked=" + s.parkedSize()
                 + " waiting=" + s.waitingSize() + " dead=" + s.deadLetters() + "}";
+    }
+
+    /**
+     * The ids of {@code key} around its first inversion, by their index in send order: every copy in the topic and
+     * what each handler call that got the id answered.
+     */
+    private void report(String key, List<Seen> read) {
+        var sent = committed.get(key);
+        var copies = read.stream().filter(r -> r.key().equals(key)).toList();
+        var firsts = copies.stream().map(r -> sent.indexOf(r.id())).distinct().toList();
+        int low = Integer.MAX_VALUE;
+        int high = -1;
+        for (int j = 1, max = firsts.get(0); j < firsts.size(); max = Math.max(max, firsts.get(j++))) {
+            if (firsts.get(j) < max) {
+                low = Math.min(low, firsts.get(j));
+                high = Math.max(high, max);
+            }
+        }
+        int from = Math.max(0, low - 3);
+        int to = Math.min(sent.size() - 1, Math.min(high + 3, from + 30));
+        System.out.println("out of order " + key + ": first copies in topic order (send index) " + firsts);
+        for (int i = from; i <= to; i++) {
+            var id = sent.get(i);
+            System.out.println("  #" + i + " committed t" + (committedAtMs.get(id) - startedAtMs) + " copies "
+                    + copies.stream().filter(r -> r.id().equals(id))
+                            .map(r -> "p" + r.partition() + ":" + r.offset() + "/t" + (r.appendedAtMs() - startedAtMs))
+                            .toList()
+                    + " calls " + history.getOrDefault(id, List.of()));
+        }
     }
 
     /** Keys whose first occurrences of the expected ids differ from their send order. */
@@ -436,7 +477,7 @@ class KafkaClusterFaultsIT {
         }
     }
 
-    private record Seen(UUID id, String key, long appendedAtMs) {}
+    private record Seen(UUID id, String key, long appendedAtMs, int partition, long offset) {}
 
     /**
      * Reads the topic from the start until every id of {@code expected} but those {@code excused} is there or
@@ -463,7 +504,7 @@ class KafkaClusterFaultsIT {
                 }
                 for (var r : consumer.poll(Duration.ofMillis(500))) {
                     var id = KafkaOutboxHeaders.messageId(r);
-                    read.add(new Seen(id, new String(r.key(), UTF_8), r.timestamp()));
+                    read.add(new Seen(id, new String(r.key(), UTF_8), r.timestamp(), r.partition(), r.offset()));
                     missing.remove(id);
                 }
             }
@@ -475,16 +516,20 @@ class KafkaClusterFaultsIT {
         var properties = new Properties();
         properties.putAll(cluster.clientProperties(true));
         properties.put(ProducerConfig.CLIENT_ID_CONFIG, "outbox-" + closing.size());
+        if (DELIVERY_TIMEOUT != null) {
+            properties.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, DELIVERY_TIMEOUT);
+        }
         var sender = new KafkaOutboxSender(() -> properties);
         closing.add(sender);
-        var runtime = OutboxRuntime.builder(config, transactions, recording(sender.handler())).build();
+        var runtime = OutboxRuntime.builder(config, transactions, recording(sender.handler(), closing.size() / 2))
+                .build();
         closing.add(runtime);
         runtime.start();
         return runtime;
     }
 
     /** {@code kafka}, noting when each delivered id's call began and what the failed records answered. */
-    private OutboxHandler recording(KafkaOutboxHandler kafka) {
+    private OutboxHandler recording(KafkaOutboxHandler kafka, int runtime) {
         return new OutboxHandler() {
             @Override
             public void handle(OutboxRecord record) {
@@ -494,9 +539,15 @@ class KafkaClusterFaultsIT {
             @Override
             public List<Outcome> handleBatch(List<OutboxRecord> records) {
                 long began = System.nanoTime();
+                int call = callNumbers.incrementAndGet();
                 var outcomes = kafka.handleBatch(records);
+                long ended = System.nanoTime();
                 for (int i = 0; i < outcomes.size(); i++) {
                     var outcome = outcomes.get(i);
+                    history.computeIfAbsent(records.get(i).messageId(), k -> new CopyOnWriteArrayList<>())
+                            .add("r" + runtime + " call " + call + " [" + i + "/" + records.size() + "] t"
+                                    + TimeUnit.NANOSECONDS.toMillis(began - startedAt) + "-"
+                                    + TimeUnit.NANOSECONDS.toMillis(ended - startedAt) + " " + describe(outcome));
                     if (outcome == Outcome.delivered()) {
                         deliveredInCallFrom.putIfAbsent(records.get(i).messageId(), began);
                     } else {
@@ -532,9 +583,14 @@ class KafkaClusterFaultsIT {
                 + message.substring(0, Math.min(90, message.length()));
     }
 
-    /** A fresh table; the sender bounds a call by delivery.timeout.ms (20 s) + 5 s, so the relay gives it longer. */
+    /**
+     * A fresh table; the sender bounds a call by {@code delivery.timeout.ms} + 5 s + {@code max.block.ms} (30 s by
+     * default), so the relay gives it as long.
+     */
     private static TestOutboxConfig config() {
-        return new TestOutboxConfig().batchTimeout(Duration.ofSeconds(30)).deadLettersTimeout(Duration.ofSeconds(30));
+        var timeout = DELIVERY_TIMEOUT == null ? Duration.ofSeconds(30)
+                : Duration.ofMillis(Long.parseLong(DELIVERY_TIMEOUT)).plusSeconds(10);
+        return new TestOutboxConfig().batchTimeout(timeout).deadLettersTimeout(timeout);
     }
 
     private static TestOutboxConfig sameTables(TestOutboxConfig config) {
