@@ -44,6 +44,24 @@ class CooldownTest {
         assertThat(cooldown.coolingUntil(q, t0)).isNull();
     }
 
+    /**
+     * With the default lease (the 120 s delivery timeout), a probe of a dead key runs long; the others still come back
+     * at most every 10 s, so a key back up while a long probe still runs is found within about 10 s, not half a lease.
+     */
+    @Test
+    void theOthersComeBackAtMostEveryTenSecondsWhileAProbeRuns() {
+        var cooldown = new Cooldown<TopicPartition>(Duration.ofSeconds(120));
+        cooldown.failed(p, t0);
+        long expired = t0 + s(1);
+        assertThat(cooldown.coolingUntil(p, expired)).as("the probe").isNull();
+
+        assertThat(cooldown.coolingUntil(p, expired + s(8))).isEqualTo(Duration.ofSeconds(8));
+        assertThat(cooldown.coolingUntil(p, expired + s(16))).isEqualTo(Duration.ofSeconds(10));
+        assertThat(cooldown.coolingUntil(p, expired + s(60))).isEqualTo(Duration.ofSeconds(10));
+        assertThat(cooldown.coolingUntil(p, expired + s(115))).as("never past the lease")
+                .isEqualTo(Duration.ofSeconds(5));
+    }
+
     /** A probe that sent nothing gives its lease back: the next caller probes at once, and no failure is counted. */
     @Test
     void aReleasedLeaseLetsTheNextCallerProbe() {
