@@ -127,7 +127,12 @@ public final class XidRecovery {
 
     /** The halt record with the tick xmax as its parameter, keeping a higher one recorded before ({@link Ticks}). */
     static String haltInsert(TableNames names) {
-        return "insert into " + names.halt() + " as h (max_tick_xmax) values (?::text::xid8)"
+        return haltUpsert(names, "values (?::text::xid8)");
+    }
+
+    /** {@link #haltInsert} of the tick xmax that {@code rows} (a VALUES list or a query of one xid8 column) gives. */
+    static String haltUpsert(TableNames names, String rows) {
+        return "insert into " + names.halt() + " as h (max_tick_xmax) " + rows
                 + " on conflict (id) do update set max_tick_xmax = greatest(h.max_tick_xmax, excluded.max_tick_xmax)";
     }
 

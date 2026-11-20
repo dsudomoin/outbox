@@ -9,6 +9,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.tuple;
 
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
+import io.github.dsudomoin.outbox.testing.RoundTrips;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -48,6 +49,29 @@ class TicksIT {
     @AfterEach
     void release() {
         db.release();
+    }
+
+    /**
+     * A tick costs two round trips: the settings and the tick lock, then the probe, the tick row and the commit; each
+     * round trip is a commit's wait for its tick on a network with latency. The young and the regressed attempts end
+     * in the same two.
+     */
+    @Test
+    void aTickTakesTwoRoundTrips() throws Exception {
+        try (var c = TestDb.connect()) {
+            ticks.make(c, Duration.ZERO); // the probe's statement is built once, from the catalog
+            long before = ticks.latest(c).id();
+
+            var made = RoundTrips.count(() -> ticks.tick(c, Duration.ZERO));
+            assertThat(made.result()).isEqualTo(Ticks.Made.INSERTED);
+            assertThat(made.roundTrips()).as("round trips of a tick").isEqualTo(2);
+            assertThat(ticks.latest(c).id()).isGreaterThan(before);
+            assertThat(c.getAutoCommit()).as("autocommit restored").isTrue();
+
+            var young = RoundTrips.count(() -> ticks.tick(c, Duration.ofHours(1)));
+            assertThat(young.result()).isEqualTo(Ticks.Made.SKIPPED);
+            assertThat(young.roundTrips()).as("round trips of a skipped tick").isEqualTo(2);
+        }
     }
 
     @Test
