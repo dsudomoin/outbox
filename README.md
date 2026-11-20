@@ -162,7 +162,7 @@ flowchart LR
 | Сообщение одного ключа временно не проходит | Ключ отводится в retry-таблицу и повторяется с backoff, остальные ключи шарда идут мимо него (в тесте топика ключа ещё нет на брокере, и Retry отвечает сам `KafkaOutboxSender`; сообщения, закоммиченные уже после сбоя, доходят, пока ключ стоит) | Сбойный ключ задерживает только себя, его порядок сохраняется | `KafkaGuaranteesIT#aFailingKeyIsRetriedWhileOtherKeysFlow`, `ShardProcessorIT#failingKeyIsDivertedOthersFlow` |
 | Несколько инстансов на одной базе | Шаг шарда в каждый момент выполняет один воркер одного инстанса; шарды переходят между инстансами | Каждое сообщение доставлено, порядок ключа сохранён; без сбоев повторов нет | `KafkaGuaranteesIT#twoRuntimesShareOneDatabase`, `OutboxRelayIT#multipleRelaysDeliverEachMessageOnceInSteadyState` |
 | Ядовитое сообщение: брокер отвергает его навсегда (больше `max.message.bytes` топика) | `Permanent`: запись уходит в dead-таблицу, хук Kafka DLQ публикует её в топик по шаблону (в тесте `{topic}.dlq`) и удаляет письмо; записи, которые были в полёте вместе с ней, получают `NotAttempted` | Одно плохое сообщение не стопорит ни свой ключ, ни шард, и попытки соседей по вызову на него не тратятся. С `relay.retry.holdPermanent` ключ стоит (строка ниже) | `KafkaGuaranteesIT#aPoisonMessageGoesToTheDeadLetterTopicAndItsKeyContinues`, `KafkaGuaranteesIT#aPoisonSmallerThanTheProducerBatchStillGoesToTheDeadLetterTopic` (в одном producer batch с соседями, см. [Требования к Kafka](#требования-к-kafka)), `ShardProcessorIT#permanentGoesToDeadAndKeyContinues` |
-| Ядовитое сообщение при `relay.retry.holdPermanent = true` (и `max.in.flight.requests.per.connection = 1` у продюсера): брокер отвергает его (больше `max.message.bytes` топика) или его не берёт сам продюсер (больше `max.request.size`) | Отказ считается повтором: запись становится головой ключа в retry-таблице, следующая запись ключа ждёт за ней и в топик не попадает, другой ключ идёт дальше, в DLQ ничего не уходит. Когда `max.message.bytes` топика подняли (или запустили инстанс с продюсером, который берёт запись), следующий повтор доставляет обе | Постоянный сбой не нарушает порядок ключа и не пропускает запись, пока причину не устранят или ключ не снимут | `KafkaGuaranteesIT#aMessageTooLargeForItsTopicStopsItsKeyWhenPermanentFailuresAreHeld`, `KafkaGuaranteesIT#aMessageTheProducerRefusesStopsItsKeyWhenPermanentFailuresAreHeld`, `HoldPermanentIT` |
+| Ядовитое сообщение при `relay.retry.holdPermanent = true`: брокер отвергает его (больше `max.message.bytes` топика) или его не берёт сам продюсер (больше `max.request.size`) | Отказ считается повтором: запись становится головой ключа в retry-таблице, следующая запись ключа ждёт за ней и в топик не попадает, другой ключ идёт дальше, в DLQ ничего не уходит. Когда `max.message.bytes` топика подняли (или запустили инстанс с продюсером, который берёт запись), следующий повтор доставляет обе | Постоянный сбой не нарушает порядок ключа и не пропускает запись, пока причину не устранят или ключ не снимут | `KafkaGuaranteesIT#aMessageTooLargeForItsTopicStopsItsKeyWhenPermanentFailuresAreHeld`, `KafkaGuaranteesIT#aMessageTheProducerRefusesStopsItsKeyWhenPermanentFailuresAreHeld`, `HoldPermanentIT` |
 | Остановка и рестарт | `close()` ждёт идущий шаг до `relay.shutdownTimeout`, и тот коммитится (после таймаута воркеры прерываются, а их записи доставляются снова); невыполненную работу берут другие инстансы или этот после старта, вместе с паузами и начатыми батчами | Ничего не теряется | `KafkaGuaranteesIT#aStoppedRuntimeLeavesItsBacklogToTheNext` (повторов в тесте не больше `batchSize × workers`), `OutboxRelayIT#shutdownWaitsForInFlightBatch`, `OutboxRelayIT#restartResumesPausedAndChunkedShards` |
 | Порядок по ключу | Блокировка ключа держится до коммита писателя, relay читает шард по тикам | Порядок коммитов для пары (topic, key), см. [Гарантируется](#гарантируется) | `PgOutboxIT#sameKeyIdsFollowCommitOrder`, `KafkaEndToEndIT#perKeyOrderSurvivesBrokerRestart` (брокер заморожен на 15 с), проверка порядка в каждом тесте `KafkaGuaranteesIT` |
 | Дубликаты | Повтор после отката шага, таймаута Kafka или остановки | At-least-once: дубликат несёт тот же `outbox-message-id`, inbox отсеивает его в своём scope | `KafkaGuaranteesIT#crashAfterTheKafkaSendBeforeTheCursorCommitRedelivers` (не меньше двух копий одного id), `KafkaEndToEndIT#perKeyOrderSurvivesBrokerRestart` (повторы допустимы, пропусков нет), `PgInboxIT#duplicateAcrossConcurrentConsumersOnlyOneWins`, `FrameworkFreeIT#inboxAcceptsAnIdOnce` |
@@ -2754,8 +2754,9 @@ outbox.relay.retry {
 - Обработчик по умолчанию и Kafka-отправитель в этом режиме не трогают остальные записи ключа в вызове после
   `Permanent` (`NotAttempted`), как после `Retry`. Свой `handleBatch` должен делать так же: запись, которую он
   доставит после `Permanent` своего ключа, окажется у цели раньше удержанной, а потом придёт ещё раз, за ней.
-- Для Kafka задайте `max.in.flight.requests.per.connection = 1` в `outbox.kafka.driverProperties`
-  ([Требования к Kafka](#требования-к-kafka), «Outcome»).
+- Kafka-отправитель шлёт такие вызовы с одним запросом в полёте на соединение с брокером, через отдельных
+  продюсеров, что бы ни стояло в `max.in.flight.requests.per.connection`. Записи вызова к одному брокеру идут
+  запрос за запросом, поэтому большой вызов медленнее ([Требования к Kafka](#требования-к-kafka), «Outcome»).
 
 ### Часы
 
@@ -2840,7 +2841,7 @@ Spring Boot — в [Настройке в `application.yml`](#настройка
 | `initialDelay` | `1s` | > 0. Первый backoff для головы в retry-таблице, для паузы шарда и для шага шарда, который падает в одиночку второй раз подряд; удваивается с каждым сбоем. |
 | `maxDelay` | `5m` | ≥ `initialDelay`. Потолок backoff. |
 | `maxAttempts` | `0` | ≥ 0. Запись, провалившая столько попыток, переносится в dead-таблицу; `0` — повторять вечно. `NotAttempted` не считается. Отвод одного ключа засчитывает голове паузы шарда, только если сбои начались с неё; голова, которую проба взяла после отвода, получает одну попытку. При недоступной цели каждая пробная строка выбирает свои попытки за их backoff и уходит в dead-таблицу. Если снизить значение, записи, уже набравшие столько попыток, уйдут в dead-таблицу при следующем повторе, без нового вызова; ждущих голов это не касается. |
-| `holdPermanent` | `false` | `true`: relay считает каждый `Permanent` обработчика повтором (`Retry`) с той же ошибкой. Запись не уходит в dead-таблицу, а становится головой своего ключа, следующие записи ключа ждут за ней; попытки считаются, backoff растёт до `maxDelay`, каждый вызов с такими записями пишет ERROR. При `maxAttempts > 0` запись всё равно уйдёт в dead-таблицу после стольких попыток. Свой `handleBatch` должен отвечать `NotAttempted` остальным записям ключа после его `Permanent`, для Kafka нужен `max.in.flight.requests.per.connection = 1` ([Постоянный сбой останавливает ключ](#постоянный-сбой-останавливает-ключ)). В Spring Boot — `outbox.relay.retry.hold-permanent`. |
+| `holdPermanent` | `false` | `true`: relay считает каждый `Permanent` обработчика повтором (`Retry`) с той же ошибкой. Запись не уходит в dead-таблицу, а становится головой своего ключа, следующие записи ключа ждут за ней; попытки считаются, backoff растёт до `maxDelay`, каждый вызов с такими записями пишет ERROR. При `maxAttempts > 0` запись всё равно уйдёт в dead-таблицу после стольких попыток. Свой `handleBatch` должен отвечать `NotAttempted` остальным записям ключа после его `Permanent`; Kafka-отправитель шлёт такие вызовы с одним запросом в полёте, и большой вызов идёт медленнее ([Постоянный сбой останавливает ключ](#постоянный-сбой-останавливает-ключ)). В Spring Boot — `outbox.relay.retry.hold-permanent`. |
 
 ### `outbox.relay.requeue`
 
@@ -2965,7 +2966,7 @@ xid](#восстановление-после-регрессии-xid-xid-regress
 |---|---|---|
 | `driverProperties` | — | Свойства продюсера Kafka. `bootstrap.servers` обязателен. Навязываемые, отвергаемые и задаваемые по умолчанию настройки: [Требования к Kafka](#требования-к-kafka). |
 | `deadLetterTopic` | — (выключено) | Шаблон топика для dead letters, `{topic}` — топик письма, например `"{topic}.dlq"`. Без ключа хук Kafka не активен, и письма остаются в dead-таблице. Проверяется при старте: имя топика Kafka (до 249 символов `[a-zA-Z0-9._-]`), не `{topic}` само по себе ([Kafka DLQ](#kafka-dlq)). |
-| `clientIdSuffix` | `true` | `true`: заданный `client.id` получает у каждого продюсера суффикс, `<client.id>-outbox-<n>` или `<client.id>-outbox-unbatched-<n>`, и JMX-метрики у продюсеров свои. `false`: все продюсеры получают `client.id` без изменений, и их JMX-метрики сталкиваются ([Требования к Kafka](#требования-к-kafka), «Метрики»). В Spring Boot — `outbox.kafka.client-id-suffix`. |
+| `clientIdSuffix` | `true` | `true`: заданный `client.id` получает у каждого продюсера суффикс, `<client.id>-outbox-<n>` или `<client.id>-outbox-unbatched-<n>` (у вызовов с `relay.retry.holdPermanent` — `<client.id>-outbox-held-<n>` и `<client.id>-outbox-held-unbatched-<n>`), и JMX-метрики у продюсеров свои. `false`: все продюсеры получают `client.id` без изменений, и их JMX-метрики сталкиваются ([Требования к Kafka](#требования-к-kafka), «Метрики»). В Spring Boot — `outbox.kafka.client-id-suffix`. |
 
 В Spring Boot есть ещё `outbox.kafka.fallback` ([Kafka и `outbox.kafka.fallback`](#kafka-и-outboxkafkafallback)).
 
@@ -3039,9 +3040,13 @@ relay: на инстансе с `relay.enabled = false` оно не выполн
   авторизации, повторяется. С `relay.retry.holdPermanent` постоянный сбой останавливает ключ, а не ведёт в
   dead-таблицу ([Постоянный сбой останавливает ключ](#постоянный-сбой-останавливает-ключ)). Тогда отправитель не
   трогает остальные записи ключа в вызове и после `RecordTooLargeException`, которую выдал сам продюсер (запись
-  больше `max.request.size`), а в `driverProperties` нужен `max.in.flight.requests.per.connection = 1`. Иначе
-  следующая запись ключа может быть уже в полёте, когда брокер отвергает удержанную, и брокер её запишет: она
-  окажется в топике раньше удержанной. Когда брокер отвергает запись уже после отправки, отправитель закрывает
+  больше `max.request.size`), и шлёт вызов с одним запросом в полёте на соединение с брокером, через отдельные пулы
+  продюсеров с `max.in.flight.requests.per.connection=1`. При нескольких запросах в полёте следующая запись ключа
+  может быть уже на пути к брокеру, когда он отвергает удержанную, и брокер её запишет: она окажется в топике
+  раньше удержанной. Цена: записи вызова к одному брокеру идут запрос за запросом, и большой вызов медленнее.
+  Замер грубый, на локальном брокере почти без сетевой задержки: вызов из 10 000 записей по 100 байт занимал по
+  медиане 58 мс против 35 мс, то есть примерно в 1,7 раза дольше; с настоящей задержкой до брокера разница больше. Если
+  `max.in.flight.requests.per.connection = 1` уже задан, отдельных продюсеров нет. Когда брокер отвергает запись уже после отправки, отправитель закрывает
   продюсер, и записи вызова, ещё ждавшие ack, вместе с соседями отвергнутой записи по её batch проваливаются из-за неё
   одной. Они получают `NotAttempted`: попытку не тратят, backoff не растёт, до `maxAttempts` и dead-таблицы не
   доходят.
@@ -3081,7 +3086,8 @@ relay: на инстансе с `relay.enabled = false` оно не выполн
   ещё не получил: не больше одного ожидания метаданных на вызов.
 - **Метрики.** Продюсеры библиотеки не привязаны к Micrometer: клиентские метрики Kafka видны только через JMX.
   JMX различает продюсеры по `client.id`, поэтому заданный `client.id` служит префиксом: каждый продюсер получает
-  свой `<client.id>-outbox-<n>`, а продюсер второго пула — `<client.id>-outbox-unbatched-<n>`. Квоты брокера
+  свой `<client.id>-outbox-<n>`, а продюсер второго пула — `<client.id>-outbox-unbatched-<n>`; у вызовов с
+  `relay.retry.holdPermanent` — `<client.id>-outbox-held-<n>` и `<client.id>-outbox-held-unbatched-<n>`. Квоты брокера
   сравнивают `client.id` целиком, так что квота на голый `client.id` к продюсерам outbox не применится: квоту для них
   задавайте на principal пользователя. Если квота нужна именно на `client.id`, выставьте
   `outbox.kafka.clientIdSuffix = false` (в Spring Boot `outbox.kafka.client-id-suffix=false`), и все продюсеры

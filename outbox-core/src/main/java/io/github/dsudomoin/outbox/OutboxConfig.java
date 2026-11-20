@@ -193,9 +193,9 @@ public interface OutboxConfig {
          * {@link OutboxAdmin#abandonKey} gives it up. The default {@link OutboxHandler#handleBatch} and the Kafka
          * sender then skip the rest of the key in the call, as after a Retry; a {@code handleBatch} of your own must
          * answer {@code NotAttempted} for the later records of a key it answered {@code Permanent} for, or they reach
-         * the target ahead of it and are handed again behind it. A Kafka route also needs
-         * {@code max.in.flight.requests.per.connection=1} in its producer properties: with more requests in flight
-         * the broker may write a later record of the key while it refuses the held one.
+         * the target ahead of it and are handed again behind it. The Kafka sender sends such calls with one request in
+         * flight per broker connection, whatever {@code max.in.flight.requests.per.connection} is set to, so a large
+         * call is slower.
          */
         default boolean holdPermanent() {
             return false;
