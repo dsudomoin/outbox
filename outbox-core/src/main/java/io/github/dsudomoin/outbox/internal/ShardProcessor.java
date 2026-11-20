@@ -1228,8 +1228,9 @@ public final class ShardProcessor implements AutoCloseable {
             s.delivered += recordOutcomes(items, decision.actions(), shard, now);
             // each one delivered past, or written by its action; a parked row the retry pass already wrote (parked
             // again or kept) and the main pass merged again counts once
-            int recorded = items.size();
-            for (int i = 0; s.pass != null && i < Math.min(parkedCount, items.size()); i++) {
+            int recorded = items.size(); // read by an observed settle only: no lookup otherwise
+            boolean counted = s.pass != null && s.pass.step != OutboxTelemetry.RelayStep.NONE;
+            for (int i = 0; counted && i < Math.min(parkedCount, items.size()); i++) {
                 recorded -= s.pass.recordedBefore(items.get(i).record().id()) ? 1 : 0;
             }
             s.recorded = recorded;
@@ -1698,7 +1699,7 @@ public final class ShardProcessor implements AutoCloseable {
          * dead without a call, a parked row kept without a call.
          */
         int recorded;
-        /** The parked rows it kept without a call ({@link #recorded}); null before the first. */
+        /** The parked rows it kept without a call ({@link #recorded}); null before the first or unobserved. */
         @Nullable
         Set<Long> kept;
         /**
@@ -1741,9 +1742,12 @@ public final class ShardProcessor implements AutoCloseable {
             return answered.contains(id) || kept != null && kept.contains(id);
         }
 
-        /** Counts {@code row} written for the settle, unless an earlier round already wrote it. */
+        /**
+         * Counts {@code row} written for the settle, unless an earlier round already wrote it; only while the step is
+         * observed, as nothing else reads the count.
+         */
         void record(OutboxRecord row) {
-            if (!recordedBefore(row.id())) {
+            if (step != OutboxTelemetry.RelayStep.NONE && !recordedBefore(row.id())) {
                 recorded++;
             }
         }
@@ -1985,10 +1989,12 @@ public final class ShardProcessor implements AutoCloseable {
                 if (!stayed) {
                     return;
                 }
-                if (pass.kept == null) {
-                    pass.kept = new HashSet<>();
+                if (pass.step != OutboxTelemetry.RelayStep.NONE) {
+                    if (pass.kept == null) {
+                        pass.kept = new HashSet<>();
+                    }
+                    pass.kept.add(row.id());
                 }
-                pass.kept.add(row.id());
                 pass.noteFetched(row);
                 // a row before it stays parked, due later: this one waits with it, or it would bring that row along
                 // at once, and again after each answer, spending its requeues without a delay
