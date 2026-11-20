@@ -25,6 +25,7 @@ import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.internal.BatchClassifier;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
+import io.github.dsudomoin.outbox.internal.ShardProcessor;
 import jakarta.annotation.Nullable;
 import java.time.Clock;
 import java.time.Duration;
@@ -106,16 +107,24 @@ import org.slf4j.LoggerFactory;
  * {@code acks=all} forced; {@code max.block.ms} defaults to 5000, {@code enable.metrics.push} to false,
  * {@code delivery.timeout.ms} to 20000 and then, if unset, {@code request.timeout.ms} to 15000 (Kafka requires
  * {@code delivery.timeout.ms >= linger.ms + request.timeout.ms}). {@code transactional.id}, {@code partitioner.class}
- * and {@code partitioner.ignore.keys=true} are rejected: ordering and the cooldown need Kafka's per-key partitioning. A
- * call hands records over and waits for acks until {@code delivery.timeout.ms} + 5 s from entry (25 s by default); a
- * send or metadata wait still blocking then can add up to {@code max.block.ms} (30 s in all by default). The relay
- * interrupts a handler call at 80 % of its {@code batchTimeout} (24 s of 30 s by default) and waits for the outcomes
- * until {@code batchTimeout}. The sender honours the interrupt at once: it stops handing records over, closes the
- * producer if records are in flight, and returns acked records as {@code Delivered}, unacked ones as {@code Retry}
- * (remembered, as above) and the rest as {@code NotAttempted}. Running past the soft cut is therefore safe, but turns
- * slow sends into retries, which go unbatched until a call settles them. Keep {@code batchTimeout} at least
- * {@code delivery.timeout.ms} + 5 s + {@code max.block.ms} so that they end as Kafka's outcomes instead; the Kora
- * adapter's {@code KafkaOutboxModule} logs a WARN at startup when it is shorter.
+ * and {@code partitioner.ignore.keys=true} are rejected: ordering and the cooldown need Kafka's per-key partitioning.
+ *
+ * <p>A call hands records over during its first 5 s, while Kafka can still answer them within
+ * {@code delivery.timeout.ms} before the call's deadline, and waits for acks until {@code delivery.timeout.ms} + 5 s
+ * from entry (25 s by default). A {@code send()} that waited for buffer space appends its record late, and Kafka's
+ * delivery timeout of the record starts there: the wait then runs {@code delivery.timeout.ms} + 5 s from the last
+ * append, at most {@code delivery.timeout.ms} + 5 s + {@code max.block.ms} from entry (30 s by default). Records not
+ * handed over in time are {@code NotAttempted}; the relay reads them again in its next step. At 80 % of
+ * {@code batchTimeout} (24 s of 30 s by default) the relay asks its handler call to wind down, with an interrupt: the
+ * sender stops handing records over, but keeps waiting for those in flight and keeps the producer open, so they end
+ * with Kafka's own outcome. Inside a relay call it waits until 200 ms before the relay cancels the call at
+ * {@code batchTimeout}, no longer. A call still waiting then is cut: the sender closes the producer and returns acked
+ * records as {@code Delivered}, unacked ones as {@code Retry} (remembered, as above) and the rest as
+ * {@code NotAttempted}. Any other interrupt cuts the call at once the same way: the relay's threads shutting down, a
+ * second interrupt after the wind-down, a caller outside the relay. A cut turns slow sends into retries, which go
+ * unbatched until a call settles them, and a new producer sends them again (a duplicate when Kafka had written them).
+ * Keep {@code batchTimeout} at least {@code delivery.timeout.ms} + 5 s + {@code max.block.ms} so that they end as
+ * Kafka's outcomes instead; the Kora and Spring adapters log a WARN at startup when it is shorter.
  *
  * <p>A record goes to Kafka with its headers but any named {@code outbox-local}, of whatever value: that name marks
  * a record for a route of the relay, and reaches no Kafka topic, a dead-letter topic included.
@@ -123,6 +132,8 @@ import org.slf4j.LoggerFactory;
 public final class KafkaOutboxSender implements AutoCloseable {
 
     private static final Duration WAIT_SLACK = Duration.ofSeconds(5);
+    /** How long before the relay cancels its handler call a call ends, so that its outcomes still count. */
+    private static final long RELAY_MARGIN = Duration.ofMillis(200).toNanos();
     private static final Duration RELEASE_TIMEOUT = Duration.ofSeconds(5);
     private static final int EXPIRED_REMEMBERED = 10_000;
     private static final Duration REMEMBERED_FOR = Duration.ofMinutes(10);
@@ -209,7 +220,8 @@ public final class KafkaOutboxSender implements AutoCloseable {
         this(factory, unbatched, deliveryTimeout, Duration.ZERO, clock, nanos);
     }
 
-    private KafkaOutboxSender(Supplier<Producer<byte[], byte[]>> factory,
+    /** For tests: {@code maxBlock} is the producers' {@code max.block.ms}. */
+    KafkaOutboxSender(Supplier<Producer<byte[], byte[]>> factory,
             Supplier<Producer<byte[], byte[]>> unbatched, Duration deliveryTimeout, Duration maxBlock, Clock clock,
             LongSupplier nanos) {
         this.factory = factory;
@@ -265,11 +277,12 @@ public final class KafkaOutboxSender implements AutoCloseable {
     }
 
     /**
-     * One outcome per record, in list order. Records never handed to Kafka (after a failure closed the
-     * producer, after an interrupt or past the deadline) are {@code NotAttempted}, and so are records that failed only
-     * because the broker refused another record of the call for good: they spend no attempt. An
+     * One outcome per record, in list order. Records never handed to Kafka (after a failure closed the producer, after
+     * an interrupt or the relay's wind-down, or past the hand-over cutoff) are {@code NotAttempted}, and so are records
+     * that failed only because the broker refused another record of the call for good: they spend no attempt. An
      * {@link InvalidTopicException} is the topic's: every record of that topic not otherwise settled shares its
-     * {@code Permanent}. Honours interrupts: returns early and keeps the flag.
+     * {@code Permanent}. Honours interrupts: returns early and keeps the flag; the relay's wind-down stops only the
+     * hand-over (see the class javadoc).
      */
     public List<Outcome> send(List<OutboxRecord> records) {
         return sendAndReport(records).outcomes();
@@ -287,18 +300,25 @@ public final class KafkaOutboxSender implements AutoCloseable {
         if (records.isEmpty()) {
             return new Sent(List.of(), false);
         }
-        long deadline = System.nanoTime() + wait.toNanos();
+        long entry = System.nanoTime();
         boolean unbatched = anyRemembered() && records.stream().anyMatch(r -> expired.containsKey(r.messageId()));
         var home = unbatched ? unbatchedPool : pool;
         var pooled = home.pollFirst();
         if (pooled == null) {
             pooled = new Pooled((unbatched ? unbatchedFactory : factory).get(), home);
         }
-        var call = new Call(pooled.producer, records.size(), unbatched);
+        var call = new Call(pooled.producer, records.size(), unbatched, entry);
         try {
-            var partitions = sendAll(call, records, deadline, pooled);
-            if (!call.await(deadline)) {
-                call.cut(Thread.currentThread().isInterrupted() ? "interrupted" : "not acknowledged within " + wait);
+            // a record handed over later might be answered after the deadline
+            var partitions = sendAll(call, records, entry + WAIT_SLACK.toNanos(), pooled);
+            long until = awaitUntil(entry, call.lastAppend);
+            var ended = call.await(until);
+            if (ended != Call.Ended.ACKED) {
+                call.cut(switch (ended) {
+                    case INTERRUPTED -> "interrupted";
+                    case INTERRUPTED_AFTER_WIND_DOWN -> "interrupted after the relay's wind-down";
+                    default -> "not acknowledged within " + Duration.ofMillis(NANOSECONDS.toMillis(until - entry));
+                });
             }
             return new Sent(outcomes(call, records, partitions), call.closedByRefusal());
         } catch (RuntimeException | Error e) {
@@ -312,6 +332,23 @@ public final class KafkaOutboxSender implements AutoCloseable {
                 drain(unbatchedPool);
             }
         }
+    }
+
+    /**
+     * Until when a call that entered at {@code entry} waits for acks (on {@link System#nanoTime}): Kafka answers a
+     * record within {@code delivery.timeout.ms} of its append, the end of its {@code send()}, which may wait for buffer
+     * space up to {@code max.block.ms}; so {@link #wait} from the last append, at most {@link #longestCall} from entry,
+     * and inside a relay call {@link #RELAY_MARGIN} before the relay cancels it, which would retry every record.
+     */
+    private long awaitUntil(long entry, long lastAppend) {
+        long until = earlier(lastAppend + wait.toNanos(), entry + longestCall.toNanos());
+        var relay = ShardProcessor.callDeadline();
+        return relay.isPresent() ? earlier(until, relay.getAsLong() - RELAY_MARGIN) : until;
+    }
+
+    /** The earlier of two {@link System#nanoTime} values: safe across its overflow. */
+    private static long earlier(long a, long b) {
+        return a - b <= 0 ? a : b;
     }
 
     /**
@@ -349,9 +386,9 @@ public final class KafkaOutboxSender implements AutoCloseable {
 
     /**
      * Logs a WARN when a call's own budget exceeds {@code limit}, the value of {@code setting} that bounds a caller's
-     * calls; {@code effect} says what then becomes of slow ones. Such calls are not lost: the caller interrupts them
-     * and the sender returns their real outcomes at once, but slow sends then end as retries. Internal, unstable: for
-     * the adapters of this repository.
+     * calls; {@code effect} says what then becomes of slow ones. Such calls are not lost: the sender returns their real
+     * outcomes before the caller gives up on them (on the caller's interrupt, or just before the relay cancels its
+     * call), but slow sends then end as retries. Internal, unstable: for the adapters of this repository.
      */
     @InternalApi
     public void warnIfLongerThan(String setting, Duration limit, String effect) {
@@ -362,8 +399,12 @@ public final class KafkaOutboxSender implements AutoCloseable {
         }
     }
 
-    /** Steps 1–3; returns the partition of each record the sender chose or computed (null: Kafka chooses). */
-    private TopicPartition[] sendAll(Call call, List<OutboxRecord> records, long deadline, Pooled pooled) {
+    /**
+     * Steps 1–3; returns the partition of each record the sender chose or computed (null: Kafka chooses). Hands no
+     * record over from {@code handOverUntil} (on {@link System#nanoTime}), nor once the thread is interrupted or the
+     * relay asks for a wind-down.
+     */
+    private TopicPartition[] sendAll(Call call, List<OutboxRecord> records, long handOverUntil, Pooled pooled) {
         var partitions = call.partitions;
         var partitionInfos = new HashMap<String, List<PartitionInfo>>();
         var unkeyed = new HashMap<String, Optional<TopicPartition>>(); // per topic, sticky for the call
@@ -373,7 +414,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
         var refused = new HashSet<Object>(); // topics and (topic, key)s whose record Kafka refused before appending it
         // the rest stays unsent (NotAttempted); an interrupt closes the producer only if records are in flight
         for (int i = 0; i < records.size() && !call.closed && !Thread.currentThread().isInterrupted()
-                && System.nanoTime() < deadline; i++) {
+                && !ShardProcessor.windDownRequested() && System.nanoTime() - handOverUntil < 0; i++) {
             var record = records.get(i);
             var topic = record.topic();
             call.started();
@@ -410,7 +451,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
                     }
                     partitionInfos.put(topic, infos);
                     pooled.used(topic, nanos.getAsLong());
-                    if (System.nanoTime() >= deadline) { // a slow lookup: send() could block max.block.ms again
+                    if (System.nanoTime() - handOverUntil >= 0) { // a slow lookup: past the hand-over cutoff
                         call.complete(i, Outcome.notAttempted(), false);
                         break;
                     }
@@ -434,6 +475,8 @@ public final class KafkaOutboxSender implements AutoCloseable {
                 if (call.refused != null) {
                     refuse(call, i, record, call.refused, false, coolingUntil, refused);
                     call.refused = null;
+                } else {
+                    call.lastAppend = System.nanoTime(); // where Kafka's delivery timeout of the record starts
                 }
             } catch (InterruptException e) { // waiting for metadata or buffer space: the record joined no batch
                 call.complete(i, Outcome.notAttempted(), false);
@@ -703,10 +746,12 @@ public final class KafkaOutboxSender implements AutoCloseable {
         @Nullable
         Exception refused; // caller thread only: what send() reported through the callback before appending
         boolean metadataTimedOut; // caller thread only
+        long lastAppend; // caller thread only: when send() last returned an appended record, else the call's entry
 
-        Call(Producer<byte[], byte[]> producer, int size, boolean unbatched) {
+        Call(Producer<byte[], byte[]> producer, int size, boolean unbatched, long entry) {
             this.producer = producer;
             this.unbatched = unbatched;
+            this.lastAppend = entry;
             this.partitions = new TopicPartition[size];
             this.outcomes = new Outcome[size];
             this.ownFailure = new boolean[size];
@@ -853,25 +898,49 @@ public final class KafkaOutboxSender implements AutoCloseable {
             return true;
         }
 
+        /** How {@link #await} ended. */
+        enum Ended { ACKED, INTERRUPTED, INTERRUPTED_AFTER_WIND_DOWN, LATE }
+
         /**
-         * True once every started record completed or the call closed; false on deadline or interrupt (flag kept). A
-         * call closed by a failure waits for the rest of its records: the close aborts them at once, and the records of
-         * the failed batch behind the one that closed it bring their own answers (a refusal among them).
+         * {@code ACKED} once every started record completed or the call closed; otherwise at {@code until} (on
+         * {@link System#nanoTime}) or on an interrupt, the flag kept. The relay's wind-down (an interrupt while
+         * {@link ShardProcessor#windDownRequested()}) is not one: the records in flight get until {@code until} for
+         * Kafka's own outcome, as closing the producer would turn them into retries, which a new producer sends again
+         * (a duplicate when Kafka had written them). Its interrupt is consumed and set again on return; the next one,
+         * as the relay's cancel, ends the wait. A call closed by a failure waits for the rest of its records: the close
+         * aborts them at once, and the records of the failed batch behind the one that closed it bring their own
+         * answers (a refusal among them).
          */
-        synchronized boolean await(long deadlineNanos) {
-            while (pending > 0 && (!closed || closedBy != null)) {
-                long left = deadlineNanos - System.nanoTime();
-                if (left <= 0) {
-                    return false;
+        synchronized Ended await(long until) {
+            boolean windingDown = false;
+            try {
+                while (pending > 0 && (!closed || closedBy != null)) {
+                    if (Thread.currentThread().isInterrupted()) {
+                        if (windingDown) {
+                            return Ended.INTERRUPTED_AFTER_WIND_DOWN;
+                        }
+                        if (!ShardProcessor.windDownRequested()) {
+                            return Ended.INTERRUPTED;
+                        }
+                        windingDown = true;
+                        Thread.interrupted();
+                    }
+                    long left = until - System.nanoTime();
+                    if (left <= 0) {
+                        return Ended.LATE;
+                    }
+                    try {
+                        NANOSECONDS.timedWait(this, left);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt(); // seen at the top of the loop
+                    }
                 }
-                try {
-                    NANOSECONDS.timedWait(this, left);
-                } catch (InterruptedException e) {
+                return Ended.ACKED;
+            } finally {
+                if (windingDown) {
                     Thread.currentThread().interrupt();
-                    return false;
                 }
             }
-            return true;
         }
     }
 }

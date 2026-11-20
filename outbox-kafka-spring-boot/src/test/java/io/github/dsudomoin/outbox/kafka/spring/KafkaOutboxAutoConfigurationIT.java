@@ -56,8 +56,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 class KafkaOutboxAutoConfigurationIT {
 
     private static final Duration WAIT = Duration.ofSeconds(30);
-    private static final String BATCH_TIMEOUT_EFFECT = "The relay interrupts a call at 80% of batchTimeout; the sender"
-        + " then stops at once, keeps acked records as delivered and retries the rest, so slow sends end as retries";
+    private static final String BATCH_TIMEOUT_EFFECT = "The relay cancels a call at batchTimeout; the sender ends it"
+        + " just before, keeps acked records as delivered and retries the rest, so slow sends end as retries";
     private static final String DEAD_LETTERS_EFFECT = "The dead-letter pass abandons a hook call at its timeout and"
         + " hands its letters again after a backoff, so slow dead-letter sends end as retries and letters acked"
         + " meanwhile repeat on their dead-letter topic";

@@ -59,8 +59,8 @@ public final class KafkaOutboxAutoConfiguration {
         };
         var sender = new KafkaOutboxSender(config);
         outbox.ifAvailable(o -> sender.warnIfLongerThan("outbox.relay.batchTimeout", o.relay().batchTimeout(),
-            "The relay interrupts a call at 80% of batchTimeout; the sender then stops at once, keeps acked records as"
-                + " delivered and retries the rest, so slow sends end as retries"));
+            "The relay cancels a call at batchTimeout; the sender ends it just before, keeps acked records as delivered"
+                + " and retries the rest, so slow sends end as retries"));
         return sender;
     }
 

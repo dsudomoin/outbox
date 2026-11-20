@@ -68,9 +68,9 @@ public interface KafkaOutboxModule {
             @Nullable OutboxConfig outbox) {
         var sender = new KafkaOutboxSender(config);
         if (outbox != null) {
-            sender.warnIfLongerThan("outbox.relay.batchTimeout", outbox.relay().batchTimeout(), "The relay interrupts"
-                    + " a call at 80% of batchTimeout; the sender then stops at once, keeps acked records as delivered"
-                    + " and retries the rest, so slow sends end as retries");
+            sender.warnIfLongerThan("outbox.relay.batchTimeout", outbox.relay().batchTimeout(), "The relay cancels a"
+                    + " call at batchTimeout; the sender ends it just before, keeps acked records as delivered and"
+                    + " retries the rest, so slow sends end as retries");
         }
         return new LifecycleWrapper<>(sender, s -> {}, KafkaOutboxSender::close);
     }
