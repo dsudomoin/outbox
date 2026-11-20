@@ -54,7 +54,7 @@ class CoolingTargetIT {
                 : Outcome.delivered());
         sendDistinctKeys(runtime);
 
-        await(Duration.ofSeconds(30), () -> calls.size() > COOLING_CALLS);
+        await(Duration.ofSeconds(30), () -> failuresAtCall.size() > COOLING_CALLS);
 
         for (int i = 1; i <= COOLING_CALLS; i++) {
             var gap = Duration.ofNanos(calls.get(i)[0] - calls.get(i - 1)[0]);
@@ -94,6 +94,33 @@ class CoolingTargetIT {
 
         assertThat(Duration.ofNanos(calls.get(2)[0] - calls.get(1)[0])).as("second pause")
                 .isGreaterThanOrEqualTo(Duration.ofMillis(1950));
+    }
+
+    /** A target asking to come back sooner than {@code retry.initialDelay} still waits that long: no spinning shard. */
+    @Test
+    void aPauseTheTargetAsksForIsAtLeastTheInitialDelay() throws Exception {
+        var runtime = start(n -> n <= 2 ? Outcome.notAttempted(Instant.now().plusMillis(50)) : Outcome.delivered());
+        sendDistinctKeys(runtime);
+
+        await(Duration.ofSeconds(30), () -> calls.size() > 2);
+
+        for (int i = 1; i <= 2; i++) {
+            assertThat(Duration.ofNanos(calls.get(i)[0] - calls.get(i - 1)[0])).as("pause after call %d", i)
+                    .isGreaterThanOrEqualTo(Duration.ofMillis(950));
+        }
+    }
+
+    /** A target asking to come back in an hour gets {@code retry.maxDelay}, as a failing one would at most. */
+    @Test
+    void aPauseTheTargetAsksForIsAtMostTheMaxDelay() throws Exception {
+        var runtime = start(n -> n <= 1 ? Outcome.notAttempted(Instant.now().plus(Duration.ofHours(1)))
+                : Outcome.delivered(), Duration.ofSeconds(2));
+        sendDistinctKeys(runtime);
+
+        await(Duration.ofSeconds(10), () -> calls.size() > 1);
+
+        assertThat(Duration.ofNanos(calls.get(1)[0] - calls.get(0)[0])).as("pause after the call")
+                .isGreaterThanOrEqualTo(Duration.ofMillis(1950)).isLessThan(Duration.ofSeconds(4));
     }
 
     /**
@@ -152,8 +179,12 @@ class CoolingTargetIT {
 
     /** One shard, {@link #RECORDS} rows a call, the relay running; {@code outcome} by the call's number from 1. */
     private OutboxRuntime start(Function<Integer, Outcome> outcome) {
-        var config = new TestOutboxConfig().shards(1).batchSize(RECORDS).retry(Duration.ofSeconds(1),
-                Duration.ofMinutes(5), 0);
+        return start(outcome, Duration.ofMinutes(5));
+    }
+
+    /** As {@link #start(Function)}, with {@code retry.maxDelay}; {@code retry.initialDelay} is 1 s. */
+    private OutboxRuntime start(Function<Integer, Outcome> outcome, Duration maxDelay) {
+        var config = new TestOutboxConfig().shards(1).batchSize(RECORDS).retry(Duration.ofSeconds(1), maxDelay, 0);
         var runtime = OutboxRuntime.builder(config, transactions, new OutboxHandler() {
             @Override
             public void handle(OutboxRecord record) {
