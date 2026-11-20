@@ -140,16 +140,30 @@ class KafkaClusterFaultsIT {
     /** (b) two of three nodes killed for 20 s: below min.insync.replicas, and the controller quorum is lost too. */
     @Test
     void twoNodesAreDownAtOnce() {
+        twoNodesDown("b-two-down", Duration.ofSeconds(20));
+    }
+
+    /**
+     * (b60) as (b), for 60 s: longer than the producer's {@code delivery.timeout.ms} (20 s), so every record handed
+     * during the fault expires at least once.
+     */
+    @Test
+    @Timeout(value = 5, unit = TimeUnit.MINUTES)
+    void twoNodesAreDownForAMinute() {
+        twoNodesDown("b60-two-down-60s", Duration.ofSeconds(60));
+    }
+
+    private void twoNodesDown(String name, Duration down) {
         start();
         int leader = cluster.leaderOfMostPartitions(topic);
         int other = leader % 3 + 1;
-        System.out.println("b: killing nodes " + leader + " and " + other + ", leaders " + cluster.leaders(topic));
+        System.out.println(name + ": killing nodes " + leader + " and " + other + ", leaders " + cluster.leaders(topic));
         cluster.kill(leader);
         cluster.kill(other);
-        hold(Duration.ofSeconds(20));
+        hold(down);
         cluster.start(leader);
         cluster.start(other);
-        finish("b-two-down", Long.MIN_VALUE);
+        finish(name, Long.MIN_VALUE);
     }
 
     /**
