@@ -1634,6 +1634,59 @@ class KafkaOutboxSenderTest {
         assertThat(producer.closed()).isTrue();
     }
 
+    /**
+     * In a call of a relay that holds permanent failures the acks still reach the telemetry while the call waits
+     * through the relay's wind-down, which consumes the interrupt: record b, acked after the wind-down, is reported
+     * before the call ends; the cancel then cuts it with the interrupt kept, and only the acked records were reported.
+     */
+    @Test
+    void acksAreReportedThroughTheWindDownOfAHeldCallUntilItsCancel() throws Exception {
+        var sender = sender(DELIVERY_TIMEOUT);
+        var records = List.of(record(1, "a"), record(2, "b"), record(3, "c"));
+        var reported = new CopyOnWriteArrayList<OutboxRecord>();
+        var reportThreads = new CopyOnWriteArrayList<Thread>();
+        var secondReported = new CountDownLatch(2);
+        var delivery = new OutboxTelemetry.Delivery() {
+            @Override
+            public void recordFinished(OutboxRecord record, Outcome outcome) {
+                reported.add(record);
+                reportThreads.add(Thread.currentThread());
+                secondReported.countDown();
+            }
+        };
+        var caller = new AtomicReference<Thread>();
+        var flagKept = new AtomicBoolean();
+        var outcomes = new AtomicReference<List<Outcome>>();
+        var handler = TestHandlerCall.holdingPermanent(Duration.ofSeconds(30), () -> {
+            caller.set(Thread.currentThread());
+            outcomes.set(RecordScope.bound(delivery, () -> sender.send(records)));
+            flagKept.set(Thread.currentThread().isInterrupted());
+            return List.of();
+        });
+        var result = executor.submit(handler::call);
+        var producer = awaitSent(0, 3);
+        producer.completeNext();
+
+        handler.windDown();
+        Thread.sleep(300);
+        assertThat(result).as("still awaiting b and c").isNotDone();
+        producer.completeNext();
+        assertThat(secondReported.await(5, SECONDS)).as("b reported while the call waits").isTrue();
+        assertThat(result).isNotDone();
+
+        handler.cancel();
+
+        result.get(5, SECONDS);
+        assertThat(outcomes.get()).satisfiesExactly(
+                o -> assertThat(o).isEqualTo(Outcome.delivered()),
+                o -> assertThat(o).isEqualTo(Outcome.delivered()),
+                o -> assertThat(o).isInstanceOf(Outcome.Retry.class));
+        assertThat(reported).containsExactly(records.get(0), records.get(1));
+        assertThat(reportThreads).containsOnly(caller.get());
+        assertThat(flagKept).isTrue();
+        assertThat(producer.closed()).isTrue();
+    }
+
     /** A call the relay gave up on while its interrupt went unseen hands nothing more over. */
     @Test
     void aCancelledCallHandsNothingOver() throws Exception {
