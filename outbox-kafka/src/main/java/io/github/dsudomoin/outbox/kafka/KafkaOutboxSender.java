@@ -390,14 +390,18 @@ public final class KafkaOutboxSender implements AutoCloseable {
         try {
             var partitions = sendAll(call, records, handOverUntil(entry), pooled);
             long until = awaitUntil(entry, call.lastAppend);
-            var ended = call.await(until, records);
-            if (ended != Call.Ended.ACKED) {
-                call.cut(switch (ended) {
-                    case INTERRUPTED -> "interrupted";
-                    case CANCELLED -> "the relay gave up on the call";
-                    case INTERRUPTED_AFTER_WIND_DOWN -> "interrupted after the relay's wind-down";
-                    default -> "not acknowledged within " + Duration.ofMillis(NANOSECONDS.toMillis(until - entry));
-                });
+            try {
+                var ended = call.await(until, records);
+                if (ended != Call.Ended.ACKED) {
+                    call.cut(switch (ended) {
+                        case INTERRUPTED -> "interrupted";
+                        case CANCELLED -> "the relay gave up on the call";
+                        case INTERRUPTED_AFTER_WIND_DOWN -> "interrupted after the relay's wind-down";
+                        default -> "not acknowledged within " + Duration.ofMillis(NANOSECONDS.toMillis(until - entry));
+                    });
+                }
+            } finally { // after the cut, which must not wait for the telemetry; before the outcomes are read
+                call.report(records);
             }
             return new Sent(outcomes(call, records, partitions), call.closedByRefusal());
         } catch (RuntimeException | Error e) {
@@ -1111,10 +1115,10 @@ public final class KafkaOutboxSender implements AutoCloseable {
          * ends the wait. So does the relay's cancel ({@link ShardProcessor#callCancelled()}), at once, though its
          * interrupt may come as one with the wind-down's: the relay has let the shard go, and a record still in flight
          * could be written after a later one of its key. A call closed by a failure waits for the rest of its records:
-         * the close
-         * aborts them at once, and the records of the failed batch behind the one that closed it bring their own
-         * answers (a refusal among them). Reports the records acked meanwhile after each wake-up and before returning,
-         * however it ends, outside this monitor.
+         * the close aborts them at once, and the records of the failed batch behind the one that closed it bring their
+         * own answers (a refusal among them). Reports the records acked meanwhile after each wake-up, outside this
+         * monitor, but only once the checks above found the call should go on waiting; the caller reports the rest
+         * after its cut ({@link #report}).
          */
         Ended await(long until, List<OutboxRecord> records) {
             boolean windingDown = false;
@@ -1145,19 +1149,16 @@ public final class KafkaOutboxSender implements AutoCloseable {
                             try {
                                 NANOSECONDS.timedWait(this, left);
                             } catch (InterruptedException e) {
-                                Thread.currentThread().interrupt(); // seen at the top of the loop
+                                Thread.currentThread().interrupt();
+                                continue; // the checks above before any report: a cancel or an interrupt cuts at once
                             }
                         }
                     }
                     report(records);
                 }
             } finally {
-                try {
-                    report(records);
-                } finally {
-                    if (windingDown) {
-                        Thread.currentThread().interrupt();
-                    }
+                if (windingDown) {
+                    Thread.currentThread().interrupt();
                 }
             }
         }
@@ -1166,7 +1167,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
          * Caller thread, not holding this: {@link OutboxHandler#recordFinished} of each record acked since the last
          * report, in ack order. The telemetry must not run under this, which Kafka's I/O thread takes in callbacks.
          */
-        private void report(List<OutboxRecord> records) {
+        void report(List<OutboxRecord> records) {
             if (acks == null) {
                 return;
             }

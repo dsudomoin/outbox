@@ -1687,6 +1687,55 @@ class KafkaOutboxSenderTest {
         assertThat(producer.closed()).isTrue();
     }
 
+    /**
+     * The relay's cancel cuts at once, before the acks still queued are reported: record b is acked while the caller
+     * reports a, the cancel comes before that report returns, and b is reported only once the producer is closed. A
+     * slow telemetry must not hold the records in flight past the cancel.
+     */
+    @Test
+    void aCancelCutsBeforeTheQueuedAcksAreReported() throws Exception {
+        var sender = sender(DELIVERY_TIMEOUT);
+        var records = List.of(record(1, "a"), record(2, "b"), record(3, "c"));
+        var closedAtReport = new ConcurrentHashMap<OutboxRecord, Boolean>();
+        var reportingA = new CountDownLatch(1);
+        var release = new AtomicBoolean();
+        var delivery = new OutboxTelemetry.Delivery() {
+            @Override
+            public void recordFinished(OutboxRecord record, Outcome outcome) {
+                closedAtReport.put(record, producers.get(0).closed());
+                if (record == records.get(0)) {
+                    reportingA.countDown();
+                    long until = System.nanoTime() + SECONDS.toNanos(10);
+                    while (!release.get() && System.nanoTime() - until < 0) { // ignores the interrupt, keeps its flag
+                        Thread.onSpinWait();
+                    }
+                }
+            }
+        };
+        var outcomes = new AtomicReference<List<Outcome>>();
+        var handler = new TestHandlerCall(Duration.ofSeconds(30), () -> {
+            outcomes.set(RecordScope.bound(delivery, () -> sender.send(records)));
+            return List.of();
+        });
+        var result = executor.submit(handler::call);
+        var producer = awaitSent(0, 3);
+        producer.completeNext();
+        assertThat(reportingA.await(5, SECONDS)).isTrue();
+        producer.completeNext(); // b: queued while a's report runs
+
+        handler.cancel();
+        release.set(true);
+
+        result.get(5, SECONDS);
+        assertThat(outcomes.get()).satisfiesExactly(
+                o -> assertThat(o).isEqualTo(Outcome.delivered()),
+                o -> assertThat(o).isEqualTo(Outcome.delivered()),
+                o -> assertThat(o).isInstanceOf(Outcome.Retry.class));
+        assertThat(closedAtReport).containsOnlyKeys(records.get(0), records.get(1));
+        assertThat(closedAtReport.get(records.get(0))).isFalse();
+        assertThat(closedAtReport.get(records.get(1))).as("b reported after the cut").isTrue();
+    }
+
     /** A call the relay gave up on while its interrupt went unseen hands nothing more over. */
     @Test
     void aCancelledCallHandsNothingOver() throws Exception {
