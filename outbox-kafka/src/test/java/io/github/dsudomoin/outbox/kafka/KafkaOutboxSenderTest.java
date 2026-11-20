@@ -1715,6 +1715,22 @@ class KafkaOutboxSenderTest {
                 o -> assertThat(o).isEqualTo(Outcome.delivered()));
     }
 
+    /** A record the call did not hand over, with no time to come back (here: interrupted), says so, not "until null". */
+    @Test
+    void handlerAdapterNamesARecordNotHandedOver() {
+        var handler = sender(DELIVERY_TIMEOUT).handler();
+
+        Thread.currentThread().interrupt();
+        try {
+            assertThatThrownBy(() -> handler.handle(record(1, "a")))
+                    .isInstanceOf(KafkaException.class)
+                    .hasMessageContaining("not handed to Kafka")
+                    .hasMessageNotContaining("null");
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
     @Test
     void releaseClosesPooledProducers() throws Exception {
         var sender = sender(DELIVERY_TIMEOUT);
