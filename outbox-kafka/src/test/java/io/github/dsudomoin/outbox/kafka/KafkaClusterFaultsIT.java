@@ -153,6 +153,26 @@ class KafkaClusterFaultsIT {
         twoNodesDown("b60-two-down-60s", Duration.ofSeconds(60));
     }
 
+    /**
+     * (b60p) two of three nodes frozen (docker pause) for 60 s: unlike a kill, the connections stay open, so the
+     * requests the producers sent meanwhile wait in the frozen nodes' sockets and are served when they wake, those of
+     * producers closed since included.
+     */
+    @Test
+    @Timeout(value = 5, unit = TimeUnit.MINUTES)
+    void twoNodesFreezeForAMinute() {
+        start();
+        int leader = cluster.leaderOfMostPartitions(topic);
+        int other = leader % 3 + 1;
+        System.out.println("b60p: pausing nodes " + leader + " and " + other + ", leaders " + cluster.leaders(topic));
+        cluster.pause(leader);
+        cluster.pause(other);
+        hold(Duration.ofSeconds(60));
+        cluster.unpause(leader);
+        cluster.unpause(other);
+        finish("b60p-two-frozen-60s", Long.MIN_VALUE);
+    }
+
     private void twoNodesDown(String name, Duration down) {
         start();
         int leader = cluster.leaderOfMostPartitions(topic);
