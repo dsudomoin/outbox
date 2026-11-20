@@ -101,7 +101,8 @@ import org.slf4j.LoggerFactory;
  * {@code delivery.timeout.ms} expires all its records; in a batch of its own, the refused record fails with
  * {@link RecordTooLargeException}. Such a call sends a partition at most {@code max.in.flight.requests.per.connection}
  * records per round trip; its producers are closed once nothing is remembered. With nothing remembered, a call looks
- * nothing up.
+ * nothing up. So are the records that failed only because the broker refused another record of their call: a
+ * batch-mate of the refused record's key, sent with it again in one batch, would fail with it on every call.
  *
  * <p>A call of a relay that holds permanent failures ({@code relay.retry.holdPermanent}, see
  * {@link ShardProcessor#holdsPermanent}) borrows from two more pools, batched and unbatched as above, whose producers
@@ -727,9 +728,11 @@ public final class KafkaOutboxSender implements AutoCloseable {
                 }
                 // records that failed only because the broker refused another one cost no attempt: the ones the close
                 // aborted or left unacked, and a batch-mate ahead of the refused record, which Kafka fails first with a
-                // generic KafkaException (Sender.java:806-822)
-                if (refusal && outcome instanceof Outcome.Retry retry
-                        && (!call.ownFailure[i] || retry.error().getClass() == KafkaException.class)) {
+                // generic KafkaException (Sender.java:806-822). They are remembered: sent again in one batch with the
+                // refused record, a batch-mate of its key would fail for it on every call without an attempt spent
+                boolean forARefusal = refusal && outcome instanceof Outcome.Retry retry
+                        && (!call.ownFailure[i] || retry.error().getClass() == KafkaException.class);
+                if (forARefusal) {
                     outcome = notSent;
                 }
                 result.add(outcome);
@@ -740,7 +743,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
                     invalidTopics.putIfAbsent(records.get(i).topic(), outcome);
                 }
                 var partition = partitions[i] != null ? partitions[i] : call.partitionChosenByKafka(i);
-                if (call.stalled[i] && outcome != Outcome.delivered()) {
+                if ((call.stalled[i] || forARefusal) && outcome != Outcome.delivered()) {
                     if (expired.size() < EXPIRED_REMEMBERED) {
                         expired.put(records.get(i).messageId(), now);
                     }

@@ -620,6 +620,34 @@ class KafkaOutboxSenderTest {
     }
 
     /**
+     * The broker refuses a record behind an earlier one of its key in the same producer batch: the earlier one fails
+     * for it alone, NotAttempted, so the relay hands both again. They are remembered, so that call goes unbatched: the
+     * earlier one is delivered on its own and the refused one fails on its own, instead of both coming back in one
+     * batch, with no attempt spent, for as long as the refusal lasts.
+     */
+    @Test
+    void recordsFailedForABatchMatesRefusalGoUnbatchedNext() throws Exception {
+        var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, new TestClock());
+        var key = keyOnPartition(0, "a");
+        var earlier = record(1, key);
+        var refused = record(2, key);
+        var first = sendAsync(sender, List.of(earlier, refused));
+        ((TestProducer) awaitSent(0, 2)).failBatch(1);
+        assertThat(first.get(5, SECONDS)).satisfiesExactly(
+                o -> assertThat(o).isInstanceOf(Outcome.NotAttempted.class),
+                o -> assertThat(o).isInstanceOf(Outcome.Permanent.class));
+
+        var again = sendAsync(sender, List.of(earlier, refused));
+        var next = awaitSent(1, 2);
+        assertThat(unbatched).as("remembered: unbatched").contains(next);
+        next.completeNext();
+        next.errorNext(new InvalidRecordException("bad record"));
+        assertThat(again.get(5, SECONDS)).satisfiesExactly(
+                o -> assertThat(o).isEqualTo(Outcome.delivered()),
+                o -> assertThat(o).isInstanceOf(Outcome.Permanent.class));
+    }
+
+    /**
      * The broker refuses a record behind a valid batch-mate: Kafka fails the batch-mate first, with a generic
      * {@link KafkaException} that closes the call, and the refusal comes after it. The refusal still shows that the
      * partition answers and ends the cooldown; the call waits for it, so it is {@code Permanent}, and the batch-mate,
