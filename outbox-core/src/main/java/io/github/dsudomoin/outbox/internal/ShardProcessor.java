@@ -151,6 +151,8 @@ public final class ShardProcessor implements AutoCloseable {
     private final RetryStore retries;
     private final ParkedStore parked;
     private final String hasRetryRows;
+    /** {@link Cursors#latestWithTargetsSql} at this relay's {@code maxTicksPerBatch} and {@link #batchIds}. */
+    private final String targeted;
     /** Failed attempts that divert a single key: {@code headFailuresBeforeDivert}, at most {@code maxAttempts}. */
     private final int divertAt;
     /** Ids a new batch may span, all shards together: {@code batchSize × shards}. */
@@ -243,6 +245,7 @@ public final class ShardProcessor implements AutoCloseable {
                 ? Math.min(relay.headFailuresBeforeDivert(), retry.maxAttempts())
                 : relay.headFailuresBeforeDivert();
         this.batchIds = (long) relay.batchSize() * config.shards();
+        this.targeted = cursors.latestWithTargetsSql(relay.maxTicksPerBatch(), batchIds);
         this.fullCheckInterval = config.partitions().maintenanceInterval().toNanos();
         this.fullChecked = new AtomicLongArray(config.shards());
         this.probing = new AtomicIntegerArray(config.shards());
@@ -426,13 +429,13 @@ public final class ShardProcessor implements AutoCloseable {
             }
         }
         var lockShards = lockable.stream().map(shards::get).toList();
-        Map<Integer, Cursors.Current> currents = null;
+        Map<Integer, Cursors.Targeted> currents = null;
         boolean[] locked;
         if (settings == null) {
             locked = tryLock(inTx, lockShards);
         } else {
             currents = new HashMap<>();
-            locked = tryLockAndRead(inTx, settings, lockShards, currents);
+            locked = tryLockAndRead(inTx, settings, lockShards, latestTickId, currents);
         }
         var lockedShards = new ArrayList<Integer>(lockable.size());
         for (int k = 0; k < lockable.size(); k++) {
@@ -464,11 +467,17 @@ public final class ShardProcessor implements AutoCloseable {
      */
     private List<ShardResult> stepLocked(Connection inTx, List<Integer> shards, List<Integer> lockable,
             List<Integer> lockedShards, ShardResult[] results, long latestTickId, Instant now, Instant parkedUntil,
-            long started, OutboxTelemetry.RelayStep[] step, @Nullable Map<Integer, Cursors.Current> read,
+            long started, OutboxTelemetry.RelayStep[] step, @Nullable Map<Integer, Cursors.Targeted> read,
             boolean commit) throws SQLException, InterruptedException {
         var steps = new ArrayList<Step>(lockable.size());
         // a statement after the locks: sees the previous holders' commits
-        var currents = read != null ? read : cursors.latest(inTx, lockedShards);
+        Map<Integer, Cursors.Current> currents;
+        if (read == null) {
+            currents = cursors.latest(inTx, lockedShards);
+        } else {
+            currents = new HashMap<>();
+            read.forEach((shard, targeted) -> currents.put(shard, targeted.current()));
+        }
         for (var i : lockable) {
             if (results[i] != null) {
                 continue;
@@ -486,7 +495,11 @@ public final class ShardProcessor implements AutoCloseable {
             }
             steps.add(new Step(i, current, cursor));
         }
-        chooseTargets(inTx, steps, latestTickId);
+        if (read == null) {
+            chooseTargets(inTx, steps, latestTickId);
+        } else {
+            targets(steps, read, latestTickId);
+        }
 
         var appends = new ArrayList<Cursor>(steps.size());
         var work = new ArrayList<Step>(steps.size());
@@ -970,6 +983,28 @@ public final class ShardProcessor implements AutoCloseable {
         return next;
     }
 
+    /** {@link #chooseTargets} from the ticks the cursor read chose ({@link Cursors.Targeted}), with no statement. */
+    private static void targets(List<Step> steps, Map<Integer, Cursors.Targeted> read, long latestTickId) {
+        for (var s : steps) {
+            var targeted = read.get(s.shard);
+            if (s.cursor.targetTickId() == null && latestTickId <= s.cursor.tickId()) {
+                continue; // no batch to read
+            }
+            s.prev = effectiveTick(s.current);
+            var skip = targeted.skipped();
+            if (s.cursor.targetTickId() == null && skip != null) { // the ticks up to it hold no row of the shard
+                s.prev = skip;
+                s.cursor = s.cursor.withProgress(skip.id(), null, 0);
+                s.next = s.cursor;
+            }
+            if (targeted.target() == null) {
+                throw new IllegalStateException("no tick " + (s.cursor.targetTickId() != null
+                        ? s.cursor.targetTickId() + ": it was deleted" : "after " + s.cursor.tickId()));
+            }
+            s.target = targeted.target();
+        }
+    }
+
     /**
      * The target of each step that has one, from statements shared by all: the batch in progress keeps its target,
      * never re-chosen mid-batch (rows of a long transaction below lastId committing after the old target would be
@@ -1267,12 +1302,12 @@ public final class ShardProcessor implements AutoCloseable {
     }
 
     /**
-     * {@code settings}, {@link #tryLock} and {@link Cursors#latest(Connection, java.util.Collection)} of {@code shards}, in one
-     * round trip: each statement takes its own snapshot, so the cursors, read after the locks, see the previous
-     * holders' commits. Puts the cursor of each shard locked into {@code currents}.
+     * {@code settings}, {@link #tryLock} and {@link Cursors#latest(Connection, java.util.Collection)} of
+     * {@code shards}, in one round trip: each statement takes its own snapshot, so the cursors, read after the locks,
+     * see the previous holders' commits. Puts the cursor of each shard locked into {@code currents}.
      */
-    private boolean[] tryLockAndRead(Connection c, String settings, List<Integer> shards,
-            Map<Integer, Cursors.Current> currents) throws SQLException {
+    private boolean[] tryLockAndRead(Connection c, String settings, List<Integer> shards, long latestTickId,
+            Map<Integer, Cursors.Targeted> currents) throws SQLException {
         var locked = new boolean[shards.size()];
         if (shards.isEmpty()) {
             try (var st = c.createStatement()) {
@@ -1280,10 +1315,13 @@ public final class ShardProcessor implements AutoCloseable {
             }
             return locked;
         }
-        var read = new HashMap<Integer, Cursors.Current>();
-        try (var ps = c.prepareStatement(settings + "; " + TRY_LOCK + "; " + cursors.latestManySql())) {
+        var read = new HashMap<Integer, Cursors.Targeted>();
+        try (var ps = c.prepareStatement(settings + "; " + TRY_LOCK + "; " + targeted)) {
             bindTryLock(ps, shards);
             ps.setArray(6, c.createArrayOf("int4", shards.toArray()));
+            for (int i = 7; i <= 11; i++) {
+                ps.setLong(i, latestTickId);
+            }
             int resultSets = 0;
             for (boolean rows = ps.execute(); rows || ps.getUpdateCount() != -1; rows = ps.getMoreResults()) {
                 if (!rows) {
@@ -1293,7 +1331,7 @@ public final class ShardProcessor implements AutoCloseable {
                     if (resultSets++ == 0) {
                         readLocks(rs, locked);
                     } else {
-                        read.putAll(Cursors.currents(rs));
+                        read.putAll(Cursors.targeted(rs));
                     }
                 }
             }

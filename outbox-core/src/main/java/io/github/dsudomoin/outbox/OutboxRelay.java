@@ -143,8 +143,8 @@ public final class OutboxRelay implements AutoCloseable {
      * rows its last batch delivered (0 before it delivered any), kept by a step that left it untouched (unread behind a
      * cut, or not attempted). A group takes shards until their rows would pass {@code batchSize}, which a group's read
      * and call share, so a shard with an unfinished batch is stepped alone (a cut read leaves the shards after it
-     * untouched and its own rest to be read again) while shards that finish their batches share steps. In memory, per relay instance; {@link #batchRows}: what
-     * the batch in progress delivered so far.
+     * untouched and its own rest to be read again) while shards that finish their batches share steps. In memory, per
+     * relay instance; {@link #batchRows}: what the batch in progress delivered so far.
      */
     private final AtomicIntegerArray expected;
     private final AtomicIntegerArray batchRows;
@@ -541,7 +541,9 @@ public final class OutboxRelay implements AutoCloseable {
         return results;
     }
 
-    /** {@code shards} in groups of at most {@link #MAX_GROUP} whose {@link #expected} rows stay below {@code batchSize}. */
+    /**
+     * {@code shards} in groups of at most {@link #MAX_GROUP} whose {@link #expected} rows stay below {@code batchSize}.
+     */
     private List<List<Integer>> groups(List<Integer> shards) {
         var groups = new ArrayList<List<Integer>>();
         var group = new ArrayList<Integer>();
@@ -769,13 +771,12 @@ public final class OutboxRelay implements AutoCloseable {
         }
 
         /**
-         * The next group, empty when the round is done: at most {@link #groupSize} shards whose {@link #expected} rows stay
-         * below {@code batchSize} (at least one; a {@link #busy} shard alone); each is
-         * {@link #inFlight} until its step
-         * ends. A shard another worker steps is passed over and {@link #wanted}: that step puts it into the round
-         * current then. A shard a sibling stepped after the read at this round's tick or a newer one is skipped: its
-         * candidacy is stale, and that step put it back if it left work. A shard {@link #isolated} is a group of its
-         * own; one {@link #backingOff} is dropped.
+         * The next group, empty when the round is done: at most {@link #groupSize} shards whose {@link #expected}
+         * rows stay below {@code batchSize} (at least one; a {@link #busy} shard alone); each is {@link #inFlight}
+         * until its step ends. A shard another worker steps is passed over and {@link #wanted}: that step puts it
+         * into the round current then. A shard a sibling stepped after the read at this round's tick or a newer one is
+         * skipped: its candidacy is stale, and that step put it back if it left work. A shard {@link #isolated} is a
+         * group of its own; one {@link #backingOff} is dropped.
          */
         synchronized List<Integer> take() {
             var group = new ArrayList<Integer>(Math.min(groupSize, queue.size()));
@@ -948,8 +949,7 @@ public final class OutboxRelay implements AutoCloseable {
 
         private boolean passOn(Connection c, long seen) throws Exception {
             c.setAutoCommit(true);
-            tickIfDue(c, seen);
-            readRound(c);
+            readRound(c, tickIfDue(c, seen));
             boolean worked = false;
             long started = System.nanoTime();
             while (!stopping && !maintenance.halted()) {
@@ -959,8 +959,9 @@ public final class OutboxRelay implements AutoCloseable {
                 // the tick attempts of a long pass (a backlog keeps its round from running out), each followed by
                 // a look at the latest tick: without them ticks would wait for the pass, and each would hold ever
                 // more rows, read again in full by every chunk of a batch
-                if (tickIfDue(c, wakeups.get())) {
-                    readRound(c);
+                long made = tickIfDue(c, wakeups.get());
+                if (made >= 0) {
+                    readRound(c, made);
                 }
                 var r = round; // a sibling may have read a newer tick: its round is the one to work on
                 var group = r.take();
@@ -979,11 +980,12 @@ public final class OutboxRelay implements AutoCloseable {
          * connection without the lock: a sibling whose connection went silent in its read holds nobody else past that.
          * A round is never replaced with one of an earlier read, as such a sibling's read may land late; it is compared
          * by read order, not by tick id, which goes down when the tick table and its sequence are restored to an
-         * earlier point.
+         * earlier point. {@code made}: the id of the tick this worker has just inserted, read as the latest without a
+         * statement (a newer one of another instance is read at the next look); 0 or less: none.
          */
-        private void readRound(Connection c) throws SQLException, InterruptedException {
+        private void readRound(Connection c, long made) throws SQLException, InterruptedException {
             long ticket = roundTickets.incrementAndGet();
-            long latest = ticks.latest(c, clock).id();
+            long latest = made > 0 ? made : ticks.latest(c, clock).id();
             if (current(latest)) {
                 return;
             }
@@ -1182,21 +1184,23 @@ public final class OutboxRelay implements AutoCloseable {
      * another instance then stands for this one's. An inserted tick covers the commits seen before the attempt; one
      * {@link Ticks#make} skipped for a younger tick covers only those seen {@code minTickInterval} before it (that tick
      * is at most three quarters of the interval old, so its snapshot comes after them), since that younger tick may
-     * predate the rest, which therefore get another attempt {@code minTickInterval} later. Each inserted tick wakes all workers; one refused for an xid regression refreshes the halt at once.
-     * Returns whether it made the attempt.
+     * predate the rest, which therefore get another attempt {@code minTickInterval} later. Each inserted tick wakes all
+     * workers; one refused for an xid regression refreshes the halt at once. Returns the id of the tick inserted, 0
+     * when the attempt inserted none, -1 when no attempt was due.
      */
-    private boolean tickIfDue(Connection c, long seen) throws SQLException {
+    private long tickIfDue(Connection c, long seen) throws SQLException {
         long attempt;
         Duration youngest;
         synchronized (tickState) {
             long now = System.nanoTime();
             if (!attemptDue(seen, now)) {
-                return false;
+                return -1;
             }
             lastTickAttempt = attempt = now;
             youngest = wakePending ? wakeTickAge : idleTickAge;
         }
-        var made = ticks.tick(c, youngest);
+        var tick = ticks.attempt(c, youngest);
+        var made = tick.made();
         if (made == Ticks.Made.REGRESSED) {
             maintenance.checkHalt(); // the halt it recorded: the workers stop now, not at the next maintenance run
         }
@@ -1210,7 +1214,7 @@ public final class OutboxRelay implements AutoCloseable {
             ticksMade.incrementAndGet();
             wakeAll();
         }
-        return true;
+        return tick.id();
     }
 
     /** Registers the wake-ups up to {@code seen}; whether a tick attempt is due now. */

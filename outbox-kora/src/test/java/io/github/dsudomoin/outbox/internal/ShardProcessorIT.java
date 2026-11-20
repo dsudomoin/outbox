@@ -155,11 +155,11 @@ class ShardProcessorIT {
 
     /**
      * A step in its own transaction, as a relay worker runs it, opens it, takes the shard, reads its cursor and
-     * commits in as few round trips as the statements' dependencies allow: the settings, the locks and the cursors in
-     * one, the new cursor rows with the commit in one.
+     * commits in as few round trips as the statements' dependencies allow: the settings, the locks and the cursors
+     * with the ticks of the batch in one, the batch read in one, the new cursor rows with the commit in one.
      */
     @Test
-    void aStepInItsOwnTransactionTakesFiveRoundTrips() throws Exception {
+    void aStepInItsOwnTransactionTakesThreeRoundTrips() throws Exception {
         bootstrap();
         send(msg("t", "a", "a1"));
         tick();
@@ -172,7 +172,7 @@ class ShardProcessorIT {
 
             assertThat(stepped.result()).extracting(ShardProcessorIT::withoutCaughtUp)
                     .containsExactly(new ShardResult(PROGRESS, 1, true));
-            assertThat(stepped.roundTrips()).as("round trips of a step of one shard").isEqualTo(5);
+            assertThat(stepped.roundTrips()).as("round trips of a step of one shard").isEqualTo(3);
             assertThat(c.getAutoCommit()).as("autocommit restored").isTrue();
         }
         assertThat(cursor()).isEqualTo(new Cursor(0, t, null, 0, null, 0, null, null));

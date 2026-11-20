@@ -20,6 +20,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Random;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -71,6 +72,97 @@ class TicksIT {
             var young = RoundTrips.count(() -> ticks.tick(c, Duration.ofHours(1)));
             assertThat(young.result()).isEqualTo(Ticks.Made.SKIPPED);
             assertThat(young.roundTrips()).as("round trips of a skipped tick").isEqualTo(2);
+        }
+    }
+
+    /**
+     * The step's cursor read chooses each shard's ticks as {@link Ticks#fresh} and {@code chooseTarget} do, which it
+     * replaces: on random tick logs (marking bitmaps of every kind, null bitmaps and {@code max_id}s, gaps in the ids)
+     * and random cursors (fresh and mid-batch, below and at the latest tick), the same skipped-to tick and target.
+     */
+    @Test
+    void theCursorReadChoosesTheTicksFreshAndChooseTargetChoose() throws Exception {
+        int maxTicks = 5;
+        long batchIds = 30;
+        var cursors = new Cursors(names, SHARDS);
+        var sql = cursors.latestWithTargetsSql(maxTicks, batchIds);
+        var random = new Random(7);
+        try (var c = TestDb.connect()) {
+            long first = ticks.latest(c).id(); // the bootstrap tick
+            long maxId = 0;
+            for (int i = 0; i < 60; i++) {
+                maxId += random.nextInt(12);
+                var dirty = switch (random.nextInt(6)) {
+                    case 0 -> "null";
+                    case 1 -> "''";
+                    case 2 -> "B'01'"; // drawn from another shard count: every shard
+                    default -> "B'" + IntStream.range(0, SHARDS).mapToObj(b -> random.nextInt(4) == 0 ? "1" : "0")
+                            .collect(java.util.stream.Collectors.joining()) + "'";
+                };
+                var max = random.nextInt(15) == 0 ? "null" : Long.toString(maxId);
+                long id = queryLong(c, "insert into " + names.tick() + " (snapshot, max_id, dirty) select"
+                        + " pg_current_snapshot(), " + max + ", " + dirty + "::varbit returning id");
+                if (random.nextInt(10) == 0 && i < 55) {
+                    execute(c, "delete from " + names.tick() + " where id = " + id); // a gap in the ids
+                }
+            }
+            var ids = new ArrayList<Long>();
+            try (var st = c.createStatement(); var rs = st.executeQuery("select id from " + names.tick()
+                    + " where id > " + first + " order by id")) {
+                while (rs.next()) {
+                    ids.add(rs.getLong(1));
+                }
+            }
+            int compared = 0;
+            for (int round = 0; round < 40; round++) {
+                long latest = ids.get(ids.size() / 2 + random.nextInt(ids.size() - ids.size() / 2));
+                for (int shard = 0; shard < SHARDS; shard++) {
+                    long at = ids.get(random.nextInt(ids.size()));
+                    Long target = null;
+                    if (random.nextInt(4) == 0) { // mid-batch, its target above its tick
+                        var above = ids.stream().filter(id -> id > at).toList();
+                        target = above.isEmpty() ? null : above.get(random.nextInt(above.size()));
+                    }
+                    cursors.append(c, new Cursors.Cursor(shard, Math.min(at, latest), target, 0, null, 0, null, null));
+                }
+                var expected = new java.util.HashMap<Integer, List<Long>>();
+                for (int shard = 0; shard < SHARDS; shard++) {
+                    var current = cursors.latest(c, shard);
+                    long eff = current.effectiveTickId();
+                    var cursor = current.cursor();
+                    Long skip = null;
+                    Long target = null;
+                    if (cursor.targetTickId() != null) {
+                        target = cursor.targetTickId();
+                    } else if (latest > eff) {
+                        var fresh = ticks.fresh(c, Map.of(shard, eff), latest, maxTicks);
+                        var skipped = fresh.skipped().get(shard);
+                        long lo = skipped != null ? skipped.id() : eff;
+                        Long prevMax = skipped != null ? skipped.maxId() : current.tick().maxId();
+                        var candidates = List.copyOf(fresh.ticks().subMap(lo, false, Math.min(latest, lo + maxTicks),
+                                true).values());
+                        skip = skipped == null ? null : skipped.id();
+                        target = candidates.isEmpty() ? ticks.oldestAfter(c, lo).id()
+                                : ShardProcessor.chooseTarget(prevMax, candidates, batchIds).id();
+                    }
+                    expected.put(shard, java.util.Arrays.asList(skip, target));
+                }
+                var actual = new java.util.HashMap<Integer, List<Long>>();
+                try (var ps = c.prepareStatement(sql)) {
+                    ps.setArray(1, c.createArrayOf("int4", IntStream.range(0, SHARDS).boxed().toArray()));
+                    for (int i = 2; i <= 6; i++) {
+                        ps.setLong(i, latest);
+                    }
+                    try (var rs = ps.executeQuery()) {
+                        Cursors.targeted(rs).forEach((shard, t) -> actual.put(shard, java.util.Arrays.asList(
+                                t.skipped() == null ? null : t.skipped().id(),
+                                t.target() == null ? null : t.target().id())));
+                    }
+                }
+                assertThat(actual).as("round %d, latest %d", round, latest).isEqualTo(expected);
+                compared += SHARDS;
+            }
+            assertThat(compared).isEqualTo(40 * SHARDS);
         }
     }
 

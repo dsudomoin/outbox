@@ -91,6 +91,9 @@ public final class Ticks {
      */
     public record Tick(long id, @Nullable PgSnapshot snapshot, Instant createdAt, @Nullable Long maxId) {}
 
+    /** What {@link #attempt} did, and the id of the tick it inserted (0 when it inserted none). */
+    public record Attempt(Made made, long id) {}
+
     /** What {@link #tick} did. */
     public enum Made {
         INSERTED,
@@ -297,7 +300,8 @@ public final class Ticks {
                     + " where t.created_at > clock_timestamp() - ? * interval '1 microsecond'"
                     + " and t.created_at <= clock_timestamp()"
                     // the regression guard of the probing insert, without its halt: the next probe records that
-                    + " or pg_snapshot_xmax(pg_current_snapshot()) < pg_snapshot_xmax(t.snapshot)) returning id; commit";
+                    + " or pg_snapshot_xmax(pg_current_snapshot()) < pg_snapshot_xmax(t.snapshot))"
+                    + " returning id; commit";
         }
         return sql;
     }
@@ -321,6 +325,11 @@ public final class Ticks {
      * tick lock, then the probe, the tick row and the commit ({@link #insert}); a failed probe costs three more.
      */
     public Made tick(Connection autocommit, Duration minInterval) throws SQLException {
+        return attempt(autocommit, minInterval).made();
+    }
+
+    /** {@link #tick}, with the id of the tick inserted: its maker reads it from there, not from the table. */
+    public Attempt attempt(Connection autocommit, Duration minInterval) throws SQLException {
         var c = autocommit;
         boolean autoCommit = c.getAutoCommit();
         c.setAutoCommit(false);
@@ -328,7 +337,7 @@ public final class Ticks {
             var made = lock(c) ? insert(c, minInterval) : null;
             if (made == null) {
                 c.rollback();
-                made = Made.SKIPPED;
+                made = new Attempt(Made.SKIPPED, 0);
             } else {
                 c.commit(); // committed by the statement already: sends nothing
             }
@@ -364,17 +373,18 @@ public final class Ticks {
      * written since. The insert after a failed probe skips such a tick too and leaves the halt to the next probe.
      */
     @Nullable
-    private Made insert(Connection c, Duration minInterval) throws SQLException {
+    private Attempt insert(Connection c, Duration minInterval) throws SQLException {
         long micros = TimeUnit.MICROSECONDS.convert(minInterval);
         try (var ps = c.prepareStatement(probedTick(c))) {
             ps.setLong(1, micros);
-            Made made = null;
+            Attempt made = null;
             for (boolean rows = ps.execute(); rows || ps.getUpdateCount() != -1; rows = ps.getMoreResults()) {
                 if (rows) { // the tick's row, between the lock_timeout and the commit
                     try (var rs = ps.getResultSet()) {
                         rs.next();
-                        made = rs.getObject(1) != null ? Made.INSERTED : rs.getBoolean(2) ? Made.REGRESSED
-                                : Made.SKIPPED; // the newest tick is younger than the bound
+                        long id = rs.getLong(1);
+                        made = new Attempt(!rs.wasNull() ? Made.INSERTED : rs.getBoolean(2) ? Made.REGRESSED
+                                : Made.SKIPPED, id); // skipped: the newest tick is younger than the bound
                     }
                 }
             }
@@ -392,11 +402,13 @@ public final class Ticks {
             }
             try (var ps = c.prepareStatement(unprobedTick(c))) {
                 ps.setLong(1, micros);
-                Made made = Made.SKIPPED;
+                var made = new Attempt(Made.SKIPPED, 0);
                 for (boolean rows = ps.execute(); rows || ps.getUpdateCount() != -1; rows = ps.getMoreResults()) {
                     if (rows) {
                         try (var rs = ps.getResultSet()) {
-                            made = rs.next() ? Made.INSERTED : Made.SKIPPED;
+                            if (rs.next()) {
+                                made = new Attempt(Made.INSERTED, rs.getLong(1));
+                            }
                         }
                     }
                 }
@@ -558,11 +570,7 @@ public final class Ticks {
         // u, materialised, is read twice: its rows with a skip, then its distinct starts
         try (var ps = c.prepareStatement("with u as materialized (select u.shard, u.after_id, t.id, t.created_at,"
                 + " t.max_id from unnest(?::int[], ?::int8[]) u(shard, after_id) left join " + names.tick()
-                + " t on t.id = (select max(m.id) from " + names.tick() + " m where m.id > u.after_id and m.id <"
-                + " (select n.id from " + names.tick() + " n where n.id > u.after_id and n.id <= ? and (n.id = ?"
-                + " or n.dirty is null or not exists (select 1 from " + names.tick() + " g where g.id = n.id - 1)"
-                + " or case when length(n.dirty) = 0 then false when length(n.dirty) <> " + shards + " then true"
-                + " else get_bit(n.dirty, u.shard) = 1 end) order by n.id limit 1)))"
+                + " t on t.id = " + skippedTo(names, shards, "u.after_id", "u.shard", "?") + ")"
                 + " select shard, id, created_at, max_id from u where id is not null"
                 + " union all select null, id, created_at, max_id from (select distinct t.id, t.created_at, t.max_id"
                 + " from (select distinct coalesce(id, after_id) lo from u) r cross join lateral (select id,"
@@ -587,6 +595,19 @@ public final class Ticks {
             }
         }
         return new Fresh(skipped, between);
+    }
+
+    /**
+     * The scalar subquery of {@link #fresh}'s skip for the shard {@code shard} from the tick {@code afterId} up to the
+     * tick {@code latestId} (SQL expressions; {@code latestId} is used twice, a parameter so takes two): the last tick
+     * before the first one after {@code afterId} that marks the shard, null when that is the first one after it.
+     */
+    static String skippedTo(TableNames names, int shards, String afterId, String shard, String latestId) {
+        return "(select max(m.id) from " + names.tick() + " m where m.id > " + afterId + " and m.id <"
+                + " (select n.id from " + names.tick() + " n where n.id > " + afterId + " and n.id <= " + latestId
+                + " and (n.id = " + latestId + " or n.dirty is null or not exists (select 1 from " + names.tick()
+                + " g where g.id = n.id - 1) or case when length(n.dirty) = 0 then false when length(n.dirty) <> "
+                + shards + " then true else get_bit(n.dirty, " + shard + ") = 1 end) order by n.id limit 1))";
     }
 
     /** The ticks with these ids, keyed by id; an id without a tick is absent. One statement. */

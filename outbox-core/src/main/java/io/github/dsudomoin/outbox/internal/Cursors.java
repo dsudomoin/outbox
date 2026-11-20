@@ -424,19 +424,64 @@ public final class Cursors {
         return result;
     }
 
-    /** The statement of {@link #latest(Connection, Collection)}: one parameter, the shards ({@code int4[]}). */
-    String latestManySql() {
-        return latestMany;
+    /**
+     * A shard's {@link Current} with the ticks its step reads between, chosen as {@code ShardProcessor} chooses them
+     * from {@link Ticks#fresh} and {@code chooseTarget}: for a batch in progress its target; for a fresh batch when the
+     * latest tick is past the effective one, the tick it skips to ({@code skipped}, null when it skips none) and the
+     * target among the next {@code maxTicksPerBatch} ticks. {@code target} is null when the shard has neither.
+     */
+    record Targeted(Current current, @Nullable Tick skipped, @Nullable Tick target) {}
+
+    /**
+     * {@link #latest(Connection, Collection)} with each shard's target ticks ({@link Targeted}), in one statement, so
+     * a step needs no statement of its own to choose them. Parameters: the shards ({@code int4[]}), then the latest
+     * tick's id five times.
+     */
+    String latestWithTargetsSql(int maxTicks, long batchIds) {
+        var tick = names.tick();
+        return "select c.*, e.eff, t.snapshot::text, t.created_at, t.max_id,"
+                + " f.id, f.snapshot::text, f.created_at, f.max_id, g.id, g.snapshot::text, g.created_at, g.max_id"
+                + " from unnest(?::int[]) s(shard) cross join lateral (select " + COLUMNS + " from " + names.cursor()
+                + " where shard = s.shard order by seq desc limit 1) c left join " + newestCheckpoint(names)
+                + " k on true cross join lateral (select " + effective(shards) + " eff) e"
+                + " left join " + tick + " t on t.id = e.eff"
+                // a fresh batch skips the leading ticks that do not mark the shard (Ticks.fresh)
+                + " left join " + tick + " f on c.target_tick_id is null and e.eff < ?::int8 and f.id = "
+                + Ticks.skippedTo(names, shards, "e.eff", "c.shard", "?::int8")
+                // then takes the first tick after its start and the ones after it up to batchIds of ids past its
+                // previous tick, as long as each has its max_id, within maxTicksPerBatch (ShardProcessor.chooseTarget);
+                // with no tick in that range (a gap in tick ids), the oldest tick after the start
+                + " cross join lateral (select coalesce(f.id, e.eff) lo, coalesce(f.max_id, case when f.id is null"
+                + " then t.max_id end) prev_max, least(?::int8, coalesce(f.id, e.eff) + " + maxTicks + ") hi) b"
+                + " cross join lateral (select min(x.id) first from " + tick + " x where x.id > b.lo"
+                + " and x.id <= b.hi) a"
+                + " left join " + tick + " g on g.id = case when c.target_tick_id is not null then c.target_tick_id"
+                + " when e.eff >= ?::int8 then null else coalesce((select max(y.id) from " + tick + " y"
+                + " where y.id > a.first and y.id <= b.hi and b.prev_max is not null and not exists (select 1 from "
+                + tick + " n where"
+                + " n.id > a.first and n.id <= y.id and (n.max_id is null or n.max_id - b.prev_max > " + batchIds
+                + "))), a.first, (select min(z.id) from " + tick + " z where z.id > b.lo)) end";
     }
 
-    /** The rows of {@link #latestManySql()}, keyed by shard. */
-    static Map<Integer, Current> currents(ResultSet rs) throws SQLException {
-        var result = new HashMap<Integer, Current>();
+    /** The rows of {@link #latestWithTargetsSql}, keyed by shard. */
+    static Map<Integer, Targeted> targeted(ResultSet rs) throws SQLException {
+        var result = new HashMap<Integer, Targeted>();
         while (rs.next()) {
             var current = current(rs);
-            result.put(current.cursor().shard(), current);
+            result.put(current.cursor().shard(), new Targeted(current, tickAt(rs, 13), tickAt(rs, 17)));
         }
         return result;
+    }
+
+    /** The tick of columns {@code from} (id) to {@code from + 3} (snapshot, created_at, max_id), null without an id. */
+    @Nullable
+    private static Tick tickAt(ResultSet rs, int from) throws SQLException {
+        long id = rs.getLong(from);
+        if (rs.wasNull()) {
+            return null;
+        }
+        return new Tick(id, PgSnapshot.parse(rs.getString(from + 1)),
+                rs.getObject(from + 2, OffsetDateTime.class).toInstant(), rs.getObject(from + 3, Long.class));
     }
 
     private static Current current(ResultSet rs) throws SQLException {

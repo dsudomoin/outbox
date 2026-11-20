@@ -22,6 +22,7 @@ import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.RoundTrips;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -106,6 +107,40 @@ class OutboxRelayIT {
 
         assertThat(Duration.ofNanos(System.nanoTime() - committed)).isLessThan(Duration.ofMillis(500));
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyElementsOf(ids);
+    }
+
+    /**
+     * From a lone commit to the handler's call the relay waits for the database five times: the tick (its lock, then
+     * its probe and row with the commit), the round's cursor read, the step's locks with its cursors and target ticks,
+     * and the batch read. On a network each of them is a round trip of latency every message pays.
+     */
+    @Test
+    void aLoneCommitReachesTheHandlerAfterFiveRoundTripsOfTheRelay() throws Exception {
+        config.workers(1).idlePollInterval(Duration.ofSeconds(30)); // only the wake-up ticks
+        bootstrap();
+        var counting = new AtomicReference<RoundTrips>();
+        var atCall = new AtomicInteger(-1);
+        var handler = new RecordingHandler();
+        var relay = start(record -> {
+            var c = counting.get();
+            if (c != null) {
+                atCall.compareAndSet(-1, c.get());
+            }
+            handler.handle(record);
+        });
+        var outbox = outbox(relay::wake);
+        awaitParked();
+        send(outbox, msg("t", "k", "warm-up")); // the shard's first step checks its retry and parked rows in full
+        await(Duration.ofSeconds(5), () -> handler.delivered().size() == 1);
+        awaitParked();
+
+        try (var roundTrips = RoundTrips.onThreads("outbox-relay-")) {
+            counting.set(roundTrips);
+            send(outbox, msg("t", "k", "p"));
+            await(Duration.ofSeconds(5), () -> handler.delivered().size() == 2);
+        }
+
+        assertThat(atCall.get()).as("round trips of the relay from the commit to the handler").isEqualTo(5);
     }
 
     @Test
