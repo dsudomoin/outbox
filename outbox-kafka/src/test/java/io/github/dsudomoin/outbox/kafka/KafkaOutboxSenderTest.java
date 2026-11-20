@@ -2,6 +2,7 @@ package io.github.dsudomoin.outbox.kafka;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -11,6 +12,7 @@ import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.Outcome;
+import io.github.dsudomoin.outbox.internal.TestHandlerCall;
 import jakarta.annotation.Nullable;
 import java.time.Clock;
 import java.time.Duration;
@@ -33,6 +35,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
@@ -1122,37 +1125,44 @@ class KafkaOutboxSenderTest {
         assertThat(producer.closed()).isTrue();
     }
 
-    /** M1: handing records over honours the deadline too: what is left then is not attempted. */
+    /**
+     * M1: a call hands records over while Kafka can still answer them before its deadline, {@code delivery.timeout.ms}
+     * + 5 s from entry: so until 5 s from entry. What is left then is not attempted, with no {@code notBefore}.
+     */
     @Test
-    void handOverStopsAtTheDeadline() {
+    void handOverStopsOnceLessThanTheDeliveryTimeoutIsLeft() {
+        var started = System.nanoTime();
+        var handedAt = new CopyOnWriteArrayList<Duration>();
         var sender = sender(() -> new TestProducer(true, r -> {
+            handedAt.add(Duration.ofNanos(System.nanoTime() - started));
             sleep(300); // e.g. waiting for buffer space
             return null;
-        }), Duration.ofMillis(200));
-        var started = System.nanoTime();
+        }), Duration.ofSeconds(2));
 
         var outcomes = sender.send(IntStream.range(0, 30).mapToObj(i -> record(i, "k" + i)).toList());
 
         assertThat(Duration.ofNanos(System.nanoTime() - started))
-                .as("delivery.timeout.ms + 5 s, plus the send in progress").isLessThan(Duration.ofMillis(6500));
+                .as("5 s, plus the send in progress").isLessThan(Duration.ofMillis(5600));
+        assertThat(handedAt).allSatisfy(at -> assertThat(at).isLessThan(Duration.ofSeconds(5)));
         assertThat(outcomes.subList(0, 15)).containsOnly(Outcome.delivered());
-        assertThat(outcomes.get(29)).isEqualTo(Outcome.notAttempted());
+        assertThat(outcomes.subList(18, 30)).as("the deadline is 7 s: these would be answered after it")
+                .containsOnly(Outcome.notAttempted());
         assertThat(outcomes).containsOnly(Outcome.delivered(), Outcome.notAttempted());
     }
 
-    /** A metadata lookup that ends past the deadline hands nothing over: send() could block max.block.ms again. */
+    /** A metadata lookup that ends past the hand-over cutoff (5 s from entry) hands nothing over. */
     @Test
-    void noSendAfterALookupThatEndsPastTheDeadline() {
+    void noSendAfterALookupThatEndsPastTheHandOverCutoff() {
         var sender = sender(() -> new TestProducer(true, r -> null) {
             @Override
             public synchronized List<PartitionInfo> partitionsFor(String topic) {
                 if (topic.equals("slow")) {
-                    sleep(5300); // resolves, but after the 5.2 s deadline
+                    sleep(5300); // resolves, before the 7 s deadline, but after the 5 s cutoff
                     return super.partitionsFor(TOPIC);
                 }
                 return super.partitionsFor(topic);
             }
-        }, Duration.ofMillis(200));
+        }, Duration.ofSeconds(2));
 
         var outcomes = sender.send(List.of(recordTo("slow", 1, "k"), record(2, "a")));
 
@@ -1279,6 +1289,148 @@ class KafkaOutboxSenderTest {
         fresh.completeNext();
         assertThat(next.get(5, SECONDS)).as("records aborted by our close do not cool their partitions")
                 .containsExactly(Outcome.delivered(), Outcome.delivered());
+    }
+
+    /**
+     * The relay's wind-down at its soft deadline stops the hand-over, but the records in flight get Kafka's own
+     * outcome: closing the producer would retry them through a new one, a duplicate of each record Kafka wrote.
+     */
+    @Test
+    void aWindDownStopsTheHandOverAndAwaitsTheRecordsInFlight() throws Exception {
+        var sender = sender(() -> new TestProducer(false, r -> null) {
+            @Override
+            public Future<RecordMetadata> send(ProducerRecord<byte[], byte[]> record, Callback callback) {
+                if (new String(record.key(), UTF_8).equals("c")) {
+                    try { // like KafkaProducer waiting for buffer space
+                        Thread.sleep(10_000);
+                    } catch (InterruptedException e) {
+                        throw new InterruptException(e);
+                    }
+                }
+                return super.send(record, callback);
+            }
+        }, DELIVERY_TIMEOUT);
+        var call = inRelayCall(Duration.ofSeconds(30),
+                () -> sender.send(List.of(record(1, "a"), record(2, "b"), record(3, "c"), record(4, "d"))));
+        var producer = awaitSent(0, 2);
+        producer.completeNext();
+
+        call.handler().windDown();
+        Thread.sleep(500);
+        assertThat(call.result()).as("still awaiting b").isNotDone();
+        assertThat(producer.closed()).isFalse();
+        producer.completeNext();
+
+        assertThat(call.result().get(2, SECONDS)).containsExactly(Outcome.delivered(), Outcome.delivered(),
+                Outcome.notAttempted(), Outcome.notAttempted());
+        assertThat(call.flagKept()).isTrue();
+        assertThat(producer.closed()).isFalse();
+        var next = sendAsync(sender, List.of(record(5, "a")));
+        awaitSent(0, 3).completeNext();
+        assertThat(next.get(5, SECONDS)).containsExactly(Outcome.delivered());
+        assertThat(producers).as("the producer went back to the pool").hasSize(1);
+    }
+
+    /** An interrupt without the wind-down (the relay shutting its threads down) still cuts at once. */
+    @Test
+    void aPlainInterruptInARelayCallStillCutsAtOnce() throws Exception {
+        var sender = sender(DELIVERY_TIMEOUT);
+        var thread = new AtomicReference<Thread>();
+        var call = inRelayCall(Duration.ofSeconds(30), () -> {
+            thread.set(Thread.currentThread());
+            return sender.send(List.of(record(1, "a"), record(2, "b")));
+        });
+        var producer = awaitSent(0, 2);
+
+        thread.get().interrupt();
+
+        assertThat(call.result().get(2, SECONDS)).allSatisfy(o -> assertThat(o).isInstanceOf(Outcome.Retry.class));
+        assertThat(call.flagKept()).isTrue();
+        assertThat(producer.closed()).isTrue();
+    }
+
+    /** The interrupt after the wind-down (the relay cancelling the call) cuts at once. */
+    @Test
+    void anInterruptAfterTheWindDownCutsAtOnce() throws Exception {
+        var sender = sender(DELIVERY_TIMEOUT);
+        var call = inRelayCall(Duration.ofSeconds(30), () -> sender.send(List.of(record(1, "a"), record(2, "b"))));
+        var producer = awaitSent(0, 2);
+        producer.completeNext();
+        call.handler().windDown();
+        Thread.sleep(300);
+        assertThat(call.result()).isNotDone();
+
+        call.handler().windDown();
+
+        assertThat(call.result().get(2, SECONDS)).satisfiesExactly(
+                o -> assertThat(o).isEqualTo(Outcome.delivered()),
+                o -> assertThat(o).isInstanceOf(Outcome.Retry.class));
+        assertThat(call.flagKept()).isTrue();
+        assertThat(producer.closed()).isTrue();
+    }
+
+    /**
+     * A {@code batchTimeout} shorter than the call's own budget: after the wind-down the call awaits its records until
+     * just before the relay would cancel it, then cuts, so the outcomes it has count and no record is retried for
+     * nothing.
+     */
+    @Test
+    void aWindDownNearTheRelaysCancelCutsBeforeIt() throws Exception {
+        var sender = sender(DELIVERY_TIMEOUT);
+        var batchTimeout = Duration.ofSeconds(2);
+        long started = System.nanoTime();
+        var call = inRelayCall(batchTimeout, () -> sender.send(List.of(record(1, "a"), record(2, "b"))));
+        var producer = awaitSent(0, 2);
+        producer.completeNext();
+        Thread.sleep(Math.max(0, 1600 - NANOSECONDS.toMillis(System.nanoTime() - started))); // the soft deadline
+        call.handler().windDown();
+
+        var outcomes = call.result().get(2, SECONDS);
+        assertThat(Duration.ofNanos(System.nanoTime() - started)).as("200 ms before the relay's cancel")
+                .isBetween(Duration.ofMillis(1750), Duration.ofMillis(1990));
+        assertThat(outcomes).satisfiesExactly(
+                o -> assertThat(o).isEqualTo(Outcome.delivered()),
+                o -> assertThat(o).isInstanceOf(Outcome.Retry.class));
+        assertThat(call.flagKept()).isTrue();
+        assertThat(producer.closed()).isTrue();
+    }
+
+    /**
+     * {@code send()} may return up to {@code max.block.ms} after it was called (waiting for buffer space), and Kafka's
+     * delivery timeout of the record starts there: the call awaits {@code delivery.timeout.ms} + 5 s from that append.
+     */
+    @Test
+    void aRecordAppendedLateGetsItsDeliveryTimeoutFromTheAppend() throws Exception {
+        var sender = sender(() -> new TestProducer(false, r -> {
+            sleep(2000); // waiting for buffer space
+            return null;
+        }), Duration.ofSeconds(1), Duration.ofSeconds(3));
+        long started = System.nanoTime();
+        var result = sendAsync(sender, List.of(record(1, "a")));
+        var producer = awaitSent(0, 1);
+        Thread.sleep(Math.max(0, 6500 - NANOSECONDS.toMillis(System.nanoTime() - started))); // past entry + 6 s
+
+        producer.completeNext();
+
+        assertThat(result.get(5, SECONDS)).containsExactly(Outcome.delivered());
+        assertThat(producer.closed()).isFalse();
+    }
+
+    /** However late {@code send()} returns, a call ends {@code delivery.timeout.ms} + 5 s + {@code max.block.ms} in. */
+    @Test
+    void aLateAppendStillEndsTheCallWithinItsLongestBudget() throws Exception {
+        var sender = sender(() -> new TestProducer(false, r -> {
+            sleep(3000); // longer than max.block.ms: a stub's, to find the bound
+            return null;
+        }), Duration.ofMillis(200), Duration.ofSeconds(1));
+        long started = System.nanoTime();
+
+        var outcomes = sender.send(List.of(record(1, "a")));
+
+        assertThat(Duration.ofNanos(System.nanoTime() - started)).as("5.2 s + 1 s from entry")
+                .isBetween(Duration.ofMillis(6150), Duration.ofMillis(6800));
+        assertThat(outcomes).allSatisfy(o -> assertThat(o).isInstanceOf(Outcome.Retry.class));
+        assertThat(producers.get(0).closed()).isTrue();
     }
 
     @Test
@@ -1681,6 +1833,16 @@ class KafkaOutboxSenderTest {
 
     private KafkaOutboxSender sender(Supplier<MockProducer<byte[], byte[]>> make, Duration deliveryTimeout,
             Clock clock, LongSupplier nanos) {
+        return sender(make, deliveryTimeout, Duration.ZERO, clock, nanos);
+    }
+
+    private KafkaOutboxSender sender(Supplier<MockProducer<byte[], byte[]>> make, Duration deliveryTimeout,
+            Duration maxBlock) {
+        return sender(make, deliveryTimeout, maxBlock, Clock.systemUTC(), System::nanoTime);
+    }
+
+    private KafkaOutboxSender sender(Supplier<MockProducer<byte[], byte[]>> make, Duration deliveryTimeout,
+            Duration maxBlock, Clock clock, LongSupplier nanos) {
         Supplier<MockProducer<byte[], byte[]>> made = () -> {
             var producer = make.get();
             producers.add(producer);
@@ -1690,7 +1852,20 @@ class KafkaOutboxSenderTest {
             var producer = made.get();
             unbatched.add(producer);
             return producer;
-        }, deliveryTimeout, clock, nanos);
+        }, deliveryTimeout, maxBlock, clock, nanos);
+    }
+
+    /** A handler call of the relay, run on {@link #executor}, and whether it returned with the interrupt flag set. */
+    private record RelayCall(TestHandlerCall handler, Future<List<Outcome>> result, AtomicBoolean flagKept) {}
+
+    private RelayCall inRelayCall(Duration batchTimeout, Supplier<List<Outcome>> body) {
+        var flagKept = new AtomicBoolean();
+        var handler = new TestHandlerCall(batchTimeout, () -> {
+            var outcomes = body.get();
+            flagKept.set(Thread.currentThread().isInterrupted()); // the relay's call clears it once it returns
+            return outcomes;
+        });
+        return new RelayCall(handler, executor.submit(handler::call), flagKept);
     }
 
     private Future<List<Outcome>> sendAsync(KafkaOutboxSender sender, List<OutboxRecord> records) {
