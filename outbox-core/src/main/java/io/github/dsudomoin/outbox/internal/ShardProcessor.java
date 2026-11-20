@@ -999,8 +999,12 @@ public final class ShardProcessor implements AutoCloseable {
             // no row is charged an attempt; a time already past is a failed attempt, or a target answering so would
             // spin the shard. The step still counts towards probe mode and the divert of a single key, up to divertAt,
             // so rows of a key that keeps cooling cannot hold the keys behind them; the backoff a later failure starts
-            // from stays bounded by that
-            var until = BatchClassifier.dueAt(decided, askedFor, now).truncatedTo(ChronoUnit.MICROS);
+            // from stays bounded by that. Between initialDelay and maxDelay: a target asking for less would spin the
+            // shard, one asking for hours would hold it longer than any failure does
+            var earliest = decided.plus(retry.initialDelay());
+            var latest = decided.plus(retry.maxDelay());
+            var until = (askedFor.isBefore(earliest) ? earliest : askedFor.isAfter(latest) ? latest : askedFor)
+                    .truncatedTo(ChronoUnit.MICROS);
             int failures = cursor.failures();
             next = next.withPause(until, failures < divertAt ? failures + 1 : failures);
             s.status = ShardStatus.PAUSED;
