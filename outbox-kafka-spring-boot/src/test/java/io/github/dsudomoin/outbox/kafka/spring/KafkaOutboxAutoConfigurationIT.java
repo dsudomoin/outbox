@@ -423,7 +423,11 @@ class KafkaOutboxAutoConfigurationIT {
         }
         try (var err = new CapturedStderr()) {
             runner("outbox.relay.batch-timeout=30s").run(context -> assertThat(context).hasNotFailed());
-            assertThat(err.text()).doesNotContain(BATCH_TIMEOUT_EFFECT);
+            assertThat(err.text()).as("below the default budget, 130 s").contains("outbox.relay.batchTimeout (PT30S)");
+        }
+        try (var err = new CapturedStderr()) {
+            runner("outbox.relay.batch-timeout=130s").run(context -> assertThat(context).hasNotFailed());
+            assertThat(err.text()).as("the default fits the default producer").doesNotContain(BATCH_TIMEOUT_EFFECT);
         }
     }
 
@@ -439,6 +443,10 @@ class KafkaOutboxAutoConfigurationIT {
         try (var err = new CapturedStderr()) {
             runner("outbox.dead-letters.timeout=5s").run(context -> assertThat(context).hasNotFailed());
             assertThat(err.text()).doesNotContain(DEAD_LETTERS_EFFECT);
+        }
+        try (var err = new CapturedStderr()) {
+            runner("outbox.kafka.dead-letter-topic={topic}.dlq").run(context -> assertThat(context).hasNotFailed());
+            assertThat(err.text()).as("the default fits the default producer").doesNotContain(DEAD_LETTERS_EFFECT);
         }
     }
 
@@ -481,7 +489,7 @@ class KafkaOutboxAutoConfigurationIT {
                     context.getBean(KafkaOutboxSender.class).send(List.of(record));
                 });
             assertThat(err.text()).contains("ProducerConfig values", "acks = -1", "enable.idempotence = true",
-                "delivery.timeout.ms = 20000", "request.timeout.ms = 15000", "max.block.ms = 5000",
+                "delivery.timeout.ms = 120000", "request.timeout.ms = 30000", "max.block.ms = 5000",
                 "key.serializer = class org.apache.kafka.common.serialization.ByteArraySerializer");
         }
     }

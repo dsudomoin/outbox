@@ -117,7 +117,8 @@ class OutboxPropertiesTest {
             assertThat((String) properties.get(key).get("description")).as("description of " + key).isNotBlank();
         }
         assertThat(String.valueOf(properties.get("outbox.relay.batch-size").get("defaultValue"))).isEqualTo("1000");
-        assertThat(properties.get("outbox.relay.batch-timeout").get("defaultValue")).isEqualTo("30s");
+        assertThat(properties.get("outbox.relay.batch-timeout").get("defaultValue")).isEqualTo("130s");
+        assertThat(properties.get("outbox.dead-letters.timeout").get("defaultValue")).isEqualTo("130s");
         assertThat(String.valueOf(properties.get("outbox.heartbeat.dedicated-connection").get("defaultValue")))
             .isEqualTo("true");
         assertThat((String) properties.get("outbox.heartbeat.dedicated-connection").get("description")).isNotBlank();

@@ -290,7 +290,7 @@ class OutboxConfigTest {
         assertThat(relay.maxTicksPerBatch()).isEqualTo(100);
         assertThat(relay.minTickInterval()).isEqualTo(Duration.ofMillis(50));
         assertThat(relay.idlePollInterval()).isEqualTo(Duration.ofMillis(200));
-        assertThat(relay.batchTimeout()).isEqualTo(Duration.ofSeconds(30));
+        assertThat(relay.batchTimeout()).isEqualTo(Duration.ofSeconds(130));
         assertThat(relay.shutdownTimeout()).isEqualTo(Duration.ofSeconds(30));
         assertThat(relay.connectionHold()).isEqualTo(Duration.ofMinutes(1));
         assertThat(relay.headFailuresBeforeDivert()).isEqualTo(3);
@@ -322,7 +322,7 @@ class OutboxConfigTest {
 
         var deadLetters = config.deadLetters();
         assertThat(deadLetters.batchSize()).isEqualTo(100);
-        assertThat(deadLetters.timeout()).isEqualTo(Duration.ofSeconds(30));
+        assertThat(deadLetters.timeout()).isEqualTo(Duration.ofSeconds(130));
         assertThat(deadLetters.retention()).isZero();
         assertThat(deadLetters.redriveHistory()).isEqualTo(Duration.ofDays(30));
 

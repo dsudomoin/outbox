@@ -1081,9 +1081,10 @@ class KafkaOutboxSenderTest {
                 .containsEntry(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
                 .containsEntry(ProducerConfig.ACKS_CONFIG, "all")
                 .containsEntry(ProducerConfig.MAX_BLOCK_MS_CONFIG, "5000")
-                .containsEntry(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, "20000")
-                .containsEntry(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, "15000")
+                .containsEntry(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, "120000")
+                .doesNotContainKey(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG) // Kafka's own 30 s
                 .containsEntry("bootstrap.servers", "localhost:9092");
+        assertThat(config.getInt(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG)).isEqualTo(30000);
         assertThat(user).containsEntry("key.serializer", StringSerializer.class.getName()); // not mutated
         assertThatCode(() -> new KafkaProducer<byte[], byte[]>(config.originals()).close(Duration.ZERO))
                 .as("Kafka accepts the defaults (delivery.timeout.ms >= linger.ms + request.timeout.ms)")
@@ -1099,7 +1100,7 @@ class KafkaOutboxSenderTest {
                 List.of("acks", "1"), List.of("acks", 0), List.of("transactional.id", "tx"),
                 List.of("partitioner.class", "org.apache.kafka.clients.producer.RoundRobinPartitioner"),
                 List.of("partitioner.ignore.keys", "true"),
-                List.of("request.timeout.ms", 30000))) { // the 20 s default delivery timeout cannot cover it
+                List.of("request.timeout.ms", 130000))) { // the 120 s default delivery timeout cannot cover it
             assertThatThrownBy(() -> KafkaOutboxSender.producerConfig(
                     props("bootstrap.servers", "localhost:9092", bad.get(0), bad.get(1))))
                     .as("%s", bad)
@@ -1888,7 +1889,8 @@ class KafkaOutboxSenderTest {
                 .containsEntry("acks", "all")
                 .containsEntry("key.serializer", ByteArraySerializer.class.getName())
                 .containsEntry("value.serializer", ByteArraySerializer.class.getName())
-                .containsEntry("delivery.timeout.ms", "20000")
+                .containsEntry("delivery.timeout.ms", "120000")
+                .doesNotContainKey("request.timeout.ms")
                 .containsEntry("max.block.ms", "5000")
                 .containsEntry("enable.metrics.push", "false");
     }

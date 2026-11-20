@@ -32,7 +32,7 @@ class KafkaOutboxModuleTest {
 
     /**
      * A call can take delivery.timeout.ms + 5 s + max.block.ms; the relay gives it batchTimeout. The defaults fit:
-     * 20 s + 5 s + 5 s against 30 s.
+     * 120 s + 5 s + 5 s against 130 s.
      */
     @Test
     void warnsOnlyWhenACallCanOutlastBatchTimeout() throws Exception {
@@ -42,7 +42,7 @@ class KafkaOutboxModuleTest {
         var relayDefault = outboxConfig(new OutboxConfig.RelayConfig() {}.batchTimeout());
         try (var err = new CapturedStderr()) {
             module.kafkaOutboxSender(defaults, relayDefault).release();
-            module.kafkaOutboxSender(slowMetadata, outboxConfig(Duration.ofSeconds(35))).release();
+            module.kafkaOutboxSender(slowMetadata, outboxConfig(Duration.ofSeconds(135))).release();
             module.kafkaOutboxSender(slowMetadata, null).release(); // no relay in the app
             assertThat(err.text()).doesNotContain("batchTimeout");
         }
@@ -54,7 +54,7 @@ class KafkaOutboxModuleTest {
 
     /**
      * A sender's call can take delivery.timeout.ms + 5 s + max.block.ms; the dead-letter pass gives a hook call
-     * {@code outbox.deadLetters.timeout}. The defaults fit: 20 s + 5 s + 5 s against 30 s.
+     * {@code outbox.deadLetters.timeout}. The defaults fit: 120 s + 5 s + 5 s against 130 s.
      */
     @Test
     void warnsOnlyWhenACallCanOutlastTheHookTimeout() {
@@ -90,7 +90,7 @@ class KafkaOutboxModuleTest {
             assertThat(sender.value().send(List.of(record))).containsExactly(Outcome.notAttempted());
             assertThat(Thread.interrupted()).isTrue();
             assertThat(err.text()).contains("ProducerConfig values", "acks = -1", "enable.idempotence = true",
-                    "delivery.timeout.ms = 20000", "request.timeout.ms = 15000", "max.block.ms = 5000",
+                    "delivery.timeout.ms = 120000", "request.timeout.ms = 30000", "max.block.ms = 5000",
                     "key.serializer = class " + ByteArraySerializer.class.getName());
         } finally {
             sender.release();
