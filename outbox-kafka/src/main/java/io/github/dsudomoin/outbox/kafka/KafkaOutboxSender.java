@@ -21,10 +21,12 @@ import static org.apache.kafka.clients.producer.ProducerConfig.TRANSACTIONAL_ID_
 import static org.apache.kafka.clients.producer.ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG;
 
 import io.github.dsudomoin.outbox.InternalApi;
+import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.internal.BatchClassifier;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
+import io.github.dsudomoin.outbox.internal.RecordScope;
 import io.github.dsudomoin.outbox.internal.ShardProcessor;
 import jakarta.annotation.Nullable;
 import java.time.Clock;
@@ -143,6 +145,11 @@ import org.slf4j.LoggerFactory;
  * settles them, and a new producer sends them again (a duplicate when Kafka had written them). Keep
  * {@code batchTimeout} at least {@code delivery.timeout.ms} + 5 s + {@code max.block.ms} so that they end as Kafka's
  * outcomes instead; the Kora and Spring adapters log a WARN at startup when it is shorter.
+ *
+ * <p>Each record goes to {@code producer.send} in its record scope ({@link OutboxHandler#inRecordScope}), so a span a
+ * producer instrumentation starts there is a child of the record's delivery. While the call waits, each record the
+ * broker acknowledges is reported delivered ({@link OutboxHandler#recordFinished}) on the calling thread, in ack order;
+ * a failure is reported only by the outcomes the call returns. With no delivery hearing reports, nothing is queued.
  *
  * <p>A record goes to Kafka with its headers but any named {@code outbox-local}, of whatever value: that name marks
  * a record for a route of the relay, and reaches no Kafka topic, a dead-letter topic included.
@@ -382,7 +389,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
         try {
             var partitions = sendAll(call, records, handOverUntil(entry), pooled);
             long until = awaitUntil(entry, call.lastAppend);
-            var ended = call.await(until);
+            var ended = call.await(until, records);
             if (ended != Call.Ended.ACKED) {
                 call.cut(switch (ended) {
                     case INTERRUPTED -> "interrupted";
@@ -572,7 +579,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
                         }
                     }
                     var explicit = record.key() == null && partition != null ? partition.partition() : null;
-                    call.producer.send(producerRecord(record, explicit), acked(call.callback(i)));
+                    send(call.producer, record, producerRecord(record, explicit), acked(call.callback(i)));
                     if (call.refused != null) {
                         refuse(call, i, record, call.refused, false, coolingUntil, refused);
                         call.refused = null;
@@ -601,6 +608,18 @@ public final class KafkaOutboxSender implements AutoCloseable {
             });
         }
         return partitions;
+    }
+
+    /** {@code producer.send} in {@code record}'s scope ({@link OutboxHandler#inRecordScope}); throws as it does. */
+    private static void send(Producer<byte[], byte[]> producer, OutboxRecord record,
+            ProducerRecord<byte[], byte[]> producerRecord, Callback callback) {
+        try {
+            OutboxHandler.inRecordScope(record, () -> producer.send(producerRecord, callback));
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) { // send throws none: a scope's own
+            throw new KafkaException(e);
+        }
     }
 
     /**
@@ -906,6 +925,14 @@ public final class KafkaOutboxSender implements AutoCloseable {
         Exception refused; // caller thread only: what send() reported through the callback before appending
         boolean metadataTimedOut; // caller thread only
         long lastAppend; // caller thread only: when send() last returned an appended record, else the call's entry
+        /**
+         * Delivered records in ack order, for {@link OutboxHandler#recordFinished}; null when no delivery hears
+         * reports ({@link RecordScope#reports}). Appended under this up to {@code acked}, read by the caller.
+         */
+        @Nullable
+        final int[] acks;
+        int acked;
+        int reported; // caller thread only: acks reported so far
 
         Call(Producer<byte[], byte[]> producer, int size, boolean unbatched, boolean held, long entry) {
             this.producer = producer;
@@ -917,6 +944,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
             this.ownFailure = new boolean[size];
             this.metadata = new RecordMetadata[size];
             this.stalled = new boolean[size];
+            this.acks = RecordScope.reports() ? new int[size] : null;
         }
 
         synchronized void started() {
@@ -935,6 +963,9 @@ public final class KafkaOutboxSender implements AutoCloseable {
                 ownFailure[i] = own;
                 metadata[i] = kafka;
                 pending--;
+                if (acks != null && outcome instanceof Outcome.Delivered) {
+                    acks[acked++] = i;
+                }
                 notifyAll();
             }
         }
@@ -1072,40 +1103,69 @@ public final class KafkaOutboxSender implements AutoCloseable {
          * could be written after a later one of its key. A call closed by a failure waits for the rest of its records:
          * the close
          * aborts them at once, and the records of the failed batch behind the one that closed it bring their own
-         * answers (a refusal among them).
+         * answers (a refusal among them). Reports the records acked meanwhile after each wake-up and before returning,
+         * however it ends, outside this monitor.
          */
-        synchronized Ended await(long until) {
+        Ended await(long until, List<OutboxRecord> records) {
             boolean windingDown = false;
             try {
-                while (pending > 0 && (!closed || closedBy != null)) {
-                    if (ShardProcessor.callCancelled()) {
-                        return Ended.CANCELLED;
-                    }
-                    if (Thread.currentThread().isInterrupted()) {
-                        if (windingDown) {
-                            return Ended.INTERRUPTED_AFTER_WIND_DOWN;
+                while (true) {
+                    synchronized (this) {
+                        if (pending == 0 || closed && closedBy == null) {
+                            return Ended.ACKED;
                         }
-                        if (!ShardProcessor.windDownRequested()) {
-                            return Ended.INTERRUPTED;
+                        if (ShardProcessor.callCancelled()) {
+                            return Ended.CANCELLED;
                         }
-                        windingDown = true;
-                        Thread.interrupted();
+                        if (Thread.currentThread().isInterrupted()) {
+                            if (windingDown) {
+                                return Ended.INTERRUPTED_AFTER_WIND_DOWN;
+                            }
+                            if (!ShardProcessor.windDownRequested()) {
+                                return Ended.INTERRUPTED;
+                            }
+                            windingDown = true;
+                            Thread.interrupted();
+                        }
+                        long left = until - System.nanoTime();
+                        if (left <= 0) {
+                            return Ended.LATE;
+                        }
+                        if (acks == null || reported == acked) { // nothing to report: wait
+                            try {
+                                NANOSECONDS.timedWait(this, left);
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt(); // seen at the top of the loop
+                            }
+                        }
                     }
-                    long left = until - System.nanoTime();
-                    if (left <= 0) {
-                        return Ended.LATE;
-                    }
-                    try {
-                        NANOSECONDS.timedWait(this, left);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt(); // seen at the top of the loop
-                    }
+                    report(records);
                 }
-                return Ended.ACKED;
             } finally {
-                if (windingDown) {
-                    Thread.currentThread().interrupt();
+                try {
+                    report(records);
+                } finally {
+                    if (windingDown) {
+                        Thread.currentThread().interrupt();
+                    }
                 }
+            }
+        }
+
+        /**
+         * Caller thread, not holding this: {@link OutboxHandler#recordFinished} of each record acked since the last
+         * report, in ack order. The telemetry must not run under this, which Kafka's I/O thread takes in callbacks.
+         */
+        private void report(List<OutboxRecord> records) {
+            if (acks == null) {
+                return;
+            }
+            int to;
+            synchronized (this) {
+                to = acked;
+            }
+            while (reported < to) { // counted first: a report that throws is not made again
+                OutboxHandler.recordFinished(records.get(acks[reported++]), Outcome.delivered());
             }
         }
     }
