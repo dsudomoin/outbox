@@ -440,79 +440,111 @@ public final class KafkaOutboxSender implements AutoCloseable {
         // we skipped
         var coolingUntil = new HashMap<Object, Optional<Instant>>();
         var refused = new HashSet<Object>(); // topics and (topic, key)s whose record Kafka refused before appending it
-        // the rest stays unsent (NotAttempted); an interrupt closes the producer only if records are in flight
-        for (int i = 0; i < records.size() && !call.closed && !Thread.currentThread().isInterrupted()
-                && !ShardProcessor.windDownRequested() && System.nanoTime() - handOverUntil < 0; i++) {
-            var record = records.get(i);
-            var topic = record.topic();
-            call.started();
-            try {
-                if (!refused.isEmpty()
-                        && (refused.contains(topic) || refused.contains(BatchClassifier.orderingKey(record)))) {
-                    call.complete(i, Outcome.notAttempted(), false);
-                    continue;
-                }
-                if (call.metadataTimedOut && !partitionInfos.containsKey(topic)
-                        && !pooled.resolved(topic, nanos.getAsLong())) {
-                    // one metadata wait per call; before the cooldown lookup, which would lease the topic to us
-                    var until = notBefore(topicCooldown.peek(topic, nanos.getAsLong()));
-                    call.complete(i, until.isPresent() ? Outcome.notAttempted(until.get()) : Outcome.notAttempted(),
-                            false);
-                    continue;
-                }
-                var topicUntil = coolingUntil.computeIfAbsent(topic,
-                        t -> notBefore(topicCooldown.coolingUntil(topic, nanos.getAsLong())));
-                if (topicUntil.isPresent()) {
-                    call.complete(i, Outcome.notAttempted(topicUntil.get()), false);
-                    continue;
-                }
-                var infos = partitionInfos.get(topic);
-                if (infos == null) {
-                    try {
-                        infos = call.producer.partitionsFor(topic);
-                    } catch (InterruptException e) {
-                        throw e;
-                    } catch (RuntimeException e) { // a metadata failure: the record was never handed to send()
-                        pooled.forget(topic);
-                        refuse(call, i, record, e, true, coolingUntil, refused);
-                        continue;
-                    }
-                    partitionInfos.put(topic, infos);
-                    pooled.used(topic, nanos.getAsLong());
-                    if (System.nanoTime() - handOverUntil >= 0) { // a slow lookup: past the hand-over cutoff
+        var leases = new HashMap<Object, Long>(); // the probe leases of topics and partitions it took, and when
+        var sent = new HashSet<Object>(); // topics and partitions it appended a record to
+        try {
+            // the rest stays unsent (NotAttempted); an interrupt closes the producer only if records are in flight
+            for (int i = 0; i < records.size() && !call.closed && !Thread.currentThread().isInterrupted()
+                    && !ShardProcessor.windDownRequested() && System.nanoTime() - handOverUntil < 0; i++) {
+                var record = records.get(i);
+                var topic = record.topic();
+                call.started();
+                try {
+                    if (!refused.isEmpty()
+                            && (refused.contains(topic) || refused.contains(BatchClassifier.orderingKey(record)))) {
                         call.complete(i, Outcome.notAttempted(), false);
-                        break;
-                    }
-                }
-                var topicPartitions = infos;
-                var partition = record.key() != null
-                        ? new TopicPartition(topic, BuiltInPartitioner.partitionForKey(record.key(), infos.size()))
-                        : unkeyed.computeIfAbsent(topic, t -> unkeyedPartition(topic, topicPartitions, coolingUntil))
-                                .orElse(null);
-                if (partition != null) {
-                    partitions[i] = partition;
-                    var until = coolingUntil.computeIfAbsent(partition,
-                            p -> notBefore(cooldown.coolingUntil(partition, nanos.getAsLong())));
-                    if (until.isPresent()) {
-                        call.complete(i, Outcome.notAttempted(until.get()), false);
                         continue;
                     }
+                    if (call.metadataTimedOut && !partitionInfos.containsKey(topic)
+                            && !pooled.resolved(topic, nanos.getAsLong())) {
+                        // one metadata wait per call; before the cooldown lookup, which would lease the topic to us
+                        var until = notBefore(topicCooldown.peek(topic, nanos.getAsLong()));
+                        call.complete(i, until.isPresent() ? Outcome.notAttempted(until.get()) : Outcome.notAttempted(),
+                                false);
+                        continue;
+                    }
+                    var topicUntil = coolingUntil.computeIfAbsent(topic,
+                            t -> leaseOrWait(topicCooldown, topic, leases));
+                    if (topicUntil.isPresent()) {
+                        call.complete(i, Outcome.notAttempted(topicUntil.get()), false);
+                        continue;
+                    }
+                    var infos = partitionInfos.get(topic);
+                    if (infos == null) {
+                        try {
+                            infos = call.producer.partitionsFor(topic);
+                        } catch (InterruptException e) {
+                            throw e;
+                        } catch (RuntimeException e) { // a metadata failure: the record was never handed to send()
+                            pooled.forget(topic);
+                            refuse(call, i, record, e, true, coolingUntil, refused);
+                            continue;
+                        }
+                        partitionInfos.put(topic, infos);
+                        pooled.used(topic, nanos.getAsLong());
+                        if (System.nanoTime() - handOverUntil >= 0) { // a slow lookup: past the hand-over cutoff
+                            call.complete(i, Outcome.notAttempted(), false);
+                            break;
+                        }
+                    }
+                    var topicPartitions = infos;
+                    var partition = record.key() != null
+                            ? new TopicPartition(topic, BuiltInPartitioner.partitionForKey(record.key(), infos.size()))
+                            : unkeyed.computeIfAbsent(topic,
+                                    t -> unkeyedPartition(topic, topicPartitions, coolingUntil, leases)).orElse(null);
+                    if (partition != null) {
+                        partitions[i] = partition;
+                        var until = coolingUntil.computeIfAbsent(partition,
+                                p -> leaseOrWait(cooldown, partition, leases));
+                        if (until.isPresent()) {
+                            call.complete(i, Outcome.notAttempted(until.get()), false);
+                            continue;
+                        }
+                    }
+                    var explicit = record.key() == null && partition != null ? partition.partition() : null;
+                    call.producer.send(producerRecord(record, explicit), call.callback(i));
+                    if (call.refused != null) {
+                        refuse(call, i, record, call.refused, false, coolingUntil, refused);
+                        call.refused = null;
+                    } else {
+                        call.lastAppend = System.nanoTime(); // where Kafka's delivery timeout of the record starts
+                        sent.add(topic);
+                        if (partition != null) {
+                            sent.add(partition);
+                        }
+                    }
+                } catch (InterruptException e) { // waiting for metadata or buffer space: the record joined no batch
+                    call.complete(i, Outcome.notAttempted(), false);
+                } catch (RuntimeException e) {
+                    call.failed(i, e, null);
                 }
-                var explicit = record.key() == null && partition != null ? partition.partition() : null;
-                call.producer.send(producerRecord(record, explicit), call.callback(i));
-                if (call.refused != null) {
-                    refuse(call, i, record, call.refused, false, coolingUntil, refused);
-                    call.refused = null;
-                } else {
-                    call.lastAppend = System.nanoTime(); // where Kafka's delivery timeout of the record starts
-                }
-            } catch (InterruptException e) { // waiting for metadata or buffer space: the record joined no batch
-                call.complete(i, Outcome.notAttempted(), false);
-            } catch (RuntimeException e) {
-                call.failed(i, e, null);
             }
+        } finally { // a probe that appended nothing (a slow lookup, an interrupt) must not hold its key for the lease
+            leases.forEach((key, leasedAt) -> {
+                if (!sent.contains(key)) {
+                    if (key instanceof TopicPartition partition) {
+                        cooldown.release(partition, leasedAt);
+                    } else {
+                        topicCooldown.release((String) key, leasedAt);
+                    }
+                }
+            });
         }
         return partitions;
+    }
+
+    /**
+     * {@code cooldown}'s answer for {@code key} as a {@code notBefore}; a probe lease it gives this call (an ended
+     * cooldown) is noted in {@code leases} with the time it was taken, so the call can give back one it does not use.
+     */
+    private <K> Optional<Instant> leaseOrWait(Cooldown<K> cooldown, K key, Map<Object, Long> leases) {
+        long now = nanos.getAsLong();
+        boolean known = cooldown.contains(key);
+        var wait = cooldown.coolingUntil(key, now);
+        if (wait == null && known) {
+            leases.put(key, now);
+        }
+        return notBefore(wait);
     }
 
     /**
@@ -520,7 +552,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
      * a random partition with a leader that does not cool, or, when all of them cool, the one cooling least long.
      */
     private Optional<TopicPartition> unkeyedPartition(String topic, List<PartitionInfo> infos,
-            Map<Object, Optional<Instant>> coolingUntil) {
+            Map<Object, Optional<Instant>> coolingUntil, Map<Object, Long> leases) {
         if (infos.stream().noneMatch(p -> cooldown.contains(new TopicPartition(topic, p.partition())))) {
             return Optional.empty();
         }
@@ -533,8 +565,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
                 continue;
             }
             var partition = new TopicPartition(topic, info.partition());
-            var until = coolingUntil.computeIfAbsent(partition,
-                    p -> notBefore(cooldown.coolingUntil(partition, nanos.getAsLong()))); // may lease it
+            var until = coolingUntil.computeIfAbsent(partition, p -> leaseOrWait(cooldown, partition, leases));
             if (until.isEmpty()) {
                 return Optional.of(partition);
             }

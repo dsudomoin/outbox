@@ -13,7 +13,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * or the lease ends and the next caller probes. While a probe runs, the others are told to come back after as long as
  * the probe has run so far, at least 1 s and at most until the lease ends: a probe that succeeds in milliseconds frees
  * the key within about a second, while a probe of a dead key (which takes the whole lease) has the others re-check
- * about five times in a 20 s lease (after 1, 2, 4, 8, 16 s), not every second.
+ * about five times in a 20 s lease (after 1, 2, 4, 8, 16 s), not every second. A probe that sends nothing gives its
+ * lease back ({@link #release}).
  */
 final class Cooldown<K> {
 
@@ -62,6 +63,16 @@ final class Cooldown<K> {
         }
         long probed = now - (state.until() - lease); // since the lease was taken
         return Duration.ofNanos(Math.min(Math.max(probed, INITIAL.toNanos()), left));
+    }
+
+    /**
+     * Ends the probe lease a caller took at {@code leasedAt} (the {@code now} its {@link #coolingUntil} returned null
+     * for) without counting a failure, for a probe that sent nothing: the next caller probes. A no-op once the probe's
+     * key succeeded, failed or was leased again.
+     */
+    void release(K key, long leasedAt) {
+        states.computeIfPresent(key, (k, s) -> s.probing() && s.until() == leasedAt + lease
+                ? new State(s.failures(), leasedAt, false) : s);
     }
 
     /** Like {@link #coolingUntil} but never leases: null when the cooldown has ended. */
