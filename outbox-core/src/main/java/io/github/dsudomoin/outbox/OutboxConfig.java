@@ -77,10 +77,12 @@ public interface OutboxConfig {
         /**
          * Rows per chunk read and per handler call. Keep {@code batchSize ×} the handler's time per record well below
          * {@link #batchTimeout()}: a longer call is cut at its soft deadline and the shard moves on only by the records
-         * the handler finished. A handler that spends a few milliseconds on each record (one request per record) sets
-         * it to 1000 or lower: at 10 000 its call outlives the soft deadline, and a failed step hands all of its
-         * records again. Draining a backlog, a read of 10 000 rows sorts on disk under Postgres's default
-         * {@code work_mem} of 4 MB, a few per cent slower than in memory: see the README on {@code work_mem}.
+         * the handler finished. A handler that spends milliseconds on each record (one request per record) sets it to
+         * 1000 or lower: at 10 000 and 10 ms a record its call takes 100 s, about the soft deadline of the default
+         * {@link #batchTimeout()}, and a failed step hands all of its records again. At 10 000, a shard whose recent
+         * rows exceed about 420 bytes is read by the byte-budgeted statement ({@link #batchBytes()}). Measured against
+         * 1000 on a Postgres 1 ms away, 4 workers, 256 shards: 300-byte rows drained about 2.4 times faster, 1 KB rows
+         * in the database's memory about 1.2 times, a backlog larger than its memory within 10 % of 1000.
          */
         default int batchSize() {
             return 10_000;
@@ -91,9 +93,10 @@ public interface OutboxConfig {
          * key and headers as stored (a null counts nothing), and a call takes rows while they fit, at least one, so a
          * row larger than this goes alone. Parked and retry rows of a call get as much again, so a call holds at most
          * about twice this; each worker holds about one call, and the driver keeps another copy while it reads.
-         * While a shard's recent rows are small, its chunk goes by a plain read without the byte count, so a sudden
-         * jump in message size can make one read per worker past this; the first read of each shard after a start or
-         * a worker's fatal error is always bounded. 0: no byte limit.
+         * While a shard's recent rows are small ({@code batchSize} of the largest below a quarter of this: about 420
+         * bytes at the defaults), its chunk goes by a plain read without the byte count, so a sudden jump in message
+         * size can make one read per worker past this; the first read of each shard after a start or a worker's fatal
+         * error is always bounded. 0: no byte limit.
          */
         default long batchBytes() {
             return 16L * 1024 * 1024;
@@ -151,8 +154,8 @@ public interface OutboxConfig {
          * at most three quarters of this old; none while an xid-regression halt is recorded. A failed run logs a WARN
          * at most once a minute and the next run tries again. Maintenance, which deletes old ticks, runs only where a
          * relay runs: with every relay down while someone writes, the tick table grows by about one row per interval
-         * (about 86 400 a day at 1 s) until a relay's first maintenance run. Zero: no ticks. Ignored while the relay
-         * runs, which ticks itself.
+         * (about 86 400 a day at 1 s), and once a relay is back maintenance deletes them as the relay drains past them,
+         * not at its first run. Zero: no ticks. Ignored while the relay runs, which ticks itself.
          */
         default Duration ticksWithoutRelay() {
             return Duration.ofSeconds(1);

@@ -63,7 +63,8 @@ public record OutboxProperties(
      *     works. Default 4.
      * @param batchSize rows per chunk read and per handler call. Keep batchSize × the handler's time per record well
      *     below batch-timeout: a longer call is cut at its soft deadline and the shard moves on only by the records the
-     *     handler finished. A handler that spends a few milliseconds on each record sets it to 1000 or lower.
+     *     handler finished. A handler that spends milliseconds on each record sets it to 1000 or lower. At 10000, a
+     *     shard whose recent rows exceed about 420 bytes is read by the byte-budgeted statement.
      *     Default 10000.
      * @param batchBytes bytes per chunk read and per handler call, as batch-size bounds its rows: a row counts its
      *     payload, key and headers as stored, and a call takes rows while they fit, at least one, so a row larger than
@@ -91,8 +92,9 @@ public record OutboxProperties(
      *     written while no relay runs comes in batches instead of one tick that the relay draining it reads again on
      *     every chunk. A run sees whether this instance committed since its last tick and ticks unless a tick of any
      *     instance is at most three quarters of this old; none while an xid-regression halt is recorded. With every
-     *     relay down, the tick table grows by about one row per interval while someone writes, until a relay's first
-     *     maintenance run deletes them. 0: no ticks, at most 24 days. Ignored while the relay runs. Default 1 s.
+     *     relay down, the tick table grows by about one row per interval while someone writes; once a relay is back,
+     *     maintenance deletes them as the relay drains past them. 0: no ticks, at most 24 days. Ignored while the relay
+     *     runs. Default 1 s.
      * @param headFailuresBeforeDivert failed attempts in a row after which a shard reads one head row and diverts the
      *     single failing key. Default 3.
      * @param cursorAnchorInterval how long an idle shard's latest cursor row may stay on a tick below its effective
