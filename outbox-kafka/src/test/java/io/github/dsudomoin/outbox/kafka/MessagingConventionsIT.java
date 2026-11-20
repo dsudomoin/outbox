@@ -75,6 +75,8 @@ import org.junit.jupiter.api.Test;
 class MessagingConventionsIT {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(60);
+    /** One header whose value length (2) runs past the one byte stored: the relay's decode refuses it. */
+    private static final byte[] CORRUPT_HEADERS = {0, 1, 0, 1, 'a', 0, 0, 0, 2, 0};
 
     private final InMemorySpanExporter spans = InMemorySpanExporter.create();
     private final SdkTracerProvider provider = SdkTracerProvider.builder().setSampler(Sampler.alwaysOn())
@@ -353,6 +355,45 @@ class MessagingConventionsIT {
         assertThat(fetches).extracting(s -> s.getAttributes().get(BATCH_COUNT)).containsExactly(2L);
         assertThat(spans(s -> s.getName().startsWith("settle "))).singleElement()
                 .satisfies(s -> assertThat(s.getParentSpanId()).isEqualTo(fetches.get(0).getSpanId()));
+    }
+
+    /**
+     * A step that fails before it has records, here its main read decoding a row whose stored headers are corrupt,
+     * still exports its fetch span, with ERROR status, {@code error.type} and 0 records, and no settle span; a failed
+     * step records nothing in the fetch batch-size histogram.
+     */
+    @Test
+    void failedStepExportsItsFetchSpan() throws Exception {
+        var topic = TestKafka.createTopic(1);
+        var config = config().shards(1);
+        var telemetry = telemetry(config);
+        var handler = new Handler();
+        var runtime = start(config, telemetry, handler);
+        // committed corrupt: the relay never sees the row as written
+        transactions.inTx(c -> {
+            var id = runtime.outbox().send(OutboxMessage.of(topic, "k", bytes("v")));
+            try (var ps = c.prepareStatement("update " + config.table() + " set headers = ? where message_id = ?")) {
+                ps.setBytes(1, CORRUPT_HEADERS);
+                ps.setObject(2, id);
+                assertThat(ps.executeUpdate()).isOne();
+            }
+            return id;
+        });
+
+        Predicate<SpanData> failedFetch = s -> s.getName().equals("fetch " + config.table())
+                && s.getStatus().getStatusCode() == StatusCode.ERROR;
+        await(() -> !spans(failedFetch).isEmpty());
+
+        var fetch = spans(failedFetch).get(0);
+        assertThat(fetch.getKind()).isEqualTo(SpanKind.CLIENT);
+        assertCommon(fetch, config.table(), "fetch", "receive");
+        assertThat(fetch.getAttributes().get(ERROR_TYPE)).isEqualTo(IllegalArgumentException.class.getName());
+        assertThat(fetch.getAttributes().get(BATCH_COUNT)).isZero();
+        assertThat(spans(s -> s.getName().startsWith("settle ") && s.getParentSpanId().equals(fetch.getSpanId())))
+                .as("no settle of a step that never settled").isEmpty();
+        assertThat(handler.calls).as("handler calls").isEmpty();
+        assertThat(telemetry.meters().histogram(FETCH_BATCH_SIZE)).as("only successful steps, none with records")
+                .allMatch(n -> n == 0);
     }
 
     /**

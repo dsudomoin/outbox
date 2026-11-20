@@ -44,14 +44,16 @@ import java.util.concurrent.atomic.LongAdder;
  * {@code error.type}), delivery attempts, dead letters by {@code error.type}, the fetch batch size, and each shard's
  * pending count and oldest age.
  *
- * <p>The core also steps a shard that turns out to have nothing to hand (a tick landing while its step runs, a read
- * of exactly {@code batchSize} rows followed by an empty one, a tick marking every shard). Such a step exports no
- * {@code fetch} and no {@code settle} span, and records 0 in the fetch batch-size histogram: {@link #stepStarted}
- * only notes the current context and the time, and the fetch span is created, with that parent and start, at the
- * step's first handler call or its first shard with records. The trade-off: the fetch span exists only once the step
- * knows it has records, so the spans of the step's first reads (a JDBC instrumentation's) are not its children, they
- * run before it exists. An implementation that wants them as children starts the span eagerly and accepts fetch
- * spans that count 0.
+ * <p>A fetch span exists for each step that returned records or failed. The core also steps a shard that turns out
+ * to have nothing to hand (a tick landing while its step runs, a read of exactly {@code batchSize} rows followed by
+ * an empty one, a tick marking every shard); such a step, when it succeeds, exports no {@code fetch} and no
+ * {@code settle} span. {@link #stepStarted} only notes the current context and the time, and the fetch span is
+ * created, with that parent and start, at the step's first handler call, its first shard with records, or its
+ * failure, which it carries as {@code error.type} and ERROR status. The fetch batch-size histogram is recorded for
+ * every successful step, an empty one as 0, and not for a failed one. The trade-off: the fetch span exists only once
+ * the step knows it has records (or failed), so the spans of the step's first reads (a JDBC instrumentation's) are
+ * not its children, they run before it exists. An implementation that wants them as children starts the span
+ * eagerly and accepts fetch spans that count 0.
  */
 final class MessagingConventionsTelemetry implements OutboxTelemetry {
 
@@ -248,10 +250,12 @@ final class MessagingConventionsTelemetry implements OutboxTelemetry {
                 return;
             }
             ended = true;
-            if (error == null) { // every successful fetch, an empty one as 0
+            if (error == null) { // every successful fetch, an empty one as 0; never a failed one
                 meters.record(FETCH_BATCH_SIZE, fetched);
+            } else {
+                span(); // a failed step exports its fetch span, records or none
             }
-            if (span == null) {
+            if (span == null) { // an empty step that succeeded
                 return;
             }
             span.setAttribute(BATCH_COUNT, fetched);
