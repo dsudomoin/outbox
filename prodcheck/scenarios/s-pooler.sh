@@ -58,45 +58,30 @@ s_pgbouncer_txn() { # the application's pool through transaction pooling, the ow
   acc_end
 }
 
-s_pgbouncer_txn_all() { # everything through transaction pooling: maintenance sees it and steps aside, delivery goes on
+s_pgbouncer_txn_all() { # everything through transaction pooling, no direct connection anywhere: start, maintenance and delivery all go on
   pc_begin pgbouncer-txn-all
-  pooler_up transaction outbox 6
+  pooler_up transaction outbox 40 # the size the formula asks for here: relay steps hold a server connection while a handler takes another
   PC_PG_URL=$POOLER_URL
   local opts="$NO_PREPARE -Doutbox.partitions.maintenanceInterval=2s"
-  # a pool in use: three queries in a row land on different server sessions, bootstrap must refuse. Best effort, the
-  # README says: they can still land on one, so a start that got through gets another try
-  local name=kora-outbox-prodcheck-pooler log=$LOGS/pc-$SCN-busy-start.log rc=0 try
-  for try in 1 2 3; do
-    rc=0
-    docker exec -d "$name" bash -c 'end=$((SECONDS + 25)); for n in $(seq 24); do (while [ $SECONDS -lt $end ]; do psql -h 127.0.0.1 -p 6432 -U outbox -d outbox -Atq -c "select pg_sleep(0.02)" > /dev/null 2>&1; done) & done; wait'
-    sleep 2
-    bounded 20 env HTTP_PORT=9080 METRICS_PORT=9085 POSTGRES_URL="$PC_PG_URL" TARGET_DB_URL="$PC_TARGET_DB_URL" TARGET_URL="$PC_TARGET_URL" INSTANCE_NAME=app-busy "JAVA_OPTS=-Xmx512m $opts" "$SHOP" > "$log" 2>&1 || rc=$?
-    log "bootstrap on a busy pool, try $try: exit $rc; $(grep -m1 -E 'session|pooling' "$log" | cut -c1-200)"
-    grep -qE 'pg_backend_pid|one server session|transaction pooling' "$log" && break
-    sleep 8
-  done
-  check "$(passes grep -qE 'pg_backend_pid|one server session|transaction pooling' "$log")" "старт на занятом пуле отвергнут и называет причину (код $rc): $(grep -m1 -E 'pg_backend_pid|one server session|transaction pooling' "$log" | cut -c1-160)"
-  sleep 8
-  # a pool of one server session passes the check: it is best effort, the README says; the problem shows in maintenance
-  pooler_up transaction outbox 1
+  # a pool in use: three queries in a row land on different server sessions, which the start no longer minds
+  local name=kora-outbox-prodcheck-pooler
+  docker exec -d "$name" bash -c 'end=$((SECONDS + 25)); for n in $(seq 24); do (while [ $SECONDS -lt $end ]; do psql -h 127.0.0.1 -p 6432 -U outbox -d outbox -Atq -c "select pg_sleep(0.02)" > /dev/null 2>&1; done) & done; wait'
+  sleep 2
   pc_target
   local i
   for i in 1001 1002 1003; do pc_shop "$i" $opts; done
-  check 0 "старт на спокойном пуле проходит: проверка best effort, как и сказано в README"
-  pooler_up transaction outbox 40 # the size the formula asks for here: relay steps hold a server connection while a handler takes another; dropped once, they come back
-  sleep 3
+  check 0 "старт на занятом пуле проходит"
   tfault 'delayMs=5'
   for i in 1001 1002 1003; do pc_load "$i" "$MIX"; done
-  sees_it() { [ "$(pooling_gauge 1001)" = 1 ] || [ "$(pooling_gauge 1002)" = 1 ] || [ "$(pooling_gauge 1003)" = 1 ]; }
-  check "$(passes wait_for 60 sees_it)" "под нагрузкой gauge outbox.maintenance.transaction_pooling = 1"
-  check "$(passes logs_have 'pg_backend_pid\(\) was')" "ERROR обслуживания: $(cat "$LOGS/pc-$SCN-"100*.log | grep -m1 'pg_backend_pid() was' | cut -c1-200)"
-  sleep 20
-  local lines per
-  lines=$(cat "$LOGS/pc-$SCN-"100*.log | grep -c 'pg_backend_pid() was' || true)
-  check "$(passes is "$lines" -le $((3 * 3)))" "ERROR не чаще раза в минуту на экземпляр: $lines строк"
-  check "$(passes effects_grow 5)" "доставка идёт: send и relay не требуют одной сессии"
-  log "advisory locks left on server sessions: $(psql_q "select count(*) from pg_locks where locktype = 'advisory'"), premade $(st 1001 'd["premade"]'), since_success $(st 1001 'd["maintenanceSinceSuccessSeconds"]')"
-  log "outbox.inbox gauge: $(on 1001 metric outbox_inbox_maintenance_transaction_pooling) $(on 1002 metric outbox_inbox_maintenance_transaction_pooling)"
-  REPAIRED="прямое соединение владельца (pgbouncer-txn) или сессионный режим; потерь нет, пока запаса партиций хватает"
+  sleep 25
+  for i in 1001 1002 1003; do
+    check "$(passes is "$(pooling_gauge "$i")" = 0)" "экземпляр $i: outbox.maintenance.transaction_pooling = 0"
+  done
+  check "$(passes is "$(logs_count 'pg_backend_pid\(\) was')" = 0)" "ни одной строки об отказе из-за пулера"
+  check "$(passes is "$(st 1001 'int(d["maintenanceSinceSuccessSeconds"] or 999) < 10')" = True)" "обслуживание идёт через пулер: since_success < 10 с"
+  check "$(passes effects_grow 5)" "доставка идёт"
+  # a session lock or setting left behind would stay in an idle server session: none may hold an advisory lock
+  check "$(passes is "$(psql_q "select count(*) from pg_locks l join pg_stat_activity a using (pid) where l.locktype = 'advisory' and a.state = 'idle'")" = 0)" "в простаивающих серверных сессиях нет advisory-блокировок"
+  log "premade $(st 1001 'd["premade"]'), since_success $(st 1001 'd["maintenanceSinceSuccessSeconds"]')"
   pc_finish
 }
