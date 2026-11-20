@@ -566,6 +566,37 @@ class KafkaOutboxSenderTest {
     }
 
     /**
+     * A call that probes two partitions frees the one that answers as soon as Kafka acknowledges a record of it, not
+     * when the call ends: while the other one keeps the call waiting, the rest of the callers send to the first again.
+     */
+    @Test
+    void aPartitionThatAnswersIsFreeOnItsAckWhileTheProbingCallWaitsForAnother() throws Exception {
+        var clock = new TestClock();
+        var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
+        var onP1 = keyOnPartition(0, "a");
+        var onP2 = keyOnPartition(1, "b");
+        var first = sendAsync(sender, List.of(record(1, onP1)));
+        awaitSent(0, 1).errorNext(new NotEnoughReplicasException("not enough"));
+        first.get(5, SECONDS);
+        var second = sendAsync(sender, List.of(record(2, onP2)));
+        awaitSent(1, 1).errorNext(new NotEnoughReplicasException("not enough"));
+        second.get(5, SECONDS);
+        clock.advance(Duration.ofSeconds(1)); // both cooldowns end: the next call probes both
+
+        var probe = sendAsync(sender, List.of(record(3, onP1), record(4, onP2)));
+        var probing = awaitSent(2, 2);
+        probing.completeNext(); // the first partition answers; the second does not, yet
+
+        var other = sendAsync(sender, List.of(record(5, onP1)));
+        var next = awaitSent(3, 1);
+        next.completeNext();
+        assertThat(other.get(5, SECONDS)).containsExactly(Outcome.delivered());
+
+        probing.completeNext();
+        assertThat(probe.get(5, SECONDS)).containsExactly(Outcome.delivered(), Outcome.delivered());
+    }
+
+    /**
      * A refusal from the broker shows that the partition answers: like a delivery, it ends the partition's cooldown,
      * so a probe whose only record was refused does not hold the partition until its lease ends.
      */

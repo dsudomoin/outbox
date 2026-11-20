@@ -14,8 +14,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * the probe has run so far, at least 1 s, at most 10 s and at most until the lease ends: a probe that succeeds in
  * milliseconds frees the key within about a second, while a probe of a dead key (which takes the whole lease, the
  * sender's 120 s {@code delivery.timeout.ms} by default) has the others re-check after 1, 2, 4, 8 and 16 s and then
- * every 10 s, not every second, and a key that comes back while it runs is found within about 10 s. A probe that sends
- * nothing gives its lease back ({@link #release}).
+ * every 10 s, not every second. The sender ends a partition's cooldown, and its topic's, as soon as Kafka acknowledges
+ * a record of it, even while the probing call still waits for others: so a key that comes back while its probe runs is
+ * free once the probe's record is acknowledged (Kafka retries it within its own backoff, under a second by default), and
+ * the others find it within about 10 s of that. A probe that sends nothing gives its lease back ({@link #release}).
  */
 final class Cooldown<K> {
 

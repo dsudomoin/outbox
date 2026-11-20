@@ -569,7 +569,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
                         }
                     }
                     var explicit = record.key() == null && partition != null ? partition.partition() : null;
-                    call.producer.send(producerRecord(record, explicit), call.callback(i));
+                    call.producer.send(producerRecord(record, explicit), acked(call.callback(i)));
                     if (call.refused != null) {
                         refuse(call, i, record, call.refused, false, coolingUntil, refused);
                         call.refused = null;
@@ -612,6 +612,25 @@ public final class KafkaOutboxSender implements AutoCloseable {
             leases.put(key, now);
         }
         return notBefore(wait);
+    }
+
+    /**
+     * {@code callback}, which first ends the cooldowns of the record's partition and topic once Kafka acknowledges it:
+     * a probe that holds several leases frees each partition as it answers, not when the whole call ends, which a
+     * partition still down holds up to {@code delivery.timeout.ms}. A failure later in the call still cools them when
+     * it ends ({@link #outcomes}). The call's own decisions stay as they were taken ({@code coolingUntil} in
+     * {@link #sendAll}).
+     */
+    private Callback acked(Callback callback) {
+        return (kafka, e) -> {
+            if (e == null && kafka != null) {
+                topicCooldown.succeeded(kafka.topic());
+                if (kafka.partition() >= 0) {
+                    cooldown.succeeded(new TopicPartition(kafka.topic(), kafka.partition()));
+                }
+            }
+            callback.onCompletion(kafka, e);
+        };
     }
 
     /**
