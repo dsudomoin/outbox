@@ -254,6 +254,15 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         }
     }
 
+    @Override
+    public void queueState(List<ShardQueue> shards) {
+        try {
+            delegate.queueState(shards);
+        } catch (Throwable e) {
+            warn("queueState", e);
+        }
+    }
+
     /**
      * Logs {@code error} by its {@link RetryStore#describe} text, which cannot throw, and rethrows only a
      * {@link VirtualMachineError} other than {@link StackOverflowError}: an {@code AssertionError} or a sneaky checked

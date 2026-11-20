@@ -1934,6 +1934,7 @@ class MaintenanceIT {
                 "outbox.shard.lag", "outbox.retry.size", "outbox.retry.oldest", "outbox.waiting.size",
                 "outbox.waiting.oldest",
                 "outbox.dead.size", "outbox.dead.pending", "outbox.dead.pending.oldest", "outbox.parked.size",
+                "outbox.pending", "outbox.pending.oldest",
                 "outbox.partitions.premade",
                 "outbox.partitions.overflow", "outbox.partitions.xids_left", "outbox.partitions.retained",
                 "outbox.partitions.orphaned", "outbox.maintenance.transaction_pooling",
@@ -1972,6 +1973,8 @@ class MaintenanceIT {
         }
         assertThat(gauge(registry, "outbox.partitions.overflow")).isZero();
         assertThat(registry.get("outbox.shard.lag").gauge().value()).isBetween(10.0, 20.0);
+        assertThat(gauge(registry, "outbox.pending")).as("the row not relayed, both retry rows and the parked one")
+                .isEqualTo(4);
     }
 
     @Test

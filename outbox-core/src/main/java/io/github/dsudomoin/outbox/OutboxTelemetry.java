@@ -146,6 +146,27 @@ public interface OutboxTelemetry {
      */
     default void gauge(OutboxGauge gauge, DoubleSupplier value) {}
 
+    /**
+     * Each shard's queue, after every gauge refresh of maintenance, on the instance whose run took the maintenance
+     * lock and on its thread: one entry per shard, in shard order. The same read sets {@link OutboxGauge#PENDING} (the
+     * sum of the known {@code pending}) and {@link OutboxGauge#PENDING_OLDEST} (the largest known
+     * {@code oldestSeconds}), NaN when no shard's is known. Never with {@link #NONE}: that runs no count at all.
+     */
+    default void queueState(List<ShardQueue> shards) {}
+
+    /**
+     * One shard's queue. {@code pending}: its rows written and not yet delivered: those of the main stream beyond its
+     * position (a batch in progress: past its {@code last_id}), plus its rows in the retry table, waiting ones
+     * included, and in the parked table. {@code oldestSeconds}: the database's {@code now()} less the oldest such
+     * row's {@code created_at}, 0 when none. Either NaN when unknown: the shard has no cursor, or a tick it stands on
+     * is gone. {@code estimated}: false when {@code pending} is an exact count. The count runs within a budget of
+     * 250 ms; past it the main stream is estimated from the ticks, for a shard behind as the ids handed out between
+     * its effective tick and the latest divided by the shard count (NaN when a tick has no {@code max_id}), its oldest
+     * as the age of its effective tick, for one caught up as none, and the retry and parked rows are counted in a
+     * second statement of the same budget, or left out when that runs over too. True also for an unknown entry.
+     */
+    record ShardQueue(int shard, double pending, double oldestSeconds, boolean estimated) {}
+
     /** One {@code send} / {@code sendAll} call, in the business transaction. */
     interface Enqueue {
 

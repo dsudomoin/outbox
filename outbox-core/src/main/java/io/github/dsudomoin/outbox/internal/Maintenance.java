@@ -77,7 +77,9 @@ import org.slf4j.LoggerFactory;
  * {@code outbox.relay.waiting.alertAfter}), {@code outbox.dead.size}, {@code outbox.dead.pending}
  * (letters waiting for the hook), {@code outbox.dead.pending.oldest} (seconds since the oldest of them failed, 0 when
  * none),
- * {@code outbox.parked.size}, {@code outbox.partitions.premade},
+ * {@code outbox.parked.size}, {@code outbox.pending} and {@code outbox.pending.oldest} (with
+ * {@link OutboxTelemetry#queueState}; no statement with {@link OutboxTelemetry#NONE}),
+ * {@code outbox.partitions.premade},
  * {@code outbox.partitions.overflow}, {@code outbox.partitions.xids_left} (xids before inserts fail while the tail is
  * not attached, with an ERROR each run; NaN while it is), {@code outbox.partitions.retained} (ranges below the one
  * holding the current xid that are not dropped yet; when {@link #RETAINED_WARN} or more of them lie above the latest
@@ -191,6 +193,9 @@ public final class Maintenance {
     final DeadIndexBuilder deadIndex; // for tests
     /** Off with {@code outbox.schema.bootstrap = false}: the migrations made the index. */
     private final boolean buildsDeadIndex;
+    private final OutboxTelemetry telemetry;
+    /** Read with the gauges unless the telemetry is {@link OutboxTelemetry#NONE}; a test's seam. */
+    volatile QueueState queueState;
 
     private volatile double lag = Double.NaN;
     private volatile double retrySize = Double.NaN;
@@ -201,6 +206,8 @@ public final class Maintenance {
     private volatile double deadPendingCount = Double.NaN;
     private volatile double deadPendingOldest = Double.NaN;
     private volatile double parkedSize = Double.NaN;
+    private volatile double pending = Double.NaN;
+    private volatile double pendingOldest = Double.NaN;
     private volatile double premade = Double.NaN;
     private volatile double xidsLeft = Double.NaN;
     private volatile double retained = Double.NaN;
@@ -217,6 +224,8 @@ public final class Maintenance {
             Duration detachLockTimeout) {
         this.db = db;
         this.names = names;
+        this.telemetry = telemetry;
+        this.queueState = new QueueState(names, config.shards(), QueueState.BUDGET);
         this.detachLockTimeout = detachLockTimeout;
         this.socket = new SocketBound(config.networkTimeout());
         this.quiesceTimeout = quiesceTimeout(config);
@@ -268,6 +277,8 @@ public final class Maintenance {
         telemetry.gauge(OutboxGauge.DEAD_PENDING, () -> deadPendingCount);
         telemetry.gauge(OutboxGauge.DEAD_PENDING_OLDEST, () -> deadPendingOldest);
         telemetry.gauge(OutboxGauge.PARKED_SIZE, () -> parkedSize);
+        telemetry.gauge(OutboxGauge.PENDING, () -> pending);
+        telemetry.gauge(OutboxGauge.PENDING_OLDEST, () -> pendingOldest);
         telemetry.gauge(OutboxGauge.PARTITIONS_PREMADE, () -> premade);
         telemetry.gauge(OutboxGauge.PARTITIONS_OVERFLOW, () -> partitions.overflow() ? 1 : 0);
         telemetry.gauge(OutboxGauge.PARTITIONS_XIDS_LEFT, () -> xidsLeft);
@@ -530,10 +541,10 @@ public final class Maintenance {
      * shard fails, so the relay is stopped for it (see {@link #logStranded}). {@code lagFrom}: the tick
      * {@code outbox.shard.lag} measures from, {@code slowest}, or the oldest tick left when some shards are stranded.
      * {@code ignoredCheckpointTick}: the newest checkpoint's tick before this run's when that checkpoint counts for
-     * nothing ({@link Cursors#ignoredCheckpointTick}), else null.
+     * nothing ({@link Cursors#ignoredCheckpointTick}), else null. {@code ticks}: the ticks read besides L, by id.
      */
     private record Read(Tick latest, List<Position> positions, @Nullable Tick slowest, Map<Integer, Long> stranded,
-            Tick lagFrom, @Nullable Long ignoredCheckpointTick) {
+            Tick lagFrom, @Nullable Long ignoredCheckpointTick, Map<Long, Tick> ticks) {
 
         /**
          * {@code outbox.shard.lag}: from the slowest busy shard's effective tick to L, 0 when no shard is busy, and 0
@@ -578,7 +589,7 @@ public final class Maintenance {
                     + " unreliable until new ticks pass that moment; this WARN repeats at most once a minute",
                     names.base(), latest.id(), latest.createdAt(), lagFrom.id(), lagFrom.createdAt());
         }
-        return new Read(latest, positions, slowest, stranded, lagFrom, cursors.ignoredCheckpointTick(c));
+        return new Read(latest, positions, slowest, stranded, lagFrom, cursors.ignoredCheckpointTick(c), found);
     }
 
     /**
@@ -1020,6 +1031,30 @@ public final class Maintenance {
             deadPendingOldest = rs.getDouble(2);
         }
         parkedSize = parked.size(c);
+        refreshQueueState(c, read);
+    }
+
+    /**
+     * {@code outbox.pending}, {@code outbox.pending.oldest} and {@link OutboxTelemetry#queueState}, from this run's
+     * cursor read ({@link QueueState}: an exact count within its budget, else estimated); with
+     * {@link OutboxTelemetry#NONE} no statement at all.
+     */
+    private void refreshQueueState(Connection c, @Nullable Read read) throws SQLException {
+        if (telemetry == OutboxTelemetry.NONE) {
+            return;
+        }
+        List<OutboxTelemetry.ShardQueue> entries;
+        try {
+            entries = read == null ? QueueState.unknown(shards)
+                    : queueState.read(c, read.latest(), read.positions(), read.ticks());
+        } catch (SQLException | RuntimeException e) {
+            pending = Double.NaN; // unknown, not the last count
+            pendingOldest = Double.NaN;
+            throw e;
+        }
+        pending = QueueState.total(entries);
+        pendingOldest = QueueState.oldest(entries);
+        telemetry.queueState(entries);
     }
 
     /**

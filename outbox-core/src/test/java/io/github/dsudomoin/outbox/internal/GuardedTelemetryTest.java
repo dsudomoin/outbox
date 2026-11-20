@@ -91,6 +91,7 @@ class GuardedTelemetryTest {
             t.inboxOutsideWindow();
             t.releaseThread();
             t.gauge(OutboxGauge.SHARD_LAG, () -> 1);
+            t.queueState(List.of(new OutboxTelemetry.ShardQueue(0, 1, 2, false)));
         }).doesNotThrowAnyException();
     }
 
@@ -651,6 +652,11 @@ class GuardedTelemetryTest {
 
         @Override
         public void gauge(OutboxGauge gauge, DoubleSupplier value) {
+            throw bug();
+        }
+
+        @Override
+        public void queueState(List<ShardQueue> shards) {
             throw bug();
         }
     }
