@@ -12,8 +12,8 @@ import io.micrometer.tracing.propagation.Propagator;
 /**
  * The tracing handler of {@code outbox.deliver} observations: the span of a
  * {@link PropagatingReceiverTracingObservationHandler}, whose parent is a record's stored trace context, plus a link to
- * the span of the relay step that delivers the record. A record without a stored context the propagator can read has the step's span, current then, as its parent,
- * and no link. Readable means, as the getter reads the last header of a name: a well-formed W3C {@code traceparent}
+ * the span of the relay step that delivers the record. A record without a stored context the propagator can read has
+ * the step's span, current then, as its parent, and no link. Readable means, as the getter reads the last header of a name: a well-formed W3C {@code traceparent}
  * when the propagator reads W3C trace context, a well-formed B3 single header or B3 trace and span ids when it reads
  * B3. {@code baggage} and {@code tracestate} alone carry no parent. A record stored in another format gets no link.
  * Register it before a plain receiver handler in a first-matching composite; it supports

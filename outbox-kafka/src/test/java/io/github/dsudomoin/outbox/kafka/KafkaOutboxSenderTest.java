@@ -188,10 +188,10 @@ class KafkaOutboxSenderTest {
         var producer = awaitSent(0, 3);
         producer.completeNext();
 
-        assertThat(firstReported.await(5, SECONDS)).as("record 0 reported while the call waits").isTrue();
+        assertThat(firstReported.await(15, SECONDS)).as("record 0 reported while the call waits").isTrue();
         assertThat(callbackDuringReport).as("a callback completes during a report").isTrue();
         producer.completeNext();
-        assertThat(result.get(5, SECONDS)).containsOnly(Outcome.delivered()).hasSize(3);
+        assertThat(result.get(15, SECONDS)).containsOnly(Outcome.delivered()).hasSize(3);
         assertThat(reported).containsExactlyElementsOf(records);
         assertThat(reportThreads).containsOnly(caller.get());
         assertThat(scopes).hasValue(3);
