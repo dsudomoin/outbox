@@ -194,18 +194,34 @@ class KafkaClusterFaultsIT {
      */
     @Test
     void oneNodeDownBelowMinInsyncReplicas() {
+        belowMinInsyncReplicas("b2-below-min-isr", Duration.ofSeconds(20));
+    }
+
+    /**
+     * (b2-60) as (b2), for 60 s, longer than the producer's {@code delivery.timeout.ms}: what the leaders appended
+     * before the controller fenced the dead node commits when the in-sync set shrinks, but its producer is never told,
+     * and its records go again from another producer once their batches expire.
+     */
+    @Test
+    @Timeout(value = 5, unit = TimeUnit.MINUTES)
+    void oneNodeDownBelowMinInsyncReplicasForAMinute() {
+        belowMinInsyncReplicas("b2-60-below-min-isr-60s", Duration.ofSeconds(60));
+    }
+
+    private void belowMinInsyncReplicas(String name, Duration down) {
         start();
         cluster.setTopicConfig(topic, "min.insync.replicas", "3");
         sleep(Duration.ofSeconds(2)); // the leaders apply it from the metadata log
         int leader = cluster.leaderOfMostPartitions(topic);
-        System.out.println("b2: min.insync.replicas=3, killing node " + leader + ", leaders " + cluster.leaders(topic));
+        System.out.println(name + ": min.insync.replicas=3, killing node " + leader + ", leaders "
+                + cluster.leaders(topic));
         try (var err = new CapturedStderr()) {
             cluster.kill(leader);
-            hold(Duration.ofSeconds(20));
+            hold(down);
             cluster.start(leader);
             extraDetails = () -> " notEnoughReplicasLogged=" + Pattern.compile("NOT_ENOUGH_REPLICAS").matcher(err.text())
                     .results().count() + " notEnoughReplicasOutcomes=" + notEnoughReplicasOutcomes.get();
-            finish("b2-below-min-isr", Long.MIN_VALUE);
+            finish(name, Long.MIN_VALUE);
             assertThat(Pattern.compile("NOT_ENOUGH_REPLICAS").matcher(err.text()).results().count()
                     + notEnoughReplicasOutcomes.get()).as("NotEnoughReplicas seen by the producer").isPositive();
         }
