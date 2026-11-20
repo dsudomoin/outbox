@@ -534,6 +534,38 @@ class KafkaOutboxSenderTest {
     }
 
     /**
+     * As {@link #recordsUnacknowledgedWhenABatchExpiredGoThroughAnUnbatchedProducer}, in calls of a relay that holds
+     * permanent failures: the refused record is not settled, since the relay retries it, so it stays remembered and its
+     * next call goes unbatched again instead of sharing a producer batch until another delivery timeout.
+     */
+    @Test
+    void aRecordRefusedInAHeldCallStaysRemembered() throws Exception {
+        var clock = new TestClock();
+        var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
+        var before = record(1, keyOnPartition(0, "a"));
+        var poison = record(2, keyOnPartition(0, "a"));
+        var first = heldAsync(sender, List.of(before, poison));
+        awaitSent(0, 2).errorNext(new TimeoutException("Expiring 2 record(s)"));
+        assertThat(first.get(5, SECONDS)).allSatisfy(o -> assertThat(o).isInstanceOf(Outcome.Retry.class));
+        clock.advance(Duration.ofSeconds(1)); // the partition cools for 1 s
+
+        var second = heldAsync(sender, List.of(before, poison));
+        var unbatchedProducer = awaitSent(1, 2);
+        assertThat(unbatched).containsExactly(unbatchedProducer);
+        unbatchedProducer.completeNext();
+        unbatchedProducer.errorNext(new RecordTooLargeException("broker says too large"));
+        assertThat(second.get(5, SECONDS)).satisfiesExactly(
+                o -> assertThat(o).isEqualTo(Outcome.delivered()),
+                o -> assertThat(o).isInstanceOf(Outcome.Permanent.class));
+
+        var third = heldAsync(sender, List.of(poison)); // the relay's retry of the held record
+        var again = awaitSent(2, 1);
+        assertThat(unbatched).as("still remembered: unbatched").contains(again);
+        again.errorNext(new RecordTooLargeException("broker says too large"));
+        assertThat(third.get(5, SECONDS)).singleElement().isInstanceOf(Outcome.Permanent.class);
+    }
+
+    /**
      * A refusal from the broker shows that the partition answers: like a delivery, it ends the partition's cooldown,
      * so a probe whose only record was refused does not hold the partition until its lease ends.
      */
@@ -2109,6 +2141,10 @@ class KafkaOutboxSenderTest {
     }
 
     private static final String MAX_IN_FLIGHT = "max.in.flight.requests.per.connection";
+
+    private Future<List<Outcome>> heldAsync(KafkaOutboxSender sender, List<OutboxRecord> records) {
+        return executor.submit(() -> held(sender, records));
+    }
 
     /** {@link KafkaOutboxSender#send} inside a relay call that holds permanent failures. */
     private static List<Outcome> held(KafkaOutboxSender sender, List<OutboxRecord> records) throws Exception {

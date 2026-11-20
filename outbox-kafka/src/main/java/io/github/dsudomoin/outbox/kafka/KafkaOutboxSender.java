@@ -109,7 +109,8 @@ import org.slf4j.LoggerFactory;
  * {@code client.id}, {@code <client.id>-outbox-held-<n>} and {@code <client.id>-outbox-held-unbatched-<n>}). With
  * more requests in flight, a later record of a key may already be on its way when the broker refuses an earlier one,
  * and the broker writes it: the held record would then be behind it. Such a call also skips the rest of a key after a
- * client-side {@link RecordTooLargeException}. One request in flight means a call's records to one broker go one
+ * client-side {@link RecordTooLargeException}, and a remembered record the broker refuses stays remembered: the relay
+ * retries it, so its next call goes unbatched again. One request in flight means a call's records to one broker go one
  * request at a time, so a large call is slower; with the user's own setting of 1 those calls use the two pools
  * above.
  *
@@ -367,7 +368,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
             var made = held ? (unbatched ? heldUnbatchedFactory : heldFactory) : (unbatched ? unbatchedFactory : factory);
             pooled = new Pooled(made.get(), home);
         }
-        var call = new Call(pooled.producer, records.size(), unbatched, entry);
+        var call = new Call(pooled.producer, records.size(), unbatched, held, entry);
         try {
             var partitions = sendAll(call, records, handOverUntil(entry), pooled);
             long until = awaitUntil(entry, call.lastAppend);
@@ -715,6 +716,11 @@ public final class KafkaOutboxSender implements AutoCloseable {
                     if (expired.size() < EXPIRED_REMEMBERED) {
                         expired.put(records.get(i).messageId(), now);
                     }
+                } else if (call.unbatched && call.held && outcome instanceof Outcome.Permanent) {
+                    // not settled: the relay retries it, and it must go unbatched again
+                    if (expired.size() < EXPIRED_REMEMBERED) {
+                        expired.put(records.get(i).messageId(), now);
+                    }
                 } else if (call.unbatched && (outcome == Outcome.delivered() || outcome instanceof Outcome.Permanent)) {
                     expired.remove(records.get(i).messageId()); // settled
                 }
@@ -851,6 +857,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
         final Producer<byte[], byte[]> producer;
         final Thread caller = Thread.currentThread();
         final boolean unbatched; // its producer is from the unbatched pool
+        final boolean held; // a call of a relay that holds permanent failures (ShardProcessor.holdsPermanent)
         /** The partition of each record the sender chose or computed (null: Kafka's); written by the caller. */
         final TopicPartition[] partitions;
         // guarded by this, like ownFailure, metadata, stalled, pending, started, closeReason, closedBy
@@ -869,9 +876,10 @@ public final class KafkaOutboxSender implements AutoCloseable {
         boolean metadataTimedOut; // caller thread only
         long lastAppend; // caller thread only: when send() last returned an appended record, else the call's entry
 
-        Call(Producer<byte[], byte[]> producer, int size, boolean unbatched, long entry) {
+        Call(Producer<byte[], byte[]> producer, int size, boolean unbatched, boolean held, long entry) {
             this.producer = producer;
             this.unbatched = unbatched;
+            this.held = held;
             this.lastAppend = entry;
             this.partitions = new TopicPartition[size];
             this.outcomes = new Outcome[size];
