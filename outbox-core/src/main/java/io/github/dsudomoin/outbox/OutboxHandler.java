@@ -86,7 +86,7 @@ public interface OutboxHandler {
                 anyDelivered = true;
             } catch (OutboxPermanentException e) {
                 outcomes.add(Outcome.permanent(e));
-                if (ShardProcessor.holdsPermanent()) { // the relay retries it: the rest of its key waits behind it
+                if (holdsPermanent()) { // the relay retries it: the rest of its key waits behind it
                     blocked.add(key);
                 }
             } catch (OutboxWaitException e) {
@@ -125,6 +125,19 @@ public interface OutboxHandler {
      */
     static boolean windDownRequested() {
         return Thread.currentThread().isInterrupted() || ShardProcessor.windDownRequested();
+    }
+
+    /**
+     * True inside a {@link #handleBatch} call running on this thread whose relay holds permanent failures
+     * ({@code outbox.relay.retry.holdPermanent}); false otherwise, outside a relay call too, or on a thread the call
+     * started. The relay then takes a {@code Permanent} outcome as a {@code Retry}: the record stays the head of its
+     * (topic, key) and the later records of that key wait behind it. So a call that returns {@code Permanent} for a
+     * record must not deliver a later record of its key in the same call: answer {@code NotAttempted} for those, as
+     * after a {@code Retry}. One it delivers reaches the target ahead of the held record and is handed again behind
+     * it. The default {@code handleBatch} and the Kafka sender keep to this.
+     */
+    static boolean holdsPermanent() {
+        return ShardProcessor.holdsPermanent();
     }
 
     /**

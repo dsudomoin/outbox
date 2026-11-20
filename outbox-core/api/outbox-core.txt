@@ -275,6 +275,7 @@ package io.github.dsudomoin.outbox {
     method public static io.github.dsudomoin.outbox.OutboxHandler! byTopic(java.util.Map<java.lang.String!,io.github.dsudomoin.outbox.OutboxHandler!>!, io.github.dsudomoin.outbox.OutboxHandler!);
     method public void handle(io.github.dsudomoin.outbox.OutboxRecord!) throws java.lang.Exception;
     method public default java.util.List<io.github.dsudomoin.outbox.Outcome!>! handleBatch(java.util.List<io.github.dsudomoin.outbox.OutboxRecord!>!);
+    method public static boolean holdsPermanent();
     method public static <T> T inRecordScope(io.github.dsudomoin.outbox.OutboxRecord!, java.util.concurrent.Callable<T>!) throws java.lang.Exception;
     method public static boolean windDownRequested();
   }
