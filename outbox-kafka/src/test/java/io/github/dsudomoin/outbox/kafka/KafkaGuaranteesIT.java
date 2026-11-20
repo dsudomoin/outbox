@@ -49,7 +49,7 @@ import org.junit.jupiter.api.Test;
 class KafkaGuaranteesIT {
 
     private static final Duration CONSUME_TIMEOUT = Duration.ofSeconds(60);
-    /** The sender's default {@code delivery.timeout.ms}. */
+    /** The suite's {@code delivery.timeout.ms} ({@link TestKafka#shortTimeouts}). */
     private static final Duration DELIVERY_TIMEOUT = Duration.ofSeconds(20);
 
     private final JdbcTransactions transactions = new JdbcTransactions(TestDataSources.newDataSource());
@@ -345,7 +345,10 @@ class KafkaGuaranteesIT {
         }
     }
 
-    /** A fresh table; the sender bounds a call by delivery.timeout.ms (20 s) + 5 s, so the relay gives it longer. */
+    /**
+     * A fresh table; the sender bounds a call by delivery.timeout.ms (20 s here) + 5 s + max.block.ms, so the relay
+     * gives it that.
+     */
     private static TestOutboxConfig config() {
         return new TestOutboxConfig().batchTimeout(Duration.ofSeconds(30)).deadLettersTimeout(Duration.ofSeconds(30));
     }
@@ -374,6 +377,7 @@ class KafkaGuaranteesIT {
         var properties = new Properties();
         properties.putAll(driverProperties);
         properties.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, TestKafka.bootstrapServers());
+        TestKafka.shortTimeouts(properties);
         var sender = new KafkaOutboxSender(() -> properties);
         closing.add(sender);
         return sender;

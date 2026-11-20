@@ -55,7 +55,7 @@ class KafkaEndToEndIT {
     private static final Duration CONSUME_TIMEOUT = Duration.ofSeconds(30);
 
     private final TestDatabase db = TestDb.newDatabase(20);
-    // the sender bounds a call by delivery.timeout.ms (20 s) + 5 s, so the relay must give it longer
+    // the sender bounds a call by delivery.timeout.ms (20 s here, TestKafka.shortTimeouts) + 5 s + max.block.ms
     private final TestOutboxConfig config = new TestOutboxConfig().batchTimeout(Duration.ofSeconds(30));
     private final OutboxMetrics metrics = new OutboxMetrics(null);
     private final List<KafkaOutboxSender> senders = new ArrayList<>();
@@ -101,7 +101,7 @@ class KafkaEndToEndIT {
     /**
      * The outage is a 15 s {@code docker pause} rather than a stop/start, which can change the mapped port: the broker
      * freezes with its connections open. The producer timeouts are cut to a few seconds, so the outage outlasts them
-     * (the 20 s default delivery timeout would ride it out): in-flight requests time out, producers are closed and
+     * (the suite's 20 s delivery timeout would ride it out): in-flight requests time out, producers are closed and
      * records retried, while requests the frozen broker already holds may still be appended after it resumes.
      * Writers keep committing throughout. Duplicates are allowed; per key, the first occurrence of each message must
      * follow send order and none may be missing.
@@ -285,6 +285,7 @@ class KafkaEndToEndIT {
         var properties = new Properties();
         properties.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, TestKafka.bootstrapServers());
         properties.putAll(overrides);
+        TestKafka.shortTimeouts(properties);
         var sender = new KafkaOutboxSender(() -> properties);
         senders.add(sender);
         return sender;

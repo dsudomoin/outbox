@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
@@ -42,6 +43,19 @@ public final class TestKafka {
 
     public static String bootstrapServers() {
         return Broker.INSTANCE.getBootstrapServers();
+    }
+
+    /**
+     * Sets {@code delivery.timeout.ms} 20 s and {@code request.timeout.ms} 15 s where {@code properties} sets neither,
+     * and returns them: suites about the guarantees, not the defaults, size their relay for these (20 + 5 + 5 s within
+     * a 30 s {@code batchTimeout}), and wait less on a broker that does not answer than the 120 s default would.
+     */
+    public static Properties shortTimeouts(Properties properties) {
+        if (!properties.containsKey("delivery.timeout.ms")) {
+            properties.put("delivery.timeout.ms", "20000");
+            properties.putIfAbsent("request.timeout.ms", "15000");
+        }
+        return properties;
     }
 
     /** A new topic with a unique name. */

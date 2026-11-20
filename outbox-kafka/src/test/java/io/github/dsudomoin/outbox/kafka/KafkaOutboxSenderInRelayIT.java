@@ -36,9 +36,9 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link KafkaOutboxSender} inside the relay's handler call, in real time, with the default timeouts
- * ({@code delivery.timeout.ms} 20 s, {@code max.block.ms} 5 s, {@code batchTimeout} 30 s): {@link OutboxRuntime} over
- * Postgres, and a stub producer in place of Kafka.
+ * {@link KafkaOutboxSender} inside the relay's handler call, in real time, with the timeouts the defaults were when a
+ * soft-deadline cut was found to duplicate records ({@code delivery.timeout.ms} 20 s, {@code max.block.ms} 5 s,
+ * {@code batchTimeout} 30 s): {@link OutboxRuntime} over Postgres, and a stub producer in place of Kafka.
  */
 class KafkaOutboxSenderInRelayIT {
 
@@ -117,8 +117,9 @@ class KafkaOutboxSenderInRelayIT {
     }
 
     private OutboxRuntime start(Function<Map<String, Object>, Producer<byte[], byte[]>> producers) {
-        var sender = new KafkaOutboxSender(() -> props(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092"),
-                producers);
+        // the timeouts the duplicate was found with, the defaults then: the relay's soft deadline cut such calls
+        var sender = new KafkaOutboxSender(() -> TestKafka.shortTimeouts(
+                props(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092")), producers);
         closing.add(sender);
         var config = new TestOutboxConfig().shards(1).batchTimeout(BATCH_TIMEOUT);
         var runtime = OutboxRuntime.builder(config, transactions, sender.handler()).build();

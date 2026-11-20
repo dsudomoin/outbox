@@ -39,7 +39,8 @@ import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 class KafkaDeadLetterIT {
 
     private final TestDatabase db = TestDb.newDatabase(10);
-    // the sender bounds a call by delivery.timeout.ms (20 s) + 5 s: the relay and the hook must give it longer
+    // the sender bounds a call by delivery.timeout.ms (20 s here, TestKafka.shortTimeouts) + 5 s + max.block.ms: the
+    // relay and the hook give it that
     private final TestOutboxConfig config = new TestOutboxConfig()
             .batchTimeout(Duration.ofSeconds(30))
             .deadLettersTimeout(Duration.ofSeconds(30));
@@ -117,6 +118,7 @@ class KafkaDeadLetterIT {
         config.retry(Duration.ofMillis(50), Duration.ofMillis(200), 0);
         var properties = new Properties();
         properties.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, TestKafka.bootstrapServers());
+        TestKafka.shortTimeouts(properties);
         properties.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, "2000"); // the metadata wait for the missing topic
         sender = new KafkaOutboxSender(() -> properties);
         schema = new OutboxSchema(db, config);
@@ -174,6 +176,7 @@ class KafkaDeadLetterIT {
     private void start(String deadLetterTopic) throws Exception {
         var properties = new Properties();
         properties.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, TestKafka.bootstrapServers());
+        TestKafka.shortTimeouts(properties);
         var kafka = new KafkaOutboxConfig() {
             @Override
             public Properties driverProperties() {
