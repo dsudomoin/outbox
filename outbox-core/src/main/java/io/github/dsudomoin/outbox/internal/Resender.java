@@ -217,7 +217,6 @@ public final class Resender {
      * The shard of each row, recomputed for the current {@code outbox.shards}, a random one when it has no key; the
      * keyed rows' distinct key hashes locked in one statement, until {@code inTx} ends.
      */
-    /** Locks the rows' distinct key hashes in one statement; returns the shard of each row. */
     private Short[] lockKeys(Connection inTx, String[] topics, byte[][] keys) throws SQLException {
         var rowShards = new Short[topics.length];
         var hashes = keyHashes(topics, keys, rowShards);

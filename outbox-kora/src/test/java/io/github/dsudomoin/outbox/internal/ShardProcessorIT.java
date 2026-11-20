@@ -5471,16 +5471,8 @@ class ShardProcessorIT {
         try (var c = TestDb.connect()) {
             latest = ticks.latest(c).id();
         }
-        try (var c = recording(TestDb.connect())) {
-            ShardProcessor.prepareTransaction(c, config.batchTimeout());
-            try {
-                var result = processor.tryProcess(c, shard, latest, now);
-                c.commit();
-                return withoutCaughtUp(result);
-            } catch (Throwable t) {
-                c.rollback();
-                throw t;
-            }
+        try (var c = recording(TestDb.connect())) { // as a relay worker steps: its own transaction, committed
+            return withoutCaughtUp(processor.tryProcessCommitted(c, List.of(shard), latest, now, now).get(0));
         }
     }
 
@@ -5490,17 +5482,10 @@ class ShardProcessorIT {
         try (var c = TestDb.connect()) {
             latest = ticks.latest(c).id();
         }
-        try (var c = recording(TestDb.connect())) {
-            ShardProcessor.prepareTransaction(c, config.batchTimeout());
-            try {
-                var results = processor.tryProcess(c, List.of(shards), latest, now);
-                c.commit();
-                lastCaughtUp = results.stream().map(ShardResult::caughtUp).toList();
-                return results.stream().map(ShardProcessorIT::withoutCaughtUp).toList();
-            } catch (Throwable t) {
-                c.rollback();
-                throw t;
-            }
+        try (var c = recording(TestDb.connect())) { // as a relay worker steps: its own transaction, committed
+            var results = processor.tryProcessCommitted(c, List.of(shards), latest, now, now);
+            lastCaughtUp = results.stream().map(ShardResult::caughtUp).toList();
+            return results.stream().map(ShardProcessorIT::withoutCaughtUp).toList();
         }
     }
 
