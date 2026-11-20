@@ -120,7 +120,8 @@ package io.github.dsudomoin.outbox.spring {
   }
 
   public static final class OutboxProperties.Retry implements io.github.dsudomoin.outbox.OutboxConfig.RetryConfig {
-    ctor public OutboxProperties.Retry(@org.springframework.boot.context.properties.bind.DefaultValue("1s") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("5m") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("0") int);
+    ctor public OutboxProperties.Retry(@org.springframework.boot.context.properties.bind.DefaultValue("1s") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("5m") java.time.Duration!, @org.springframework.boot.context.properties.bind.DefaultValue("0") int, @org.springframework.boot.context.properties.bind.DefaultValue("false") boolean);
+    method public boolean holdPermanent();
     method public java.time.Duration! initialDelay();
     method public int maxAttempts();
     method public java.time.Duration! maxDelay();

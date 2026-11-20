@@ -121,11 +121,15 @@ public record OutboxProperties(
      * @param maxDelay the backoff's cap. Default 5 min.
      * @param maxAttempts a record that failed this many attempts moves to the dead table; 0 = retry forever, the
      *     default.
+     * @param holdPermanent a Permanent outcome stops its (topic, key) as a Retry does instead of moving the record to
+     *     the dead table while its key goes on: the record stays the retry head, spends attempts and shows in
+     *     outbox.retry.oldest. A key is never skipped past its record only with maxAttempts = 0. Default false.
      */
     public record Retry(
         @DefaultValue("1s") Duration initialDelay,
         @DefaultValue("5m") Duration maxDelay,
-        @DefaultValue("0") int maxAttempts
+        @DefaultValue("0") int maxAttempts,
+        @DefaultValue("false") boolean holdPermanent
     ) implements RetryConfig {}
 
     /**
