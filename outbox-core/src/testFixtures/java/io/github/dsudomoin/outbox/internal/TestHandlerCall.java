@@ -8,15 +8,28 @@ import java.util.concurrent.Callable;
 /**
  * Runs code as the relay runs a handler call, for tests of handlers outside this package: {@link #windDown} is what the
  * relay does at the soft deadline, {@link #cancel} what it does when it gives up on the call, and
- * {@link ShardProcessor#callDeadline()} is {@code batchTimeout} from the construction. Nothing cancels the call by
- * itself: the test does what the relay would.
+ * {@link ShardProcessor#callDeadline()} is {@code batchTimeout} from the construction, and
+ * {@link ShardProcessor#holdsPermanent()} is false unless it was made by {@link #holdingPermanent}. Nothing cancels the
+ * call by itself: the test does what the relay would.
  */
 public final class TestHandlerCall {
 
     private final ShardProcessor.HandlerCall call;
 
     public TestHandlerCall(Duration batchTimeout, Callable<List<Outcome>> body) {
-        this.call = new ShardProcessor.HandlerCall(body, batchTimeout.toNanos());
+        this(batchTimeout, body, false);
+    }
+
+    private TestHandlerCall(Duration batchTimeout, Callable<List<Outcome>> body, boolean holdPermanent) {
+        this.call = new ShardProcessor.HandlerCall(body, batchTimeout.toNanos(), holdPermanent);
+    }
+
+    /**
+     * A call of a relay with {@code relay.retry.holdPermanent} on: {@link ShardProcessor#holdsPermanent()} is true
+     * while it runs.
+     */
+    public static TestHandlerCall holdingPermanent(Duration batchTimeout, Callable<List<Outcome>> body) {
+        return new TestHandlerCall(batchTimeout, body, true);
     }
 
     /** Runs the call on this thread. */

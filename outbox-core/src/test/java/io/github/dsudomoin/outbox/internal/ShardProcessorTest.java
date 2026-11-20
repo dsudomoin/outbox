@@ -57,13 +57,33 @@ class ShardProcessorTest {
         assertThat(ShardProcessor.chooseTarget(100L, candidates, 10).id()).isEqualTo(5);
     }
 
+    /**
+     * {@code holdsPermanent()} is the running call's: true in a call that holds, false in one that does not
+     * or outside one.
+     */
+    @Test
+    void holdsPermanentIsTheRunningCallsSetting() throws Exception {
+        var seen = new ArrayList<Boolean>();
+        new ShardProcessor.HandlerCall(() -> {
+            seen.add(ShardProcessor.holdsPermanent());
+            return List.of();
+        }, TimeUnit.SECONDS.toNanos(30), true).call();
+        new ShardProcessor.HandlerCall(() -> {
+            seen.add(ShardProcessor.holdsPermanent());
+            return List.of();
+        }, TimeUnit.SECONDS.toNanos(30), false).call();
+
+        assertThat(seen).containsExactly(true, false);
+        assertThat(ShardProcessor.holdsPermanent()).as("outside a call").isFalse();
+    }
+
     @Test
     void softInterruptLeftUnconsumedByTheCallIsClearedWhenItReturns() throws Exception {
         var self = new AtomicReference<ShardProcessor.HandlerCall>();
         var call = new ShardProcessor.HandlerCall(() -> {
             self.get().interrupt(); // the soft deadline hits; the handler returns without looking
             return List.of();
-        }, TimeUnit.SECONDS.toNanos(30));
+        }, TimeUnit.SECONDS.toNanos(30), false);
         self.set(call);
         try {
             call.call();
@@ -77,7 +97,7 @@ class ShardProcessorTest {
     void softInterruptAimedAtAFinishedCallNeverReachesTheNextTaskOnItsThread() throws Exception {
         var pool = Executors.newSingleThreadExecutor();
         try {
-            var call = new ShardProcessor.HandlerCall(List::of, TimeUnit.SECONDS.toNanos(30));
+            var call = new ShardProcessor.HandlerCall(List::of, TimeUnit.SECONDS.toNanos(30), false);
             pool.submit(call).get();
             var started = new CountDownLatch(1);
             var interrupterDone = new CountDownLatch(1);
@@ -110,7 +130,7 @@ class ShardProcessorTest {
             seen.add(ShardProcessor.callStarted());
             seen.add(ShardProcessor.callDeadline());
             return List.of();
-        }, timeout);
+        }, timeout, false);
         long after = System.nanoTime();
 
         call.call();
@@ -136,7 +156,7 @@ class ShardProcessorTest {
             seen.add(ShardProcessor.windDownRequested());
             seen.add(ShardProcessor.callCancelled());
             return List.of();
-        }, TimeUnit.SECONDS.toNanos(30));
+        }, TimeUnit.SECONDS.toNanos(30), false);
         self.set(call);
 
         call.call();
@@ -155,7 +175,7 @@ class ShardProcessorTest {
             Thread.interrupted(); // a client clears the flag and throws something else
             seen.add(OutboxHandler.windDownRequested());
             return List.of();
-        }, TimeUnit.SECONDS.toNanos(30));
+        }, TimeUnit.SECONDS.toNanos(30), false);
         self.set(call);
 
         call.call();
@@ -177,7 +197,8 @@ class ShardProcessorTest {
             }
         };
         var records = List.of(record(1, "a"), record(2, "b"), record(3, "c"), record(4, "d"));
-        var call = new ShardProcessor.HandlerCall(() -> handler.handleBatch(records), TimeUnit.SECONDS.toNanos(30));
+        var call = new ShardProcessor.HandlerCall(() -> handler.handleBatch(records), TimeUnit.SECONDS.toNanos(30),
+                false);
         self.set(call);
 
         var outcomes = call.call();

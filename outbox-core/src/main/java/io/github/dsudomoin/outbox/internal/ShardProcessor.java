@@ -256,7 +256,7 @@ public final class ShardProcessor implements AutoCloseable {
         this.limits = new AtomicIntegerArray(full);
         this.executor = new ThreadPoolExecutor(0, Math.max(4, 2 * relay.workers()), 60, TimeUnit.SECONDS,
                 new SynchronousQueue<>(), r -> {
-                    var t = new HandlerThread(r, "outbox-handler-" + THREADS.incrementAndGet(), holdPermanent);
+                    var t = new Thread(r, "outbox-handler-" + THREADS.incrementAndGet());
                     t.setDaemon(true);
                     return t;
                 });
@@ -1832,6 +1832,7 @@ public final class ShardProcessor implements AutoCloseable {
             throws InterruptedException {
         var readOnly = Collections.unmodifiableList(records);
         long timeout = relay.batchTimeout().toNanos();
+        // the deadline runs from before the submit: the waits below start after it, so the cancel comes no earlier
         var task = new HandlerCall(() -> {
             try {
                 return RecordScope.bound(delivery, () -> {
@@ -1842,7 +1843,7 @@ public final class ShardProcessor implements AutoCloseable {
             } finally {
                 telemetry.releaseThread(); // nothing leaks into the next batch on this thread
             }
-        }, timeout); // from before the submit: the waits below start after it, so the cancel comes no earlier
+        }, timeout, holdPermanent);
         Future<List<Outcome>> call;
         try {
             call = executor.submit(task);
@@ -2091,14 +2092,19 @@ public final class ShardProcessor implements AutoCloseable {
         private final long deadline; // started + batchTimeout: see callDeadline()
         @Nullable
         private Thread thread; // under this
+        private final boolean holdPermanent; // see holdsPermanent()
         private volatile boolean windDown;
         private volatile boolean cancelled;
 
-        /** {@code timeout}: the call's {@code batchTimeout}, in nanoseconds from now. */
-        HandlerCall(Callable<List<Outcome>> body, long timeout) {
+        /**
+         * {@code timeout}: the call's {@code batchTimeout}, in nanoseconds from now; {@code holdPermanent}: its relay's
+         * {@code relay.retry.holdPermanent}.
+         */
+        HandlerCall(Callable<List<Outcome>> body, long timeout, boolean holdPermanent) {
             this.body = body;
             this.started = System.nanoTime();
             this.deadline = started + timeout;
+            this.holdPermanent = holdPermanent;
         }
 
         @Override
@@ -2159,18 +2165,8 @@ public final class ShardProcessor implements AutoCloseable {
      * it. For the handlers of this repository.
      */
     public static boolean holdsPermanent() {
-        return CALL.get() != null && Thread.currentThread() instanceof HandlerThread t && t.holdPermanent;
-    }
-
-    /** A thread of {@link #executor}, which runs only this processor's handler calls. */
-    private static final class HandlerThread extends Thread {
-
-        final boolean holdPermanent;
-
-        HandlerThread(Runnable task, String name, boolean holdPermanent) {
-            super(task, name);
-            this.holdPermanent = holdPermanent;
-        }
+        var call = CALL.get();
+        return call != null && call.holdPermanent;
     }
 
     @Nullable
