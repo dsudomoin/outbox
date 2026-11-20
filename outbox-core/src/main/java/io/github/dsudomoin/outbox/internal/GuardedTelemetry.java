@@ -179,7 +179,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
             warn("stepStarted", e);
             return RelayStep.NONE;
         }
-        return step == RelayStep.NONE ? step : new GuardedRelayStep(step);
+        return step == null || step == RelayStep.NONE ? RelayStep.NONE : new GuardedRelayStep(step);
     }
 
     @Override

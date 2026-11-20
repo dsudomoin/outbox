@@ -229,6 +229,76 @@ class RelayTelemetryIT {
     }
 
     @Test
+    void aRollbackThatThrowsAnErrorStillEndsTheSettleAndTheStep() throws Exception {
+        // the commit fails (a deferred trigger on the cursor table), then the rollback of that connection throws an
+        // Error after rolling back
+        var direct = TestDataSources.newDataSource();
+        var rollbackErrors = new AtomicInteger();
+        var failing = (javax.sql.DataSource) java.lang.reflect.Proxy.newProxyInstance(
+                javax.sql.DataSource.class.getClassLoader(), new Class<?>[] {javax.sql.DataSource.class},
+                (proxy, method, args) -> {
+                    var target = method.getName().equals("getConnection") && (args == null || args.length == 0)
+                            ? rollbackFailing(direct.getConnection(), rollbackErrors) : null;
+                    if (target != null) {
+                        return target;
+                    }
+                    try {
+                        return method.invoke(direct, args);
+                    } catch (java.lang.reflect.InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
+        var config = new TestOutboxConfig().workers(1);
+        var cursor = config.table() + "_cursor";
+        var events = new Events(transactions, cursor);
+        var failingTransactions = new JdbcTransactions(failing);
+        var r = OutboxRuntime.builder(config, failingTransactions, new RecordingHandler()).telemetry(events).build();
+        runtime = r;
+        r.start();
+        var function = config.table() + "_refuse";
+        try (var c = transactions.newConnection()) {
+            TestSql.execute(c, "create function " + function + "() returns trigger language plpgsql as $$ begin"
+                    + " raise exception 'commit refused'; end $$");
+            TestSql.execute(c, "create constraint trigger refuse after insert on " + cursor
+                    + " deferrable initially deferred for each row execute function " + function + "()");
+        }
+
+        failingTransactions.inTx(c -> r.outbox().send(OutboxMessage.of("orders", "k", bytes("m"))));
+        await(Duration.ofSeconds(10), () -> rollbackErrors.get() > 0
+                && events.ended().stream().anyMatch(s -> s.log.contains("failed")));
+        runtime.close();
+        try (var c = transactions.newConnection()) {
+            TestSql.execute(c, "drop trigger refuse on " + cursor);
+        }
+
+        var failed = events.ended().stream().filter(s -> s.log.contains("failed")).findFirst().orElseThrow();
+        assertThat(failed.log).endsWith("settleStarted", "settleFailed(1)", "failed");
+        assertThat(failed.errors.get(0)).hasMessageContaining("commit refused");
+    }
+
+    /** {@code c}, whose rollback right after a failed commit rolls back and then throws an Error. */
+    private static java.sql.Connection rollbackFailing(java.sql.Connection c, AtomicInteger errors) {
+        var commitFailed = new java.util.concurrent.atomic.AtomicBoolean();
+        return (java.sql.Connection) java.lang.reflect.Proxy.newProxyInstance(
+                java.sql.Connection.class.getClassLoader(), new Class<?>[] {java.sql.Connection.class},
+                (proxy, method, args) -> {
+                    try {
+                        var result = method.invoke(c, args);
+                        if (method.getName().equals("rollback") && args == null && commitFailed.getAndSet(false)) {
+                            errors.incrementAndGet();
+                            throw new AssertionError("rollback failed (test)");
+                        }
+                        return result;
+                    } catch (java.lang.reflect.InvocationTargetException e) {
+                        if (method.getName().equals("commit")) {
+                            commitFailed.set(true);
+                        }
+                        throw e.getCause();
+                    }
+                });
+    }
+
+    @Test
     void fetchedCountsEveryRowReadPerShard() throws Exception {
         String a = "a";
         String b = "b";
@@ -365,6 +435,82 @@ class RelayTelemetryIT {
                 permanent + " io.github.dsudomoin.outbox.OutboxPermanentException");
     }
 
+    @Test
+    void retriedAndSingleShardDeliveriesGetTheirStepsOwnHandle() throws Exception {
+        // diverted at the first failure: the record comes back through the retry pass, and the shard's next main read
+        // probes its head alone, in a call of its own
+        var config = new TestOutboxConfig().headFailuresBeforeDivert(1);
+        var events = new Events(transactions, config.table() + "_cursor");
+        var keys = sameShardKeys(2);
+        var handler = new RecordingHandler().failNext(r -> new String(r.key(), UTF_8).equals(keys.get(0)),
+                () -> new IllegalStateException("once"));
+        var outbox = start(config, handler, events);
+
+        var failing = transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", keys.get(0), bytes("f"))));
+        await(Duration.ofSeconds(10), () -> handler.batches().stream().flatMap(List::stream)
+                .anyMatch(Outcome.Retry.class::isInstance));
+        var next = transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", keys.get(1), bytes("n"))));
+        await(Duration.ofSeconds(10), () -> delivered(handler).containsAll(List.of(failing, next)));
+        runtime.close();
+
+        assertThat(events.foreignSteps).as("every delivery got the handle its step's stepStarted returned").isZero();
+        assertThat(events.handedOnSteps).as("its first call and its retry, both on observed steps")
+                .filteredOn(failing::equals).hasSizeGreaterThanOrEqualTo(2);
+        assertThat(events.handedOnSteps).contains(next);
+    }
+
+    @Test
+    void fetchedCountsTheRetryFollowersItHands() throws Exception {
+        // the head fails and is diverted alone (the rows after it are read again); it fails again in the retry pass
+        // while the main read moves its 5 rows behind it as followers; the next retry pass hands all 6 in one call
+        var config = new TestOutboxConfig().headFailuresBeforeDivert(1);
+        var events = new Events(transactions, config.table() + "_cursor");
+        var handler = new RecordingHandler().failNext(r -> true, () -> new IllegalStateException("first"))
+                .failNext(r -> true, () -> new IllegalStateException("second"));
+        var outbox = start(config, handler, events);
+        var messages = new ArrayList<OutboxMessage>();
+        for (int i = 0; i < 6; i++) {
+            messages.add(OutboxMessage.of("orders", "k", bytes("m" + i)));
+        }
+
+        transactions.inTx(c -> outbox.sendAll(messages));
+        await(Duration.ofSeconds(10), () -> handler.delivered().size() >= 6);
+        runtime.close();
+
+        var handedSix = events.ended().stream().filter(step -> step.maxHanded == 6).toList();
+        assertThat(handedSix).as("the main call, then the retry call").hasSizeGreaterThanOrEqualTo(2)
+                .allSatisfy(step -> assertThat(step.log).contains("fetched(" + shard("k") + ",6)"));
+    }
+
+    @Test
+    void aParkedRowTheRetryPassWritesAndTheMainPassMergesAgainIsSettledOnce() throws Exception {
+        var config = new TestOutboxConfig().relayEnabled(false).requeueDelay(Duration.ofMillis(50));
+        var events = new Events(transactions, config.table() + "_cursor");
+        var requeues = new AtomicInteger();
+        OutboxHandler handler = new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {}
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                return records.stream().map(r -> new String(r.payload(), UTF_8).equals("p")
+                        && requeues.getAndIncrement() < 2 ? Outcome.requeue() : Outcome.delivered()).toList();
+            }
+        };
+        var outbox = start(config, handler, events);
+
+        transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", "k", bytes("p"))));
+        runtime.relay().drain(); // p requeued: parked, due 50 ms later
+        Thread.sleep(150);
+        transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", "k", bytes("n"))));
+        events.steps.clear();
+        runtime.relay().drain(); // the retry pass offers p, parks it again; the main read of n merges it once more
+
+        var step = events.single();
+        assertThat(step.log).as("p once, n once").contains("fetched(" + shard("k") + ",2)", "committed(2)");
+        assertThat(step.handedTimes).as("p in the retry pass's call, p and n in the main call").containsExactly(1, 2);
+    }
+
     private Outbox start(TestOutboxConfig config, OutboxHandler handler) {
         return start(config, handler, telemetry);
     }
@@ -436,13 +582,16 @@ class RelayTelemetryIT {
 
     /**
      * The relay steps with work, each with the events of its step, settle and deliveries in order, and the dead
-     * letters; at the settle's start and the step's end it counts the shard's cursor rows on a connection of its own.
+     * letters; at the settle's start and the step's end it reads the shard's newest cursor row on a connection of its
+     * own.
      */
     private static final class Events implements OutboxTelemetry {
 
         final List<Observed> steps = new CopyOnWriteArrayList<>();
         final List<String> deadLettered = new CopyOnWriteArrayList<>();
         final List<Boolean> sameRecord = new CopyOnWriteArrayList<>();
+        /** The message ids handed in a delivery of an observed step, once per handing. */
+        final List<UUID> handedOnSteps = new CopyOnWriteArrayList<>();
         private final JdbcTransactions transactions;
         private final String cursor;
         volatile int foreignSteps;
@@ -470,6 +619,9 @@ class RelayTelemetryIT {
             }
             observed.log.add("deliveryStarted");
             observed.handed = records.size();
+            observed.maxHanded = Math.max(observed.maxHanded, records.size());
+            observed.handedTimes.add(records.size());
+            records.forEach(r -> handedOnSteps.add(r.messageId()));
             return new Delivery() {
                 private volatile List<OutboxRecord> handed = List.of();
 
@@ -523,7 +675,8 @@ class RelayTelemetryIT {
 
         private long cursorRows(int shard) {
             try (var c = transactions.newConnection()) {
-                return TestSql.queryLong(c, "select count(*) from " + cursor + " where shard = " + shard);
+                // the newest row, not a count: a maintenance run may delete older rows of the shard meanwhile
+                return TestSql.queryLong(c, "select coalesce(max(seq), 0) from " + cursor + " where shard = " + shard);
             } catch (java.sql.SQLException e) {
                 throw new IllegalStateException(e);
             }
@@ -535,6 +688,8 @@ class RelayTelemetryIT {
             final List<Throwable> errors = new CopyOnWriteArrayList<>();
             volatile int shard = -1;
             volatile int handed;
+            volatile int maxHanded;
+            final List<Integer> handedTimes = new CopyOnWriteArrayList<>();
             volatile long cursorRowsAtSettle = -1;
             volatile long cursorRowsAtFinish = -1;
 

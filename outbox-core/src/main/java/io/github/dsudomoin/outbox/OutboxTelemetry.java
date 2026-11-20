@@ -212,11 +212,12 @@ public interface OutboxTelemetry {
 
         /**
          * Once per shard of the step with work, after the step's reads of that shard and before its main handler call
-         * (the calls of its due retry and parked rows come earlier): {@code records} rows read for it, distinct within
-         * each part: its due retry heads with the parked rows of their keys, its due parked rows, its main read and
-         * the parked rows merged into that read's call. A row the retry pass hands and the main pass merges again
-         * counts twice; the retry rows a call takes along as followers, and those a later round of the pass promotes,
-         * do not count.
+         * (the calls of its due retry and parked rows come earlier): {@code records}, the records of the shard the step
+         * read and handed to the handler, or wrote without a call, each once: its due retry heads with their
+         * followers (those a later round of the retry pass promotes included), its due parked rows and the parked rows
+         * offered with them, a retry head moved to the dead table out of attempts, its main read (the rows of keys in
+         * the retry table and those held out of the call included) and the parked rows merged into that read's call.
+         * Rows read and left for a later step without being handed (a head the call has no room for) do not count.
          */
         default void fetched(int shard, int records) {}
 
@@ -238,12 +239,13 @@ public interface OutboxTelemetry {
 
     /**
      * The writes of one relay step, from its last handler call to its transaction's end. {@code records}: the records
-     * whose state the commit records, each once: those handed whose outcome it writes (delivered, retried or diverted
-     * to the retry table, dead, parked or requeued, kept parked, postponed), the main read's rows it moves without a
-     * call (behind their key in the retry table, or held in the parked table), the parked rows it keeps behind one
-     * that stays, and the retry heads it moves to the dead table out of attempts. Not those the next step reads again
-     * (the trailing records a call did not attempt, the records of a paused shard), nor the rows a parked row moved
-     * to the retry table takes along unread.
+     * whose state the commit records, each once however often the step wrote it (a parked row the retry pass parks
+     * again and the main pass merges and writes once more counts once): those handed whose outcome it writes
+     * (delivered, retried or diverted to the retry table, dead, parked or requeued, kept parked, postponed), the main
+     * read's rows it moves without a call (behind their key in the retry table, or held in the parked table), the
+     * parked rows it keeps behind one that stays, and the retry heads it moves to the dead table out of attempts. Not
+     * those the next step reads again (the trailing records a call did not attempt, the records of a paused shard),
+     * nor the rows a parked row moved to the retry table takes along unread.
      */
     interface Settle {
 
@@ -282,9 +284,13 @@ public interface OutboxTelemetry {
          * On the handler thread, as soon as the handler knows the outcome of {@code record}, one of the handed records
          * (the same object): {@link OutboxHandler#recordFinished}, which the default {@code handleBatch} calls after
          * each record it attempts. At most once per record from a well-behaved handler, before {@link #finished}; a
-         * handler may also report twice, after the relay timed its call out, or a record not of this call. The report
-         * is the handler's word: {@link #finished} still follows with the outcome of every record, and that outcome,
-         * not this one, decides the record's row (a call that fails as a whole retries a record reported delivered).
+         * handler may also report twice, or a record not of this call. A call the relay cancelled at
+         * {@code batchTimeout} keeps this delivery bound to its handler thread until its {@code handleBatch} returns,
+         * so a report may arrive while {@link #finished} or {@link #failed} runs on the relay thread, or after the
+         * step's {@link RelayStep#finished()}: an implementation must be thread-safe and let the first end of a record
+         * win. The report is the handler's word: {@link #finished} still follows with the outcome of every record, and
+         * that outcome, not this one, decides the record's row (a call that fails as a whole retries a record reported
+         * delivered).
          */
         default void recordFinished(OutboxRecord record, Outcome outcome) {}
 

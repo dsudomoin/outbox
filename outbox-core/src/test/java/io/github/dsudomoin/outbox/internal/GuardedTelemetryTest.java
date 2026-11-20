@@ -229,6 +229,29 @@ class GuardedTelemetryTest {
     }
 
     @Test
+    void aNullStepIsNone() {
+        var seen = new ArrayList<OutboxTelemetry.RelayStep>();
+        var t = GuardedTelemetry.of(new OutboxTelemetry() {
+            @Override
+            public RelayStep stepStarted(List<Integer> shards) {
+                return null;
+            }
+
+            @Override
+            public Delivery deliveryStarted(RelayStep step, List<OutboxRecord> records, Instant now) {
+                seen.add(step);
+                return Delivery.NONE;
+            }
+        });
+
+        var step = t.stepStarted(List.of(1));
+        t.deliveryStarted(step, RECORDS, Instant.EPOCH);
+
+        assertThat(step).isSameAs(OutboxTelemetry.RelayStep.NONE);
+        assertThat(seen).containsExactly(OutboxTelemetry.RelayStep.NONE);
+    }
+
+    @Test
     void newHooksDefaultToTheOldOnes() {
         var events = new ArrayList<String>();
         var t = GuardedTelemetry.of(new OutboxTelemetry() {
