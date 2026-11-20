@@ -91,9 +91,9 @@ public final class OutboxSchema implements AutoCloseable {
     private static final Duration MAX_PG_TIMEOUT = Duration.ofDays(24);
     /**
      * Added to twice the longer of {@code idlePollInterval} and {@code minTickInterval}: a reshard is refused while the
-     * newest tick is younger than that, as every running relay ticks at least that often, idle or not. A writer with
-     * the relay disabled ticks too ({@code relay.ticksWithoutRelay}), only while it writes; its live heartbeat row
-     * refuses the reshard before this guard, so its ticks do not change the outcome.
+     * newest tick is younger than that, as an instance is still ticking: every running relay ticks at least that
+     * often, idle or not, and a writer with {@code relay.ticksWithoutRelay} while it writes; that writer's live
+     * heartbeat row refuses the reshard before this guard, so its ticks do not change the outcome.
      */
     private static final Duration TICK_MARGIN = Duration.ofSeconds(5);
     /** How many of the latest ticks the reshard's tick guard looks at for the largest gap between two. */
@@ -802,7 +802,7 @@ public final class OutboxSchema implements AutoCloseable {
                         + ". A reshard needs every instance stopped: stop writers, wait for outbox.shard.lag 0, stop"
                         + " all instances, start with the new value." + keep, e);
             }
-            // a relay that ticked between the wait and the locks: no tick is made while LOCK_TICK is held
+            // an instance that ticked between the wait and the locks: no tick is made while LOCK_TICK is held
             var age = tickAge(c, n);
             if (age != null && age.ago() < age.bound()) {
                 throw relayRunning(n, from, to, keep, age);
@@ -857,8 +857,8 @@ public final class OutboxSchema implements AutoCloseable {
             if (bound - ago > left) {
                 throw relayRunning(n, from, to, keep, age);
             }
-            log.info("outbox reshard of {} waits {} ms for the latest tick to be {} ms old: a relay may still run",
-                    n.base(), bound - ago, bound);
+            log.info("outbox reshard of {} waits {} ms for the latest tick to be {} ms old: an instance may still"
+                    + " tick", n.base(), bound - ago, bound);
             try {
                 Thread.sleep(Math.min(bound - ago + 10, TICK_RECHECK));
             } catch (InterruptedException e) {
@@ -893,7 +893,8 @@ public final class OutboxSchema implements AutoCloseable {
 
     private IllegalStateException relayRunning(TableNames n, int from, int to, String keep, TickAge age) {
         return new IllegalStateException("outbox.shards = " + to + " but " + n.cursor() + " holds cursors for " + from
-                + " shards, and a relay is still running (latest tick " + age.ago() + " ms ago): a reshard needs every"
+                + " shards, and an instance is still ticking (a relay, or a writer with"
+                + " outbox.relay.ticksWithoutRelay; latest tick " + age.ago() + " ms ago): a reshard needs every"
                 + " instance stopped, those of releases without the heartbeat too, and no tick for " + age.bound()
                 + " ms (waited up to " + tickWait.toSeconds() + " s). Stop writers, wait for outbox.shard.lag 0, stop"
                 + " all instances, start with the new value." + keep);

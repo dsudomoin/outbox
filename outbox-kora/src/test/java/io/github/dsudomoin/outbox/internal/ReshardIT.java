@@ -170,7 +170,8 @@ class ReshardIT {
         schema.tickWait = Duration.ofSeconds(1);
         assertThatThrownBy(schema::start)
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageMatching("(?s).*a relay is still running \\(latest tick \\d+ ms ago\\).*");
+                .hasMessageMatching("(?s).*an instance is still ticking \\(a relay, or a writer with"
+                        + " outbox.relay.ticksWithoutRelay; latest tick \\d+ ms ago\\).*");
         assertThat(cursorShards()).isEqualTo(4);
     }
 
