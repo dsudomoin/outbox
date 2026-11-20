@@ -12,27 +12,33 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
+import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 /**
  * A target that asks the relay to come back later: every record of a call {@code NotAttempted} with a
  * {@code notBefore}, as the Kafka sender answers for a partition cooling down after a failure. Such a call tried
- * nothing, so it is no failed attempt: the shard waits until the earliest {@code notBefore}, and neither its backoff
- * nor its batch limit grows.
+ * nothing: the shard waits until the earliest {@code notBefore}, not a doubling backoff, and its batch limit stays.
+ * The step still counts towards probe mode and the divert of a single key ({@code headFailuresBeforeDivert}, 3 here).
  */
 class CoolingTargetIT {
 
     private static final int RECORDS = 8;
     private static final Duration COOLING = Duration.ofSeconds(1);
-    private static final int COOLING_CALLS = 4;
+    /** Below {@code headFailuresBeforeDivert}: no probe yet. */
+    private static final int COOLING_CALLS = 2;
 
     private final JdbcTransactions transactions = new JdbcTransactions(TestDataSources.newDataSource());
     private final List<AutoCloseable> runtimes = new ArrayList<>();
     /** When each handler call began, nanoTime, and how many records it got. */
     private final List<long[]> calls = new CopyOnWriteArrayList<>();
+    /** The shard's failures as each call began: those its last committed cursor carries. */
+    private final List<Long> failuresAtCall = new CopyOnWriteArrayList<>();
+    private volatile String cursorTable = "";
 
     @AfterEach
     void close() throws Exception {
@@ -49,16 +55,16 @@ class CoolingTargetIT {
         sendDistinctKeys(runtime);
 
         await(Duration.ofSeconds(30), () -> calls.size() > COOLING_CALLS);
-        long failures = transactions.inTx(c -> TestSql.queryLong(c, "select failures from "
-                + runtime.schema().names().cursor() + " order by seq desc limit 1"));
 
         for (int i = 1; i <= COOLING_CALLS; i++) {
             var gap = Duration.ofNanos(calls.get(i)[0] - calls.get(i - 1)[0]);
             assertThat(gap).as("pause after cooling call %d", i)
                     .isGreaterThanOrEqualTo(COOLING.minusMillis(50)).isLessThan(COOLING.multipliedBy(2));
         }
-        assertThat(failures).as("failures counted for calls that tried nothing").isZero();
-        assertThat(calls.get(COOLING_CALLS)[1]).as("records in the first call after the cooling").isEqualTo(RECORDS);
+        assertThat(failuresAtCall.get(COOLING_CALLS)).as("one per cooling call, towards the divert")
+                .isEqualTo(COOLING_CALLS);
+        assertThat(calls.get(COOLING_CALLS)[1]).as("records in the first call after the cooling: the limit stayed")
+                .isEqualTo(RECORDS);
     }
 
     @Test
@@ -90,6 +96,60 @@ class CoolingTargetIT {
                 .isGreaterThanOrEqualTo(Duration.ofMillis(1950));
     }
 
+    /**
+     * A hot key whose rows fill the shard's whole read window keeps cooling: each call holds only its rows, and the
+     * target asks to come back every time. Cooling steps still count towards the divert, so the key goes to the retry
+     * table and a healthy key behind the window is delivered while it cools, not after the outage; once the key stops
+     * cooling, its rows arrive in order.
+     */
+    @Test
+    void aHotKeyThatKeepsCoolingIsDivertedAndTheKeysBehindItGoOn() throws Exception {
+        var cooling = new AtomicBoolean(true);
+        var delivered = new CopyOnWriteArrayList<String>();
+        var config = new TestOutboxConfig().shards(1).batchSize(RECORDS).retry(Duration.ofSeconds(1),
+                Duration.ofMinutes(5), 0);
+        var runtime = OutboxRuntime.builder(config, transactions, new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                var outcomes = new ArrayList<Outcome>();
+                for (var r : records) {
+                    var key = new String(r.key(), UTF_8);
+                    if (key.equals("hot") && cooling.get()) {
+                        outcomes.add(Outcome.notAttempted(Instant.now().plus(COOLING)));
+                    } else {
+                        delivered.add(key + ":" + new String(r.payload(), UTF_8));
+                        outcomes.add(Outcome.delivered());
+                    }
+                }
+                return outcomes;
+            }
+        }).build();
+        runtimes.add(runtime);
+        runtime.start();
+        int hotRows = 2 * RECORDS + 3;
+        transactions.inTx(c -> {
+            var messages = new ArrayList<OutboxMessage>();
+            for (int i = 0; i < hotRows; i++) {
+                messages.add(OutboxMessage.of("orders", "hot", ("" + i).getBytes(UTF_8)));
+            }
+            messages.add(OutboxMessage.of("orders", "healthy", "0".getBytes(UTF_8)));
+            return runtime.outbox().sendAll(messages);
+        });
+
+        await(Duration.ofSeconds(8), () -> delivered.contains("healthy:0"));
+        assertThat(delivered).as("while the hot key cools").containsExactly("healthy:0");
+
+        cooling.set(false);
+        await(Duration.ofSeconds(30), () -> delivered.size() == hotRows + 1);
+        assertThat(delivered.stream().filter(d -> d.startsWith("hot:")).toList()).as("the hot key, in order")
+                .containsExactlyElementsOf(IntStream.range(0, hotRows).mapToObj(i -> "hot:" + i).toList());
+    }
+
     /** One shard, {@link #RECORDS} rows a call, the relay running; {@code outcome} by the call's number from 1. */
     private OutboxRuntime start(Function<Integer, Outcome> outcome) {
         var config = new TestOutboxConfig().shards(1).batchSize(RECORDS).retry(Duration.ofSeconds(1),
@@ -103,12 +163,15 @@ class CoolingTargetIT {
             @Override
             public List<Outcome> handleBatch(List<OutboxRecord> records) {
                 calls.add(new long[] {System.nanoTime(), records.size()});
+                failuresAtCall.add(transactions.inTx(c -> TestSql.queryLong(c, "select failures from " + cursorTable
+                        + " order by seq desc limit 1")));
                 var answer = outcome.apply(calls.size());
                 return records.stream().map(r -> answer).toList();
             }
         }).build();
         runtimes.add(runtime);
         runtime.start();
+        cursorTable = runtime.schema().names().cursor(); // before the first row is sent, so before the first call
         return runtime;
     }
 
