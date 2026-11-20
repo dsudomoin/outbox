@@ -749,7 +749,10 @@ class KafkaOutboxSenderTest {
         assertThat(seen.get(1)).containsEntry("batch.size", "0"); // the second one is the unbatched pool's
     }
 
-    /** A client-side refusal says nothing about the partition: its cooldown, here a probe's lease, stays. */
+    /**
+     * A client-side refusal says nothing about the partition: its cooldown stays, not ended as by a delivery. The probe
+     * appended nothing, so it gives its lease back: the next record is the probe, and the others wait behind it.
+     */
     @Test
     void clientSideRefusalLeavesThePartitionsCooldown() throws Exception {
         var clock = new TestClock();
@@ -764,7 +767,12 @@ class KafkaOutboxSenderTest {
 
         assertThat(sender.send(List.of(record(2, onP, "x".repeat(101))))).singleElement()
                 .isInstanceOf(Outcome.Permanent.class);
-        assertThat(sender.send(List.of(record(3, onP)))).singleElement().isInstanceOf(Outcome.NotAttempted.class);
+        var probe = sendAsync(sender, List.of(record(3, onP)));
+        var producer = awaitSent(1, 1);
+        assertThat(sender.send(List.of(record(4, onP)))).as("behind the probe").singleElement()
+                .isInstanceOf(Outcome.NotAttempted.class);
+        producer.completeNext();
+        assertThat(probe.get(5, SECONDS)).containsExactly(Outcome.delivered());
     }
 
     /** Only an expired batch makes records remembered: a call that failed otherwise leaves the next one batched. */
@@ -1666,6 +1674,73 @@ class KafkaOutboxSenderTest {
                 o -> assertThat(o).isInstanceOf(Outcome.Retry.class),
                 o -> assertThat(o).isInstanceOf(Outcome.NotAttempted.class));
         assertThat(lookups).as("the first failure and one probe").hasValue(2);
+    }
+
+    /**
+     * The probe of a topic whose cooldown ended looks the topic up too slowly to hand anything over (past the 5 s
+     * cutoff): it sent nothing, so it must not hold the topic for the whole lease; the next call probes it.
+     */
+    @Test
+    void aTopicProbeThatHandsNothingOverLetsTheNextCallProbe() throws Exception {
+        var lookups = new AtomicInteger();
+        var sender = sender(() -> new TestProducer(true, r -> null) {
+            @Override
+            public synchronized List<PartitionInfo> partitionsFor(String topic) {
+                if (topic.equals(OTHER)) {
+                    switch (lookups.incrementAndGet()) {
+                        case 1 -> throw new TimeoutException("Topic u not present in metadata after 300 ms.");
+                        case 2 -> sleep(5300); // resolves, past the hand-over cutoff
+                        default -> { }
+                    }
+                }
+                return super.partitionsFor(topic);
+            }
+        }, DELIVERY_TIMEOUT);
+        assertThat(sender.send(List.of(recordTo(OTHER, 1, "k")))).singleElement().isInstanceOf(Outcome.Retry.class);
+        Thread.sleep(1100); // the 1 s cooldown ends
+        assertThat(sender.send(List.of(recordTo(OTHER, 2, "k")))).as("the slow probe")
+                .containsExactly(Outcome.notAttempted());
+
+        assertThat(sender.send(List.of(recordTo(OTHER, 3, "k")))).as("the next call probes")
+                .containsExactly(Outcome.delivered());
+    }
+
+    /**
+     * The probe of a partition whose cooldown ended is interrupted while {@code send()} waits for buffer space: the
+     * record joined no batch, so the next call probes the partition instead of waiting out the lease.
+     */
+    @Test
+    void aPartitionProbeInterruptedBeforeItsAppendLetsTheNextCallProbe() throws Exception {
+        var key = keyOnPartition(0);
+        var blocking = new CountDownLatch(1);
+        var sender = sender(() -> new TestProducer(false, r -> null) {
+            @Override
+            public Future<RecordMetadata> send(ProducerRecord<byte[], byte[]> record, Callback callback) {
+                if (new String(record.value(), UTF_8).equals("block")) {
+                    blocking.countDown();
+                    try {
+                        Thread.sleep(10_000);
+                    } catch (InterruptedException e) {
+                        throw new InterruptException(e);
+                    }
+                }
+                return super.send(record, callback);
+            }
+        }, DELIVERY_TIMEOUT);
+        var failed = sendAsync(sender, List.of(record(1, key)));
+        awaitSent(0, 1).errorNext(new NotLeaderOrFollowerException("gone")); // the partition cools for 1 s
+        assertThat(failed.get(5, SECONDS)).singleElement().isInstanceOf(Outcome.Retry.class);
+        Thread.sleep(1100);
+        var probe = new CompletableFuture<List<Outcome>>();
+        var thread = new Thread(() -> probe.complete(sender.send(List.of(record(2, key, "block")))));
+        thread.start();
+        assertThat(blocking.await(5, SECONDS)).isTrue();
+        thread.interrupt();
+        assertThat(probe.get(5, SECONDS)).containsExactly(Outcome.notAttempted());
+
+        var next = sendAsync(sender, List.of(record(3, key)));
+        awaitSent(1, 1).completeNext();
+        assertThat(next.get(5, SECONDS)).as("the next call probes").containsExactly(Outcome.delivered());
     }
 
     @Test

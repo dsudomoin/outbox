@@ -44,6 +44,39 @@ class CooldownTest {
         assertThat(cooldown.coolingUntil(q, t0)).isNull();
     }
 
+    /** A probe that sent nothing gives its lease back: the next caller probes at once, and no failure is counted. */
+    @Test
+    void aReleasedLeaseLetsTheNextCallerProbe() {
+        var cooldown = new Cooldown<TopicPartition>(LEASE);
+        cooldown.failed(p, t0);
+        long expired = t0 + s(1);
+        assertThat(cooldown.coolingUntil(p, expired)).as("the probe").isNull();
+
+        cooldown.release(p, expired);
+
+        assertThat(cooldown.coolingUntil(p, expired + ms(10))).as("the next caller probes").isNull();
+        assertThat(cooldown.coolingUntil(p, expired + ms(20))).as("holding the lease").isNotNull();
+        assertThat(cooldown.failed(p, expired + ms(30))).as("its failure: the second, not the third")
+                .isEqualTo(Duration.ofSeconds(2));
+    }
+
+    /** A release of a lease that is no longer the caller's (its key failed, or another caller leased it) is a no-op. */
+    @Test
+    void aStaleReleaseChangesNothing() {
+        var cooldown = new Cooldown<TopicPartition>(LEASE);
+        cooldown.failed(p, t0);
+        long expired = t0 + s(1);
+        cooldown.coolingUntil(p, expired); // the probe
+        cooldown.failed(p, expired + ms(10)); // it failed: 2 s
+
+        cooldown.release(p, expired);
+
+        assertThat(cooldown.coolingUntil(p, expired + ms(20))).isEqualTo(Duration.ofSeconds(2).minusMillis(10));
+        assertThat(cooldown.coolingUntil(p, expired + s(3))).as("the next probe").isNull();
+        cooldown.release(p, expired); // the earlier lease: not this one
+        assertThat(cooldown.coolingUntil(p, expired + s(3) + ms(10))).as("still the second probe's").isNotNull();
+    }
+
     /** I2: an expired cooldown admits one probe; it holds the key for the lease, then the next caller probes. */
     @Test
     void expiryAdmitsOneProbeAtATime() {
