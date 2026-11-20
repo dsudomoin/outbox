@@ -151,7 +151,8 @@ public interface OutboxTelemetry {
      * Each shard's queue, after every gauge refresh of maintenance, on the instance whose run took the maintenance
      * lock and on its thread: one entry per shard, in shard order. The same read sets {@link OutboxGauge#PENDING} (the
      * sum of the known {@code pending}) and {@link OutboxGauge#PENDING_OLDEST} (the largest known
-     * {@code oldestSeconds}), NaN when no shard's is known. Never with {@link #NONE}: that runs no count at all.
+     * {@code oldestSeconds}), NaN when no shard's is known. Not called when that read fails: both gauges go NaN
+     * then. Never with {@link #NONE}: that runs no count at all.
      */
     default void queueState(List<ShardQueue> shards) {}
 
