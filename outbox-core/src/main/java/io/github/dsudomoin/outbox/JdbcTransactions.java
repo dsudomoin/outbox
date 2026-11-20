@@ -4,7 +4,10 @@ import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Set;
 import java.util.function.Consumer;
 import javax.sql.DataSource;
 import org.slf4j.Logger;
@@ -96,12 +99,9 @@ public final class JdbcTransactions implements OutboxTransactions {
         if (tx == null) {
             throw new IllegalStateException("not inside JdbcTransactions.inTx(...)");
         }
-        for (var registered : tx.afterCommit) {
-            if (registered == action) {
-                return;
-            }
+        if (tx.registered.add(action)) {
+            tx.afterCommit.add(action);
         }
-        tx.afterCommit.add(action);
     }
 
     @Override
@@ -158,7 +158,9 @@ public final class JdbcTransactions implements OutboxTransactions {
 
     private static final class Transaction {
         final Connection connection;
+        /** In registration order; {@link #registered} holds the same instances, for an O(1) duplicate check. */
         final List<Runnable> afterCommit = new ArrayList<>(1);
+        final Set<Runnable> registered = Collections.newSetFromMap(new IdentityHashMap<>(4));
 
         Transaction(Connection connection) {
             this.connection = connection;

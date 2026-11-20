@@ -2,6 +2,7 @@ package io.github.dsudomoin.outbox.internal;
 
 import io.github.dsudomoin.outbox.OutboxGauge;
 import io.github.dsudomoin.outbox.OutboxHeader;
+import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.Outcome;
@@ -9,6 +10,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -20,7 +22,7 @@ import org.slf4j.LoggerFactory;
 /**
  * An {@link OutboxTelemetry} that throws nothing but a {@link VirtualMachineError} other than a stack overflow: whatever
  * else a hook throws is logged at WARN, at most once per 10 s per hook, and the outbox goes on as without it (headers
- * and records unchanged, the record's call run once).
+ * and records unchanged, a record's call and a message's insert run once).
  */
 public final class GuardedTelemetry implements OutboxTelemetry {
 
@@ -267,6 +269,18 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         }
 
         @Override
+        public Message message(OutboxMessage message, UUID recordId, int shard) {
+            Message m;
+            try {
+                m = delegate.message(message, recordId, shard);
+            } catch (Throwable e) {
+                warn("Enqueue.message", e);
+                return Message.NONE;
+            }
+            return m == null || m == Message.NONE ? Message.NONE : new GuardedMessage(m);
+        }
+
+        @Override
         public void finished() {
             try {
                 delegate.finished();
@@ -281,6 +295,73 @@ public final class GuardedTelemetry implements OutboxTelemetry {
                 delegate.failed(error);
             } catch (Throwable e) {
                 warn("Enqueue.failed", e);
+            }
+        }
+    }
+
+    private final class GuardedMessage implements Message {
+
+        private final Message delegate;
+
+        GuardedMessage(Message delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public List<OutboxHeader> headers(List<OutboxHeader> headers) {
+            try {
+                var result = delegate.headers(headers);
+                return result == null ? headers : result;
+            } catch (Throwable e) {
+                warn("Message.headers", e);
+                return headers;
+            }
+        }
+
+        /** As {@link GuardedDelivery#inRecordScope}, and a second run of the insert refused: it would write twice. */
+        @Override
+        public <T> T inScope(Callable<T> insert) throws Exception {
+            var tracked = new TrackedCall<>(insert, true);
+            T result;
+            try {
+                result = delegate.inScope(tracked);
+            } catch (Throwable e) {
+                if (tracked.state == TrackedCall.THREW) {
+                    if (e != tracked.error) {
+                        warn("Message.inScope", e);
+                    }
+                    throw rethrow(tracked.error); // the insert's own failure, whatever the scope made of it
+                }
+                warn("Message.inScope", e);
+                return tracked.state == TrackedCall.RETURNED ? tracked.result : insert.call();
+            }
+            if (tracked.state == TrackedCall.THREW) { // a scope that swallowed the insert's failure: not written
+                warn("Message.inScope", new IllegalStateException("the message scope swallowed its insert's "
+                        + tracked.error));
+                throw rethrow(tracked.error);
+            }
+            if (tracked.state == TrackedCall.NOT_RUN) { // a scope that skipped its insert: run it, as without telemetry
+                warn("Message.inScope", new IllegalStateException("the message scope did not run its insert"));
+                return insert.call();
+            }
+            return tracked.result;
+        }
+
+        @Override
+        public void inserted() {
+            try {
+                delegate.inserted();
+            } catch (Throwable e) {
+                warn("Message.inserted", e);
+            }
+        }
+
+        @Override
+        public void failed(Throwable error) {
+            try {
+                delegate.failed(error);
+            } catch (Throwable e) {
+                warn("Message.failed", e);
             }
         }
     }
@@ -337,7 +418,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
 
         @Override
         public <T> T inRecordScope(OutboxRecord record, Callable<T> call) throws Exception {
-            var tracked = new TrackedCall<>(call);
+            var tracked = new TrackedCall<>(call, false);
             T result;
             try {
                 result = delegate.inRecordScope(record, tracked);
@@ -389,7 +470,10 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         return (Exception) error;
     }
 
-    /** A record's call that remembers whether it ran and how it ended. */
+    /**
+     * A scope's call that remembers whether it ran and how it ended; {@code once}: a second run throws
+     * {@link IllegalStateException} instead of running it again.
+     */
     private static final class TrackedCall<T> implements Callable<T> {
 
         static final int NOT_RUN = 0;
@@ -397,16 +481,21 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         static final int THREW = 2;
 
         private final Callable<T> call;
+        private final boolean once;
         int state = NOT_RUN;
         T result;
         Throwable error;
 
-        TrackedCall(Callable<T> call) {
+        TrackedCall(Callable<T> call, boolean once) {
             this.call = call;
+            this.once = once;
         }
 
         @Override
         public T call() throws Exception {
+            if (once && state != NOT_RUN) {
+                throw new IllegalStateException("the scope ran its call twice");
+            }
             try {
                 result = call.call();
                 state = RETURNED;

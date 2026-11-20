@@ -25,7 +25,9 @@ import org.slf4j.LoggerFactory;
  * so is one of a topic a route of this instance claims that some live relay instance does not route, and a contract
  * version some live relay instance cannot read ({@link ContractGuard}). A message of a topic a route of this instance
  * claims is written with the {@code outbox-local} header, which marks its record for a route, after the telemetry's
- * headers and in place of any such header given; any other message is written without one.
+ * headers and in place of any such header given; any other message is written without one. The telemetry counts a
+ * message {@code enqueued} after the commit of the transaction that wrote it, through one after-commit action per
+ * call, none while it is {@link OutboxTelemetry#NONE}.
  */
 public final class PgOutbox implements Outbox, Contracts.TypedSend {
 
@@ -103,6 +105,7 @@ public final class PgOutbox implements Outbox, Contracts.TypedSend {
         var c = currentTransaction();
         var id = insert(c, message, type);
         wakeUpAfterCommit();
+        countAfterCommit(message.topic());
         return id;
     }
 
@@ -112,6 +115,9 @@ public final class PgOutbox implements Outbox, Contracts.TypedSend {
         var id = insert(connection, message, UNKNOWN_TYPE);
         if (connection == db.currentConnection()) {
             wakeUpAfterCommit(); // the caller passed its transaction's own connection
+            countAfterCommit(message.topic());
+        } else {
+            telemetry.enqueued(message.topic()); // a commit this outbox cannot see
         }
         return id;
     }
@@ -132,13 +138,22 @@ public final class PgOutbox implements Outbox, Contracts.TypedSend {
         }
         var enqueue = telemetry.enqueueStarted();
         var ids = new UUID[n];
+        var handles = enqueue == OutboxTelemetry.Enqueue.NONE ? null : new OutboxTelemetry.Message[n];
+        int started = 0;
         try {
             var rows = new ArrayList<Resender.Row>(n);
             for (int i = 0; i < n; i++) {
                 var m = messages.get(i);
                 ids[i] = UuidV7.next(clock.millis());
-                var headers = marked(local[i], enqueue.headers(m.headers()));
-                rows.add(new Resender.Row(ids[i], m.topic(), m.key(), m.payload(), HeaderCodec.encode(headers)));
+                int shard = shardOf(m);
+                var headers = enqueue.headers(m.headers());
+                if (handles != null) {
+                    handles[i] = enqueue.message(m, ids[i], shard);
+                    started = i + 1;
+                    headers = handles[i].headers(headers);
+                }
+                rows.add(new Resender.Row(ids[i], shard, m.topic(), m.key(), m.payload(),
+                        HeaderCodec.encode(marked(local[i], headers))));
             }
             try {
                 resender.insertAll(c, rows);
@@ -146,14 +161,30 @@ public final class PgOutbox implements Outbox, Contracts.TypedSend {
                 throw db.translate(e);
             }
         } catch (RuntimeException | Error e) {
+            for (int i = 0; i < started; i++) {
+                handles[i].failed(e);
+            }
             enqueue.failed(e);
             throw e;
         }
-        for (var m : messages) {
-            telemetry.enqueued(m.topic());
+        if (handles != null) {
+            for (var handle : handles) {
+                handle.inserted();
+            }
         }
         enqueue.finished();
         wakeUpAfterCommit();
+        if (telemetry != OutboxTelemetry.NONE) {
+            var topics = new String[n]; // the caller's list may change before the commit
+            for (int i = 0; i < n; i++) {
+                topics[i] = messages.get(i).topic();
+            }
+            afterCommit(() -> {
+                for (var topic : topics) {
+                    telemetry.enqueued(topic);
+                }
+            });
+        }
         return List.of(ids);
     }
 
@@ -167,29 +198,49 @@ public final class PgOutbox implements Outbox, Contracts.TypedSend {
         var id = UuidV7.next(clock.millis());
         boolean keyed = m.key() != null;
         int hash = keyed ? Hashing.keyHash(m.topic(), m.key()) : 0;
+        int shard = keyed ? Hashing.shard(hash, shards) : Hashing.randomShard(shards);
+        var message = enqueue.message(m, id, shard);
         try (var ps = c.prepareStatement(keyed ? insertKeyed : insertUnkeyed)) {
-            ps.setShort(1, (short) (keyed ? Hashing.shard(hash, shards) : Hashing.randomShard(shards)));
+            ps.setShort(1, (short) shard);
             ps.setObject(2, id);
             ps.setString(3, m.topic());
             ps.setBytes(4, m.key());
             ps.setBytes(5, m.payload());
-            ps.setBytes(6, HeaderCodec.encode(marked(local, enqueue.headers(m.headers()))));
+            ps.setBytes(6, HeaderCodec.encode(marked(local, message.headers(enqueue.headers(m.headers())))));
             if (keyed) {
                 ps.setInt(7, keyNamespace);
                 ps.setInt(8, hash);
             }
-            ps.executeUpdate();
+            if (message == OutboxTelemetry.Message.NONE) {
+                ps.executeUpdate(); // no scope to run it in, and no callable to allocate
+            } else {
+                message.inScope(ps::executeUpdate);
+            }
         } catch (SQLException e) {
             var error = db.translate(e);
+            message.failed(error);
             enqueue.failed(error);
             throw error;
         } catch (RuntimeException | Error e) {
+            message.failed(e);
             enqueue.failed(e);
             throw e;
+        } catch (Exception e) { // only an unguarded scope throws another checked exception
+            var error = new IllegalStateException("outbox telemetry's message scope failed the insert", e);
+            message.failed(error);
+            enqueue.failed(error);
+            throw error;
         }
-        telemetry.enqueued(m.topic());
+        message.inserted();
         enqueue.finished();
         return id;
+    }
+
+    /** The shard {@code send} would put {@code m} on: its key's, or a random one without a key. */
+    private int shardOf(OutboxMessage m) {
+        return m.key() == null
+                ? Hashing.randomShard(shards)
+                : Hashing.shard(Hashing.keyHash(m.topic(), m.key()), shards);
     }
 
     /**
@@ -254,8 +305,19 @@ public final class PgOutbox implements Outbox, Contracts.TypedSend {
      * commit.
      */
     private void wakeUpAfterCommit() {
+        afterCommit(wakeUpHook);
+    }
+
+    /** {@code enqueued(topic)} after the commit, unless the telemetry is off: a new action per call, each runs. */
+    private void countAfterCommit(String topic) {
+        if (telemetry != OutboxTelemetry.NONE) {
+            afterCommit(() -> telemetry.enqueued(topic));
+        }
+    }
+
+    private void afterCommit(Runnable action) {
         try {
-            db.afterCommit(wakeUpHook);
+            db.afterCommit(action);
         } catch (SQLException e) {
             throw db.translate(e);
         }

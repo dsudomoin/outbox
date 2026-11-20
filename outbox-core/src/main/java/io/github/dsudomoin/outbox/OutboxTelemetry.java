@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.function.DoubleSupplier;
 
@@ -22,7 +23,11 @@ public interface OutboxTelemetry {
         return Enqueue.NONE;
     }
 
-    /** Per message, after its insert. */
+    /**
+     * Per message, once its write is committed: after the commit of the business transaction, on the thread that ran
+     * it, never for a write rolled back. A {@code send(Connection, ...)} on a connection that is not the current
+     * transaction's cannot see its commit: it counts right after the insert.
+     */
     default void enqueued(String topic) {}
 
     /** One per handler call, on the relay thread, before the records are handed to the handler. */
@@ -117,7 +122,7 @@ public interface OutboxTelemetry {
      */
     default void gauge(OutboxGauge gauge, DoubleSupplier value) {}
 
-    /** One {@code send} / {@code sendAll} call. */
+    /** One {@code send} / {@code sendAll} call, in the business transaction. */
     interface Enqueue {
 
         Enqueue NONE = new Enqueue() {};
@@ -127,10 +132,47 @@ public interface OutboxTelemetry {
             return headers;
         }
 
+        /**
+         * Once per message of the call, in list order, after the call's checks and before its insert: the message
+         * written as the record {@code recordId} ({@link OutboxRecord#messageId()}) on {@code shard}
+         * ({@link OutboxRecord#shard()}), both as stored.
+         */
+        default Message message(OutboxMessage message, UUID recordId, int shard) {
+            return Message.NONE;
+        }
+
         /** Every message of the call is inserted. */
         default void finished() {}
 
         /** The call failed with {@code error}, which reaches the caller. */
+        default void failed(Throwable error) {}
+    }
+
+    /**
+     * One message of an {@link Enqueue}, ended once: {@link #inserted()} or {@link #failed}, before the call's
+     * {@link Enqueue#finished()} or {@link Enqueue#failed}. Its commit is {@link #enqueued}.
+     */
+    interface Message {
+
+        Message NONE = new Message() {};
+
+        /** The headers to store for the message, given those {@link Enqueue#headers} returned. */
+        default List<OutboxHeader> headers(List<OutboxHeader> headers) {
+            return headers;
+        }
+
+        /**
+         * Runs {@code insert}, the message's own INSERT, exactly once in the scope of the message; a
+         * {@code sendAll} writes its messages in one statement and calls no scope.
+         */
+        default <T> T inScope(Callable<T> insert) throws Exception {
+            return insert.call();
+        }
+
+        /** The message is inserted; its transaction has not committed yet. */
+        default void inserted() {}
+
+        /** The insert failed with {@code error}, which reaches the caller. */
         default void failed(Throwable error) {}
     }
 

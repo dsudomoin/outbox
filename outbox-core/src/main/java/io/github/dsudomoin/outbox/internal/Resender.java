@@ -14,10 +14,10 @@ import java.util.UUID;
 /**
  * The bulk inserts into the outbox: {@code sendAll} ({@link #insertAll}), and every path that puts rows back into it
  * (orphan restore, redrive, stranded-shard repair: {@link #insertFrom}). A row gets a new id and the inserting
- * transaction's xid; it keeps its {@code message_id} and stored headers, and its shard is recomputed for the current
- * {@code outbox.shards}. Keyed rows take {@code pg_advisory_xact_lock(keyNamespace, keyHash)}, the lock {@code send}
- * takes, before the identity assigns their ids, so a row cannot interleave with a concurrent {@code send} of its
- * (topic, key).
+ * transaction's xid; it keeps its {@code message_id} and stored headers. {@link #insertAll} stores the shard its caller
+ * chose; {@link #insertFrom} recomputes it for the current {@code outbox.shards}. Keyed rows take
+ * {@code pg_advisory_xact_lock(keyNamespace, keyHash)}, the lock {@code send} takes, before the identity assigns their
+ * ids, so a row cannot interleave with a concurrent {@code send} of its (topic, key).
  */
 public final class Resender {
 
@@ -39,9 +39,13 @@ public final class Resender {
      */
     static final long STATEMENT_BYTES = 64L << 20;
 
-    /** A row to insert; {@code headers} in the stored encoding ({@link HeaderCodec}). */
-    public record Row(
-            UUID messageId, String topic, @Nullable byte[] key, @Nullable byte[] payload, @Nullable byte[] headers) {}
+    /**
+     * A row to insert; {@code shard} as {@code send} computes it for the current {@code outbox.shards}
+     * ({@link Hashing#shard} of the key hash, {@link Hashing#randomShard} without a key), {@code headers} in the stored
+     * encoding ({@link HeaderCodec}).
+     */
+    public record Row(UUID messageId, int shard, String topic, @Nullable byte[] key, @Nullable byte[] payload,
+            @Nullable byte[] headers) {}
 
     /** A row of another table to copy ({@link #insertFrom}): its id there, and the topic and key it has there. */
     public record Source(long id, String topic, @Nullable byte[] key) {}
@@ -110,8 +114,8 @@ public final class Resender {
     /**
      * Locks the rows' distinct key hashes in one statement, then inserts them, ids in list order: in one statement, or
      * in consecutive ones of at most {@link #STATEMENT_BYTES} of keys, payloads and headers each when the list holds
-     * more (a row over it in one of its own). Unkeyed rows take no lock and land on a random shard. Every key lock is
-     * held until {@code inTx} ends, so callers bound the list. Returns the rows inserted. Throws
+     * more (a row over it in one of its own), each on its {@link Row#shard()}. Unkeyed rows take no lock. Every key
+     * lock is held until {@code inTx} ends, so callers bound the list. Returns the rows inserted. Throws
      * {@link IllegalStateException} while the instance's {@link ShardGuard} finds the cursors on another shard count.
      */
     public int insertAll(Connection inTx, List<Row> rows) throws SQLException {
@@ -120,21 +124,27 @@ public final class Resender {
         if (n == 0) {
             return 0;
         }
+        var rowShards = new Short[n];
         var ids = new UUID[n];
         var topics = new String[n];
         var keys = new byte[n][];
         var payloads = new byte[n][];
         var headers = new byte[n][];
+        var hashes = new Integer[n];
+        int keyed = 0;
         for (int i = 0; i < n; i++) {
             var r = rows.get(i);
+            rowShards[i] = (short) r.shard();
             ids[i] = r.messageId();
             topics[i] = r.topic();
             keys[i] = r.key();
             payloads[i] = r.payload();
             headers[i] = r.headers();
+            if (keys[i] != null) {
+                hashes[keyed++] = Hashing.keyHash(topics[i], keys[i]);
+            }
         }
-        var rowShards = new Short[n];
-        var hashes = keyHashes(topics, keys, rowShards);
+        hashes = Arrays.copyOf(hashes, keyed);
         int inserted = 0;
         for (int from = 0, to; from < n; from = to) {
             long bytes = 0;

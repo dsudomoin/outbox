@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.dsudomoin.outbox.OutboxGauge;
 import io.github.dsudomoin.outbox.OutboxHeader;
+import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.Outcome;
@@ -19,6 +20,7 @@ import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.DoubleSupplier;
+import java.util.regex.Pattern;
 import org.junit.jupiter.api.Test;
 
 class GuardedTelemetryTest {
@@ -27,6 +29,8 @@ class GuardedTelemetryTest {
     private static final OutboxRecord RECORD =
             new OutboxRecord(1, UUID.randomUUID(), "orders", null, null, HEADERS, Instant.EPOCH, 0, 0);
     private static final List<OutboxRecord> RECORDS = List.of(RECORD);
+    private static final OutboxMessage MESSAGE = OutboxMessage.of("orders", new byte[] {2});
+    private static final UUID MESSAGE_ID = UUID.randomUUID();
 
     @Test
     void throwingEnqueueLeavesHeadersUnchanged() {
@@ -215,6 +219,111 @@ class GuardedTelemetryTest {
     }
 
     @Test
+    void throwingMessageIsIgnored() {
+        try (var err = new CapturedStderr()) {
+            var message = GuardedTelemetry.of(new Throwing()).enqueueStarted().message(MESSAGE, MESSAGE_ID, 3);
+            assertThat(message).isSameAs(OutboxTelemetry.Message.NONE);
+            assertThat(occurrences(err.text(), "hook Enqueue.message failed")).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void messageNoneIsNotWrapped() {
+        var plain = new OutboxTelemetry() {
+            @Override
+            public Enqueue enqueueStarted() {
+                return new Enqueue() {};
+            }
+        };
+        var enqueue = GuardedTelemetry.of(plain).enqueueStarted();
+        assertThat(enqueue.message(MESSAGE, MESSAGE_ID, 3)).isSameAs(OutboxTelemetry.Message.NONE);
+    }
+
+    @Test
+    void messageGetsItsIdAndShard() {
+        var seen = new ArrayList<String>();
+        var t = GuardedTelemetry.of(new OutboxTelemetry() {
+            @Override
+            public Enqueue enqueueStarted() {
+                return new Enqueue() {
+                    @Override
+                    public Message message(OutboxMessage message, UUID recordId, int shard) {
+                        seen.add(message.topic() + " " + recordId + " " + shard);
+                        return null;
+                    }
+                };
+            }
+        });
+
+        var message = t.enqueueStarted().message(MESSAGE, MESSAGE_ID, 3);
+
+        assertThat(seen).containsExactly("orders " + MESSAGE_ID + " 3");
+        assertThat(message).as("null reads as none").isSameAs(OutboxTelemetry.Message.NONE);
+    }
+
+    @Test
+    void throwingMessageHooksAreLoggedOnceAndIgnored() throws Exception {
+        var calls = new AtomicInteger();
+        try (var err = new CapturedStderr()) {
+            var message = GuardedTelemetry.of(new MessageThrowing()).enqueueStarted().message(MESSAGE, MESSAGE_ID, 3);
+            for (int i = 1; i <= 2; i++) {
+                assertThat(message.headers(HEADERS)).isSameAs(HEADERS);
+                assertThat(message.inScope(calls::incrementAndGet)).as("the insert's own result").isEqualTo(i);
+                assertThatCode(message::inserted).doesNotThrowAnyException();
+                assertThatCode(() -> message.failed(new IOException("x"))).doesNotThrowAnyException();
+            }
+            assertThat(calls).as("the insert ran once per scope, though the scope threw before it").hasValue(2);
+            var text = err.text();
+            for (var hook : List.of("Message.headers", "Message.inScope", "Message.inserted", "Message.failed")) {
+                assertThat(occurrences(text, "hook " + hook + " failed")).as(hook).isEqualTo(1);
+            }
+        }
+    }
+
+    @Test
+    void insertRunsOnceWhenMessageScopeThrowsAfterIt() throws Exception {
+        var calls = new AtomicInteger();
+        var message = GuardedTelemetry.of(new MessageScope(Scope.THROW_AFTER)).enqueueStarted()
+                .message(MESSAGE, MESSAGE_ID, 3);
+        assertThat(message.inScope(calls::incrementAndGet)).isEqualTo(1);
+        assertThat(calls).hasValue(1);
+    }
+
+    @Test
+    void insertRunsOnceWhenMessageScopeSkipsIt() throws Exception {
+        var calls = new AtomicInteger();
+        var message = GuardedTelemetry.of(new MessageScope(Scope.SKIP)).enqueueStarted()
+                .message(MESSAGE, MESSAGE_ID, 3);
+        assertThat(message.inScope(calls::incrementAndGet)).isEqualTo(1);
+        assertThat(calls).hasValue(1);
+    }
+
+    @Test
+    void insertRunsOnceWhenMessageScopeCallsItTwice() throws Exception {
+        var calls = new AtomicInteger();
+        var message = GuardedTelemetry.of(new MessageScope(Scope.TWICE)).enqueueStarted()
+                .message(MESSAGE, MESSAGE_ID, 3);
+        try (var err = new CapturedStderr()) {
+            assertThat(message.inScope(calls::incrementAndGet)).isEqualTo(1);
+            assertThat(err.text()).contains("Message.inScope");
+        }
+        assertThat(calls).as("a second insert would write the message twice").hasValue(1);
+    }
+
+    @Test
+    void insertFailurePassesThroughTheMessageScope() {
+        var message = GuardedTelemetry.of(new MessageScope(Scope.SWALLOW)).enqueueStarted()
+                .message(MESSAGE, MESSAGE_ID, 3);
+        var failure = new IllegalStateException("insert");
+        try (var err = new CapturedStderr()) {
+            assertThatThrownBy(() -> message.inScope(() -> {
+                throw failure;
+            })).isSameAs(failure);
+            assertThat(err.text()).contains("Message.inScope");
+        }
+    }
+
+    @Test
     void warnsAtMostOncePer10s() {
         var t = GuardedTelemetry.of(new Throwing());
         try (var err = new CapturedStderr()) {
@@ -252,6 +361,11 @@ class GuardedTelemetryTest {
             return new Enqueue() {
                 @Override
                 public List<OutboxHeader> headers(List<OutboxHeader> headers) {
+                    throw bug();
+                }
+
+                @Override
+                public Message message(OutboxMessage message, UUID recordId, int shard) {
                     throw bug();
                 }
 
@@ -424,5 +538,80 @@ class GuardedTelemetryTest {
                 }
             };
         }
+    }
+    /** Every message hook throws, its scope before running the insert. */
+    private static final class MessageThrowing implements OutboxTelemetry {
+        @Override
+        public Enqueue enqueueStarted() {
+            return new Enqueue() {
+                @Override
+                public Message message(OutboxMessage message, UUID recordId, int shard) {
+                    return new Message() {
+                        @Override
+                        public List<OutboxHeader> headers(List<OutboxHeader> headers) {
+                            throw new IllegalStateException("telemetry bug");
+                        }
+
+                        @Override
+                        public <T> T inScope(Callable<T> insert) {
+                            throw new IllegalStateException("telemetry bug");
+                        }
+
+                        @Override
+                        public void inserted() {
+                            throw new IllegalStateException("telemetry bug");
+                        }
+
+                        @Override
+                        public void failed(Throwable error) {
+                            throw new IllegalStateException("telemetry bug");
+                        }
+                    };
+                }
+            };
+        }
+    }
+
+    private enum Scope { THROW_AFTER, SKIP, TWICE, SWALLOW }
+
+    /** A message scope with one of the bugs of {@link Scope}. */
+    private record MessageScope(Scope bug) implements OutboxTelemetry {
+        @Override
+        public Enqueue enqueueStarted() {
+            return new Enqueue() {
+                @Override
+                public Message message(OutboxMessage message, UUID recordId, int shard) {
+                    return new Message() {
+                        @Override
+                        public <T> T inScope(Callable<T> insert) throws Exception {
+                            switch (bug) {
+                                case THROW_AFTER -> {
+                                    insert.call();
+                                    throw new IllegalStateException("telemetry bug");
+                                }
+                                case SKIP -> {
+                                    return null;
+                                }
+                                case TWICE -> {
+                                    insert.call();
+                                    return insert.call();
+                                }
+                                default -> {
+                                    try {
+                                        return insert.call();
+                                    } catch (Exception e) {
+                                        return null;
+                                    }
+                                }
+                            }
+                        }
+                    };
+                }
+            };
+        }
+    }
+
+    private static int occurrences(String text, String part) {
+        return text.split(Pattern.quote(part), -1).length - 1;
     }
 }

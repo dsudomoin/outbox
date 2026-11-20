@@ -54,7 +54,7 @@ class ResenderIT {
     }
 
     @Test
-    void keepsMessageIdAndHeadersAndRecomputesTheShard() throws Exception {
+    void keepsMessageIdHeadersAndTheGivenShard() throws Exception {
         var headers = HeaderCodec.encode(List.of(new OutboxHeader("h", bytes("v")), new OutboxHeader("n", null)));
         try (var c = TestDb.connect(); var ps = c.prepareStatement("insert into " + names.base()
                 + " (shard, message_id, topic, key, payload, headers) values (?, gen_random_uuid(), ?, ?, ?, ?)")) {
@@ -72,7 +72,8 @@ class ResenderIT {
         }
         var stale = stored();
         var rows = stale.stream()
-                .map(s -> new Resender.Row(s.messageId(), s.topic(), s.key(), s.payload(), s.headers()))
+                .map(s -> new Resender.Row(s.messageId(), shardOf(s.topic(), s.key()), s.topic(), s.key(),
+                        s.payload(), s.headers()))
                 .toList();
 
         try (var c = TestDb.connect()) {
@@ -93,12 +94,7 @@ class ResenderIT {
             assertThat(s.key()).isEqualTo(row.key());
             assertThat(s.payload()).isEqualTo(row.payload());
             assertThat(s.headers()).as("the stored encoding").isEqualTo(row.headers());
-            if (row.key() == null) {
-                assertThat(s.shard()).isBetween(0, config.shards() - 1);
-            } else {
-                assertThat(s.shard())
-                        .isEqualTo(Hashing.shard(Hashing.keyHash(row.topic(), row.key()), config.shards()));
-            }
+            assertThat(s.shard()).as("the caller's shard").isEqualTo(row.shard());
         }
     }
 
@@ -114,8 +110,9 @@ class ResenderIT {
             return id;
         }));
         assertThat(sent.await(10, SECONDS)).as("A holds the key lock").isTrue();
-        var other = new Resender.Row(UUID.randomUUID(), "t", bytes("other"), bytes("o"), null);
-        var same = new Resender.Row(UUID.randomUUID(), "t", bytes("k"), bytes("b"), null);
+        var other = new Resender.Row(UUID.randomUUID(), shardOf("t", bytes("other")), "t", bytes("other"), bytes("o"),
+                null);
+        var same = new Resender.Row(UUID.randomUUID(), shardOf("t", bytes("k")), "t", bytes("k"), bytes("b"), null);
         var b = pool.submit(() -> {
             try (var c = TestDb.connect()) {
                 c.setAutoCommit(false);
@@ -148,7 +145,8 @@ class ResenderIT {
         for (int i = 0; i < 51; i++) {
             var payload = new byte[i == 25 ? 1_500_000 : 100_000]; // one row over the bound on its own
             payload[0] = (byte) i;
-            rows.add(new Resender.Row(UUID.randomUUID(), "t", i % 2 == 0 ? null : bytes("k" + i % 7), payload, null));
+            var key = i % 2 == 0 ? null : bytes("k" + i % 7);
+            rows.add(new Resender.Row(UUID.randomUUID(), shardOf("t", key), "t", key, payload, null));
         }
         var inserts = new AtomicInteger();
         var locks = new AtomicInteger();
@@ -187,7 +185,7 @@ class ResenderIT {
         var payload = new byte[1_100_000];
         var rows = new ArrayList<Resender.Row>();
         for (int i = 0; i < 1030; i++) {
-            rows.add(new Resender.Row(UUID.randomUUID(), "t", null, payload, null));
+            rows.add(new Resender.Row(UUID.randomUUID(), shardOf("t", null), "t", null, payload, null));
         }
 
         try (var c = TestDb.connect()) {
@@ -243,6 +241,13 @@ class ResenderIT {
             Thread.currentThread().interrupt();
             throw new IllegalStateException(e);
         }
+    }
+
+    /** The shard {@code send} picks: the key's, a random one without a key. */
+    private int shardOf(String topic, byte[] key) {
+        return key == null
+                ? Hashing.randomShard(config.shards())
+                : Hashing.shard(Hashing.keyHash(topic, key), config.shards());
     }
 
     private static byte[] bytes(String s) {
