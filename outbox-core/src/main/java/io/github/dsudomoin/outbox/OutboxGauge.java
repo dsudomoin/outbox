@@ -17,8 +17,21 @@ public enum OutboxGauge {
     PARTITIONS_XIDS_LEFT("outbox.partitions.xids_left"),
     PARTITIONS_RETAINED("outbox.partitions.retained"),
     PARTITIONS_ORPHANED("outbox.partitions.orphaned"),
+    /**
+     * Always 0: maintenance runs behind a transaction-pooling proxy as on a direct connection, so it never skips a run
+     * for one, which this reported as 1 in earlier releases. Kept so dashboards and alerts on it keep working.
+     *
+     * @deprecated nothing to report any more; to be removed in a later release
+     */
+    @Deprecated
     MAINTENANCE_TRANSACTION_POOLING("outbox.maintenance.transaction_pooling"),
     MAINTENANCE_SINCE_SUCCESS("outbox.maintenance.since_success"),
+    /**
+     * Always 0, as {@link #MAINTENANCE_TRANSACTION_POOLING}, for the inbox's maintenance.
+     *
+     * @deprecated nothing to report any more; to be removed in a later release
+     */
+    @Deprecated
     INBOX_MAINTENANCE_TRANSACTION_POOLING("outbox.inbox.maintenance.transaction_pooling"),
     INBOX_PARTITIONS_ORPHANED("outbox.inbox.partitions.orphaned"),
     INBOX_WINDOW_REMAINING("outbox.inbox.window.remaining");

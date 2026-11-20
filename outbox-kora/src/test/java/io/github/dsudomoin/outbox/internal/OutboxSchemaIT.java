@@ -560,7 +560,7 @@ class OutboxSchemaIT {
 
             assertTimeoutPreemptively(Duration.ofSeconds(30), () -> assertThatThrownBy(schema::start)
                     .isInstanceOf(IllegalStateException.class)
-                    .hasMessageContaining("pg_advisory_lock(" + ns + ", " + TableNames.LOCK_SCHEMA + ")")
+                    .hasMessageContaining("pg_advisory_xact_lock(" + ns + ", " + TableNames.LOCK_SCHEMA + ")")
                     .hasMessageContaining("classid = " + Integer.toUnsignedLong(ns)));
             assertThat(queryString(holder, "select (to_regclass(?) is null)::text", config.table())).isEqualTo("true");
         }
@@ -599,7 +599,7 @@ class OutboxSchemaIT {
             assertTimeoutPreemptively(Duration.ofSeconds(30), () -> assertThatThrownBy(
                             new OutboxSchema(shortDb, config, 1)::start)
                     .isInstanceOf(IllegalStateException.class) // the lock_timeout, not the 1 s statement_timeout
-                    .hasMessageContaining("pg_advisory_lock(" + ns + ", " + TableNames.LOCK_SCHEMA + ")"));
+                    .hasMessageContaining("pg_advisory_xact_lock(" + ns + ", " + TableNames.LOCK_SCHEMA + ")"));
         } finally {
             shortDb.release();
         }

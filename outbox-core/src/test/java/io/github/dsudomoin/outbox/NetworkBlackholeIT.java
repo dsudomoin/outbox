@@ -270,7 +270,7 @@ class NetworkBlackholeIT {
         hole.forget();
 
         long seen = lastSuccess(names.maintenance());
-        // a run cut off holds the maintenance lock till idle_session_timeout (60 s) ends its backend
+        // a run cut off holds the maintenance lock till idle_in_transaction_session_timeout (60 s) ends its holder
         await(Duration.ofSeconds(90), () -> lastSuccess(names.maintenance()) > seen);
     }
 
@@ -293,7 +293,7 @@ class NetworkBlackholeIT {
         hole.forget();
 
         long seen = lastSuccess(names.maintenance());
-        // a run cut off holds the maintenance lock till idle_session_timeout (60 s) ends its backend
+        // a run cut off holds the maintenance lock till idle_in_transaction_session_timeout (60 s) ends its holder
         await(Duration.ofSeconds(90), () -> lastSuccess(names.maintenance()) > seen);
     }
 
@@ -312,7 +312,7 @@ class NetworkBlackholeIT {
         try (var c = DIRECT.getConnection()) {
             TestSql.execute(c, "create table " + past + " (like " + config.inbox().table() + " including defaults)");
         }
-        // a run cut off holds the maintenance lock till idle_session_timeout (60 s) ends its backend
+        // a run cut off holds the maintenance lock till idle_in_transaction_session_timeout (60 s) ends its holder
         await(Duration.ofSeconds(90), () -> {
             try (var c = DIRECT.getConnection()) {
                 return TestSql.queryString(c, "select to_regclass(?)::text", past) == null;
@@ -691,8 +691,8 @@ class NetworkBlackholeIT {
     }
 
     @Test
-    void anIndexBuildHoldsItsLockUnderAnIdleSessionTimeoutAndGivesItBack() throws Exception {
-        // a backend whose client the network lost idles holding the lock; the timeout frees it, as for maintenance's
+    void anIndexBuildHoldsItsLockUnderAnIdleTimeoutAndLeavesNothingOnItsConnections() throws Exception {
+        // a holder whose client the network lost idles holding the lock; the timeout frees it, as for maintenance's
         var config = new TestOutboxConfig().maintenanceInterval(Duration.ofMillis(100));
         var bootstrap = OutboxRuntime.builder(config, new JdbcTransactions(DIRECT), record -> {}).build();
         bootstrap.start();
@@ -700,15 +700,19 @@ class NetworkBlackholeIT {
         var names = bootstrap.schema().names();
         var index = names.dead() + "_due";
         var whileLocked = new AtomicReference<String>();
-        var atClose = new AtomicReference<String>();
+        var atClose = new ConcurrentLinkedQueue<String>();
         var source = intercepting(DIRECT, (c, call, args) -> {
             if (!Thread.currentThread().getName().equals("outbox-dead-index")) {
                 return;
             }
-            if (call.getName().equals("prepareStatement") && args[0].toString().contains("pg_advisory_unlock")) {
-                whileLocked.set(TestSql.queryString(c, "select current_setting('idle_session_timeout')"));
+            if (call.getName().equals("prepareStatement") && args[0].toString().contains("pg_try_advisory_xact_lock(?, ?)")) {
+                whileLocked.set(TestSql.queryString(c, "select current_setting('idle_in_transaction_session_timeout')"));
             } else if (call.getName().equals("close") && !c.isClosed()) {
-                atClose.set(TestSql.queryString(c, "select current_setting('idle_session_timeout')"));
+                atClose.add(TestSql.queryString(c, "select coalesce(string_agg(name, ','), 'none') from pg_settings"
+                        + " where source = 'session' and name not in ('application_name', 'client_encoding', 'DateStyle',"
+                        + " 'TimeZone', 'IntervalStyle', 'extra_float_digits')")
+                        + "|" + TestSql.queryLong(c, "select count(*) from pg_locks where locktype = 'advisory'"
+                        + " and pid = pg_backend_pid()"));
             }
         });
         try (var c = DIRECT.getConnection()) {
@@ -720,12 +724,12 @@ class NetworkBlackholeIT {
             closing.add(relay);
             relay.start();
 
-            await(() -> atClose.get() != null);
+            await(() -> atClose.size() >= 2); // the build's connection and its holder's
             assertThat(TestSql.queryString(c, "select indisvalid::text from pg_index where indexrelid = to_regclass(?)",
                     index)).isEqualTo("true");
         }
-        assertThat(whileLocked.get()).as("while it holds the lock").isEqualTo("1min");
-        assertThat(atClose.get()).as("given back").isEqualTo("0");
+        assertThat(whileLocked.get()).as("while its holder holds the lock").isEqualTo("1min");
+        assertThat(atClose).as("nothing left for the session").containsOnly("none|0");
     }
 
     @Test
@@ -925,7 +929,7 @@ class NetworkBlackholeIT {
     @Test
     void aStartCutOffHoldingTheSchemaLockLetsTheNextStartGoOn() throws Exception {
         var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(1));
-        var cut = OutboxRuntime.builder(config, new JdbcTransactions(forgottenAfter("pg_advisory_lock",
+        var cut = OutboxRuntime.builder(config, new JdbcTransactions(forgottenAfter("advisory_xact_lock(?, ?)",
                 throughTheHole(3, 0))), record -> {}).build();
         CompletableFuture.runAsync(() -> {
             try {
@@ -953,7 +957,7 @@ class NetworkBlackholeIT {
         var made = InboxRuntime.builder(config, new JdbcTransactions(DIRECT)).build();
         made.start();
         made.close();
-        var cut = InboxRuntime.builder(config, new JdbcTransactions(forgottenAfter("pg_advisory_lock",
+        var cut = InboxRuntime.builder(config, new JdbcTransactions(forgottenAfter("advisory_xact_lock(?, ?)",
                 throughTheHole(3, 0)))).build();
         CompletableFuture.runAsync(() -> {
             try {

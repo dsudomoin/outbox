@@ -209,7 +209,8 @@ class XidRecoveryIT {
         }
 
         try (var err = new CapturedStderr()) {
-            assertThat(maintenance.runOnce()).isTrue();
+            // the relay's own runs take the lock too: a run of this call's may find it held
+            await(Duration.ofSeconds(10), maintenance::runOnce);
 
             assertThat(err.text()).contains("ERROR").contains(names.base());
         }
@@ -1018,11 +1019,9 @@ class XidRecoveryIT {
         try (var err = new CapturedStderr()) {
             assertThat(admin.recoverXidRegression()).isEqualTo(5);
 
-            var text = err.text();
-            assertThat(text).contains("WARN").contains("the recovery committed, then releasing the maintenance lock")
-                    .doesNotContain("nothing re-sent");
-            assertThat(text.indexOf("returned 5, the rows re-sent")).as("the INFO, then the WARN").isNotNegative()
-                    .isLessThan(text.indexOf("the recovery committed, then"));
+            // the lock is a transaction's on a connection of its own: nothing to release on the one that died
+            assertThat(err.text()).contains("returned 5, the rows re-sent").doesNotContain("nothing re-sent")
+                    .doesNotContain("WARN");
         }
         assertThat(wakes).hasValue(1);
         assertThat(maintenance.halted()).isFalse();

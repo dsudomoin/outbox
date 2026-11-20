@@ -24,11 +24,18 @@ public final class TestPooler implements AutoCloseable {
 
     private static final int PORT = 6432;
     /**
-     * Settings a session of pgbouncer's may carry that are no client's leftovers: pgbouncer sets these itself when it
-     * hands a server session to another client.
+     * Settings a session of pgbouncer's may carry that are no client's leftovers: the ones pgbouncer sets itself when it
+     * hands a server session to another client, and the check's own transaction's.
      */
     private static final String POOLER_OWN = "'application_name', 'client_encoding', 'DateStyle', 'TimeZone',"
-            + " 'IntervalStyle', 'standard_conforming_strings', 'extra_float_digits'";
+            + " 'IntervalStyle', 'standard_conforming_strings', 'extra_float_digits', 'transaction_isolation',"
+            + " 'transaction_read_only', 'transaction_deferrable'";
+
+    /**
+     * The library's own settings: a placeholder setting is not in {@code pg_settings}, so each is read by name.
+     */
+    private static final String[] OWN_SETTINGS = {"kora_outbox.swap", "kora_outbox.drop_pending", "kora_outbox.reown",
+        "kora_outbox.locked"};
 
     private final GenericContainer<?> container;
     private final int serverConnections;
@@ -98,7 +105,7 @@ public final class TestPooler implements AutoCloseable {
      * clients as the pool has sessions each hold a transaction at once.
      */
     public void warm(String user, String password) throws SQLException {
-        sessions(user, password, c -> {});
+        sessions(user, password, c -> {}, false);
     }
 
     /**
@@ -113,23 +120,52 @@ public final class TestPooler implements AutoCloseable {
                     + " (select string_agg(format('advisory lock (%s, %s, %s) %s', classid, objid, objsubid, mode), ', ')"
                     + " from pg_locks where locktype = 'advisory' and pid = pg_backend_pid()),"
                     + " (select string_agg(name || ' = ' || setting, ', ') from pg_settings where source = 'session'"
-                    + " and name not in (" + POOLER_OWN + "))")) {
+                    + " and name not in (" + POOLER_OWN + ")), " + ownSettings())) {
                 rs.next();
-                for (int i = 2; i <= 3; i++) {
-                    if (rs.getString(i) != null) {
-                        found.add("server session " + rs.getInt(1) + ": " + rs.getString(i));
+                for (int i = 2; i <= 3 + OWN_SETTINGS.length; i++) {
+                    if (rs.getString(i) != null && !rs.getString(i).isEmpty()) {
+                        found.add("server session " + rs.getInt(1) + ": " + (i > 3 ? OWN_SETTINGS[i - 4] + " = " : "")
+                                + rs.getString(i));
                     }
                 }
             }
-        });
+        }, false);
         return found;
+    }
+
+    private static String ownSettings() {
+        var columns = new StringBuilder();
+        for (var name : OWN_SETTINGS) {
+            columns.append(columns.isEmpty() ? "" : ", ").append("current_setting('").append(name).append("', true)");
+        }
+        return columns.toString();
+    }
+
+    /**
+     * Takes back what clients left in the server sessions of {@code user}'s pool: settings set for the session and
+     * session advisory locks.
+     */
+    public void scrub(String user, String password) throws SQLException {
+        sessions(user, password, c -> {
+            try (var st = c.createStatement()) {
+                st.execute("reset all; select pg_advisory_unlock_all()");
+                for (var name : OWN_SETTINGS) {
+                    st.execute("select set_config('" + name + "', '', false)");
+                }
+            }
+        }, true);
     }
 
     private interface SessionCheck {
         void accept(Connection c) throws SQLException;
     }
 
-    private void sessions(String user, String password, SessionCheck check) throws SQLException {
+    /**
+     * {@code check} in each server session of {@code user}'s pool, as many clients holding a transaction at once as it
+     * has; ended together after the last, committed with {@code commit}, else rolled back, so none of them hands its
+     * session back to the next client before every session has been seen.
+     */
+    private void sessions(String user, String password, SessionCheck check, boolean commit) throws SQLException {
         var open = new ArrayList<Connection>();
         try {
             var seen = new java.util.HashSet<Integer>();
@@ -148,7 +184,11 @@ public final class TestPooler implements AutoCloseable {
         } finally {
             for (var c : open) {
                 try (c) {
-                    c.rollback();
+                    if (commit) {
+                        c.commit();
+                    } else {
+                        c.rollback();
+                    }
                 }
             }
         }

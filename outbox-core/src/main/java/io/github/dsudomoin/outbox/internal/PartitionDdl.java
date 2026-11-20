@@ -5,7 +5,6 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -17,13 +16,16 @@ import org.slf4j.LoggerFactory;
 /**
  * Range-partition DDL shared by the outbox (xid8 bounds) and the inbox (uuid bounds). Every method needs an autocommit
  * connection ({@code DETACH ... CONCURRENTLY} cannot run in a transaction block, the drop-or-attach methods commit),
- * except the reads, {@link #create} and {@link #attach}, which {@link XidRecovery} also runs in its transaction. Each
- * DDL statement runs under its own {@code lock_timeout} and a {@code statement_timeout} {@link #DDL_MARGIN} longer,
- * so a shorter role or database {@code statement_timeout} cannot end the lock wait first (57014). Both are given back
- * afterwards on every path: the session's own value, or a reset when it had none (inside a transaction, as
- * {@code SET LOCAL}, so its end restores what the session had before). Bound values are unquoted text
- * ({@code "1000"}); a {@code null} upper bound is {@code MAXVALUE}. Names are interpolated, so they and the values are
- * checked against a strict charset.
+ * except the reads, {@link #create} and {@link #attach}, which {@link XidRecovery} also runs in its transaction. Nothing
+ * is set for the session, so behind a transaction-pooling proxy (pgbouncer, Odyssey), where each autocommit statement
+ * may run in another server session, nothing outlives a statement into another client's session: on an autocommit
+ * connection each DDL statement runs in a transaction of its own ({@link #transaction}) under {@code SET LOCAL}
+ * timeouts, its own {@code lock_timeout} and a {@code statement_timeout} {@link #DDL_MARGIN} longer, so a shorter role
+ * or database {@code statement_timeout} cannot end the lock wait first (57014); inside the caller's transaction it
+ * runs under the same {@code SET LOCAL}s, the transaction's own values given back after it. A statement Postgres runs
+ * only alone outside a transaction block, a concurrent detach, runs as {@link #executeConcurrently} says. Bound values
+ * are unquoted text ({@code "1000"}); a {@code null} upper bound is {@code MAXVALUE}. Names are interpolated, so they
+ * and the values are checked against a strict charset.
  */
 public final class PartitionDdl {
 
@@ -32,14 +34,27 @@ public final class PartitionDdl {
     private static final Pattern NEEDLESS_QUOTES = Pattern.compile("\"([a-z_][a-z0-9_]*)\"");
     /** A DDL statement's {@code statement_timeout} past its {@code lock_timeout}: room for its own work. */
     static final Duration DDL_MARGIN = Duration.ofSeconds(60);
-    /** The two timeouts as this session set them, null where it did not (the role, database or server default). */
+    /**
+     * The timeouts as this transaction set them ({@code SET LOCAL} shows as the session's), null where it did not.
+     */
     private static final String SESSION_TIMEOUTS = "select max(setting) filter (where name = 'lock_timeout'),"
             + " max(setting) filter (where name = 'statement_timeout'),"
             + " max(setting) filter (where name = 'transaction_timeout') from pg_settings"
             + " where name in ('lock_timeout', 'statement_timeout', 'transaction_timeout') and source = 'session'";
-    /** What bootstrap and maintenance need of their connection, see {@link #backendChanges}. */
-    static final String SESSION_POOLING_REQUIRED =
-            "needs a direct or session-pooled connection (transaction-pooling proxy detected)";
+    private static final String LOCK_NOT_AVAILABLE = "55P03";
+
+    /**
+     * The {@code idle_in_transaction_session_timeout} of a work transaction that waits up to {@code lockTimeout}:
+     * {@code lockTimeout} + 30 s, kept short of a frozen lock holder's end ({@link Maintenance#HOLDER_IDLE}, less two
+     * keepalives), so a frozen instance's work transaction ends before its holder does and another instance's run never
+     * meets it.
+     */
+    static Duration workIdle(Duration lockTimeout) {
+        var cap = Maintenance.HOLDER_IDLE.minus(LockHolder.KEEPALIVE.multipliedBy(2));
+        var idle = lockTimeout.plusSeconds(30);
+        return idle.compareTo(cap) < 0 ? idle : cap;
+    }
+    private static final String QUERY_CANCELED = "57014";
 
     /**
      * The sessions of this database holding a snapshot, oldest first: how many, and the first five with their
@@ -149,9 +164,10 @@ public final class PartitionDdl {
      * {@link #create} gave each new table to the owner. Only a table's owner may give it away, so each instance's role
      * hands over its own; when it cannot ({@link #ownerProblem}), they stay, with {@link #foreignOwner}'s WARN. The
      * {@code OWNER TO} takes ACCESS EXCLUSIVE on the table, which a queued wait would hold every writer routed to it
-     * and every reader of the parent behind: one autocommit statement each takes it {@code NOWAIT}, as
-     * {@link XidPartitions#dropPending} does, tried every millisecond for {@link XidPartitions#NOWAIT_WINDOW}, other
-     * lock waits cut at {@link XidPartitions#HOLD_LOCK_TIMEOUT} and the hold at {@link XidPartitions#DAY_HOLD}. A table
+     * and every reader of the parent behind: one short transaction each takes it {@code NOWAIT}, as
+     * {@link XidPartitions#dropPending} does ({@link XidPartitions#nowaitPipeline}), tried every millisecond for
+     * {@link XidPartitions#NOWAIT_WINDOW}, other lock waits cut at {@link XidPartitions#HOLD_LOCK_TIMEOUT} and the hold
+     * at {@link XidPartitions#DAY_HOLD}, the commit sent with it. A table
      * no try got (behind a long reader), or whose handover failed, is logged and left to the next run.
      */
     static void reown(Connection c, String parent, String suffix) throws SQLException {
@@ -174,25 +190,11 @@ public final class PartitionDdl {
             return;
         }
         for (var table : tables) {
-            // a local commit, as the swap's: a wait for a synchronous standby ignores cancels and would hold the lock
-            var sql = "do $$ begin perform set_config('synchronous_commit', 'local', true); begin lock table "
-                    + name(table) + " in access exclusive mode nowait; exception when lock_not_available then perform"
-                    + " set_config('" + REOWN_RESULT + "', 'busy', false); return; end; alter table " + name(table)
-                    + " owner to " + owner + "; perform set_config('" + REOWN_RESULT + "', 'given', false); end $$";
-            long start = System.nanoTime();
+            var sql = XidPartitions.nowaitPipeline("table " + name(table), Duration.ZERO, "alter table " + name(table)
+                    + " owner to " + owner + "; perform set_config('" + REOWN_RESULT + "', 'given', true);",
+                    XidPartitions.DAY_HOLD, REOWN_RESULT);
             try {
-                var result = withTimeouts(c, XidPartitions.HOLD_LOCK_TIMEOUT,
-                        XidPartitions.DAY_HOLD.plus(XidPartitions.TRY_MARGIN), () ->
-                                XidPartitions.nowaitTries(start, () -> {
-                                    try (var st = c.createStatement()) {
-                                        st.execute(sql);
-                                    }
-                                    try (var st = c.createStatement(); var rs = st.executeQuery(
-                                            "select current_setting('" + REOWN_RESULT + "', true)")) {
-                                        rs.next();
-                                        return rs.getString(1);
-                                    }
-                                }));
+                var result = transaction(c, Maintenance.ABANDONED_AFTER, () -> XidPartitions.pipeline(c, sql, null));
                 if (!result.equals("given")) {
                     log.warn("outbox could not give table {} to {}, the owner of {}: a transaction held a lock on it at"
                             + " every try for {} ms; the next maintenance run retries", table, owner, parent,
@@ -201,6 +203,9 @@ public final class PartitionDdl {
                 }
                 log.info("gave table {} to {}, the owner of {}", table, owner, parent);
             } catch (SQLException e) {
+                if (LockHolder.lost(e)) {
+                    throw e; // the run's lock holder is gone: no more tables
+                }
                 log.warn("outbox could not give table {} to {}, the owner of {} (SQLState {}); the next maintenance"
                         + " run retries: {}", table, owner, parent, e.getSQLState(), e.getMessage());
             }
@@ -346,8 +351,9 @@ public final class PartitionDdl {
     }
 
     /**
-     * {@code DETACH ... CONCURRENTLY}, or {@code FINALIZE} when an earlier detach was interrupted (lock timeout,
-     * crash) and left the partition pending; no-op when the partition is not attached. A {@code FINALIZE} that timed
+     * {@code DETACH ... CONCURRENTLY} ({@link #executeConcurrently}, its wait cut at {@code lockTimeout}), or
+     * {@code FINALIZE} when an earlier detach was interrupted (lock timeout, crash, a role's {@code statement_timeout})
+     * and left the partition pending; no-op when the partition is not attached. A {@code FINALIZE} that timed
      * out (55P03) waited for the sessions of this database holding an older snapshot, whatever they read: the 55P03
      * again, naming the oldest of them ({@link #OLDEST_SNAPSHOTS}).
      */
@@ -355,8 +361,12 @@ public final class PartitionDdl {
         var attachment = attachment(c, parent, partition);
         if (attachment == Attachment.ATTACHED || attachment == Attachment.DETACH_PENDING) {
             try {
-                execute(c, lockTimeout, "alter table " + name(parent) + " detach partition " + name(partition)
-                        + (attachment == Attachment.DETACH_PENDING ? " finalize" : " concurrently"));
+                var detach = "alter table " + name(parent) + " detach partition " + name(partition);
+                if (attachment == Attachment.ATTACHED) {
+                    executeConcurrently(c, lockTimeout, detach + " concurrently", null);
+                } else {
+                    execute(c, lockTimeout, detach + " finalize"); // in a transaction block too, unlike CONCURRENTLY
+                }
             } catch (SQLException e) {
                 if (attachment != Attachment.DETACH_PENDING || !"55P03".equals(e.getSQLState())) {
                     throw e;
@@ -402,9 +412,11 @@ public final class PartitionDdl {
         boolean empty;
         c.setAutoCommit(false);
         try (var st = c.createStatement()) {
+            st.execute("set transaction isolation level read committed");
+            LockHolder.fenceCurrent(c);
             st.execute("set local lock_timeout = " + lockTimeout.toMillis());
             st.execute("set local statement_timeout = " + statementTimeout.toMillis());
-            st.execute("set local idle_in_transaction_session_timeout = " + lockTimeout.plusSeconds(30).toMillis()
+            st.execute("set local idle_in_transaction_session_timeout = " + workIdle(lockTimeout).toMillis()
                     + Ticks.noTransactionTimeout(c));
             st.execute("lock table " + name(table) + " in access exclusive mode");
             try (var rs = st.executeQuery("select 1 from " + name(table) + " limit 1")) {
@@ -494,9 +506,10 @@ public final class PartitionDdl {
         try (var st = c.createStatement()) {
             // first: a repeatable-read default would fix the snapshot at the first read, and the second would miss rows
             st.execute("set transaction isolation level read committed");
+            LockHolder.fenceCurrent(c);
             st.execute("set local lock_timeout = " + lockTimeout.toMillis());
             st.execute("set local statement_timeout = " + lockTimeout.plus(DDL_MARGIN).toMillis());
-            st.execute("set local idle_in_transaction_session_timeout = " + lockTimeout.plusSeconds(30).toMillis()
+            st.execute("set local idle_in_transaction_session_timeout = " + workIdle(lockTimeout).toMillis()
                     + Ticks.noTransactionTimeout(c));
             found = finds(c, table, find, bound);
             if (!found) {
@@ -547,37 +560,6 @@ public final class PartitionDdl {
     }
 
     /**
-     * Null when three consecutive statements on the autocommit connection {@code c} ran in one server session, else
-     * their {@code pg_backend_pid()}s. Bootstrap and maintenance need one session: they hold session advisory locks
-     * and set session settings around autocommit DDL. Behind a transaction-pooling proxy (pgbouncer, Odyssey) each
-     * statement may run in another server session, where such a lock or setting outlives the statement and reaches
-     * other clients. A proxy that happens to keep one server session for these three statements is not detected.
-     */
-    @Nullable
-    static String backendChanges(Connection c) throws SQLException {
-        var pids = new int[3];
-        try (var st = c.createStatement()) {
-            for (int i = 0; i < pids.length; i++) {
-                try (var rs = st.executeQuery("select pg_backend_pid()")) {
-                    rs.next();
-                    pids[i] = rs.getInt(1);
-                }
-            }
-        }
-        return pids[0] == pids[1] && pids[1] == pids[2] ? null : Arrays.toString(pids);
-    }
-
-    /** Fails {@code what} with {@link IllegalStateException} when {@link #backendChanges} finds several sessions. */
-    static void requireSessionStable(Connection c, String what) throws SQLException {
-        var pids = backendChanges(c);
-        if (pids != null) {
-            throw new IllegalStateException(what + " " + SESSION_POOLING_REQUIRED + ": pg_backend_pid() was " + pids
-                    + " in consecutive statements on one connection, so its session lock and settings would leak into"
-                    + " other clients' sessions; point the DataSource at Postgres directly or at a session-mode pool");
-        }
-    }
-
-    /**
      * The first minor of {@code major} with the fix for crashes and "could not open relation" errors of queries
      * (prepared ones above all) on a partitioned table concurrent with {@code DETACH PARTITION … CONCURRENTLY} and an
      * immediate drop of the partition, which {@link #detachConcurrentlyAndDrop} does; null when {@code major.minor}
@@ -608,11 +590,10 @@ public final class PartitionDdl {
     }
 
     /**
-     * Runs {@code sql} under the class's per-statement timeouts, then gives the session's own back. On Postgres 17+
-     * also with {@code transaction_timeout} off, which a role or database default would otherwise apply to the
-     * statement's implicit transaction too (a concurrent index build or detach included). Inside a transaction
-     * (autocommit off) all are {@code SET LOCAL}: a plain SET there would outlive the commit, carrying the
-     * transaction's own {@code SET LOCAL} values (which {@code pg_settings} reports as the session's) into the session.
+     * Runs {@code sql} under the class's per-statement timeouts, all {@code SET LOCAL}: on an autocommit connection in a
+     * transaction of its own ({@link #transaction}), inside the caller's transaction with the transaction's own values
+     * given back after it. On Postgres 17+ also with {@code transaction_timeout} off, which a role or database default
+     * would otherwise apply to the transaction too.
      */
     static void execute(Connection c, Duration lockTimeout, String sql) throws SQLException {
         execute(c, lockTimeout, lockTimeout.plus(DDL_MARGIN), sql);
@@ -640,14 +621,100 @@ public final class PartitionDdl {
 
     /**
      * {@code body} with {@code lock_timeout} and {@code statement_timeout} set (and, on Postgres 17+,
-     * {@code transaction_timeout} off) for each of its statements, the session's own given back afterwards.
+     * {@code transaction_timeout} off) for each of its statements by {@code SET LOCAL}: on an autocommit connection in
+     * a transaction of its own ({@link #transaction}), which commits after it; inside the caller's transaction with
+     * the transaction's own values given back afterwards.
      */
     static <T> T withTimeouts(Connection c, Duration lockTimeout, Duration statementTimeout,
             Sql.SqlFunction0<T> body) throws SQLException {
-        return SocketBound.atLeast(c, statementTimeout, () -> withSetTimeouts(c, lockTimeout, statementTimeout, body));
+        return SocketBound.atLeast(c, statementTimeout, () -> c.getAutoCommit()
+                ? transaction(c, Maintenance.ABANDONED_AFTER, () -> {
+                    try (var st = c.createStatement()) {
+                        st.execute("set local lock_timeout = " + lockTimeout.toMillis() + "; set local"
+                                + " statement_timeout = " + statementTimeout.toMillis());
+                    }
+                    return body.apply();
+                })
+                : withLocalTimeouts(c, lockTimeout, statementTimeout, body));
     }
 
-    private static <T> T withSetTimeouts(Connection c, Duration lockTimeout, Duration statementTimeout,
+    /**
+     * {@code body} in a transaction of its own on the autocommit connection {@code c}, given back in autocommit: read
+     * committed whatever the session's default (so each statement takes its snapshot, a check under a lock included),
+     * {@code idle_in_transaction_session_timeout} {@code idle} (a client silent that long inside it froze or lost its
+     * connection, and Postgres ends the session, freeing its locks) and, on Postgres 17+, {@code transaction_timeout}
+     * off, all {@code SET LOCAL}; fenced by the holder bound to this thread ({@link LockHolder#fenceCurrent}). Commits
+     * after {@code body}, which may have committed itself in its last statement (a pipeline ending in {@code COMMIT},
+     * so the server ends a hold without waiting for this client: the commit here then sends nothing); rolls back when
+     * it throws.
+     */
+    static <T> T transaction(Connection c, Duration idle, Sql.SqlFunction0<T> body) throws SQLException {
+        c.setAutoCommit(false);
+        T result;
+        try {
+            try (var st = c.createStatement()) {
+                // first: isolation must precede every query of the transaction
+                st.execute("set transaction isolation level read committed; set local"
+                        + " idle_in_transaction_session_timeout = " + idle.toMillis() + Ticks.noTransactionTimeout(c));
+            }
+            LockHolder.fenceCurrent(c);
+            result = body.apply();
+            c.commit();
+        } catch (Throwable e) { // an Error too: setAutoCommit(true) would commit the work so far
+            try {
+                c.rollback();
+                c.setAutoCommit(true);
+            } catch (SQLException | RuntimeException cleanup) {
+                e.addSuppressed(cleanup);
+            }
+            throw e;
+        }
+        c.setAutoCommit(true);
+        return result;
+    }
+
+    /**
+     * {@code sql}, a statement Postgres runs only alone and outside a transaction block (a concurrent detach or index
+     * build), as one autocommit statement with nothing set for the session, so behind a transaction-pooling proxy
+     * nothing outlives it into another client's session. So the role's and database's {@code lock_timeout},
+     * {@code statement_timeout} and {@code transaction_timeout} apply, which the library cannot lift for it there: a
+     * statement they cut fails as the server says, and its caller's next run retries it. Its own bound is a cancel
+     * from this client once it has run {@code waitBound} (zero: none): a JDBC query timeout, which a proxy forwards to
+     * the server session running it, surfaced as SQLState 55P03, as a {@code lock_timeout} would be. Fenced first by
+     * the holder bound to this thread, which cancels it once lost ({@link LockHolder#running}); {@code started}, if
+     * given, gets the statement before it runs, for a cancel of its own.
+     */
+    static void executeConcurrently(Connection c, Duration waitBound, String sql,
+            @Nullable Sql.SqlConsumer<java.sql.Statement> started) throws SQLException {
+        LockHolder.fenceCurrent(c);
+        SocketBound.atLeast(c, waitBound, () -> {
+            try (var st = c.createStatement()) {
+                if (!waitBound.isZero()) {
+                    st.setQueryTimeout((int) Math.max(1, (waitBound.toMillis() + 999) / 1000));
+                }
+                if (started != null) {
+                    started.accept(st);
+                }
+                LockHolder.running(st);
+                long start = System.nanoTime();
+                try {
+                    st.execute(sql);
+                } catch (SQLException e) {
+                    if (QUERY_CANCELED.equals(e.getSQLState()) && !waitBound.isZero()
+                            && System.nanoTime() - start >= waitBound.toNanos()) {
+                        throw new SQLException(e.getMessage() + " (a lock timeout: the library cut it after waiting "
+                                + waitBound.toMillis() + " ms): " + sql, LOCK_NOT_AVAILABLE, e);
+                    }
+                    throw e;
+                } finally {
+                    LockHolder.running(null);
+                }
+            }
+            return null;
+        });
+    }
+
+    private static <T> T withLocalTimeouts(Connection c, Duration lockTimeout, Duration statementTimeout,
             Sql.SqlFunction0<T> body) throws SQLException {
         String lock;
         String statement;
@@ -658,49 +725,47 @@ public final class PartitionDdl {
             statement = rs.getString(2);
             transaction = rs.getString(3);
         }
-        boolean local = !c.getAutoCommit();
         boolean pg17 = c.getMetaData().getDatabaseMajorVersion() >= 17; // before it, no such setting
         T result;
         try (var st = c.createStatement()) {
-            st.execute((local ? "set local" : "set") + " lock_timeout = " + lockTimeout.toMillis());
-            st.execute((local ? "set local" : "set") + " statement_timeout = " + statementTimeout.toMillis());
+            st.execute("set local lock_timeout = " + lockTimeout.toMillis());
+            st.execute("set local statement_timeout = " + statementTimeout.toMillis());
             if (pg17) {
-                st.execute((local ? "set local" : "set") + " transaction_timeout = 0");
+                st.execute("set local transaction_timeout = 0");
             }
             result = body.apply();
         } catch (SQLException | RuntimeException e) {
             try {
-                restore(c, lock, statement, transaction, local, pg17);
+                restore(c, lock, statement, transaction, pg17);
             } catch (SQLException cleanup) { // a terminated session: keep its cause on top
                 e.addSuppressed(cleanup);
             }
             throw e;
         }
-        restore(c, lock, statement, transaction, local, pg17);
+        restore(c, lock, statement, transaction, pg17);
         return result;
     }
 
     private static void restore(Connection c, @Nullable String lock, @Nullable String statement,
-            @Nullable String transaction, boolean local, boolean pg17) throws SQLException {
-        restore(c, "lock_timeout", lock, local);
-        restore(c, "statement_timeout", statement, local);
+            @Nullable String transaction, boolean pg17) throws SQLException {
+        restore(c, "lock_timeout", lock);
+        restore(c, "statement_timeout", statement);
         if (pg17) {
-            restore(c, "transaction_timeout", transaction, local);
+            restore(c, "transaction_timeout", transaction);
         }
     }
 
-    private static void restore(Connection c, String setting, @Nullable String sessionValue, boolean local)
-            throws SQLException {
+    /** {@code SET LOCAL} back to what the transaction had: its own {@code SET LOCAL}, else the session's default. */
+    private static void restore(Connection c, String setting, @Nullable String sessionValue) throws SQLException {
         if (sessionValue == null) {
             try (var st = c.createStatement()) {
-                st.execute(local ? "set local " + setting + " to default" : "reset " + setting);
+                st.execute("set local " + setting + " to default");
             }
             return;
         }
-        try (var ps = c.prepareStatement("select set_config(?, ?, ?)")) {
+        try (var ps = c.prepareStatement("select set_config(?, ?, true)")) {
             ps.setString(1, setting);
             ps.setString(2, sessionValue);
-            ps.setBoolean(3, local);
             ps.execute();
         }
     }

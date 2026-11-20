@@ -49,6 +49,11 @@ public final class SocketBound {
         return new SocketBound(timeout, true);
     }
 
+    /** This bound, or {@code max} where this one is longer; none stays none. */
+    SocketBound cappedAt(Duration max) {
+        return millis == 0 || millis <= max.toMillis() ? this : new SocketBound(max, atMost);
+    }
+
     /**
      * The bound on {@code c}, unless it has one of its own (shorter, for {@link #atMost}); closing the result takes it back, before {@code c} goes back
      * to whichever pool it came from, where another user may run a longer statement. Neither call goes to the database.

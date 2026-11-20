@@ -19,10 +19,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Idempotent startup bootstrap, on a connection that must keep one server session (no transaction-pooling
- * proxy, {@link PartitionDdl#backendChanges}; checked first, startup fails otherwise): tables, the hot-table index,
- * premade xid partitions with the tail, one initial tick and one cursor per shard, all under
- * {@code pg_advisory_lock(internalNs, LOCK_SCHEMA)}; like every lock namespace, {@code internalNs} comes from the table
+ * Idempotent startup bootstrap: tables, the hot-table index, premade xid partitions with the tail, one initial tick
+ * and one cursor per shard, all under {@code LOCK_SCHEMA}, which a {@link LockHolder} on a second connection holds
+ * ({@code pg_advisory_xact_lock}); like every lock namespace, {@code internalNs} comes from the table
  * the configured name resolves to ({@link TableNames#resolve}), which {@link #names()} hands to the other components.
  * The shard count ({@link #config()}): {@code outbox.shards} when set, else the cursors' count when there are cursors
  * (with an INFO), else {@link OutboxConfig#DEFAULT_SHARDS}. A set {@code outbox.shards} other than the cursors' count
@@ -35,9 +34,11 @@ import org.slf4j.LoggerFactory;
  * on) with an ERROR naming the admin call that runs the recovery. The recovery runs under its own timeouts (one
  * deadline of {@code outbox.recovery.timeout}, 10 min by default), and other instances' startups wait for it behind
  * the schema lock, at most a minute. The schema lock and every bootstrap DDL statement wait at
- * most 5 s for a lock ({@code lock_timeout}), and every bootstrap statement runs under a 1 min
- * {@code statement_timeout} (replacing a shorter role default): one that needs longer, such as an index built anew on a
- * populated table, fails startup with SQLState 57014 and is left to run by hand; the dead table's {@code <dead>_due},
+ * most 5 s for a lock ({@code lock_timeout}), and every DDL statement runs under a 1 min {@code statement_timeout}
+ * (replacing a shorter role default), each in a transaction of its own with both {@code SET LOCAL}: nothing is set for
+ * the session, so the bootstrap runs behind a transaction-pooling proxy (pgbouncer, Odyssey) too. A DDL statement that
+ * needs longer, such as an index built anew on a populated table, fails startup with SQLState 57014 and is left to run
+ * by hand; the dead table's {@code <dead>_due},
  * new with the dead-letter hook, is built here only while that table has no row, otherwise (an INFO) by
  * {@link Maintenance}, concurrently. The schema lock is retried for a
  * minute, then startup fails. On existing tables the bootstrap takes no lock that writers wait behind (index creation
@@ -62,17 +63,11 @@ public final class OutboxSchema implements AutoCloseable {
     /** Bounds every bootstrap statement, and replaces a shorter role default that would cut its lock waits short. */
     private static final Duration STATEMENT_TIMEOUT = Duration.ofMinutes(1);
     /**
-     * Set on the bootstrap's session before the schema lock, so that wait is bounded too. {@code idle_session_timeout}
-     * short of the minute other bootstraps wait for the schema lock, so Postgres ends the session of a start the network
-     * cut off and frees its session locks in time for them; not a role's own value, which the reshard's tick wait must
-     * not be cut by ({@link #TICK_RECHECK}). On Postgres 17+ also {@code transaction_timeout} off
-     * ({@link SessionSettings#noTransactionTimeout}): a role or database default shorter than these waits would end
-     * the session with FATAL 25P04, not the 55P03 the lock waits handle.
+     * How long the schema lock's holder may stay silent before Postgres ends it: short of the minute other bootstraps
+     * wait for the schema lock, so a start the network cut off frees its locks in time for them. Its keepalive speaks
+     * every {@link LockHolder#KEEPALIVE}.
      */
-    private static final Map<String, String> BOOTSTRAP_SETTINGS = Map.of(
-            "lock_timeout", String.valueOf(LOCK_TIMEOUT.toMillis()),
-            "statement_timeout", String.valueOf(STATEMENT_TIMEOUT.toMillis()),
-            "idle_session_timeout", "45000");
+    private static final Duration HOLDER_IDLE = Duration.ofSeconds(45);
     /** How long the reshard's tick wait sleeps at most: its next look keeps the session from going idle for long. */
     private static final long TICK_RECHECK = TimeUnit.SECONDS.toMillis(10);
     /** {@code LOCK_TIMEOUT} each: a minute for other instances' bootstraps, which take milliseconds each. */
@@ -408,47 +403,62 @@ public final class OutboxSchema implements AutoCloseable {
         }
     }
 
+    /**
+     * The checks first, on a connection given back before the schema lock is waited for; then, the lock held by a
+     * {@link LockHolder}, the bootstrap on a connection of its own: none is held while waiting for another, and no
+     * connection idles through the wait.
+     */
     public void start() throws SQLException {
+        TableNames resolved;
         try (var c = ddl.newConnection(); var bound = socket.on(c)) {
             if (ddl != db) { // before any DDL
                 try (var app = db.newConnection(); var appBound = socket.on(app)) {
                     SchemaCheck.requireSameDatabase(app, c, spelled.base());
                     SchemaCheck.warnIfAppCanCreateWhereOwnerResolves(app, c, spelled.base());
+                    PreparedStatements.requireKept(app, "outbox start of " + spelled.base());
                 }
             }
-            boolean autoCommit = c.getAutoCommit();
-            c.setAutoCommit(true);
-            try {
-                // first: behind a transaction-pooling proxy even the settings below would leak
-                PartitionDdl.requireSessionStable(c, "outbox bootstrap of " + spelled.base());
+            resolved = autocommit(c, () -> {
+                PreparedStatements.requireKept(c, "outbox bootstrap of " + spelled.base());
                 PartitionDdl.warnIfDetachDropUnfixed(c, "outbox bootstrap of " + spelled.base());
+                // where the table is or will be created, so every spelling of it takes the same schema lock
+                var r = spelled.resolve(c);
+                if (heartbeat != null) { // before any DDL, and before the bootstrap writes the row
+                    heartbeat.start(c, r.base());
+                }
+                return r;
+            });
+        }
+        try (var holder = LockHolder.open(ddl, socket, HOLDER_IDLE)) {
+            lockSchema(holder, resolved);
+            try (var c = ddl.newConnection(); var bound = socket.on(c); var scope = holder.bind(c)) {
                 // a statement runs for as long as its timeout: silence only past that says the network dropped it
-                var settings = SessionSettings.noTransactionTimeout(c, BOOTSTRAP_SETTINGS);
-                SocketBound.atLeast(c, STATEMENT_TIMEOUT, () -> SessionSettings.with(c, settings, () -> {
-                    // where the table is or will be created, so every spelling of it takes the same schema lock
-                    var resolved = spelled.resolve(c);
-                    if (heartbeat != null) { // before any DDL, and before the bootstrap writes the row
-                        heartbeat.start(c, resolved.base());
-                    }
-                    lockSchema(c, resolved);
-                    try {
-                        bootstrap(c, resolved);
-                        names = spelled.resolve(c); // the table exists now: checks that the name finds it there
-                    } finally {
-                        advisory(c, "pg_advisory_unlock", resolved, TableNames.LOCK_SCHEMA);
-                    }
+                autocommit(c, () -> SocketBound.atLeast(c, STATEMENT_TIMEOUT, () -> {
+                    bootstrap(c, resolved, holder);
+                    names = spelled.resolve(c); // the table exists now: checks that the name finds it there
                     return null;
                 }));
-            } catch (Throwable e) {
-                try {
-                    c.setAutoCommit(autoCommit);
-                } catch (SQLException cleanup) { // the session died, or was aborted (SessionSettings)
-                    e.addSuppressed(cleanup);
-                }
-                throw e;
             }
-            c.setAutoCommit(autoCommit);
         }
+    }
+
+    /** {@code body} on {@code c} in autocommit, {@code c}'s own mode given back after it whatever happens. */
+    private static <T> T autocommit(Connection c, Sql.SqlFunction0<T> body) throws SQLException {
+        boolean autoCommit = c.getAutoCommit();
+        c.setAutoCommit(true);
+        T result;
+        try {
+            result = body.apply();
+        } catch (Throwable e) {
+            try {
+                c.setAutoCommit(autoCommit);
+            } catch (SQLException cleanup) { // the session died
+                e.addSuppressed(cleanup);
+            }
+            throw e;
+        }
+        c.setAutoCommit(autoCommit);
+        return result;
     }
 
     /**
@@ -464,7 +474,7 @@ public final class OutboxSchema implements AutoCloseable {
         }
     }
 
-    private void bootstrap(Connection c, TableNames n) throws SQLException {
+    private void bootstrap(Connection c, TableNames n, LockHolder holder) throws SQLException {
         try (var st = c.createStatement()) {
             if (config.schema().bootstrap()) {
                 createBaseObjects(c, n);
@@ -473,13 +483,16 @@ public final class OutboxSchema implements AutoCloseable {
                     SchemaCheck.run(app, c, SchemaObjects.outbox(n), spelled.base(), "OutboxSql.outbox");
                 }
             }
-            // when a maintenance run last completed every step, on any instance; until the first one, bootstrap time
-            st.execute("insert into " + n.maintenance() + " (succeeded_at) values (now()) on conflict (id) do nothing");
-
-            checkSequenceCache(c, n);
-            raiseRewoundSequences(c, n); // before this instance makes a tick or a cursor row
-            asciiText = asciiText(c, n);
-            int present = (int) queryLong(st, Cursors.shardCount(n));
+            int present = bounded(c, () -> {
+                // when a maintenance run last completed every step, on any instance; until the first one, bootstrap
+                // time
+                st.execute("insert into " + n.maintenance() + " (succeeded_at) values (now())"
+                        + " on conflict (id) do nothing");
+                checkSequenceCache(c, n);
+                raiseRewoundSequences(c, n); // before this instance makes a tick or a cursor row
+                asciiText = asciiText(c, n);
+                return (int) queryLong(st, Cursors.shardCount(n));
+            });
             int shards;
             if (config.shards() == null) {
                 shards = present == 0 ? OutboxConfig.DEFAULT_SHARDS : present;
@@ -494,24 +507,27 @@ public final class OutboxSchema implements AutoCloseable {
                 }
             }
             var r = new Resolved(config, shards, guard, asciiText);
-            checkXidCounter(c, n, r);
+            checkXidCounter(c, n, r, holder);
 
-            ensurePartitions(c, n);
+            ensurePartitions(c, n, holder);
 
-            st.execute("insert into " + n.tick() + " (snapshot, max_id) select pg_current_snapshot(), "
-                    + Ticks.maxIdQuery(c, n) + " where not exists (select 1 from " + n.tick() + ")");
-            // not after a recovery, which makes them
-            try (var ps = c.prepareStatement(insertCursors(n) + " where not exists (select 1 from " + n.cursor()
-                    + ")")) {
-                ps.setInt(1, shards);
-                ps.executeUpdate();
-            }
-            // still under the schema lock: from here on, another instance's reshard sees this one
-            try (var ps = c.prepareStatement(Heartbeat.upsert(n))) {
-                Heartbeat.bind(ps, 0, instanceId, shards, false, config.relay().enabled(), contracts.contracts(),
-                        contracts.routes(), config.partitions().maintenanceInterval());
-                ps.executeUpdate();
-            }
+            bounded(c, () -> {
+                st.execute("insert into " + n.tick() + " (snapshot, max_id) select pg_current_snapshot(), "
+                        + Ticks.maxIdQuery(c, n) + " where not exists (select 1 from " + n.tick() + ")");
+                // not after a recovery, which makes them
+                try (var ps = c.prepareStatement(insertCursors(n) + " where not exists (select 1 from " + n.cursor()
+                        + ")")) {
+                    ps.setInt(1, shards);
+                    ps.executeUpdate();
+                }
+                // still under the schema lock: from here on, another instance's reshard sees this one
+                try (var ps = c.prepareStatement(Heartbeat.upsert(n))) {
+                    Heartbeat.bind(ps, 0, instanceId, shards, false, config.relay().enabled(), contracts.contracts(),
+                            contracts.routes(), config.partitions().maintenanceInterval());
+                    ps.executeUpdate();
+                }
+                return null;
+            });
             written = n; // committed already: a failure from here on leaves it for close() to delete
             contracts.refresh(c, n); // this row too: a send right after start is guarded
             resolved = r;
@@ -521,7 +537,7 @@ public final class OutboxSchema implements AutoCloseable {
     /** Creates the missing base objects ({@link SchemaObjects}) and upgrades the ones earlier versions made. */
     private void createBaseObjects(Connection c, TableNames n) throws SQLException {
         try (var st = c.createStatement()) {
-            st.execute("create table if not exists " + n.base() + """
+            ddl(c, "create table if not exists " + n.base() + """
                      (
                       id          bigint generated always as identity,
                       shard       smallint    not null,
@@ -534,7 +550,7 @@ public final class OutboxSchema implements AutoCloseable {
                       headers     bytea
                     ) partition by range (xid)""");
             createIndex(c, n.base() + "_shard_xid", n.base() + " (shard, xid)");
-            st.execute("create table if not exists " + n.tick() + """
+            ddl(c, "create table if not exists " + n.tick() + """
                      (
                       id         bigint generated always as identity primary key,
                       snapshot   pg_snapshot not null,
@@ -544,7 +560,7 @@ public final class OutboxSchema implements AutoCloseable {
                       shards     smallint[]
                     )""");
             if (!columnExists(c, n.tick(), "max_id")) { // a tick table made before max_id: a metadata-only change
-                st.execute("alter table " + n.tick() + " add column if not exists max_id bigint");
+                ddl(c, "alter table " + n.tick() + " add column if not exists max_id bigint");
             }
             addColumn(c, n.tick(), "dirty", "bit varying"); // made before dirty: likewise; its ticks stay null (all)
             // the shard sets dirty replaces, kept for the previous release beside or after this one: it inserts them
@@ -552,7 +568,7 @@ public final class OutboxSchema implements AutoCloseable {
             // earlier build of this version dropped it
             addColumn(c, n.tick(), "shards", "smallint[]");
             createIndex(c, n.tick() + "_xmax", n.tick() + " ((pg_snapshot_xmax(snapshot)))"); // Maintenance's xid check
-            st.execute("create table if not exists " + n.cursor() + """
+            ddl(c, "create table if not exists " + n.cursor() + """
                      (
                       shard          smallint not null,
                       seq            bigint generated always as identity,
@@ -566,10 +582,10 @@ public final class OutboxSchema implements AutoCloseable {
                       primary key (shard, seq)
                     )""");
             if (!columnExists(c, n.cursor(), "parked_due_at")) { // made before requeue: metadata-only, rows get null
-                st.execute("alter table " + n.cursor() + " add column if not exists parked_due_at timestamptz");
+                ddl(c, "alter table " + n.cursor() + " add column if not exists parked_due_at timestamptz");
             }
             // maintenance's checkpoint, which moves idle shards on without cursor rows (Cursors); none until its run
-            st.execute("create table if not exists " + n.checkpoint() + """
+            ddl(c, "create table if not exists " + n.checkpoint() + """
                      (
                       seq          bigint generated always as identity primary key,
                       tick_id      bigint not null,
@@ -577,7 +593,7 @@ public final class OutboxSchema implements AutoCloseable {
                       busy_tick_id bigint not null,
                       created_at   timestamptz not null default clock_timestamp()
                     )""");
-            st.execute("create table if not exists " + n.retry() + """
+            ddl(c, "create table if not exists " + n.retry() + """
                      (
                       id              bigint primary key,
                       shard           smallint not null,
@@ -594,7 +610,7 @@ public final class OutboxSchema implements AutoCloseable {
                       waiting_since   timestamptz
                     )""");
             if (!columnExists(c, n.retry(), "requeues")) { // made before requeue: likewise, a constant default
-                st.execute("alter table " + n.retry() + " add column if not exists requeues int not null default 0");
+                ddl(c, "alter table " + n.retry() + " add column if not exists requeues int not null default 0");
             }
             addColumn(c, n.retry(), "waiting_since", "timestamptz"); // made before WAIT: rows get null, not waiting
             createIndex(c, n.retry() + "_key", n.retry() + " (shard, topic, key, id)");
@@ -602,7 +618,7 @@ public final class OutboxSchema implements AutoCloseable {
                     n.retry() + " (shard, next_attempt_at) where next_attempt_at is not null");
             createIndex(c, n.retry() + "_waiting", n.retry() + " (waiting_since) where waiting_since is not null");
             // requeued records: unlike retry rows, they do not block their key
-            st.execute("create table if not exists " + n.parked() + """
+            ddl(c, "create table if not exists " + n.parked() + """
                      (
                       id         bigint primary key,
                       shard      smallint not null,
@@ -618,7 +634,7 @@ public final class OutboxSchema implements AutoCloseable {
                     )""");
             createIndex(c, n.parked() + "_key", n.parked() + " (shard, topic, key, id)");
             createIndex(c, n.parked() + "_due", n.parked() + " (shard, due_at)");
-            st.execute("create table if not exists " + n.dead() + """
+            ddl(c, "create table if not exists " + n.dead() + """
                      (
                       id         bigint primary key,
                       shard      smallint not null,
@@ -641,7 +657,7 @@ public final class OutboxSchema implements AutoCloseable {
                 missing |= !columnExists(c, n.dead(), column);
             }
             if (missing) {
-                st.execute("alter table " + n.dead() + " add column if not exists status text not null default 'kept',"
+                ddl(c, "alter table " + n.dead() + " add column if not exists status text not null default 'kept',"
                         + " add column if not exists due_at timestamptz,"
                         + " add column if not exists handler_attempts int not null default 0,"
                         + " add column if not exists last_handler_error text,"
@@ -661,7 +677,7 @@ public final class OutboxSchema implements AutoCloseable {
                 }
             }
             // how many times a message was redriven, read by its next dead row
-            st.execute("create table if not exists " + n.redriven() + """
+            ddl(c, "create table if not exists " + n.redriven() + """
                      (
                       message_id uuid primary key,
                       redrives   int not null,
@@ -669,7 +685,7 @@ public final class OutboxSchema implements AutoCloseable {
                     )""");
             // the xid-regression halt, persisted by Maintenance: one row while halted; recovery_failed: why the
             // automatic recovery stopped trying (XidRecovery#autoRecover)
-            st.execute("create table if not exists " + n.halt() + """
+            ddl(c, "create table if not exists " + n.halt() + """
                      (
                       id              int primary key default 1 check (id = 1),
                       halted_at       timestamptz not null default now(),
@@ -678,7 +694,7 @@ public final class OutboxSchema implements AutoCloseable {
                     )""");
             addColumn(c, n.halt(), "recovery_failed", "text"); // the previous release's table
             // when a maintenance run last completed every step, on any instance
-            st.execute("create table if not exists " + n.maintenance() + """
+            ddl(c, "create table if not exists " + n.maintenance() + """
                      (
                       id           int primary key default 1 check (id = 1),
                       succeeded_at timestamptz not null,
@@ -686,7 +702,7 @@ public final class OutboxSchema implements AutoCloseable {
                     )""");
             // PgOutboxAdmin#recoverStrandedShards: the tick each stranded shard's repair goes to, while it is stranded
             // at stranded_tick_id with its latest cursor row on cursor_tick_id and cursor_target_tick_id
-            st.execute("create table if not exists " + n.stranded() + """
+            ddl(c, "create table if not exists " + n.stranded() + """
                      (
                       shard                 smallint primary key,
                       stranded_tick_id      bigint not null,
@@ -697,14 +713,14 @@ public final class OutboxSchema implements AutoCloseable {
             // XidPartitions: when any instance first saw the hot tail over maxTailScan, null while none is
             addColumn(c, n.maintenance(), "tail_oversized_since", "timestamptz"); // the previous release's table
             // XidPartitions: the ranges it detaches as relayed, by unqualified name, until they are dropped
-            st.execute("create table if not exists " + n.dropping() + """
+            ddl(c, "create table if not exists " + n.dropping() + """
                      (
                       table_name text primary key,
                       at         timestamptz not null default now()
                     )""");
             // Heartbeat: the instances running, by the database clock, for the reshard guard and the admin status; a
             // row is live until its expires_at, which its writer sets from its own maintenanceInterval
-            st.execute("create table if not exists " + n.instance() + """
+            ddl(c, "create table if not exists " + n.instance() + """
                      (
                       instance_id text primary key,
                       shards      int not null,
@@ -740,7 +756,7 @@ public final class OutboxSchema implements AutoCloseable {
      * refuses. Then one read-committed transaction: {@code pg_advisory_xact_lock} on {@code LOCK_MAINTENANCE},
      * {@code LOCK_SWAP} (relay steps hold it shared) and {@code LOCK_TICK}, in that order, so no maintenance run, step
      * or tick interleaves; then {@code SHARE} on the outbox, so no write commits between the checks and the switch
-     * (writers wait and go on after the commit); each lock wait is bounded by the session's {@code lock_timeout}, and a
+     * (writers wait and go on after the commit); each lock wait is bounded by {@code lock_timeout} 5 s, and a
      * timeout fails startup with the drain procedure; the drain checks: the retry and parked tables empty, no batch in
      * progress, no committed row that its shard's effective tick ({@link Cursors}) does not see, no standalone range,
      * no xid regression. All pass: the cursors and checkpoints are replaced by one cursor per new shard at a new tick,
@@ -778,9 +794,13 @@ public final class OutboxSchema implements AutoCloseable {
                 // the reshard waited for it, and its row would be read under its old shard
                 try (var st = c.createStatement()) {
                     st.execute("set transaction isolation level read committed");
-                    // cut off by the network, it must not hold writers behind its SHARE lock
+                    LockHolder.fenceCurrent(c);
+                    // cut off by the network, it must not hold writers behind its SHARE lock; each lock wait within
+                    // the bootstrap's lock_timeout, the drain checks' scans within its statement_timeout
                     st.execute("set local idle_in_transaction_session_timeout = "
-                            + Maintenance.ABANDONED_AFTER.toMillis());
+                            + Maintenance.ABANDONED_AFTER.toMillis() + "; set local lock_timeout = "
+                            + LOCK_TIMEOUT.toMillis() + "; set local statement_timeout = " + STATEMENT_TIMEOUT.toMillis()
+                            + Ticks.noTransactionTimeout(c));
                 }
                 try (var ps = c.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {
                     for (int lock : List.of(TableNames.LOCK_MAINTENANCE, TableNames.LOCK_SWAP, TableNames.LOCK_TICK)) {
@@ -965,22 +985,26 @@ public final class OutboxSchema implements AutoCloseable {
      * {@code statement_timeout} (a slow disk), rolls back whole and is logged and left to maintenance while inserts at
      * the current xid still find a partition. A hot tail is left to maintenance too:
      * turning it into a range scans it, which would hold the schema lock and every other instance's startup.
-     * Partition DDL is serialised by {@code LOCK_MAINTENANCE}, taken here after {@code LOCK_SCHEMA};
-     * {@link Maintenance} takes it with {@code pg_try_advisory_lock} and never takes {@code LOCK_SCHEMA}, so the two
-     * can never deadlock.
+     * Partition DDL is serialised by {@code LOCK_MAINTENANCE}, which {@code holder} takes here after
+     * {@code LOCK_SCHEMA}; {@link Maintenance} only tries it and never takes {@code LOCK_SCHEMA}, so the two can never
+     * deadlock.
      */
-    private void ensurePartitions(Connection c, TableNames n) throws SQLException {
+    private void ensurePartitions(Connection c, TableNames n, LockHolder holder) throws SQLException {
         var partitions = XidPartitions.forBootstrap(n, config.partitions());
         partitions.warnIfActivityHidden(c); // once per start
         partitions.logTailConversion();
         try {
-            advisory(c, "pg_advisory_lock", n, TableNames.LOCK_MAINTENANCE); // bounded by the session lock_timeout
+            var held = holder.lock(n.internalNamespace(), TableNames.LOCK_MAINTENANCE, LOCK_TIMEOUT);
+            if (held == null) {
+                throw new SQLException("could not take the maintenance lock of " + n.base() + " within "
+                        + LOCK_TIMEOUT.toMillis() + " ms: a maintenance run holds it", LOCK_NOT_AVAILABLE);
+            }
             try {
                 partitions.finishPendingDetach(c, LOCK_TIMEOUT, LOCK_TIMEOUT);
                 partitions.reown(c);
                 partitions.ensurePremade(c, LOCK_TIMEOUT, LOCK_TIMEOUT);
             } finally {
-                advisory(c, "pg_advisory_unlock", n, TableNames.LOCK_MAINTENANCE);
+                holder.release(held);
             }
         } catch (SQLException e) {
             var state = e.getSQLState();
@@ -1004,8 +1028,8 @@ public final class OutboxSchema implements AutoCloseable {
         if (!indexMissing(c, index)) {
             return; // CREATE INDEX IF NOT EXISTS would still queue a SHARE lock behind running writers
         }
-        try (var st = c.createStatement()) {
-            st.execute("create index " + spelled.unqualified(index) + " on " + definition);
+        try {
+            ddl(c, "create index " + spelled.unqualified(index) + " on " + definition);
         } catch (SQLException e) {
             if (!DUPLICATE_TABLE.equals(e.getSQLState())) { // made meanwhile, by a dead-index build
                 throw e;
@@ -1026,10 +1050,21 @@ public final class OutboxSchema implements AutoCloseable {
     /** Once per table: ACCESS EXCLUSIVE for a metadata-only change (a constant default or none). */
     private static void addColumn(Connection c, String table, String column, String definition) throws SQLException {
         if (!columnExists(c, table, column)) {
-            try (var st = c.createStatement()) {
-                st.execute("alter table " + table + " add column if not exists " + column + " " + definition);
-            }
+            ddl(c, "alter table " + table + " add column if not exists " + column + " " + definition);
         }
+    }
+
+    /**
+     * A bootstrap DDL statement in a transaction of its own, under {@link #LOCK_TIMEOUT} and
+     * {@link #STATEMENT_TIMEOUT} ({@code SET LOCAL}), fenced by the schema lock's holder.
+     */
+    private static void ddl(Connection c, String sql) throws SQLException {
+        PartitionDdl.execute(c, LOCK_TIMEOUT, STATEMENT_TIMEOUT, sql);
+    }
+
+    /** {@code body}'s statements in one transaction, under the bounds of {@link #ddl}, committed after it. */
+    private static <T> T bounded(Connection c, Sql.SqlFunction0<T> body) throws SQLException {
+        return PartitionDdl.withTimeouts(c, LOCK_TIMEOUT, STATEMENT_TIMEOUT, body);
     }
 
     /** Checked first, as ALTER TABLE takes its lock even when the column exists. */
@@ -1170,11 +1205,12 @@ public final class OutboxSchema implements AutoCloseable {
 
     /**
      * The xid check {@link Maintenance} runs too: a halt found is recorded, then recovered as
-     * {@link XidRecovery#autoRecover} decides, under {@code LOCK_MAINTENANCE} waited for within the session's
-     * {@code lock_timeout}; else an ERROR, and startup goes on halted. A halt whose ticks were repaired is left for
+     * {@link XidRecovery#autoRecover} decides, under {@code LOCK_MAINTENANCE}, which {@code holder} waits for up to
+     * {@link #LOCK_TIMEOUT}; else an ERROR, and startup goes on halted. A halt whose ticks were repaired is left for
      * {@link Maintenance}'s check to lift.
      */
-    private void checkXidCounter(Connection c, TableNames n, OutboxConfig resolved) throws SQLException {
+    private void checkXidCounter(Connection c, TableNames n, OutboxConfig resolved, LockHolder holder)
+            throws SQLException {
         var recovery = new XidRecovery(n, resolved);
         var check = recovery.check(c);
         if (!check.halted()) {
@@ -1186,11 +1222,12 @@ public final class OutboxSchema implements AutoCloseable {
         String why = XidRecovery.HALT_MODE;
         if (config.recovery().xidRegression().equals("auto")) {
             why = XidRecovery.LOCK_BUSY;
-            if (lockMaintenance(c, n)) {
+            var held = holder.lock(n.internalNamespace(), TableNames.LOCK_MAINTENANCE, LOCK_TIMEOUT);
+            if (held != null) {
                 try {
                     why = recovery.autoRecover(c);
                 } finally {
-                    advisory(c, "pg_advisory_unlock", n, TableNames.LOCK_MAINTENANCE);
+                    holder.release(held);
                 }
             }
         }
@@ -1199,52 +1236,26 @@ public final class OutboxSchema implements AutoCloseable {
         }
     }
 
-    /** {@code pg_advisory_lock(internalNs, LOCK_MAINTENANCE)}; false when the session's lock_timeout ran out. */
-    private static boolean lockMaintenance(Connection c, TableNames n) throws SQLException {
-        try {
-            advisory(c, "pg_advisory_lock", n, TableNames.LOCK_MAINTENANCE);
-            return true;
-        } catch (SQLException e) {
-            if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
-                throw e;
-            }
-            return false;
-        }
-    }
-
     /**
      * Waits for other instances' bootstraps {@code schemaLockAttempts} times {@code LOCK_TIMEOUT}, then fails startup
      * naming the lock: a holder frozen mid-bootstrap must not hang every later startup.
      */
-    private void lockSchema(Connection c, TableNames n) throws SQLException {
+    private void lockSchema(LockHolder holder, TableNames n) throws SQLException {
         for (int attempt = 1; ; attempt++) {
-            try {
-                advisory(c, "pg_advisory_lock", n, TableNames.LOCK_SCHEMA);
+            if (holder.lock(n.internalNamespace(), TableNames.LOCK_SCHEMA, LOCK_TIMEOUT) != null) {
                 return;
-            } catch (SQLException e) {
-                if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
-                    throw e;
-                }
-                var lock = "pg_advisory_lock(" + n.internalNamespace() + ", " + TableNames.LOCK_SCHEMA + ")";
-                if (attempt >= schemaLockAttempts) {
-                    throw new IllegalStateException("outbox bootstrap of " + n.base() + " gave up after "
-                            + LOCK_TIMEOUT.multipliedBy(attempt).toSeconds() + " s waiting for its schema lock " + lock
-                            + ", held by another session (another instance's bootstrap, possibly stuck); find it with"
-                            + " select pid from pg_locks where locktype = 'advisory' and classid = "
-                            + Integer.toUnsignedLong(n.internalNamespace()) + " and objid = " + TableNames.LOCK_SCHEMA
-                            + " and objsubid = 2", e);
-                }
-                log.warn("outbox bootstrap of {} waits for its schema lock {}, held by another session (attempt {} of"
-                        + " {})", n.base(), lock, attempt, schemaLockAttempts);
             }
-        }
-    }
-
-    private static void advisory(Connection c, String function, TableNames n, int lock) throws SQLException {
-        try (var ps = c.prepareStatement("select " + function + "(?, ?)")) {
-            ps.setInt(1, n.internalNamespace());
-            ps.setInt(2, lock);
-            ps.execute();
+            var lock = "pg_advisory_xact_lock(" + n.internalNamespace() + ", " + TableNames.LOCK_SCHEMA + ")";
+            if (attempt >= schemaLockAttempts) {
+                throw new IllegalStateException("outbox bootstrap of " + n.base() + " gave up after "
+                        + LOCK_TIMEOUT.multipliedBy(attempt).toSeconds() + " s waiting for its schema lock " + lock
+                        + ", held by another session (another instance's bootstrap, possibly stuck); find it with"
+                        + " select pid from pg_locks where locktype = 'advisory' and classid = "
+                        + Integer.toUnsignedLong(n.internalNamespace()) + " and objid = " + TableNames.LOCK_SCHEMA
+                        + " and objsubid = 2");
+            }
+            log.warn("outbox bootstrap of {} waits for its schema lock {}, held by another session (attempt {} of"
+                    + " {})", n.base(), lock, attempt, schemaLockAttempts);
         }
     }
 

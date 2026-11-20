@@ -6,9 +6,7 @@ import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
-import java.sql.Statement;
 import java.time.Duration;
-import java.util.Collection;
 import java.util.Properties;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -160,64 +158,6 @@ public final class TestDb {
         p.setProperty("loginTimeout", "30");
         p.putAll(properties);
         return DriverManager.getConnection(jdbcUrl(), p);
-    }
-
-    /**
-     * {@code db} as seen through a transaction-pooling proxy: {@code select pg_backend_pid()} reports another backend
-     * on every statement; everything else runs on {@code db}. New connections record in {@code sql} each statement
-     * they run or prepare.
-     */
-    public static JdbcConnectionFactory transactionPooled(JdbcConnectionFactory db, Collection<String> sql) {
-        var pid = new AtomicInteger(1_000_000);
-        return new JdbcConnectionFactory() {
-            @Override
-            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
-                return db.withConnection(callback);
-            }
-
-            @Nullable
-            @Override
-            public Connection currentConnection() {
-                return db.currentConnection();
-            }
-
-            @Nullable
-            @Override
-            public ConnectionContext currentConnectionContext() {
-                return db.currentConnectionContext();
-            }
-
-            @Override
-            public Connection newConnection() {
-                var c = db.newConnection();
-                return delegate(Connection.class, c, (name, args) -> {
-                    if (name.equals("prepareStatement")) {
-                        sql.add((String) args[0]);
-                    }
-                    if (!name.equals("createStatement") || args != null) {
-                        return null;
-                    }
-                    var st = c.createStatement();
-                    return delegate(Statement.class, st, (stName, stArgs) -> {
-                        if (!stName.equals("executeQuery") && !stName.equals("execute")) {
-                            return null;
-                        }
-                        String text = (String) stArgs[0];
-                        sql.add(text);
-                        if (!text.equals("select pg_backend_pid()")) {
-                            return null;
-                        }
-                        String other = "select " + pid.incrementAndGet();
-                        return stName.equals("execute") ? st.execute(other) : st.executeQuery(other);
-                    });
-                });
-            }
-
-            @Override
-            public DataBaseTelemetry telemetry() {
-                return db.telemetry();
-            }
-        };
     }
 
     /**

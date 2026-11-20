@@ -29,7 +29,7 @@ public record TableNames(
     public static final int LOCK_MAINTENANCE = 3;
     public static final int LOCK_INBOX_MAINTENANCE = 4;
     public static final int LOCK_SWAP = 5;
-    /** The dead table's index build, {@link DeadIndexBuilder}: a session lock, only ever tried. */
+    /** The dead table's index build, {@link DeadIndexBuilder}: only ever tried. */
     public static final int LOCK_DEAD_INDEX = 6;
     public static final int LOCK_SHARD_BASE = 1000;
 

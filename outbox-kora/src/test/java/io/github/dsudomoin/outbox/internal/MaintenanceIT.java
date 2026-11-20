@@ -14,6 +14,7 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRelay;
+import io.github.dsudomoin.outbox.JdbcTransactions;
 import io.github.dsudomoin.outbox.OutboxTransactions;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Park;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
@@ -183,8 +184,8 @@ class MaintenanceIT {
     @Test
     void secondRunnerSkipsWhileFirstHoldsLock() throws Exception {
         bootstrap();
-        var poolA = pool();
-        var poolB = pool();
+        var poolA = pool(2); // the holder of the lock and the run's own connection
+        var poolB = pool(2);
         var a = new Maintenance(poolA, names, config, new OutboxMetrics(null));
         var b = new Maintenance(poolB, names, config, new OutboxMetrics(null));
         CompletableFuture<Boolean> runA;
@@ -203,12 +204,7 @@ class MaintenanceIT {
 
         assertThat(List.of(runA.get(10, TimeUnit.SECONDS), runB.get(10, TimeUnit.SECONDS)))
                 .containsExactlyInAnyOrder(true, false);
-        // both runners reset their session and the lock is free again
-        for (var pool : List.of(poolA, poolB)) {
-            try (var c = pool.newConnection()) {
-                assertThat(queryString(c, "show idle_session_timeout")).isEqualTo("0");
-            }
-        }
+        // the lock is free again
         try (var c = TestDb.connect(); var ps = c.prepareStatement("select pg_try_advisory_lock(?, ?)")) {
             ps.setInt(1, names.internalNamespace());
             ps.setInt(2, TableNames.LOCK_MAINTENANCE);
@@ -1533,7 +1529,7 @@ class MaintenanceIT {
             }
         };
 
-        assertThatThrownBy(killed::runOnce).as("its session is gone").isInstanceOf(RuntimeSqlException.class);
+        killed.runOnce(); // its connection is gone: every step after fails, and the run is no success
 
         assertThat(exists(orphan.table())).isTrue();
         assertThat(count(orphan.table(), orphan.above())).isEqualTo(2500 - OrphanRestore.CHUNK);
@@ -1891,30 +1887,6 @@ class MaintenanceIT {
         try (var c = TestDb.connect()) {
             assertThat(queryLong(c, "select count(*) from " + names.base())).isPositive();
         }
-    }
-
-    @Test
-    void transactionPoolingSkipsTheRunAndRaisesTheGauge() throws Exception {
-        bootstrap();
-        var registry = new SimpleMeterRegistry();
-        var sql = new ConcurrentLinkedQueue<String>();
-        var pooled = new Maintenance(new KoraOutboxTransactions(TestDb.transactionPooled(db, sql)), names, config,
-                new OutboxMetrics(registry));
-
-        try (var err = new CapturedStderr()) {
-            assertThat(pooled.runOnce()).as("skipped").isFalse();
-            assertThat(pooled.runOnce()).isFalse();
-            assertThat(err.text()).contains("ERROR");
-            assertThat(err.text().split("transaction-pooling proxy detected", -1)).as("once a minute").hasSize(2);
-        }
-
-        assertThat(gauge(registry, "outbox.maintenance.transaction_pooling")).isEqualTo(1);
-        assertThat(sql).as("no session lock or setting").isNotEmpty()
-                .noneMatch(s -> s.contains("advisory") || s.contains("idle_session_timeout"));
-        var directRegistry = new SimpleMeterRegistry();
-        var direct = new Maintenance(db, names, config, new OutboxMetrics(directRegistry));
-        assertThat(direct.runOnce()).isTrue();
-        assertThat(gauge(directRegistry, "outbox.maintenance.transaction_pooling")).isZero();
     }
 
     @Test
@@ -2439,80 +2411,31 @@ class MaintenanceIT {
         awaitBuildEnd(maintenance);
     }
 
+    /**
+     * A build cancelled at close never goes back to its pool: its connection is aborted, its backend ends, and a cancel
+     * that comes late finds nothing to cancel, not what the pool would run next on that backend.
+     */
     @Test
-    void aCancelThatComesLateMissesWhatThePoolRunsNext() throws Exception {
+    void aBuildStoppedAtCloseNeverGivesItsConnectionBackToThePool() throws Exception {
         bootstrap();
         deadTableWithoutIndex(1);
-        var foreign = "foreign_" + Long.toHexString(System.nanoTime());
-        var released = new CountDownLatch(1);
-        var cancel = new AtomicReference<Thread>();
         var hikari = new HikariConfig();
         hikari.setJdbcUrl(TestDb.jdbcUrl());
         hikari.setUsername(TestDb.user());
         hikari.setPassword(TestDb.password());
-        hikari.setMaximumPoolSize(1); // the next user gets the build's backend, for as long as that backend lives
-        try (var pool = new HikariDataSource(hikari); var c = TestDb.connect(); var holder = TestDb.connect()) {
-            var builder = new DeadIndexBuilder(new OutboxTransactions() {
-                @Override
-                public Connection newConnection() throws SQLException {
-                    if (!Thread.currentThread().getName().equals(DeadIndexBuilder.THREAD_NAME + "-cancel")) {
-                        return pool.getConnection();
-                    }
-                    cancel.set(Thread.currentThread());
-                    while (released.getCount() > 0) { // deaf to the interrupt, as a read from a socket is
-                        try {
-                            released.await();
-                        } catch (InterruptedException e) {
-                            // waits on
-                        }
-                    }
-                    return TestDb.connect();
-                }
-
-                @Override
-                public Connection currentConnection() {
-                    return null;
-                }
-
-                @Override
-                public void afterCommit(Runnable action) {
-                    throw new UnsupportedOperationException();
-                }
-
-                @Override
-                public String transactionHint() {
-                    return "";
-                }
-            }, names, Duration.ofMinutes(1), Duration.ofMinutes(1), new SocketBound(Duration.ZERO));
-            execute(c, "create table " + foreign + " (id int)");
-            holder.setAutoCommit(false);
-            insertDead(holder, 2);
+        hikari.setMaximumPoolSize(2); // the build's lock holder and the build
+        try (var pool = new HikariDataSource(hikari); var c = TestDb.connect(); var holder = openDeadInsert(2)) {
+            var builder = new DeadIndexBuilder(new JdbcTransactions(pool), names, Duration.ofMinutes(1),
+                    Duration.ofMinutes(1), new SocketBound(Duration.ZERO));
             builder.startIfDue(c);
             await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
+            long build = queryLong(c, "select pid from pg_stat_activity where query like 'create index concurrently%'");
 
-            builder.close(Duration.ofMillis(100)); // gives up on the cancel, stuck in the source above
-            holder.rollback();
-            await(Duration.ofSeconds(30), () -> !builder.running());
-            assertThat(indexState()).as("the build ended by itself").endsWith(":true");
+            builder.close(Duration.ofSeconds(10));
 
-            execute(holder, "insert into " + foreign + " values (1)"); // holds the pool's next user in its statement
-            var next = CompletableFuture.runAsync(() -> {
-                try (var own = pool.getConnection()) {
-                    execute(own, "create index concurrently " + foreign + "_id on " + foreign + " (id)");
-                } catch (SQLException e) {
-                    throw new IllegalStateException(e);
-                }
-            });
-            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
-
-            released.countDown();
-            cancel.get().join(TimeUnit.SECONDS.toMillis(10));
-            assertThat(cancel.get().isAlive()).isFalse();
-            holder.rollback();
-
-            next.get(30, TimeUnit.SECONDS);
-        } finally {
-            released.countDown();
+            assertThat(builder.running()).isFalse();
+            await(Duration.ofSeconds(10), () -> queryLong(c, "select count(*) from pg_stat_activity where pid = "
+                    + build) == 0);
         }
     }
 
@@ -2583,7 +2506,7 @@ class MaintenanceIT {
     }
 
     @Test
-    void aStartupQueuedForTheMaintenanceLockDoesNotDeadlockWithTheBuild() throws Exception {
+    void aStartupWaitingForTheMaintenanceLockDoesNotHoldTheBuildBack() throws Exception {
         bootstrap();
         var maintenance = maintenance();
         deadTableWithoutIndex(1000);
@@ -2592,7 +2515,8 @@ class MaintenanceIT {
             assertThat(maintenance.runOnce()).isTrue();
             await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
 
-            // another maintenance run in progress; a startup queues behind it, its statement's snapshot open
+            // another maintenance run in progress; a startup waits for it, trying the lock again and again: no
+            // statement of it waits holding a snapshot, which the build would wait for
             String lock = "(" + names.internalNamespace() + ", " + TableNames.LOCK_MAINTENANCE + ")";
             execute(run, "select pg_advisory_lock" + lock);
             var startup = CompletableFuture.runAsync(() -> {
@@ -2602,18 +2526,14 @@ class MaintenanceIT {
                     throw new RuntimeSqlException(e);
                 }
             });
-            await(Duration.ofSeconds(4), () -> queryLong(c, "select count(*) from pg_stat_activity"
-                    + " where wait_event = 'advisory' and query like '%pg_advisory_lock%'") == 1);
-            holder.commit(); // the build goes on to wait for older snapshots, the queued startup's among them
-            Thread.sleep(1500); // past deadlock_timeout (1 s), so a cycle would be found
-            assertThat(maintenance.deadIndex.running()).as("the build waits for the queued startup's snapshot")
-                    .isTrue();
+            Thread.sleep(500); // the startup waits for the lock
+            holder.commit(); // the build goes on to wait for older snapshots
+
+            awaitBuildEnd(maintenance);
+            assertThat(indexState()).as("built while the startup still waits").endsWith(":true");
             assertThat(startup).isNotDone();
             execute(run, "select pg_advisory_unlock" + lock);
-
-            startup.get(10, TimeUnit.SECONDS);
-            awaitBuildEnd(maintenance);
-            assertThat(indexState()).endsWith(":true");
+            startup.get(20, TimeUnit.SECONDS);
             assertThat(err.text()).doesNotContain("40P01").doesNotContain("deadlock");
         }
     }
@@ -2721,8 +2641,8 @@ class MaintenanceIT {
         return new Maintenance(db, names, config, new OutboxMetrics(null));
     }
 
-    private TestDatabase pool() {
-        var pool = TestDb.newDatabase(1);
+    private TestDatabase pool(int size) {
+        var pool = TestDb.newDatabase(size);
         pools.add(pool);
         return pool;
     }

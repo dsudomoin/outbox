@@ -38,10 +38,11 @@ import org.slf4j.LoggerFactory;
  * that exist ({@link Window}, refreshed at {@link #start()} and after every maintenance run) and from the clock
  * ({@link InboxPartitions#safeFrom}), so an insert never misses a partition.
  *
- * <p>{@link #start()} fails when its connection does not keep one server session (a transaction-pooling proxy,
- * {@link PartitionDdl#backendChanges}), then creates the table and its ranges under
- * {@code pg_advisory_lock(internalNs, LOCK_INBOX_MAINTENANCE)} with a 5 s {@code lock_timeout} and a 65 s
- * {@code statement_timeout}, {@code internalNs} from the table the name resolves to ({@link TableNames#resolve}), and
+ * <p>{@link #start()} creates the table and its ranges under {@code LOCK_INBOX_MAINTENANCE}, which a
+ * {@link LockHolder} waits for up to 5 s, each DDL statement in a transaction of its own with a 5 s
+ * {@code lock_timeout} and a 65 s {@code statement_timeout}, {@code internalNs} from the table the name resolves to
+ * ({@link TableNames#resolve}); nothing is set for the session, so the inbox runs behind a transaction-pooling proxy
+ * (pgbouncer, Odyssey) too. It
  * fails when an existing table has no {@code consumer} column (made by an earlier version, with dedup across
  * consumers); with {@code outbox.schema.bootstrap = false} it creates no table and checks it ({@link SchemaCheck}).
  * It then runs {@link #runMaintenance()} every {@code outbox.partitions.maintenanceInterval} on the daemon thread
@@ -68,8 +69,6 @@ public final class PgInbox implements Inbox, AutoCloseable {
     private final String insert;
     private final String insertAll;
     private final AtomicLong lastWarn = new AtomicLong(System.nanoTime() - WARN_INTERVAL);
-    private final AtomicLong poolingLogged = new AtomicLong(System.nanoTime() - WARN_INTERVAL);
-    private volatile double transactionPooling = Double.NaN;
     private volatile double orphaned = Double.NaN;
     private volatile Window window = Window.EMPTY;
     /**
@@ -108,7 +107,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
         this.insertAll = "insert into " + names.base() + " (message_id, consumer) select u.id, ?"
                 + " from unnest(?::uuid[]) with ordinality u(id, ord) order by u.ord"
                 + " on conflict (message_id, consumer) do nothing returning message_id";
-        telemetry.gauge(OutboxGauge.INBOX_MAINTENANCE_TRANSACTION_POOLING, () -> transactionPooling);
+        telemetry.gauge(OutboxGauge.INBOX_MAINTENANCE_TRANSACTION_POOLING, () -> 0); // kept for dashboards
         telemetry.gauge(OutboxGauge.INBOX_PARTITIONS_ORPHANED, () -> orphaned);
         telemetry.gauge(OutboxGauge.INBOX_WINDOW_REMAINING, () -> {
             long to = windowTo;
@@ -208,28 +207,28 @@ public final class PgInbox implements Inbox, AutoCloseable {
     }
 
     public void start() throws SQLException {
+        // the checks first, on a connection given back before the lock is waited for: none idles through the wait
         try (var c = ddl.newConnection(); var bound = socket.on(c)) {
             if (ddl != db) { // before any DDL
                 try (var app = db.newConnection(); var appBound = socket.on(app)) {
                     SchemaCheck.requireSameDatabase(app, c, names.base());
                     SchemaCheck.warnIfAppCanCreateWhereOwnerResolves(app, c, names.base());
+                    PreparedStatements.requireKept(app, "outbox inbox start of " + names.base());
                 }
             }
             c.setAutoCommit(true);
-            PartitionDdl.requireSessionStable(c, "outbox inbox bootstrap of " + names.base());
+            PreparedStatements.requireKept(c, "outbox inbox bootstrap of " + names.base());
             PartitionDdl.warnIfDetachDropUnfixed(c, "outbox inbox bootstrap of " + names.base());
             clock.read(c);
-            // statement_timeout: a shorter role or database default would end the lock waits with 57014, not 55P03
-            var budget = LOCK_TIMEOUT.plus(PartitionDdl.DDL_MARGIN);
-            // idle_session_timeout: a start the network cut off must not hold maintenance's lock for hours
-            var settings = Map.of("lock_timeout", String.valueOf(LOCK_TIMEOUT.toMillis()),
-                    "statement_timeout", String.valueOf(budget.toMillis()), "idle_session_timeout", "45000");
-            // transaction_timeout off: a shorter role default would end the session under the lock wait (25P04)
-            SocketBound.atLeast(c, budget, () -> SessionSettings.with(c, SessionSettings.noTransactionTimeout(c,
-                    settings), () -> {
-                bootstrap(c);
-                return null;
-            }));
+            if (!config.schema().bootstrap()) { // the application's migrations own it; it only reads catalogs
+                try (var app = db.newConnection(); var appBound = socket.on(app)) {
+                    SchemaCheck.run(app, c, SchemaObjects.inbox(names), names.base(), "OutboxSql.inbox");
+                }
+            }
+        }
+        bootstrap();
+        try (var c = ddl.newConnection(); var bound = socket.on(c)) {
+            c.setAutoCommit(true);
             if (!OutboxSchema.columnExists(c, names.base(), "consumer")) {
                 throw new IllegalStateException("outbox inbox table " + names.base() + " has no consumer column: an"
                         + " earlier version made it, and its dedup spans every consumer of a message; drop the table"
@@ -272,15 +271,14 @@ public final class PgInbox implements Inbox, AutoCloseable {
     }
 
     /**
-     * One run. On the instance that gets {@code pg_try_advisory_lock(internalNs, LOCK_INBOX_MAINTENANCE)} (on one
-     * autocommit connection with {@code idle_session_timeout = 60s}, so a frozen holder loses it): finish a pending
+     * One run. On the instance that gets {@code LOCK_INBOX_MAINTENANCE}, which a {@link LockHolder} on a second
+     * connection tries (idle for {@link Maintenance#HOLDER_IDLE} at most, so a frozen holder loses it): finish a pending
      * detach, drop expired ranges, make ranges up to {@code now + premake} (attaching a table of the next range that
      * exists but is not attached), drop expired ranges a crash left detached but not dropped and, with
      * {@code outbox.inbox.attachOrphans}, attach back the ones still inside the window (the gauge
      * {@code outbox.inbox.partitions.orphaned} counts the ones kept, with an ERROR), each step on its own (a failure is
-     * logged and the next step still runs). That part is skipped when the connection does not keep one server session
-     * ({@link PartitionDdl#backendChanges}), with an ERROR at most once a minute and the gauge
-     * {@code outbox.inbox.maintenance.transaction_pooling} at 1 (0 otherwise). Then, on every instance, the window
+     * logged and the next step still runs; none once the holder is gone). The gauge
+     * {@code outbox.inbox.maintenance.transaction_pooling} stays 0. Then, on every instance, the window
      * refresh; when that connection or its run fails before the refresh is done, the refresh runs on an application
      * connection (the catalogs it reads need no owner rights), and the run's failure is thrown after it. A window not
      * refreshed for {@code premake - partitionInterval} ends dedup of new ids: the gauge
@@ -288,27 +286,26 @@ public final class PgInbox implements Inbox, AutoCloseable {
      */
     public void runMaintenance() {
         Exception failure = null;
-        try (var c = ddl.newConnection(); var bound = socket.on(c)) {
-            c.setAutoCommit(true);
-            clock.read(c);
-            if (sessionStable(c)) {
-                maintain(c);
-            }
-            if (step("window refresh", () -> refreshWindow(c))) {
-                return;
-            }
+        try {
+            maintain();
         } catch (SQLException | RuntimeException e) {
             failure = e;
         }
-        try (var app = db.newConnection(); var bound = socket.on(app)) {
-            app.setAutoCommit(true);
-            clock.read(app);
-            refreshWindow(app);
+        boolean refreshed = false;
+        try (var c = ddl.newConnection(); var bound = socket.on(c)) {
+            c.setAutoCommit(true);
+            clock.read(c);
+            refreshed = step("window refresh", () -> refreshWindow(c));
         } catch (SQLException | RuntimeException e) {
-            if (failure == null) {
-                failure = e;
-            } else {
-                failure.addSuppressed(e);
+            failure = joined(failure, e);
+        }
+        if (!refreshed) {
+            try (var app = db.newConnection(); var bound = socket.on(app)) {
+                app.setAutoCommit(true);
+                clock.read(app);
+                refreshWindow(app);
+            } catch (SQLException | RuntimeException e) {
+                failure = joined(failure, e);
             }
         }
         if (failure instanceof SQLException e) {
@@ -330,31 +327,36 @@ public final class PgInbox implements Inbox, AutoCloseable {
         }
     }
 
-    private void bootstrap(Connection c) throws SQLException {
-        int ns = names.resolve(c).internalNamespace();
-        if (!config.schema().bootstrap()) { // the application's migrations own it
-            // before the lock: it only reads catalogs, and a lock timeout below must not skip it
-            try (var app = db.newConnection(); var appBound = socket.on(app)) {
-                SchemaCheck.run(app, c, SchemaObjects.inbox(names), names.base(), "OutboxSql.inbox");
+    /**
+     * The table and its ranges under {@code LOCK_INBOX_MAINTENANCE}, which a {@link LockHolder} waits for up to
+     * {@link #LOCK_TIMEOUT}; the work on a connection of its own, taken once the lock is held.
+     */
+    private void bootstrap() throws SQLException {
+        // a start the network cut off must not hold maintenance's lock for hours
+        try (var holder = LockHolder.open(ddl, socket, Duration.ofSeconds(45))) {
+            int ns = holder.read(h -> names.resolve(h).internalNamespace());
+            // waits for another instance's bootstrap or maintenance run
+            if (holder.lock(ns, TableNames.LOCK_INBOX_MAINTENANCE, LOCK_TIMEOUT) == null) {
+                throw new SQLException("could not take the inbox maintenance lock of " + names.base() + " within "
+                        + LOCK_TIMEOUT.toMillis() + " ms", LOCK_NOT_AVAILABLE);
             }
-        }
-        try {
-            advisory(c, "pg_advisory_lock", ns); // waits for another instance's bootstrap or maintenance run
-            try {
-                if (config.schema().bootstrap()) {
-                    execute(c, "create table if not exists " + names.base() + " (message_id uuid not null,"
-                            + " consumer text not null default '', received_at timestamptz not null default now(),"
-                            + " primary key (message_id, consumer)) partition by range (message_id)");
-                }
-                partitions.reown(c);
-                partitions.ensurePremade(c, clock.millis());
-            } finally {
-                advisory(c, "pg_advisory_unlock", ns);
+            try (var c = ddl.newConnection(); var bound = socket.on(c); var scope = holder.bind(c)) {
+                c.setAutoCommit(true);
+                SocketBound.atLeast(c, LOCK_TIMEOUT.plus(PartitionDdl.DDL_MARGIN), () -> {
+                    if (config.schema().bootstrap()) {
+                        PartitionDdl.execute(c, LOCK_TIMEOUT, "create table if not exists " + names.base()
+                                + " (message_id uuid not null, consumer text not null default '', received_at"
+                                + " timestamptz not null default now(), primary key (message_id, consumer))"
+                                + " partition by range (message_id)");
+                    }
+                    partitions.reown(c);
+                    partitions.ensurePremade(c, clock.millis());
+                    return null;
+                });
             }
         } catch (SQLException e) {
             // a maintenance run elsewhere holds the lock (a detach waiting for consumer transactions) and extends too
-            if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())
-                    || !partitions.window(c).contains(clock.millis())) {
+            if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState()) || !windowHoldsNow()) {
                 throw e;
             }
             log.warn("outbox inbox {} partitions not extended at startup (lock timeout); maintenance does it: {}",
@@ -362,15 +364,27 @@ public final class PgInbox implements Inbox, AutoCloseable {
         }
     }
 
-    private void maintain(Connection c) throws SQLException {
-        int ns = names.resolve(c).internalNamespace();
-        // before the lock, so a holder frozen right after taking it loses it too
-        var session = SessionSettings.set(c, Map.of("idle_session_timeout", "'60s'"));
-        boolean locked = false;
-        Throwable failure = null;
-        try {
-            locked = advisory(c, "pg_try_advisory_lock", ns);
-            if (locked) {
+    /** Whether the ranges that exist cover now. */
+    private boolean windowHoldsNow() throws SQLException {
+        try (var c = ddl.newConnection(); var bound = socket.on(c)) {
+            c.setAutoCommit(true);
+            return partitions.window(c).contains(clock.millis());
+        }
+    }
+
+    /**
+     * The locked part of a run: a {@link LockHolder} tries the lock, and only once it holds it is the run's own
+     * connection taken, so an instance holds no connection while it waits for another.
+     */
+    private void maintain() throws SQLException {
+        try (var holder = LockHolder.open(ddl, socket, Maintenance.HOLDER_IDLE)) {
+            int ns = holder.read(h -> names.resolve(h).internalNamespace());
+            if (holder.lock(ns, TableNames.LOCK_INBOX_MAINTENANCE, Duration.ZERO) == null) {
+                return;
+            }
+            try (var c = ddl.newConnection(); var socketBound = socket.on(c); var scope = holder.bind(c)) {
+                c.setAutoCommit(true);
+                clock.read(c);
                 long now = clock.millis();
                 var timeout = PartitionDdl.DETACH_LOCK_TIMEOUT;
                 step("finish pending detach", () -> partitions.finishPendingDetach(c, now, timeout));
@@ -400,22 +414,15 @@ public final class PgInbox implements Inbox, AutoCloseable {
                     orphaned = Double.NaN; // the step failed: unknown, not the old count
                 }
             }
-        } catch (Throwable t) {
-            failure = t;
-            throw t;
-        } finally {
-            try {
-                if (locked) {
-                    advisory(c, "pg_advisory_unlock", ns);
-                }
-                session.restore(c);
-            } catch (SQLException e) { // the session died, and its lock and setting with it: keep the cause on top
-                if (failure == null) {
-                    throw e;
-                }
-                failure.addSuppressed(e);
-            }
         }
+    }
+
+    private static Exception joined(@Nullable Exception first, Exception next) {
+        if (first == null) {
+            return next;
+        }
+        first.addSuppressed(next);
+        return first;
     }
 
     /**
@@ -445,21 +452,6 @@ public final class PgInbox implements Inbox, AutoCloseable {
         return null;
     }
 
-    private boolean sessionStable(Connection c) throws SQLException {
-        var pids = PartitionDdl.backendChanges(c);
-        transactionPooling = pids == null ? 0 : 1;
-        long now = System.nanoTime();
-        long last = poolingLogged.get();
-        if (pids != null && now - last >= WARN_INTERVAL && poolingLogged.compareAndSet(last, now)) {
-            log.error("outbox inbox maintenance of {} {}: pg_backend_pid() was {} in consecutive statements on one"
-                    + " connection, so its session lock and settings would leak into other clients' sessions; runs are"
-                    + " skipped (gauge outbox.inbox.maintenance.transaction_pooling) until the DataSource reaches"
-                    + " Postgres directly or through a session-mode pool; this ERROR repeats at most once a minute",
-                    names.base(), PartitionDdl.SESSION_POOLING_REQUIRED, pids);
-        }
-        return pids == null;
-    }
-
     /** Never throws: a throw would cancel every later run without a word, a fatal error (OutOfMemoryError) included. */
     private void scheduledMaintenance() {
         try {
@@ -477,8 +469,11 @@ public final class PgInbox implements Inbox, AutoCloseable {
     /** A failed step is logged (the next run retries it), so the remaining steps still run; false when it failed. */
     private boolean step(String name, SqlRunnable step) {
         try {
+            LockHolder.fenceBound(); // a run whose holder is gone stops: the first step to find it fails with LOST
             step.run();
             return true;
+        } catch (LockHolder.Gone e) {
+            return false;
         } catch (SQLException e) {
             log.warn("outbox inbox maintenance step '{}' on {} failed (SQLState {}); the next run retries it: {}",
                     name, names.base(), e.getSQLState(), e.getMessage());
@@ -560,17 +555,6 @@ public final class PgInbox implements Inbox, AutoCloseable {
         @Override
         public Inbox scope(String other) {
             return PgInbox.this.scope(other);
-        }
-    }
-
-    private static boolean advisory(Connection c, String function, int ns) throws SQLException {
-        try (var ps = c.prepareStatement("select " + function + "(?, ?)")) {
-            ps.setInt(1, ns);
-            ps.setInt(2, TableNames.LOCK_INBOX_MAINTENANCE);
-            try (var rs = ps.executeQuery()) {
-                rs.next();
-                return function.equals("pg_advisory_lock") || rs.getBoolean(1); // that one returns void
-            }
         }
     }
 

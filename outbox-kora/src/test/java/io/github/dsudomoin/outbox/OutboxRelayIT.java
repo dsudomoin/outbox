@@ -393,7 +393,7 @@ class OutboxRelayIT {
         var runs = new AtomicInteger();
         relays.add(new OutboxRelay(db, config, schema, new RecordingHandler(), TestTelemetry.kora(),
                 maintenance(observed(sql -> {
-                    if (sql.contains("pg_try_advisory_lock(")) { // a maintenance run
+                    if (sql.contains("pg_try_advisory_xact_lock(")) { // a maintenance run
                         runs.incrementAndGet();
                     }
                 })), noHook(db)));

@@ -299,9 +299,8 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         var call = printable("restoreOrphan(" + table + ", " + fromXid + ")");
         long moved;
         var restoring = new AtomicBoolean();
-        try (var c = ddl.newConnection(); var bound = socket.on(c)) {
-            c.setAutoCommit(true);
-            moved = underMaintenanceLock(c, call, () -> {
+        try {
+            moved = underMaintenanceLock(call, c -> {
                 var name = names.unqualified(table);
                 if (partitions.orphans(c).stream().noneMatch(o -> names.unqualified(o.table()).equals(name))) {
                     throw new IllegalArgumentException(table + " is not an orphan of the outbox " + names.base()
@@ -352,9 +351,8 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         var committing = new AtomicBoolean();
         var sent = new AtomicLong(-1); // the rows re-sent, once the recovery committed
         Exception cleanup = null;
-        try (var c = ddl.newConnection(); var bound = socket.on(c)) {
-            c.setAutoCommit(true);
-            underMaintenanceLock(c, call, () -> {
+        try {
+            underMaintenanceLock(call, c -> {
                 var check = recovery.check(c);
                 if (check.current() >= check.tickXmax() && check.recorded() == null) {
                     throw new IllegalStateException("no xid regression to recover: the xid counter of " + names.base()
@@ -376,7 +374,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                         + " recover\" if it committed", e);
             }
             if (sent.get() < 0 && !committing.get()) {
-                // refused, nothing changed: maintenance running, no regression, or a transaction-pooled connection
+                // refused, nothing changed: maintenance running or no regression
                 boolean refused = e instanceof IllegalStateException && !recovering.get();
                 if (!refused) {
                     log.warn("outbox admin {} on {} failed, nothing re-sent: {}", call, names.base(),
@@ -396,7 +394,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             }
             if (cleanup != null && sent.get() >= 0) {
                 log.warn("outbox admin {} on {}: the recovery committed, then releasing the maintenance lock,"
-                        + " giving idle_session_timeout back or closing the connection failed: {}", call, names.base(),
+                        + " or closing the connection failed: {}", call, names.base(),
                         printable(cleanup.toString()));
             }
             try {
@@ -446,9 +444,8 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         var recovering = new AtomicBoolean();
         var moved = new AtomicLong();
         var stranded = new ArrayList<Integer>();
-        try (var c = ddl.newConnection(); var bound = socket.on(c)) {
-            c.setAutoCommit(true);
-            underMaintenanceLock(c, call, () -> {
+        try {
+            underMaintenanceLock(call, c -> {
                 if (queryBoolean(c, "select exists (select 1 from " + names.halt() + ")")) {
                     // its re-send goes by xids, which moved rows would not keep, and it rebuilds the cursors anyway
                     throw new IllegalStateException("an xid regression halt is recorded in " + names.halt()
@@ -473,7 +470,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                 return null;
             });
         } catch (SQLException | RuntimeException e) {
-            // refused, nothing changed: maintenance running, a halt, no shard stranded or a transaction-pooled connection
+            // refused, nothing changed: maintenance running, a halt or no shard stranded
             if (recovering.get()) {
                 log.warn("outbox admin {} on {} failed after {} rows re-sent, which stay re-sent; calling again goes"
                         + " on: {}", call, names.base(), moved.get(), printable(e.toString()));
@@ -1016,35 +1013,25 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     }
 
     /**
-     * {@code body} on {@code c} under the maintenance lock, waited for at most {@link #maintenanceWait}, so no
-     * maintenance run goes on beside it. The session gets {@code idle_session_timeout = 60s} first, as
-     * {@link Maintenance} does, so Postgres ends the session of a frozen holder and frees the lock; the session's own
-     * value given back, and the lock released, before the connection goes back to the pool.
+     * {@code body} on a new connection of the owner's under the maintenance lock, waited for at most {@link #maintenanceWait}, so no
+     * maintenance run goes on beside it: a {@link LockHolder} of the owner's connections holds it, idle for
+     * {@link Maintenance#HOLDER_IDLE} at most, as {@link Maintenance}'s, so Postgres ends a frozen holder's and frees
+     * the lock; released as {@code body} ends. Nothing is set for the session, so the call runs behind a
+     * transaction-pooling proxy too.
      */
-    private <T> T underMaintenanceLock(Connection c, String call, SqlFunction0<T> body) throws SQLException {
-        PartitionDdl.requireSessionStable(c, "outbox admin " + call + " on " + names.base());
-        // before the lock, so a holder frozen right after taking it loses it too
-        var session = SessionSettings.set(c, Map.of("idle_session_timeout", "'60s'"));
-        boolean locked = false;
-        Throwable failure = null;
-        try {
-            lockMaintenance(c);
-            locked = true;
-            return body.apply();
-        } catch (Throwable t) {
-            failure = t;
-            throw t;
-        } finally {
-            try {
-                if (locked) {
-                    advisory(c, "pg_advisory_unlock");
-                }
-                session.restore(c);
-            } catch (SQLException e) { // the session died, and its lock and setting with it: keep the cause
-                if (failure == null) {
-                    throw e;
-                }
-                failure.addSuppressed(e);
+    private <T> T underMaintenanceLock(String call, Sql.SqlFunction1<Connection, T> body) throws SQLException {
+        try (var holder = LockHolder.open(ddl, socket, Maintenance.HOLDER_IDLE)) {
+            if (holder.lock(names.internalNamespace(), TableNames.LOCK_MAINTENANCE, maintenanceWait) == null) {
+                // a maintenance run holds it, or another admin call under it: the first try of a retried one, say
+                throw new IllegalStateException("maintenance or another outbox admin recovery call is running, retry:"
+                        + " the maintenance lock of " + names.base() + ", pg_advisory_xact_lock("
+                        + names.internalNamespace() + ", " + TableNames.LOCK_MAINTENANCE + "), was held for longer"
+                        + " than " + maintenanceWait.toMillis() / 1e3 + " s");
+            }
+            // the call's own connection only once the lock is held: none is held while waiting for another
+            try (var c = ddl.newConnection(); var bound = socket.on(c); var scope = holder.bind(c)) {
+                c.setAutoCommit(true);
+                return body.apply(c);
             }
         }
     }
@@ -1213,31 +1200,6 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             }
         }
         return counts;
-    }
-
-    /** {@code pg_advisory_lock(internalNs, LOCK_MAINTENANCE)} within {@link #maintenanceWait}. */
-    private void lockMaintenance(Connection c) throws SQLException {
-        try {
-            PartitionDdl.execute(c, maintenanceWait, "select pg_advisory_lock(" + names.internalNamespace() + ", "
-                    + TableNames.LOCK_MAINTENANCE + ")");
-        } catch (SQLException e) {
-            if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
-                throw e;
-            }
-            // a maintenance run holds it, or another admin call under it: the first try of a retried one, say
-            throw new IllegalStateException("maintenance or another outbox admin recovery call is running, retry: the"
-                    + " maintenance lock of " + names.base() + ", pg_advisory_lock(" + names.internalNamespace() + ", "
-                    + TableNames.LOCK_MAINTENANCE + "), was held for longer than " + maintenanceWait.toMillis() / 1e3
-                    + " s", e);
-        }
-    }
-
-    private void advisory(Connection c, String function) throws SQLException {
-        try (var ps = c.prepareStatement("select " + function + "(?, ?)")) {
-            ps.setInt(1, names.internalNamespace());
-            ps.setInt(2, TableNames.LOCK_MAINTENANCE);
-            ps.execute();
-        }
     }
 
     private void requireOwnTransactions() {

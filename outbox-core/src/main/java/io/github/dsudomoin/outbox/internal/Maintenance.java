@@ -33,13 +33,13 @@ import org.slf4j.LoggerFactory;
  * compares the cursors' shard count ({@link Cursors#shardCount}) with {@code outbox.shards}: a mismatch, as another
  * instance's reshard leaves it, halts this instance ({@link #halted()}) until they match again, with an ERROR at most
  * once a minute, and the run stops there, taking no lock ({@link #runOnce()} returns false). The
- * rest needs a connection that keeps one server session: behind a transaction-pooling proxy
- * ({@link PartitionDdl#backendChanges}) the run stops there, with an ERROR at most once a minute and
- * {@code outbox.maintenance.transaction_pooling} at 1 (0 otherwise). It runs on at most one instance at a time: it
- * holds the session lock {@code pg_try_advisory_lock(internalNs, LOCK_MAINTENANCE)} on one autocommit connection with
- * {@code idle_session_timeout = 60s}, so Postgres ends the session of a frozen holder and frees the lock (5 s while the
- * tail swap holds every relay step out, {@link XidPartitions}' quiesce); the setting
- * is given back and the lock released before the connection goes back to the pool. While halted the one step under the
+ * rest runs on at most one instance at a time, under {@code LOCK_MAINTENANCE}, which a {@link LockHolder} on a second
+ * connection only tries: a transaction of its own, idle for {@link #HOLDER_IDLE} at most, so Postgres ends a frozen
+ * holder's and frees the lock (the tail swap's quiesce, 5 s, {@link XidPartitions}), released as the run ends. Each
+ * step proves the holder alive first ({@link LockHolder#fence}), and a run whose holder is gone stops. Nothing the run
+ * does is set for the session or outlives its transaction, so it runs behind a transaction-pooling proxy (pgbouncer,
+ * Odyssey) as on a direct connection; {@code outbox.maintenance.transaction_pooling} stays 0, kept for the dashboards
+ * that read it. While halted the one step under the
  * lock is the recovery ({@link XidRecovery#autoRecover}), with {@code outbox.recovery.xidRegression = auto}; with
  * {@code halt} the run takes no lock. Otherwise the steps, each on its own (a failure is logged and the next step
  * still runs): finish a pending detach, premade partitions (the extension swaps the tail in one transaction, a tail
@@ -82,7 +82,7 @@ import org.slf4j.LoggerFactory;
  * not attached, with an ERROR each run; NaN while it is), {@code outbox.partitions.retained} (ranges below the one
  * holding the current xid that are not dropped yet; when {@link #RETAINED_WARN} or more of them lie above the latest
  * tick's xmin for {@link #RETAINED_RUNS} runs in a row, a WARN at most once a minute names the cluster's oldest xid
- * holders, which pin the drop horizon even from another database), {@code outbox.maintenance.transaction_pooling} and
+ * holders, which pin the drop horizon even from another database), {@code outbox.maintenance.transaction_pooling} (0) and
  * {@code outbox.maintenance.since_success} (NaN until the first run).
  */
 public final class Maintenance {
@@ -108,6 +108,11 @@ public final class Maintenance {
      * hours later, as no client-side bound reaches it.
      */
     static final Duration ABANDONED_AFTER = Duration.ofSeconds(5);
+    /**
+     * How long the maintenance lock's holder may stay silent before Postgres ends it: its keepalive speaks every
+     * {@link LockHolder#KEEPALIVE}, so only a frozen or cut-off one is.
+     */
+    static final Duration HOLDER_IDLE = Duration.ofSeconds(60);
     private static final String LOCK_NOT_AVAILABLE = "55P03";
     /** Blocks one statement of an age cleanup ({@link AgedDelete}) reads: 8 MB of 8 kB blocks. */
     static final int CLEANUP_BLOCKS = 1024;
@@ -154,7 +159,6 @@ public final class Maintenance {
     private final String oldestRetried;
     private final Duration waitingAlertAfter;
     private final Duration staleAfter;
-    private final AtomicLong poolingLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong staleLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong haltLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong checkpointLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
@@ -201,7 +205,6 @@ public final class Maintenance {
     private volatile double xidsLeft = Double.NaN;
     private volatile double retained = Double.NaN;
     private volatile double orphaned = Double.NaN;
-    private volatile double transactionPooling = Double.NaN;
     /** {@link System#nanoTime()} of the last success known on any instance, null before the first read. */
     @Nullable
     private volatile Long lastSuccess;
@@ -270,7 +273,7 @@ public final class Maintenance {
         telemetry.gauge(OutboxGauge.PARTITIONS_XIDS_LEFT, () -> xidsLeft);
         telemetry.gauge(OutboxGauge.PARTITIONS_RETAINED, () -> retained);
         telemetry.gauge(OutboxGauge.PARTITIONS_ORPHANED, () -> orphaned);
-        telemetry.gauge(OutboxGauge.MAINTENANCE_TRANSACTION_POOLING, () -> transactionPooling);
+        telemetry.gauge(OutboxGauge.MAINTENANCE_TRANSACTION_POOLING, () -> 0); // kept for dashboards: never skips
         telemetry.gauge(OutboxGauge.MAINTENANCE_SINCE_SUCCESS, () -> {
             var at = lastSuccess;
             return at == null ? Double.NaN : (System.nanoTime() - at) / 1e9;
@@ -435,15 +438,16 @@ public final class Maintenance {
     }
 
     /**
-     * One run; false without maintaining anything when another session holds the maintenance lock, the connection
-     * does not keep one server session, or the cursors' shard count differs from this instance's. While halted only
+     * One run; false without maintaining anything when another session holds the maintenance lock or the cursors'
+     * shard count differs from this instance's. While halted only
      * the reads, the xid check and, in {@code auto} mode, the recovery run (true with {@code halt}: no lock is
      * taken).
      */
     public boolean runOnce() {
-        try (var c = db.newConnection(); var bound = socket.on(c)) {
+        XidRecovery.Check check;
+        try (var c = db.newConnection(); var bound = socket.on(c)) { // given back before the lock is tried
             c.setAutoCommit(true);
-            var check = checkXidCounter(c); // first: nothing may keep it from running
+            check = checkXidCounter(c); // first: nothing may keep it from running
             readLastSuccess(c, check != null);
             var present = checkShards(c);
             if (present != null) {
@@ -456,7 +460,11 @@ public final class Maintenance {
                 logHalt(check, XidRecovery.HALT_MODE);
                 return true;
             }
-            return sessionStable(c) && maintain(c, check);
+        } catch (SQLException e) {
+            throw db.translate(e);
+        }
+        try {
+            return maintain(check);
         } catch (SQLException e) {
             throw db.translate(e);
         }
@@ -602,19 +610,6 @@ public final class Maintenance {
                 names.tick(), names.cursor(), names.checkpoint());
     }
 
-    private boolean sessionStable(Connection c) throws SQLException {
-        var pids = PartitionDdl.backendChanges(c);
-        transactionPooling = pids == null ? 0 : 1;
-        if (pids != null && due(poolingLogged)) {
-            log.error("outbox maintenance of {} {}: pg_backend_pid() was {} in consecutive statements on one"
-                    + " connection, so its session lock and settings would leak into other clients' sessions; runs are"
-                    + " skipped (gauge outbox.maintenance.transaction_pooling) until the DataSource reaches Postgres"
-                    + " directly or through a session-mode pool; this ERROR repeats at most once a minute",
-                    names.base(), PartitionDdl.SESSION_POOLING_REQUIRED, pids);
-        }
-        return pids == null;
-    }
-
     /** True at most once per {@code LOG_INTERVAL} for {@code logged}. */
     private static boolean due(AtomicLong logged) {
         long now = System.nanoTime();
@@ -622,42 +617,35 @@ public final class Maintenance {
         return now - last >= LOG_INTERVAL && logged.compareAndSet(last, now);
     }
 
-    /** {@code check}: the halt found by this run's check, null when none. */
-    private boolean maintain(Connection c, @Nullable XidRecovery.Check check) throws SQLException {
-        // before the lock, so a holder frozen right after taking it loses it too
-        var session = SessionSettings.set(c, Map.of("idle_session_timeout", "'60s'"));
-        boolean locked = false;
-        Throwable failure = null;
-        try {
-            locked = advisory(c, "pg_try_advisory_lock");
-            if (!locked && check != null) {
-                logHalt(check, XidRecovery.LOCK_BUSY);
-            } else if (check != null) { // halted: the one step is the recovery
-                var why = recovery.autoRecover(c);
-                var still = checkXidCounter(c); // resumes once recovered, by this run or by another instance
-                if (still != null && why != null) {
-                    logHalt(still, why);
+    /**
+     * {@code check}: the halt found by this run's check, null when none. Under {@code LOCK_MAINTENANCE}, which a
+     * {@link LockHolder} tries; false when another session holds it. The run's own connection is taken only once the
+     * lock is held, so an instance holds no connection while it waits for another: the losers of the try one, the
+     * holder of the lock two.
+     */
+    private boolean maintain(@Nullable XidRecovery.Check check) throws SQLException {
+        try (var holder = LockHolder.open(db, socket, HOLDER_IDLE)) {
+            if (holder.lock(names.internalNamespace(), TableNames.LOCK_MAINTENANCE, Duration.ZERO) == null) {
+                if (check != null) {
+                    logHalt(check, XidRecovery.LOCK_BUSY);
                 }
-            } else if (locked && run(c)) {
-                execute(c, succeeded);
-                lastSuccess = System.nanoTime();
+                return false;
             }
-            return locked;
-        } catch (Throwable t) {
-            failure = t;
-            throw t;
-        } finally {
-            try {
-                if (locked) {
-                    advisory(c, "pg_advisory_unlock");
+            try (var c = db.newConnection(); var socketBound = socket.on(c); var bound = holder.bind(c)) {
+                c.setAutoCommit(true);
+                if (check != null) { // halted: the one step is the recovery
+                    var why = recovery.autoRecover(c);
+                    var still = checkXidCounter(c); // resumes once recovered, by this run or by another instance
+                    if (still != null && why != null) {
+                        logHalt(still, why);
+                    }
+                } else if (run(c)) {
+                    holder.fence(c);
+                    execute(c, succeeded);
+                    lastSuccess = System.nanoTime();
                 }
-                session.restore(c);
-            } catch (SQLException e) { // the session died, and its lock and setting with it: keep the cause on top
-                if (failure == null) {
-                    throw e;
-                }
-                failure.addSuppressed(e);
             }
+            return true;
         }
     }
 
@@ -954,15 +942,18 @@ public final class Maintenance {
                 }
             }
             long from = next < blocks ? next : 0;
-            var settings = Map.of("statement_timeout", String.valueOf(timeout.toMillis()));
-            return SocketBound.atLeast(c, timeout, () -> SessionSettings.with(c, settings, () -> {
+            return SocketBound.atLeast(c, timeout, () -> {
                 long deleted = 0;
                 try (var ps = c.prepareStatement(delete)) {
                     for (long at = from; at < blocks; ) {
                         ps.setLong(1, at);
                         ps.setLong(2, at + CLEANUP_BLOCKS);
                         ps.setDouble(3, age.toNanos() / 1e9);
-                        deleted += ps.executeUpdate();
+                        // a transaction each, so its statement_timeout is set for it alone (SET LOCAL)
+                        deleted += PartitionDdl.transaction(c, ABANDONED_AFTER, () -> {
+                            execute(c, "set local statement_timeout = " + timeout.toMillis());
+                            return ps.executeUpdate();
+                        });
                         at += CLEANUP_BLOCKS;
                         next = at < blocks ? at : 0;
                         if (at < blocks && System.nanoTime() - end >= 0) {
@@ -974,7 +965,7 @@ public final class Maintenance {
                     }
                 }
                 return deleted;
-            }));
+            });
         }
     }
 
@@ -1067,11 +1058,19 @@ public final class Maintenance {
         }
     }
 
-    /** One step; a failure is logged (the next run retries) and yields null, so the remaining steps still run. */
+    /**
+     * One step; a failure is logged (the next run retries) and yields null, so the remaining steps still run. None runs
+     * once the run's lock holder is gone ({@link LockHolder#fenceBound}): the first to find it so fails with SQLState
+     * {@link LockHolder#LOST}, the rest pass over quietly.
+     */
     @Nullable
     private <T> T step(String name, SqlFunction0<T> step) {
         try {
+            LockHolder.fenceBound();
             return step.apply();
+        } catch (LockHolder.Gone e) {
+            stepFailed = true;
+            return null;
         } catch (SQLException e) {
             log.warn("outbox maintenance step '{}' on {} failed (SQLState {}); the next run retries it: {}", name,
                     names.base(), e.getSQLState(), e.getMessage());
@@ -1123,17 +1122,6 @@ public final class Maintenance {
     private void logHalt(XidRecovery.Check check, String why) {
         if (due(haltLogged)) {
             log.error(recovery.halted(check, why));
-        }
-    }
-
-    private boolean advisory(Connection c, String function) throws SQLException {
-        try (var ps = c.prepareStatement("select " + function + "(?, ?)")) {
-            ps.setInt(1, names.internalNamespace());
-            ps.setInt(2, TableNames.LOCK_MAINTENANCE);
-            try (var rs = ps.executeQuery()) {
-                rs.next();
-                return rs.getBoolean(1);
-            }
         }
     }
 

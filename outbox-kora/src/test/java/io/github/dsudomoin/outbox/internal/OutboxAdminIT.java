@@ -827,33 +827,35 @@ class OutboxAdminIT {
         execute("insert into " + orphan + " (id, shard, xid, message_id, topic, key)"
                 + " select g, 0, '10', gen_random_uuid(), 't', convert_to('k' || g, 'UTF8')"
                 + " from generate_series(1, 1001) g");
-        var one = TestDb.newDatabase(1); // one session: what the call leaves on it is seen by the next
+        var two = TestDb.newDatabase(2); // the lock's holder and the call's own connection
         try {
-            var single = new PgOutboxAdmin(one, names, config, new Maintenance(one, names, config,
+            var single = new PgOutboxAdmin(two, names, config, new Maintenance(two, names, config,
                     new OutboxMetrics(null)), wakes::incrementAndGet);
-            var idleTimeout = new AtomicReference<String>();
+            var heldMeanwhile = new AtomicReference<Long>();
             single.orphanRestore.afterChunk = c -> {
-                if (idleTimeout.compareAndExchange(null, queryString(c, "show idle_session_timeout")) == null) {
+                if (heldMeanwhile.compareAndExchange(null, maintenanceLockHolders()) == null) {
                     throw new RuntimeException("killed after a chunk");
                 }
             };
 
             assertThatThrownBy(() -> single.restoreOrphan(orphan, 0)).hasMessage("killed after a chunk");
 
-            assertThat(idleTimeout).as("a frozen holder loses the lock").hasValue("1min");
+            assertThat(heldMeanwhile).as("held by a transaction while the chunk ran").hasValue(1L);
             assertThat(wakes).as("rows went back before it failed").hasValue(1);
-            try (var c = one.newConnection()) {
-                assertThat(queryString(c, "show idle_session_timeout")).as("reset").isEqualTo("0");
-            }
-            try (var c = TestDb.connect()) {
-                assertThat(queryLong(c, "select count(*) from pg_locks where locktype = 'advisory' and classid::bigint"
-                        + " = " + Integer.toUnsignedLong(names.internalNamespace()) + " and objid = "
-                        + TableNames.LOCK_MAINTENANCE)).as("released").isZero();
-            }
+            assertThat(maintenanceLockHolders()).as("released").isZero();
             assertThat(single.restoreOrphan(orphan, 0)).as("the rest").isOne();
             assertThat(outboxMessageIds()).hasSize(1001);
         } finally {
-            one.release();
+            two.release();
+        }
+    }
+
+    /** Sessions holding the maintenance lock. */
+    private long maintenanceLockHolders() throws SQLException {
+        try (var c = TestDb.connect()) {
+            return queryLong(c, "select count(*) from pg_locks where locktype = 'advisory' and classid::bigint = "
+                    + Integer.toUnsignedLong(names.internalNamespace()) + " and objid = " + TableNames.LOCK_MAINTENANCE
+                    + " and objsubid = 2 and granted");
         }
     }
 
@@ -872,7 +874,7 @@ class OutboxAdminIT {
 
         try (var c = TestDb.connect()) {
             assertThat(queryString(c, "select string_agg(setting, ',') from " + seen))
-                    .as("the lock timeout, 30 s, + 30 s").isEqualTo("1min");
+                    .as("the lock timeout, 30 s, + 30 s, short of a frozen lock holder's end").isEqualTo("56s");
         }
     }
 

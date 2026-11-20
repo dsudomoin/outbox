@@ -8,7 +8,8 @@ import java.sql.SQLException;
 
 /**
  * The application's binding with its new connections from the tables' owner: what the components that run DDL and
- * hold session locks open (the bootstrap, maintenance, recoveries); the caller's transaction stays the application's.
+ * hold the maintenance locks open (the bootstrap, maintenance, recoveries); the caller's transaction stays the
+ * application's.
  */
 public record OwnerTransactions(OutboxTransactions application, ConnectionSource owner) implements OutboxTransactions {
 

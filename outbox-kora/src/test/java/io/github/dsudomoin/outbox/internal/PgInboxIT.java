@@ -400,31 +400,6 @@ class PgInboxIT {
     }
 
     @Test
-    void transactionPoolingSkipsMaintenanceAndRaisesTheGauge() throws Exception {
-        start();
-        var pooledRegistry = new SimpleMeterRegistry();
-        var sql = new ConcurrentLinkedQueue<String>();
-        var pooled = new PgInbox(new KoraOutboxTransactions(TestDb.transactionPooled(db, sql)), config,
-                new OutboxMetrics(pooledRegistry));
-
-        try (var err = new CapturedStderr()) {
-            pooled.runMaintenance();
-            pooled.runMaintenance();
-            assertThat(err.text()).contains("ERROR");
-            assertThat(err.text().split("transaction-pooling proxy detected", -1)).as("once a minute").hasSize(2);
-        }
-
-        assertThat(pooledRegistry.get("outbox.inbox.maintenance.transaction_pooling").gauge().value()).isEqualTo(1);
-        assertThat(sql).as("no session lock or setting").isNotEmpty()
-                .noneMatch(s -> s.contains("advisory") || s.contains("idle_session_timeout"));
-        var id = UuidV7.next(); // the window refresh still ran: ids are deduplicated
-        assertThat(accept(pooled, id)).isTrue();
-        assertThat(accept(pooled, id)).isFalse();
-        inbox.runMaintenance();
-        assertThat(registry.get("outbox.inbox.maintenance.transaction_pooling").gauge().value()).isZero();
-    }
-
-    @Test
     void shortRoleStatementTimeoutDoesNotCutBootstrapLockWaitShort() throws Exception {
         var role = TestDb.newLoginRole();
         try (var c = TestDb.connect()) {
@@ -981,7 +956,7 @@ class PgInboxIT {
         refreshesWithTheOwnerBroken(broken, () -> {
             var c = TestDb.connect();
             // maintain fails outside its steps: its lock statement throws
-            return broken.get() ? failing(c, "pg_try_advisory_lock") : c;
+            return broken.get() ? failing(c, "pg_try_advisory_xact_lock(") : c;
         });
     }
 

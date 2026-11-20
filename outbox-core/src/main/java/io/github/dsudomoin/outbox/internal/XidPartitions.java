@@ -29,13 +29,14 @@ import io.github.dsudomoin.outbox.internal.Sql.SqlFunction0;
  * overflow") until the next extension turns it into a range. The current xid is
  * {@code pg_snapshot_xmax(pg_current_snapshot())}, the next xid Postgres will assign. All methods need an autocommit
  * connection (but {@link #ensurePremade} for a missing tail, which {@link XidRecovery} runs in its transaction: it
- * only creates and attaches), and callers serialise them under {@code LOCK_MAINTENANCE}: bootstrap takes it after
- * {@code LOCK_SCHEMA}; {@link Maintenance} takes it with {@code pg_try_advisory_lock} and never takes
- * {@code LOCK_SCHEMA}. Besides the xid-regression recovery, the library takes ACCESS EXCLUSIVE on the parent in two
- * places, for milliseconds: the extension's tail swap ({@link #ensurePremade}), taken without waiting unless
+ * only creates and attaches), and callers serialise them under {@code LOCK_MAINTENANCE}, which a {@link LockHolder}
+ * holds: bootstrap takes it after {@code LOCK_SCHEMA}; {@link Maintenance} only tries it and never takes
+ * {@code LOCK_SCHEMA}. Nothing they do is set for the session or outlives its transaction, so they run behind a
+ * transaction-pooling proxy too. Besides the xid-regression recovery, the library takes ACCESS EXCLUSIVE on the parent
+ * in two places, for milliseconds: the extension's tail swap ({@link #ensurePremade}), taken without waiting unless
  * {@code outbox.partitions.swapLockTimeout} asks for a wait, and the drop of a range left detach-pending
  * ({@link #dropPending}, also used on the inbox parent), always by {@code NOWAIT} tries for {@link #NOWAIT_WINDOW},
- * each hold cut by the server at 260 ms, with {@code FINALIZE} when no try gets the lock; other range drops detach
+ * the hold cut by the server at 260 ms, with {@code FINALIZE} when no try gets the lock; other range drops detach
  * concurrently. On a single attached partition (outbox or inbox) it takes ACCESS EXCLUSIVE when it gives one a member
  * made to the parent's owner ({@link PartitionDdl#reown}): by the same {@code NOWAIT} tries and hold bound, the table
  * left to the next run when no try gets the lock.
@@ -57,6 +58,12 @@ public final class XidPartitions {
     /** A swap statement's {@code statement_timeout} past its hold's bound: its one try for the lock. */
     static final Duration TRY_MARGIN = Duration.ofMillis(10);
     /**
+     * The tries' statement's {@code statement_timeout} past their window and a queued wait: their loop checks its
+     * deadline between tries, a loaded host can overshoot it, and a cut there must not pass for a hold that did not
+     * fit. The tries hold nothing until one gets the lock, and that one ends the statement at once.
+     */
+    static final Duration TRIES_MARGIN = Duration.ofSeconds(1);
+    /**
      * The hold's bound by day, past its tries: the attaches and a scan within maxTailScan. Longer, the server cuts the
      * swap's statement (57014) and it rolls back; the next run tries again. Writers' bound by day: this plus
      * {@link #TRY_MARGIN} and the commit's local WAL flush.
@@ -68,8 +75,13 @@ public final class XidPartitions {
      */
     static final Duration HOLD_LOCK_TIMEOUT = Duration.ofMillis(10);
 
-    /** {@code idle_session_timeout} across the quiesce: a client silent this long under it has frozen or gone. */
-    private static final Map<String, String> QUIESCE_IDLE = Map.of("idle_session_timeout", "'5s'");
+    /**
+     * {@code idle_in_transaction_session_timeout} of the quiesce's transaction: a client silent this long under it has
+     * frozen or gone, and Postgres ends its session before it holds every relay step out for long.
+     */
+    private static final Duration QUIESCE_IDLE = Duration.ofSeconds(5);
+    /** Where a pipeline's tries leave when they got the lock, for its work to read: empty when they did not. */
+    private static final String LOCKED_AT = "kora_outbox.locked";
 
     /**
      * The scan rate, bytes a second, a tail's attach back is given time for past its lock wait and
@@ -82,7 +94,7 @@ public final class XidPartitions {
     static final int ATTACH_SLOWDOWN_CAP = 16;
     /** Ranges a swap attaches at most besides the former and the new tail: each attach adds to its hold. */
     static final int RANGES_PER_SWAP = 4;
-    /** Where a swap statement leaves what it did, for the next statement of the session to read. */
+    /** Where a swap leaves what it did, for its pipeline's last read, in its transaction. */
     private static final String SWAP_RESULT = "kora_outbox.swap";
     /** Where {@link #dropPending}'s statement leaves what it did. */
     private static final String DROP_RESULT = "kora_outbox.drop_pending";
@@ -235,7 +247,6 @@ public final class XidPartitions {
     private volatile ZonedDateTime stuckAt;
     private final AtomicLong stallLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final String quiesce;
-    private final String unquiesce;
     private final Duration longTransaction;
     private final boolean bootstrap;
     private final AtomicLong deferLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
@@ -315,12 +326,7 @@ public final class XidPartitions {
         this.maxStall = cfg.tailConversion().maxStall();
         this.zone = ZoneId.of(cfg.tailConversion().zone());
         this.clock = Clock.system(zone);
-        this.quiesce = "select pg_advisory_lock(" + names.internalNamespace() + ", " + TableNames.LOCK_SWAP + ")";
-        // only when held, so a quiesce that timed out costs no "you don't own a lock" WARNING in the server log
-        this.unquiesce = "select pg_advisory_unlock(" + names.internalNamespace() + ", " + TableNames.LOCK_SWAP + ")"
-                + " from pg_locks where locktype = 'advisory' and pid = pg_backend_pid() and mode = 'ExclusiveLock'"
-                + " and classid::bigint = " + Integer.toUnsignedLong(names.internalNamespace()) + " and objid = "
-                + TableNames.LOCK_SWAP + " and objsubid = 2";
+        this.quiesce = "select pg_advisory_xact_lock(" + names.internalNamespace() + ", " + TableNames.LOCK_SWAP + ")";
         this.longTransaction = longTransaction;
         this.bootstrap = bootstrap;
     }
@@ -357,8 +363,9 @@ public final class XidPartitions {
      * awaited: the swap would not get its lock. The run then leaves the extension to the next one with a WARN; if the
      * margin runs out first, rows go to the attached tail. Otherwise it makes {@code <base>_tail_next} anew and waits
      * up to {@code quiesceTimeout} ({@code batchTimeout} + 5 s from maintenance) for relay steps in flight, which hold
-     * {@code LOCK_SWAP} shared, by taking it exclusively ({@code pg_advisory_lock(internalNs, LOCK_SWAP)}, released
-     * after the swap). Writers go on meanwhile, but every shard pauses: no step starts while the request is queued.
+     * {@code LOCK_SWAP} shared, by taking it exclusively ({@code pg_advisory_xact_lock(internalNs, LOCK_SWAP)}) in the
+     * swap's own transaction, which frees it as it ends. Writers go on meanwhile, but every shard pauses: no step
+     * starts while the request is queued.
      * That is no bound on a step (its retry pass may run about 2 × {@code batchTimeout} and its main pass's call
      * another {@code batchTimeout}): a step running longer times the wait out, and the swap is left to the next run.
      * The swap takes its lock without waiting, so writers wait only for the milliseconds it holds it (and for a
@@ -774,66 +781,56 @@ public final class XidPartitions {
     }
 
     /**
-     * Runs {@code action} holding {@code LOCK_SWAP} exclusively, taken within {@code quiesceTimeout}: relay steps in
-     * flight, which hold it shared, have ended, and new ones skip from the request on (Postgres grants no shared lock
-     * past a queued exclusive request) until it is released, whatever fails. A step in flight past
-     * {@code quiesceTimeout} fails it with SQLState 55P03. The span runs under {@link #QUIESCE_IDLE}, set before the
-     * quiesce and given back after its release: its statements follow each other within milliseconds, so a session
-     * idle longer holding the lock belongs to a client that froze or lost its connection, and Postgres ends it before
-     * it holds every relay step out for the 60 s of the maintenance session.
+     * Runs {@code action} in a transaction of its own ({@link PartitionDdl#transaction}) holding {@code LOCK_SWAP}
+     * exclusively, taken within {@code quiesceTimeout} by {@code pg_advisory_xact_lock}: relay steps in flight, which
+     * hold it shared, have ended, and new ones skip from the request on (Postgres grants no shared lock past a queued
+     * exclusive request) until the transaction ends, committed by the swap's own pipeline or here, or rolled back,
+     * whatever fails. A step in flight past {@code quiesceTimeout} fails it with SQLState 55P03. Nothing outlives the
+     * transaction, so a transaction-pooling proxy hands no other client the lock. The transaction's
+     * {@code idle_in_transaction_session_timeout} is {@link #QUIESCE_IDLE}: its statements follow each other within
+     * milliseconds, so a client idle longer holding the lock froze or lost its connection, and Postgres ends its session
+     * before it holds every relay step out for long.
      */
     private <T> T quiesced(Connection c, Duration quiesceTimeout, SqlFunction0<T> action) throws SQLException {
-        return SessionSettings.with(c, QUIESCE_IDLE, () -> quiesce(c, quiesceTimeout, action));
-    }
-
-    private <T> T quiesce(Connection c, Duration quiesceTimeout, SqlFunction0<T> action) throws SQLException {
-        Throwable failure = null;
+        boolean[] quiesced = {false};
         try {
-            // inside the try: whatever fails once the lock is granted, even an Error, releases it below; a session
-            // lock left behind would go back to the pool and keep every relay step out
-            try {
-                PartitionDdl.execute(c, quiesceTimeout, quiesce); // under the session's own timeouts again afterwards
-            } catch (SQLException e) {
-                throw LOCK_NOT_AVAILABLE.equals(e.getSQLState()) ? relayStepsInFlight(c, quiesceTimeout, e) : e;
-            }
-            return action.apply();
-        } catch (Throwable t) {
-            failure = t;
-            throw t;
-        } finally {
-            try {
-                execute(c, unquiesce);
-            } catch (SQLException e) { // a terminated session, its lock gone with it: keep the cause on top
-                if (failure == null) {
-                    throw e;
+            return SocketBound.atLeast(c, quiesceTimeout, () -> PartitionDdl.transaction(c, QUIESCE_IDLE, () -> {
+                try (var st = c.createStatement()) {
+                    st.execute("set local lock_timeout = " + quiesceTimeout.toMillis() + "; set local statement_timeout = "
+                            + quiesceTimeout.plus(PartitionDdl.DDL_MARGIN).toMillis());
+                    st.execute(quiesce);
+                    st.execute("set local lock_timeout to default; set local statement_timeout to default");
                 }
-                failure.addSuppressed(e);
+                quiesced[0] = true;
+                return action.apply();
+            }));
+        } catch (SQLException e) {
+            if (!quiesced[0] && LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
+                throw relayStepsInFlight(c, quiesceTimeout, e);
             }
+            throw e;
         }
     }
 
     /**
-     * The swap: one {@code DO} statement in autocommit, so the server commits or rolls it back at its end and no round
-     * trip to this client falls inside the hold; its {@code statement_timeout} bounds the hold whatever this JVM does
-     * meanwhile (a GC pause, a stopped process, a dead connection). Read committed whatever the session default (set
-     * for the statement and given back), so each check takes its snapshot under the lock. The statement tries ACCESS
-     * EXCLUSIVE on the parent once, {@code NOWAIT}, so no writer ever queues behind it (a try takes two transaction
-     * ids, granted or not); it ends with nothing done if it missed, and repeats every millisecond for
-     * {@link #NOWAIT_WINDOW}, then,
-     * with {@code swapLockTimeout} above 0, one queued
-     * wait of at most that follows, which writers do queue behind. None got: 55P03. Then every table it attaches,
-     * {@code NOWAIT}: a session holding one (a stray reader, pg_dump) fails it at once (55P03). Holding the parent, no
-     * writer's
-     * transaction is open on the outbox, so a row routed to the tail before is committed or gone; every further lock
-     * wait is cut at {@link #HOLD_LOCK_TIMEOUT}, and the hold at about {@code holdBound} (its
-     * {@code statement_timeout}, {@link #TRY_MARGIN} longer for the try; 57014, all rolled back). It locks
-     * the tail; a hot one ({@code bound} not null) bigger than {@code maxBytes} now, or with the current xid at or
+     * The swap: one pipeline ({@link #nowaitPipeline}), in the caller's transaction (the quiesce's) or, on an
+     * autocommit connection, one of its own, ending in {@code COMMIT}, so the server commits or rolls it back at its end
+     * and no round trip to this client falls inside the hold; its {@code statement_timeout} bounds the hold whatever
+     * this JVM does meanwhile (a GC pause, a stopped process, a dead connection). Read committed, so each check takes
+     * its snapshot under the lock. It tries ACCESS EXCLUSIVE on the parent {@code NOWAIT}, so no writer ever queues
+     * behind it (a try takes two transaction ids, granted or not), every millisecond for {@link #NOWAIT_WINDOW}, then,
+     * with {@code swapLockTimeout} above 0, one queued wait of at most that follows, which writers do queue behind.
+     * None got: 55P03. Then every table it attaches, {@code NOWAIT}: a session holding one (a stray reader, pg_dump)
+     * fails it at once (55P03). Holding the parent, no writer's transaction is open on the outbox, so a row routed to
+     * the tail before is committed or gone; every further lock wait is cut at {@link #HOLD_LOCK_TIMEOUT}, and the hold
+     * at about {@code holdBound} (its {@code statement_timeout}, {@link #TRY_MARGIN} longer; 57014, all rolled back). It
+     * locks the tail; a hot one ({@code bound} not null) bigger than {@code maxBytes} now, or with the current xid at or
      * above {@code bound}, and an empty one holding a row, end it with nothing done. Else it detaches the tail (not
-     * concurrently: it waits for no snapshot and is never left pending): an empty tail is dropped, a hot one renamed
-     * to {@code <base>_x<lower>} and attached as {@code [lower, bound)}, which Postgres does by scanning it, keeping
-     * its indexes. Then the pre-created ranges up to {@code top}, empty and with their indexes made, are attached
-     * without a build, and {@code <base>_tail_next} becomes the tail at {@code top}. Returns why it did nothing, or
-     * null once it swapped, with one INFO saying how long the lock was tried for and held.
+     * concurrently: it waits for no snapshot and is never left pending): an empty tail is dropped, a hot one renamed to
+     * {@code <base>_x<lower>} and attached as {@code [lower, bound)}, which Postgres does by scanning it, keeping its
+     * indexes. Then the pre-created ranges up to {@code top}, empty and with their indexes made, are attached without
+     * a build, and {@code <base>_tail_next} becomes the tail at {@code top}. Returns why it did nothing, or null once it
+     * swapped, with one INFO saying how long the lock was tried for and held.
      */
     @Nullable
     String swap(Connection c, long lower, @Nullable Long bound, long top, Duration holdBound, long maxBytes)
@@ -843,21 +840,13 @@ public final class XidPartitions {
         if (beforeSwap != null) {
             beforeSwap.run();
         }
-        var given = readCommitted(c);
         long start = System.nanoTime();
-        String result;
-        try {
-            var tries = holdSql(false, lower, bound, first, top, maxBytes);
-            result = PartitionDdl.withTimeouts(c, HOLD_LOCK_TIMEOUT, holdBound.plus(TRY_MARGIN), () ->
-                    nowaitTries(start, () -> hold(c, tries)));
-            if (result.equals("busy") && !swapLockTimeout.isZero()) {
-                var queued = holdSql(true, lower, bound, first, top, maxBytes);
-                result = PartitionDdl.withTimeouts(c, swapLockTimeout, swapLockTimeout.plus(holdBound), () ->
-                        hold(c, queued));
-            }
-        } finally {
-            giveBack(c, given);
-        }
+        var sql = nowaitPipeline("table only " + base, swapLockTimeout, swapWork(lower, bound, first, top, maxBytes),
+                holdBound, SWAP_RESULT);
+        var budget = NOWAIT_WINDOW.plus(swapLockTimeout).plus(holdBound).plus(TRIES_MARGIN).plus(TRY_MARGIN);
+        String result = SocketBound.atLeast(c, budget, () -> c.getAutoCommit()
+                ? PartitionDdl.transaction(c, Maintenance.ABANDONED_AFTER, () -> pipeline(c, sql, attachWarnings))
+                : pipeline(c, sql, attachWarnings));
         if (result.equals("busy")) {
             throw new WritersHeldTheLock(base, new SQLException("could not take ACCESS EXCLUSIVE on " + base + " in "
                     + NOWAIT_WINDOW.toMillis() + " ms of NOWAIT tries: a transaction held a lock on it at every try",
@@ -886,67 +875,102 @@ public final class XidPartitions {
     }
 
     /**
-     * {@code attempt}, one statement whose NOWAIT try missed when it returns "busy", again every millisecond while it
-     * does, until {@link #NOWAIT_WINDOW} from {@code start}; its last result. A miss returns at once, having done
-     * nothing, so no writer ever waits behind a try.
+     * One pipeline, sent at once and run by the server without waiting for this client, in the caller's transaction:
+     * a {@code DO} tries ACCESS EXCLUSIVE on {@code target} ({@code "table only <parent>"}, {@code "table <table>"})
+     * {@code NOWAIT} every millisecond for {@link #NOWAIT_WINDOW} (a miss holds nothing, so no writer ever waits behind
+     * a try), then, with {@code queued} above zero, one queued wait of at most that, under a {@code statement_timeout}
+     * of their span and {@link #TRIES_MARGIN}; a second {@code DO}, only once one got it, runs {@code work} (PL/pgSQL statements, which may read
+     * {@code locked}, when it was got) under a {@code statement_timeout} of {@code holdBound} + {@link #TRY_MARGIN},
+     * every other lock wait cut at {@link #HOLD_LOCK_TIMEOUT}; then the transaction-local {@code resultKey} is read
+     * ({@code "busy"} when no try got the lock) and the transaction commits, with a local commit: a wait for a
+     * synchronous standby ignores cancels and would hold the lock unbounded. Safe: a writer's acknowledged commit waits
+     * for an LSN past this commit record, so it is replicated after it. Postgres times each statement of a pipeline
+     * from its own start, so each bound holds for its own statement.
      */
-    static String nowaitTries(long start, SqlFunction0<String> attempt) throws SQLException {
-        while (true) {
-            var r = attempt.apply();
-            if (!r.equals("busy") || System.nanoTime() - start >= NOWAIT_WINDOW.toNanos()) {
-                return r;
+    static String nowaitPipeline(String target, Duration queued, String work, Duration holdBound, String resultKey) {
+        var sql = new StringBuilder("set local synchronous_commit = local; set local lock_timeout = ")
+                .append(HOLD_LOCK_TIMEOUT.toMillis()).append("; set local statement_timeout = ")
+                .append(NOWAIT_WINDOW.plus(queued).plus(TRIES_MARGIN).toMillis()).append("; ");
+        // a lock a try took in its block's subtransaction stays with the transaction, and a miss logs nothing (but
+        // takes two transaction ids: an ACCESS EXCLUSIVE request, granted or not, assigns one for its standby record,
+        // in the block's subtransaction and its parent)
+        sql.append("do $$ declare deadline timestamptz := clock_timestamp() + make_interval(secs => ")
+                .append(NOWAIT_WINDOW.toMillis() / 1000.0).append("); got boolean := false; begin loop begin lock ")
+                .append(target).append(" in access exclusive mode nowait; got := true; exception when"
+                        + " lock_not_available then null; end; exit when got or clock_timestamp() >= deadline;"
+                        + " perform pg_sleep(0.001); end loop; ");
+        if (!queued.isZero()) {
+            sql.append("if not got then perform set_config('lock_timeout', '").append(queued.toMillis())
+                    .append("ms', true); begin lock ").append(target).append(" in access exclusive mode; got := true;"
+                            + " exception when lock_not_available then null; end; perform set_config('lock_timeout', '")
+                    .append(HOLD_LOCK_TIMEOUT.toMillis()).append("ms', true); end if; ");
+        }
+        sql.append("perform set_config('" + LOCKED_AT + "', case when got then clock_timestamp()::text else '' end,"
+                        + " true); if not got then perform set_config('").append(resultKey)
+                .append("', 'busy', true); end if; end $$; set local statement_timeout = ")
+                .append(holdBound.plus(TRY_MARGIN).toMillis())
+                .append("; do $$ declare locked timestamptz; begin if coalesce(current_setting('" + LOCKED_AT
+                        + "', true), '') = '' then return; end if; locked := current_setting('" + LOCKED_AT
+                        + "')::timestamptz; ")
+                .append(work).append(" end $$; select current_setting('").append(resultKey)
+                .append("', true); commit");
+        return sql.toString();
+    }
+
+    /**
+     * Runs {@code sql}, statements ending in one query of one text column, and returns the column, its warnings to
+     * {@code warnings} if given.
+     */
+    static String pipeline(Connection c, String sql, @Nullable Consumer<SQLWarning> warnings) throws SQLException {
+        try (var st = c.createStatement()) {
+            String result = null;
+            for (boolean rows = st.execute(sql); rows || st.getUpdateCount() != -1; rows = st.getMoreResults()) {
+                if (rows) {
+                    try (var rs = st.getResultSet()) {
+                        rs.next();
+                        result = rs.getString(1);
+                    }
+                }
             }
-            try {
-                Thread.sleep(1);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return r;
+            if (warnings != null) {
+                warnings.accept(st.getWarnings());
             }
+            return result;
         }
     }
 
     /**
      * Drops {@code partition}, detach-pending, of {@code parent} without {@code FINALIZE}, which waits for every
-     * snapshot in the database older than its own, a report on another table included: one autocommit {@code DO}
-     * statement takes ACCESS EXCLUSIVE on the parent {@code NOWAIT}, as the swap does, and drops the partition. Any
-     * query that could still see the partition holds a lock on the parent, so a try that gets it waits for no snapshot,
-     * and one that misses leaves nothing behind. Tried every millisecond for {@link #NOWAIT_WINDOW}; the drop's own
-     * lock waits are cut at {@link #HOLD_LOCK_TIMEOUT} and the hold at {@link #DAY_HOLD}. False when no try got the
-     * lock, or the drop failed (a session holding the partition itself timed it out, 55P03; a dependent object, 2BP01;
-     * another role's table, 42501): nothing done, the caller finalizes. A dead session (08xxx) throws.
-     * Only for a partition whose rows may go: the caller has proven that.
+     * snapshot in the database older than its own, a report on another table included: ACCESS EXCLUSIVE on the parent,
+     * {@code NOWAIT} as the swap takes it ({@link #nowaitPipeline}, tried every millisecond for {@link #NOWAIT_WINDOW}),
+     * and the drop, in the caller's transaction or, on an autocommit connection, one of its own. Any query that could
+     * still see the partition holds a lock on the parent, so a try that gets it waits for no snapshot, and one that
+     * misses leaves nothing behind. The drop's own lock waits are cut at {@link #HOLD_LOCK_TIMEOUT} and the hold at
+     * {@link #DAY_HOLD}. False when no try got the lock, or the drop failed (a session holding the partition itself
+     * timed it out, 55P03; a dependent object, 2BP01; another role's table, 42501): nothing done, the caller finalizes.
+     * A dead session (08xxx) throws. Only for a partition whose rows may go: the caller has proven that.
      */
     static boolean dropPending(Connection c, String parent, String partition) throws SQLException {
-        // a local commit, as the swap's: a wait for a synchronous standby ignores cancels and would hold the lock
-        var sql = "do $$ begin perform set_config('synchronous_commit', 'local', true); begin lock table only " + parent
-                + " in access exclusive mode nowait; exception when lock_not_available then perform set_config('"
-                + DROP_RESULT + "', 'busy', false); return; end; drop table if exists " + partition + "; perform"
-                + " set_config('" + DROP_RESULT + "', 'dropped', false); end $$";
-        long start = System.nanoTime();
         String result;
         try {
-            result = PartitionDdl.withTimeouts(c, HOLD_LOCK_TIMEOUT, DAY_HOLD.plus(TRY_MARGIN), () ->
-                    nowaitTries(start, () -> {
-                        execute(c, sql);
-                        try (var st = c.createStatement();
-                                var rs = st.executeQuery("select current_setting('" + DROP_RESULT + "', true)")) {
-                            rs.next();
-                            return rs.getString(1);
-                        }
-                    }));
+            var sql = dropPendingSql(parent, partition);
+            result = c.getAutoCommit()
+                    ? PartitionDdl.transaction(c, Maintenance.ABANDONED_AFTER, () -> pipeline(c, sql, null))
+                    : pipeline(c, sql, null);
         } catch (SQLException e) {
-            if (e.getSQLState() != null && e.getSQLState().startsWith("08")) { // a dead session: nothing to finalize on
-                throw e;
-            }
-            if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
-                // a dependent view, FK or function (2BP01), another role's table (42501): FINALIZE still clears the
-                // pending state, which else blocks every other detach of the parent, and dropOrphans retries the drop
-                log.warn("outbox could not drop partition {} of {}, left detach-pending (SQLState {}), so its detach is"
-                        + " finalized instead: {}", partition, parent, e.getSQLState(), e.getMessage());
-            }
-            return false;
+            return droppedPending(e, parent, partition);
         }
-        if (!result.equals("dropped")) {
+        return droppedPending(result, parent, partition);
+    }
+
+    private static String dropPendingSql(String parent, String partition) {
+        return nowaitPipeline("table only " + parent, Duration.ZERO, "drop table if exists " + partition + ";"
+                + " perform set_config('" + DROP_RESULT + "', 'dropped', true);", DAY_HOLD, DROP_RESULT);
+    }
+
+    /** {@link #dropPending}'s answer for its pipeline's {@code result}. */
+    private static boolean droppedPending(String result, String parent, String partition) {
+        if (!"dropped".equals(result)) {
             return false;
         }
         log.info("dropped partition {} of {}, left detach-pending, under ACCESS EXCLUSIVE on {} instead of finalizing"
@@ -954,45 +978,40 @@ public final class XidPartitions {
         return true;
     }
 
-    /** The swap's one statement; {@code queued}: its parent lock waits in the queue instead of trying NOWAIT. */
-    private String holdSql(boolean queued, long lower, @Nullable Long bound, long first, long top, long maxBytes) {
+    /** {@link #dropPending}'s answer for its pipeline's failure {@code e}: false, or {@code e} for a dead session. */
+    private static boolean droppedPending(SQLException e, String parent, String partition) throws SQLException {
+        if (e.getSQLState() != null && e.getSQLState().startsWith("08") || LockHolder.lost(e)) {
+            throw e; // a dead session, or a lost lock holder: nothing to finalize on, or no right to
+        }
+        if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
+            // a dependent view, FK or function (2BP01), another role's table (42501): FINALIZE still clears the
+            // pending state, which else blocks every other detach of the parent, and dropOrphans retries the drop
+            log.warn("outbox could not drop partition {} of {}, left detach-pending (SQLState {}), so its detach is"
+                    + " finalized instead: {}", partition, parent, e.getSQLState(), e.getMessage());
+        }
+        return false;
+    }
+
+    /** The swap's work, holding ACCESS EXCLUSIVE on the parent ({@link #nowaitPipeline}): PL/pgSQL statements. */
+    private String swapWork(long lower, @Nullable Long bound, long first, long top, long maxBytes) {
         String base = names.base();
         String tail = names.tail();
-        // first, a local commit: Postgres stops the statement's timeout before the commit, and a wait for a synchronous
-        // standby ignores cancels, so it would hold the lock unbounded. Safe: a writer's acknowledged commit waits for
-        // an LSN past the swap's commit record, so it is replicated after it; a swap lost in a failover leaves the
-        // previous catalog, consistent and attached as before
-        var sql = new StringBuilder("do $$ declare locked timestamptz; begin perform set_config('synchronous_commit',"
-                + " 'local', true); ");
-        if (queued) {
-            sql.append("lock table only ").append(base).append(" in access exclusive mode; ");
-        } else {
-            // a lock the try took in its block's subtransaction stays with the statement, and a miss logs nothing
-            // (but takes two transaction ids: an ACCESS EXCLUSIVE request, granted or not, assigns one for its
-            // standby record, in the block's subtransaction and its parent)
-            sql.append("begin lock table only ")
-                    .append(base).append(" in access exclusive mode nowait; exception when lock_not_available then"
-                            + " perform set_config('" + SWAP_RESULT + "', 'busy', false); return; end; ");
-        }
         // the tables it attaches, without waiting: a session holding one (a stray reader, pg_dump) fails the swap
-        sql.append("lock table ").append(names.tailNext());
+        var sql = new StringBuilder("lock table ").append(names.tailNext());
         for (long from = first; from < top; from += size) {
             sql.append(", ").append(names.partitionPrefix()).append(from);
         }
-        sql.append(" in access exclusive mode nowait; ");
-        sql.append("locked := clock_timestamp(); perform set_config('lock_timeout', '")
-                .append(HOLD_LOCK_TIMEOUT.toMillis()).append("ms', true); lock table ").append(tail)
-                .append(" in access exclusive mode; ");
+        sql.append(" in access exclusive mode nowait; lock table ").append(tail).append(" in access exclusive mode; ");
         if (bound != null) {
             sql.append("if pg_relation_size('").append(tail).append("') > ").append(maxBytes)
                     .append(" then perform set_config('" + SWAP_RESULT + "', 'large ' || pg_relation_size('")
-                    .append(tail).append("'), false); return; end if; ")
+                    .append(tail).append("'), true); return; end if; ")
                     .append("if pg_snapshot_xmax(pg_current_snapshot()) >= '").append(bound)
-                    .append("'::xid8 then perform set_config('" + SWAP_RESULT + "', 'passed', false); return;"
+                    .append("'::xid8 then perform set_config('" + SWAP_RESULT + "', 'passed', true); return;"
                             + " end if; ");
         } else {
             sql.append("if exists (select 1 from ").append(tail).append(") then perform set_config('" + SWAP_RESULT
-                    + "', 'rows', false); return; end if; ");
+                    + "', 'rows', true); return; end if; ");
         }
         sql.append("alter table ").append(base).append(" detach partition ").append(tail).append("; ");
         if (inHold != null) {
@@ -1015,51 +1034,8 @@ public final class XidPartitions {
                 .append(names.unqualified(tail)).append("; alter table ").append(base).append(" attach partition ")
                 .append(tail).append(' ').append(PartitionDdl.bounds(Long.toString(top), null))
                 .append("; perform set_config('" + SWAP_RESULT + "', 'swapped ' || round((extract(epoch from"
-                        + " clock_timestamp() - locked) * 1000)::numeric, 1), false); end $$");
+                        + " clock_timestamp() - locked) * 1000)::numeric, 1), true);");
         return sql.toString();
-    }
-
-    /** Runs one swap statement and reads what it did. */
-    private String hold(Connection c, String sql) throws SQLException {
-        try (var st = c.createStatement()) {
-            st.execute(sql);
-            if (attachWarnings != null) {
-                attachWarnings.accept(st.getWarnings());
-            }
-        }
-        try (var st = c.createStatement();
-                var rs = st.executeQuery("select current_setting('" + SWAP_RESULT + "', true)")) {
-            rs.next();
-            return rs.getString(1);
-        }
-    }
-
-    /**
-     * Makes the session's default isolation read committed for the swap's statement when it is not; what to give
-     * back: null for nothing, "" for a reset, else the session's own value.
-     */
-    @Nullable
-    private static String readCommitted(Connection c) throws SQLException {
-        String setting;
-        String source;
-        try (var st = c.createStatement(); var rs = st.executeQuery("select setting, source from pg_settings"
-                + " where name = 'default_transaction_isolation'")) {
-            rs.next();
-            setting = rs.getString(1);
-            source = rs.getString(2);
-        }
-        if (setting.equals("read committed")) {
-            return null;
-        }
-        execute(c, "set default_transaction_isolation = 'read committed'");
-        return source.equals("session") ? setting : "";
-    }
-
-    private static void giveBack(Connection c, @Nullable String given) throws SQLException {
-        if (given != null) {
-            execute(c, given.isEmpty() ? "reset default_transaction_isolation"
-                    : "set default_transaction_isolation = '" + given + "'");
-        }
     }
 
     /**
@@ -1277,16 +1253,20 @@ public final class XidPartitions {
         }
     }
 
-    /** {@link #dropPending} under the quiesce; false when a relay step in flight outlasted {@code quiesceTimeout}. */
+    /**
+     * {@link #dropPending} under the quiesce, in its transaction; false when a relay step in flight outlasted
+     * {@code quiesceTimeout}.
+     */
     private boolean droppedQuiesced(Connection c, String pending, Duration quiesceTimeout) throws SQLException {
+        String result;
         try {
-            return quiesced(c, quiesceTimeout, () -> dropPending(c, names.base(), pending));
-        } catch (SQLException e) {
-            if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
-                throw e;
-            }
+            result = quiesced(c, quiesceTimeout, () -> pipeline(c, dropPendingSql(names.base(), pending), null));
+        } catch (RelayStepsInFlight e) {
             return false;
+        } catch (SQLException e) {
+            return droppedPending(e, names.base(), pending);
         }
+        return droppedPending(result, names.base(), pending);
     }
 
     /**
@@ -1385,7 +1365,7 @@ public final class XidPartitions {
     /**
      * Who would hold the tail swap back, described, or null ({@link #SWAP_BLOCKERS}). A lock holder whose age is
      * hidden counts only when the same transaction still holds a lock on the parent a threshold later: this sleeps for
-     * it, between two autocommit statements (no transaction open, only the caller's session locks held), and only
+     * it, between two autocommit statements (no transaction open), and only
      * when the first sample finds such a holder. A short transaction of the app's own (under another login role)
      * has ended by then.
      */

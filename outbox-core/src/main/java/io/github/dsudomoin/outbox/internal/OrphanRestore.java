@@ -191,11 +191,11 @@ public final class OrphanRestore {
             try (var st = c.createStatement()) {
                 // first in the transaction: read committed, so the read takes its snapshot after the lock
                 st.execute("set transaction isolation level read committed");
+                LockHolder.fenceCurrent(c); // the maintenance lock's holder of a restoreOrphan call is alive
                 st.execute("set local lock_timeout = " + lockTimeout.toMillis());
-                // as relay steps do: Postgres ends a frozen holder's session, and with it the table's lock and a
-                // session lock it holds (the maintenance lock of a restoreOrphan call)
+                // as relay steps do: Postgres ends a frozen client's session, and with it the table's lock
                 st.execute("set local idle_in_transaction_session_timeout = "
-                        + lockTimeout.plusSeconds(30).toMillis());
+                        + PartitionDdl.workIdle(lockTimeout).toMillis());
                 // the first chunk's read walks the rows below fromXid
                 st.execute("set local statement_timeout = " + scan.toMillis() + Ticks.noTransactionTimeout(c));
                 st.execute("lock table " + table + " in access exclusive mode");
@@ -301,8 +301,10 @@ public final class OrphanRestore {
         c.setAutoCommit(false);
         try (var st = c.createStatement()) {
             st.execute("set transaction isolation level read committed");
+            LockHolder.fenceCurrent(c);
             st.execute("set local lock_timeout = " + lockTimeout.toMillis());
-            st.execute("set local idle_in_transaction_session_timeout = " + lockTimeout.plusSeconds(30).toMillis());
+            st.execute("set local idle_in_transaction_session_timeout = "
+                    + PartitionDdl.workIdle(lockTimeout).toMillis());
             st.execute("set local statement_timeout = " + lockTimeout.plus(margin).toMillis()
                     + Ticks.noTransactionTimeout(c));
             st.execute("lock table " + table + " in access exclusive mode");
