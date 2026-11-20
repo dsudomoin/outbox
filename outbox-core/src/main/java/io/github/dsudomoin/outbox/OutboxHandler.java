@@ -66,7 +66,8 @@ public interface OutboxHandler {
      * throws, an {@link Error} included, gives {@code Retry} and blocks the key (the relay logs a {@code Retry}
      * carrying an Error at ERROR, at most once per 10 s). So the default never fails a whole call. After each record
      * it attempts it reports the record's outcome ({@link #recordFinished}): {@code Delivered}, {@code Permanent},
-     * {@code Waiting} or {@code Retry}; never a {@code NotAttempted}.
+     * {@code Waiting} or {@code Retry}; never a {@code NotAttempted}. A {@code Permanent} the relay holds is reported as
+     * the {@code Retry} the relay makes of it (see {@link #recordFinished}).
      */
     default List<Outcome> handleBatch(List<OutboxRecord> records) {
         var outcomes = new ArrayList<Outcome>(records.size());
@@ -132,7 +133,9 @@ public interface OutboxHandler {
      * itself reports them the same way. A handler built on another handler may report a record twice (a decorator
      * that overrides only {@link #handle} over one that reports itself, such as the Kafka sender's handler, which
      * reports each ack, before the default {@code handleBatch} reports the record again); the telemetry keeps the
-     * first report.
+     * first report. In a call whose relay holds permanent failures ({@link #holdsPermanent}) a reported
+     * {@code Permanent} reaches the telemetry as the {@code Retry} with its error that the relay makes of the returned
+     * one.
      */
     static void recordFinished(OutboxRecord record, Outcome outcome) {
         RecordScope.recordFinished(record, outcome);

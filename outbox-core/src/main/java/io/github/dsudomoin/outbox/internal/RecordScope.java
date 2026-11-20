@@ -64,11 +64,16 @@ public final class RecordScope {
         return delivery != null && delivery != OutboxTelemetry.Delivery.NONE && !(delivery instanceof ScopeOnly);
     }
 
-    /** {@link OutboxTelemetry.Delivery#recordFinished} of the delivery bound to this thread; nothing outside one. */
+    /**
+     * {@link OutboxTelemetry.Delivery#recordFinished} of the delivery bound to this thread; nothing outside one. In a
+     * call whose relay holds permanent failures ({@link ShardProcessor#holdsPermanent}) a {@code Permanent} is reported
+     * as the {@code Retry} with its error that the relay makes of it, so the early report and the call's end agree.
+     */
     public static void recordFinished(OutboxRecord record, Outcome outcome) {
         var delivery = CURRENT.get();
         if (delivery != null && delivery != OutboxTelemetry.Delivery.NONE) {
-            delivery.recordFinished(record, outcome);
+            delivery.recordFinished(record, outcome instanceof Outcome.Permanent p && ShardProcessor.holdsPermanent()
+                    ? Outcome.retry(p.error()) : outcome);
         }
     }
 
