@@ -13,6 +13,8 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.Outcome;
+import io.github.dsudomoin.outbox.internal.GuardedTelemetry;
+import io.github.dsudomoin.outbox.internal.RecordScope;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.TestTracing;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -484,6 +486,22 @@ class KoraOutboxTelemetryTest {
         assertThat(traceId).as("handled in a Kora context of its stored trace").isEqualTo(TRACE_ID);
         assertThat(Context.current()).isSameAs(before);
         assertThat(writer).isNotSameAs(before);
+    }
+
+    /**
+     * As before the per-record reports: a sender that only reports outcomes early (Kafka's) enters no record scope per
+     * send, through the core's guard too, while the handler's own record scope still carries the stored trace.
+     */
+    @Test
+    void withoutATracerASenderHearsNoReports() throws Exception {
+        var telemetry = GuardedTelemetry.of(new KoraOutboxTelemetry(new OutboxMetrics(null), null));
+        var record = record(List.of(header("traceparent", TRACEPARENT)));
+        var delivery = telemetry.deliveryStarted(telemetry.stepStarted(List.of(0)), List.of(record), NOW);
+
+        assertThat(RecordScope.bound(delivery, RecordScope::reports)).as("reports heard").isFalse();
+        var traceId = RecordScope.bound(delivery, () -> RecordScope.run(record,
+                () -> OpentelemetryContext.getSpan().getSpanContext().getTraceId()));
+        assertThat(traceId).isEqualTo(TRACE_ID);
     }
 
     @Test

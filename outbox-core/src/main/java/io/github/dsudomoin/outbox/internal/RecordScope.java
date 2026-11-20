@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.internal;
 
+import io.github.dsudomoin.outbox.InternalApi;
 import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
@@ -30,6 +31,14 @@ public final class RecordScope {
         <T> T inRecordScope(OutboxRecord record, Callable<T> call) throws Exception;
     }
 
+    /**
+     * Marks a delivery that only gives each record its scope for the handler: it hears no reports and a sender's
+     * calls need no scope of their own, so {@link #reports()} is false for it, as for
+     * {@link OutboxTelemetry.Delivery#NONE}.
+     */
+    @InternalApi
+    public interface ScopeOnly extends OutboxTelemetry.Delivery {}
+
     /** Runs {@code body} with {@code delivery} bound to this thread; the previous binding is restored after. */
     public static <T> T bound(OutboxTelemetry.Delivery delivery, Callable<T> body) throws Exception {
         var previous = CURRENT.get();
@@ -47,12 +56,12 @@ public final class RecordScope {
 
     /**
      * Whether a delivery that hears reports is bound to this thread: one other than
-     * {@link OutboxTelemetry.Delivery#NONE}. A handler that would do extra work only to report outcomes early
-     * ({@link #recordFinished}) skips it when false.
+     * {@link OutboxTelemetry.Delivery#NONE} and no {@link ScopeOnly}. A handler that would do extra work only to report
+     * outcomes early ({@link #recordFinished}) skips it when false.
      */
     public static boolean reports() {
         var delivery = CURRENT.get();
-        return delivery != null && delivery != OutboxTelemetry.Delivery.NONE;
+        return delivery != null && delivery != OutboxTelemetry.Delivery.NONE && !(delivery instanceof ScopeOnly);
     }
 
     /** {@link OutboxTelemetry.Delivery#recordFinished} of the delivery bound to this thread; nothing outside one. */

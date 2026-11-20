@@ -72,7 +72,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
             warn("deliveryStarted", e);
             return Delivery.NONE;
         }
-        return delivery == Delivery.NONE ? delivery : new GuardedDelivery(delivery);
+        return delivery == Delivery.NONE ? delivery : guarded(delivery);
     }
 
     /** {@code step} as the delegate returned it: a guard of this telemetry is unwrapped first. */
@@ -86,7 +86,13 @@ public final class GuardedTelemetry implements OutboxTelemetry {
             warn("deliveryStarted", e);
             return Delivery.NONE;
         }
-        return delivery == null || delivery == Delivery.NONE ? Delivery.NONE : new GuardedDelivery(delivery);
+        return delivery == null || delivery == Delivery.NONE ? Delivery.NONE : guarded(delivery);
+    }
+
+    /** {@code delivery} guarded; a {@link RecordScope.ScopeOnly} one stays one. */
+    private Delivery guarded(Delivery delivery) {
+        return delivery instanceof RecordScope.ScopeOnly ? new GuardedScopeOnly(delivery)
+                : new GuardedDelivery(delivery);
     }
 
     @Override
@@ -473,7 +479,14 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         }
     }
 
-    private final class GuardedDelivery implements Delivery {
+    private final class GuardedScopeOnly extends GuardedDelivery implements RecordScope.ScopeOnly {
+
+        GuardedScopeOnly(Delivery delegate) {
+            super(delegate);
+        }
+    }
+
+    private class GuardedDelivery implements Delivery {
 
         private final Delivery delegate;
 

@@ -6,6 +6,7 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.Outcome;
+import io.github.dsudomoin.outbox.internal.RecordScope;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.trace.Span;
@@ -48,8 +49,11 @@ import ru.tinkoff.kora.common.Context;
  */
 public final class KoraOutboxTelemetry implements OutboxTelemetry {
 
-    /** Without a tracer: the records as stored, each handled in a Kora context carrying its stored trace. */
-    private static final Delivery SCOPE_ONLY = new Delivery() {
+    /**
+     * Without a tracer: the records as stored, each handled in a Kora context carrying its stored trace; it hears no
+     * reports, so a sender's calls enter no Kora context of their own.
+     */
+    private static final Delivery SCOPE_ONLY = new RecordScope.ScopeOnly() {
         @Override
         public <T> T inRecordScope(OutboxRecord record, Callable<T> call) throws Exception {
             return inKoraContext(record, call);
