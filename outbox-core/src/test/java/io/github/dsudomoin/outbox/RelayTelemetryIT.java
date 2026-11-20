@@ -276,6 +276,23 @@ class RelayTelemetryIT {
         assertThat(failed.errors.get(0)).hasMessageContaining("commit refused");
     }
 
+    @Test
+    void anErrorFromTheSettleStillEndsTheStep() throws Exception {
+        var config = new TestOutboxConfig().workers(1);
+        var events = new Events(transactions, config.table() + "_cursor");
+        events.settleError = new InternalError("settle (test)"); // a VirtualMachineError: the guard lets it through
+        var handler = new RecordingHandler();
+        var outbox = start(config, handler, events);
+
+        transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", "k", bytes("m"))));
+        await(Duration.ofSeconds(10), () -> events.steps.stream().anyMatch(s -> s.log.contains("committed(1)")));
+        Thread.sleep(200);
+        runtime.close();
+
+        var step = events.steps.stream().filter(s -> s.log.contains("committed(1)")).findFirst().orElseThrow();
+        assertThat(step.log).endsWith("committed(1)", "finished");
+    }
+
     /** {@code c}, whose rollback right after a failed commit rolls back and then throws an Error. */
     private static java.sql.Connection rollbackFailing(java.sql.Connection c, AtomicInteger errors) {
         var commitFailed = new java.util.concurrent.atomic.AtomicBoolean();
@@ -654,6 +671,9 @@ class RelayTelemetryIT {
         volatile int foreignSteps;
         @Nullable
         volatile OutboxRecord lastHanded;
+        /** Thrown once by a settle's {@code committed}, after it logs. */
+        @Nullable
+        volatile Error settleError;
 
         Events(JdbcTransactions transactions, String cursor) {
             this.transactions = transactions;
@@ -770,6 +790,11 @@ class RelayTelemetryIT {
                     @Override
                     public void committed(int records) {
                         log.add("committed(" + records + ")");
+                        var error = settleError;
+                        if (error != null) {
+                            settleError = null;
+                            throw error;
+                        }
                     }
 
                     @Override

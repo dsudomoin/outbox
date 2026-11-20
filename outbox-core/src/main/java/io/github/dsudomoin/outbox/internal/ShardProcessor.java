@@ -513,16 +513,23 @@ public final class ShardProcessor implements AutoCloseable {
         OutboxTelemetry.Settle settle = OutboxTelemetry.Settle.NONE;
         int settled;
 
+        /** An Error the guard lets through from the settle still ends the step: nothing else would. */
         @Override
         public void committed() {
-            settle.committed(settled);
-            step.finished();
+            try {
+                settle.committed(settled);
+            } finally {
+                step.finished();
+            }
         }
 
         @Override
         public void rolledBack(Throwable error) {
-            settle.failed(settled, error);
-            step.failed(error);
+            try {
+                settle.failed(settled, error);
+            } finally {
+                step.failed(error);
+            }
         }
     }
 
