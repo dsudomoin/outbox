@@ -110,24 +110,25 @@ import org.slf4j.LoggerFactory;
  * and {@code partitioner.ignore.keys=true} are rejected: ordering and the cooldown need Kafka's per-key partitioning.
  *
  * <p>A call hands records over during its first 5 s, while Kafka can still answer them within
- * {@code delivery.timeout.ms} before the call's deadline, and waits for acks until {@code delivery.timeout.ms} + 5 s
- * from entry (25 s by default). A {@code send()} that waited for buffer space appends its record late, and Kafka's
- * delivery timeout of the record starts there: the wait then runs {@code delivery.timeout.ms} + 5 s from the last
- * append, at most {@code delivery.timeout.ms} + 5 s + {@code max.block.ms} from entry (30 s by default). Records not
- * handed over in time are {@code NotAttempted}; the relay reads them again in its next step. At 80 % of
- * {@code batchTimeout} (24 s of 30 s by default) the relay asks its handler call to wind down, with an interrupt: the
- * sender stops handing records over, but keeps waiting for those in flight and keeps the producer open, so they end
- * with Kafka's own outcome. Inside a relay call it waits until 200 ms before the relay cancels the call at
- * {@code batchTimeout}, no longer. A call still waiting then is cut: the sender closes the producer and returns acked
- * records as {@code Delivered}, unacked ones as {@code Retry} (remembered, as above) and the rest as
- * {@code NotAttempted}. The call is cut the same way at once when the relay gives up on it: past {@code batchTimeout},
- * or when the relay's step is interrupted and rolls back (the relay stopping after its {@code shutdownTimeout}, an
- * interrupted {@code drain()}), even if that interrupt reaches the handler thread together with the wind-down's. So is
- * it on any other interrupt: a second one after the wind-down, the relay's handler threads shutting down, a caller
- * outside the relay. A cut turns slow sends into retries, which go
- * unbatched until a call settles them, and a new producer sends them again (a duplicate when Kafka had written them).
- * Keep {@code batchTimeout} at least {@code delivery.timeout.ms} + 5 s + {@code max.block.ms} so that they end as
- * Kafka's outcomes instead; the Kora and Spring adapters log a WARN at startup when it is shorter.
+ * {@code delivery.timeout.ms} before the call's deadline; inside a relay call, also only while they could be answered
+ * before the cut ahead of the relay's cancel (below), though never less than the relay call's first 5 s. It waits for
+ * acks until {@code delivery.timeout.ms} + 5 s from entry (25 s by default). A {@code send()} that waited for buffer
+ * space appends its record late, and Kafka's delivery timeout of the record starts there: the wait then runs
+ * {@code delivery.timeout.ms} + 5 s from the last append, at most {@code delivery.timeout.ms} + 5 s +
+ * {@code max.block.ms} from entry (30 s by default). Records not handed over in time are {@code NotAttempted}; the
+ * relay reads them again in its next step. At 80 % of {@code batchTimeout} (24 s of 30 s by default) the relay asks its
+ * handler call to wind down, with an interrupt: the sender stops handing records over, but keeps waiting for those in
+ * flight and keeps the producer open, so they end with Kafka's own outcome. Inside a relay call it waits until 1 s
+ * before the relay cancels the call at {@code batchTimeout}, no longer. A call still waiting then is cut: the sender
+ * closes the producer and returns acked records as {@code Delivered}, unacked ones as {@code Retry} (remembered, as
+ * above) and the rest as {@code NotAttempted}. The call is cut the same way at once when the relay gives up on it: past
+ * {@code batchTimeout}, or when the relay's step is interrupted and rolls back (the relay stopping after its
+ * {@code shutdownTimeout}, an interrupted {@code drain()}), even if that interrupt reaches the handler thread together
+ * with the wind-down's. So is it on any other interrupt: a second one after the wind-down, the relay's handler threads
+ * shutting down, a caller outside the relay. A cut turns slow sends into retries, which go unbatched until a call
+ * settles them, and a new producer sends them again (a duplicate when Kafka had written them). Keep
+ * {@code batchTimeout} at least {@code delivery.timeout.ms} + 5 s + {@code max.block.ms} so that they end as Kafka's
+ * outcomes instead; the Kora and Spring adapters log a WARN at startup when it is shorter.
  *
  * <p>A record goes to Kafka with its headers but any named {@code outbox-local}, of whatever value: that name marks
  * a record for a route of the relay, and reaches no Kafka topic, a dead-letter topic included.
@@ -135,8 +136,11 @@ import org.slf4j.LoggerFactory;
 public final class KafkaOutboxSender implements AutoCloseable {
 
     private static final Duration WAIT_SLACK = Duration.ofSeconds(5);
-    /** How long before the relay cancels its handler call a call ends, so that its outcomes still count. */
-    private static final long RELAY_MARGIN = Duration.ofMillis(200).toNanos();
+    /**
+     * How long before the relay cancels its handler call a call ends, so that its outcomes still reach the relay: room
+     * for a close that joins the I/O thread, a GC pause, and the way back through the handler.
+     */
+    private static final long RELAY_MARGIN = Duration.ofSeconds(1).toNanos();
     private static final Duration RELEASE_TIMEOUT = Duration.ofSeconds(5);
     private static final int EXPIRED_REMEMBERED = 10_000;
     private static final Duration REMEMBERED_FOR = Duration.ofMinutes(10);
@@ -312,8 +316,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
         }
         var call = new Call(pooled.producer, records.size(), unbatched, entry);
         try {
-            // a record handed over later might be answered after the deadline
-            var partitions = sendAll(call, records, entry + WAIT_SLACK.toNanos(), pooled);
+            var partitions = sendAll(call, records, handOverUntil(entry), pooled);
             long until = awaitUntil(entry, call.lastAppend);
             var ended = call.await(until);
             if (ended != Call.Ended.ACKED) {
@@ -336,6 +339,27 @@ public final class KafkaOutboxSender implements AutoCloseable {
                 drain(unbatchedPool);
             }
         }
+    }
+
+    /**
+     * Until when a call that entered at {@code entry} hands records over (on {@link System#nanoTime}): while Kafka can
+     * answer them before the call stops waiting, its delivery timeout before the deadline ({@link #WAIT_SLACK} from
+     * entry) and, inside a relay call, before the cut ahead of the relay's cancel. A sender called late in a relay call
+     * (a Kafka route after others in one {@code byTopic} call) then hands nothing over that the cut would leave in
+     * flight, to be sent again by a new producer. A relay call too short for any record to get the whole delivery
+     * timeout (a {@code batchTimeout} below the sender's budget: the startup WARN) keeps the first 5 s of the call, or
+     * it would deliver nothing.
+     */
+    private long handOverUntil(long entry) {
+        long until = entry + WAIT_SLACK.toNanos();
+        var deadline = ShardProcessor.callDeadline();
+        var started = ShardProcessor.callStarted();
+        if (deadline.isEmpty() || started.isEmpty()) {
+            return until;
+        }
+        long beforeTheCut = deadline.getAsLong() - RELAY_MARGIN - (wait.toNanos() - WAIT_SLACK.toNanos());
+        long firstSeconds = started.getAsLong() + WAIT_SLACK.toNanos();
+        return earlier(until, beforeTheCut - firstSeconds >= 0 ? beforeTheCut : firstSeconds);
     }
 
     /**
