@@ -46,6 +46,8 @@ import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.sdk.testing.exporter.InMemorySpanExporter;
 import io.opentelemetry.sdk.trace.SdkTracerProvider;
 import io.opentelemetry.sdk.trace.data.EventData;
+import io.opentelemetry.sdk.trace.data.LinkData;
+import io.opentelemetry.sdk.trace.data.SpanData;
 import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
 import jakarta.annotation.Nullable;
 import java.io.IOException;
@@ -1663,13 +1665,17 @@ class ShardProcessorIT {
 
             process();
 
-            var spans = exporter.getFinishedSpanItems();
-            assertThat(spans).hasSize(2);
+            assertThat(exporter.getFinishedSpanItems()).extracting(SpanData::getName)
+                    .containsExactly("outbox deliver t", "outbox deliver t", "outbox relay settle", "outbox relay step");
+            var spans = exporter.getFinishedSpanItems().subList(0, 2);
+            var step = exporter.getFinishedSpanItems().get(3);
+            assertThat(step.getKind()).isEqualTo(SpanKind.CLIENT);
             var ok = spans.get(0);
             assertThat(ok.getName()).isEqualTo("outbox deliver t");
-            assertThat(ok.getKind()).isEqualTo(SpanKind.PRODUCER);
+            assertThat(ok.getKind()).isEqualTo(SpanKind.CONSUMER);
             assertThat(ok.getTraceId()).isEqualTo(TestTracing.TRACE_ID);
             assertThat(ok.getParentSpanId()).isEqualTo(TestTracing.SPAN_ID);
+            assertThat(ok.getLinks()).extracting(LinkData::getSpanContext).containsExactly(step.getSpanContext());
             assertThat(ok.getStatus().getStatusCode()).isEqualTo(StatusCode.UNSET);
             var attributes = ok.getAttributes();
             assertThat(attributes.get(AttributeKey.stringKey("messaging.destination.name"))).isEqualTo("t");
@@ -1694,7 +1700,8 @@ class ShardProcessorIT {
             exporter.reset();
             now = now.plus(INITIAL);
             assertThat(process().delivered()).isEqualTo(1);
-            var retried = exporter.getFinishedSpanItems();
+            var retried = exporter.getFinishedSpanItems().stream()
+                    .filter(span -> span.getName().equals("outbox deliver t")).toList();
             assertThat(retried).singleElement().satisfies(span -> {
                 assertThat(span.getParentSpanId()).isEqualTo(TestTracing.SPAN_ID);
                 assertThat(span.getAttributes().get(AttributeKey.longKey("outbox.attempt"))).isEqualTo(2);
@@ -4180,7 +4187,8 @@ class ShardProcessorIT {
 
             process();
 
-            assertThat(exporter.getFinishedSpanItems()).singleElement().satisfies(span -> {
+            assertThat(exporter.getFinishedSpanItems()).filteredOn(span -> span.getName().equals("outbox deliver t"))
+                    .singleElement().satisfies(span -> {
                 assertThat(span.getAttributes().get(AttributeKey.stringKey("outbox.outcome"))).isEqualTo("requeued");
                 assertThat(span.getStatus().getStatusCode()).isEqualTo(StatusCode.UNSET);
             });

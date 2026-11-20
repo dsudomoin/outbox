@@ -55,7 +55,17 @@ public final class OutboxTracing {
 
     /** Trace headers of the span in the current Kora context; empty without a valid span. */
     public static List<OutboxHeader> currentHeaders() {
+        return headers(current());
+    }
+
+    /** The OpenTelemetry context of the current Kora context, root when it has none. */
+    static io.opentelemetry.context.Context current() {
         var otel = OpentelemetryContext.get(Context.current()).getContext();
+        return otel == null ? io.opentelemetry.context.Context.root() : otel;
+    }
+
+    /** Trace headers of the span in {@code otel}; empty without a valid span. */
+    static List<OutboxHeader> headers(io.opentelemetry.context.Context otel) {
         if (!hasValidSpan(otel)) {
             return List.of();
         }
@@ -100,7 +110,43 @@ public final class OutboxTracing {
         }
     }
 
-    private static boolean hasValidSpan(@Nullable io.opentelemetry.context.Context ctx) {
+    /**
+     * Makes a forked Kora context carrying {@code otel} current on this thread, as {@link #withKoraContext} does, until
+     * the returned scope closes; the context current before is restored then, exactly.
+     */
+    static KoraScope open(io.opentelemetry.context.Context otel) {
+        var previous = Context.current();
+        var forked = previous.fork();
+        forked.inject();
+        try {
+            OpentelemetryContext.set(forked, new OpentelemetryContext(otel));
+        } catch (Throwable e) {
+            previous.inject();
+            throw e;
+        }
+        return new KoraScope(previous);
+    }
+
+    /** A Kora context made current by {@link #open}; closed once, on the thread that opened it. */
+    static final class KoraScope {
+
+        private final Context previous;
+        private boolean closed;
+
+        private KoraScope(Context previous) {
+            this.previous = previous;
+        }
+
+        /** Restores the thread's previous context; a second close does nothing. */
+        void close() {
+            if (!closed) {
+                closed = true;
+                previous.inject();
+            }
+        }
+    }
+
+    static boolean hasValidSpan(@Nullable io.opentelemetry.context.Context ctx) {
         return ctx != null && Span.fromContext(ctx).getSpanContext().isValid();
     }
 }
