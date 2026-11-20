@@ -12,6 +12,7 @@ import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.internal.Hashing;
 import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry;
+import io.github.dsudomoin.outbox.micrometer.OutboxDeliveryTracingObservationHandler;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -30,6 +31,7 @@ import io.micrometer.tracing.otel.bridge.OtelPropagator;
 import io.micrometer.tracing.otel.bridge.OtelTracer;
 import io.micrometer.tracing.propagation.Propagator;
 import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
 import io.opentelemetry.context.propagation.ContextPropagators;
@@ -71,9 +73,12 @@ class KafkaTelemetryIT {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(60);
     private static final String STEP = "outbox relay step";
+    private static final String SETTLE = "outbox relay settle";
     private static final AttributeKey<String> MESSAGE_ID = AttributeKey.stringKey("outbox.message_id");
     private static final AttributeKey<String> SHARD = AttributeKey.stringKey("outbox.shard");
     private static final AttributeKey<String> SHARDS = AttributeKey.stringKey("outbox.shards");
+    private static final AttributeKey<String> RECORDS = AttributeKey.stringKey("outbox.records");
+    private static final AttributeKey<String> SYSTEM = AttributeKey.stringKey("messaging.system");
 
     private final InMemorySpanExporter spans = InMemorySpanExporter.create();
     private final SdkTracerProvider provider = SdkTracerProvider.builder().setSampler(Sampler.alwaysOn())
@@ -128,13 +133,16 @@ class KafkaTelemetryIT {
                 .satisfies(call -> assertThat(call).containsExactlyInAnyOrderElementsOf(ids));
         var received = byMessageId(
                 TestKafka.consumeUntil(topic, TIMEOUT, r -> byMessageId(r).keySet().containsAll(ids)));
+        var step = span(s -> s.getName().equals(STEP));
         for (int i = 0; i < ids.size(); i++) {
             var writer = writers.get(i).context();
-            var enqueue = span(s -> s.getName().equals("outbox enqueue")
+            var enqueue = span(s -> s.getName().equals("outbox enqueue " + topic)
                     && s.getParentSpanId().equals(writer.spanId()));
             var delivery = delivery(ids.get(i));
             assertThat(delivery.getParentSpanId()).as("delivery %d", i).isEqualTo(enqueue.getSpanId());
             assertThat(delivery.getTraceId()).as("delivery %d", i).isEqualTo(writer.traceId());
+            assertThat(delivery.getLinks()).as("delivery %d", i).singleElement()
+                    .satisfies(l -> assertThat(l.getSpanContext().getSpanId()).isEqualTo(step.getSpanId()));
             assertThat(traceparent(received.get(ids.get(i)))).as("Kafka record %d", i)
                     .isEqualTo("00-" + writer.traceId() + "-" + delivery.getSpanId() + "-"
                             + delivery.getSpanContext().getTraceFlags().asHex());
@@ -233,11 +241,11 @@ class KafkaTelemetryIT {
 
     /**
      * A message sent outside any span still stores trace context: the root enqueue span its send started, which
-     * parents its delivery span. A row written without telemetry stores none: its delivery span is a child of the
-     * relay step that delivers it, the current span on the stepping thread.
+     * parents its delivery span, linked to the step. A row written without telemetry stores none: its delivery span is
+     * a child of the relay step that delivers it, the current span on the stepping thread, and has no link.
      */
     @Test
-    void aRecordWithoutTraceContextInsideAStep() throws Exception {
+    void aRecordWithoutTraceContextHasTheStepAsParentAndNoLink() throws Exception {
         var topic = TestKafka.createTopic(1);
         var config = config().relayEnabled(false);
         var runtime = start(config, new Handler());
@@ -247,13 +255,154 @@ class KafkaTelemetryIT {
 
         runtime.relay().drain();
 
-        var enqueue = span(s -> s.getName().equals("outbox enqueue"));
+        var enqueue = span(s -> s.getName().equals("outbox enqueue " + topic));
         assertThat(enqueue.getParentSpanContext().isValid()).as("the enqueue span has a parent").isFalse();
-        assertThat(delivery(outsideAnySpan).getParentSpanId()).isEqualTo(enqueue.getSpanId());
+        var stored = delivery(outsideAnySpan);
+        assertThat(stored.getParentSpanId()).isEqualTo(enqueue.getSpanId());
+        assertThat(stored.getLinks()).singleElement().satisfies(l -> assertThat(
+                span(s -> s.getSpanId().equals(l.getSpanContext().getSpanId())).getName()).isEqualTo(STEP));
         var delivery = delivery(withoutContext);
         var parent = span(s -> s.getSpanId().equals(delivery.getParentSpanId()));
         assertThat(parent.getName()).isEqualTo(STEP);
         assertThat(delivery.getTraceId()).isEqualTo(parent.getTraceId());
+        assertThat(delivery.getLinks()).as("no link to its own parent").isEmpty();
+    }
+
+    /** One {@code sendAll} of three: a producer span per message, each the parent of its own delivery span. */
+    @Test
+    void enqueueSpanPerMessage() throws Exception {
+        var topic = TestKafka.createTopic(3);
+        var config = config().relayEnabled(false);
+        var runtime = start(config, new Handler());
+        var keys = List.of("a", "b", "c");
+        var writer = tracer.nextSpan().name("writer").start();
+        List<UUID> ids;
+        try (var scope = tracer.withSpan(writer)) {
+            ids = transactions.inTx(c -> runtime.outbox().sendAll(
+                    keys.stream().map(k -> OutboxMessage.of(topic, k, bytes(k))).toList()));
+        } finally {
+            writer.end();
+        }
+
+        runtime.relay().drain();
+
+        assertThat(spans("outbox enqueue " + topic)).hasSize(3).allSatisfy(s -> {
+            assertThat(s.getKind()).isEqualTo(SpanKind.PRODUCER);
+            assertThat(s.getParentSpanId()).isEqualTo(writer.context().spanId());
+        });
+        for (int i = 0; i < ids.size(); i++) {
+            var id = ids.get(i).toString();
+            var enqueue = span(s -> s.getName().equals("outbox enqueue " + topic)
+                    && id.equals(s.getAttributes().get(MESSAGE_ID)));
+            int shard = Hashing.shard(Hashing.keyHash(topic, bytes(keys.get(i))), config.shards());
+            assertThat(enqueue.getAttributes().get(SHARD)).as(keys.get(i)).isEqualTo(Integer.toString(shard));
+            assertThat(delivery(ids.get(i)).getParentSpanId()).as(keys.get(i)).isEqualTo(enqueue.getSpanId());
+        }
+    }
+
+    /** The step is a client span with the records it fetched, and it ends after its settle, which ends at the commit. */
+    @Test
+    void stepSpanIsClientAndEndsAfterCommit() throws Exception {
+        var topic = TestKafka.createTopic(1);
+        var runtime = start(config().relayEnabled(false), new Handler());
+        transactions.inTx(c -> runtime.outbox().sendAll(List.of(
+                OutboxMessage.of(topic, "k", bytes("1")), OutboxMessage.of(topic, "k", bytes("2")))));
+
+        runtime.relay().drain();
+
+        var step = span(s -> s.getName().equals(STEP));
+        var settle = span(s -> s.getName().equals(SETTLE));
+        assertThat(step.getKind()).isEqualTo(SpanKind.CLIENT);
+        assertThat(step.getAttributes().get(RECORDS)).isEqualTo("2");
+        assertThat(step.getEndEpochNanos()).isGreaterThanOrEqualTo(settle.getEndEpochNanos());
+    }
+
+    @Test
+    void settleSpanIsAChildOfTheStep() throws Exception {
+        var topic = TestKafka.createTopic(1);
+        var runtime = start(config().relayEnabled(false), new Handler());
+        transactions.inTx(c -> runtime.outbox().sendAll(List.of(
+                OutboxMessage.of(topic, "k", bytes("1")), OutboxMessage.of(topic, "k", bytes("2")))));
+
+        runtime.relay().drain();
+
+        var step = span(s -> s.getName().equals(STEP));
+        var settle = span(s -> s.getName().equals(SETTLE));
+        assertThat(settle.getKind()).isEqualTo(SpanKind.CLIENT);
+        assertThat(settle.getParentSpanId()).isEqualTo(step.getSpanId());
+        assertThat(settle.getAttributes().get(RECORDS)).isEqualTo("2");
+    }
+
+    /** A delivery of a stored trace: a consumer span under its enqueue span, with one link, to its step's span. */
+    @Test
+    void deliverLinksToItsStep() throws Exception {
+        var topic = TestKafka.createTopic(1);
+        var runtime = start(config().relayEnabled(false), new Handler());
+        var writer = tracer.nextSpan().name("writer").start();
+        UUID id;
+        try (var scope = tracer.withSpan(writer)) {
+            id = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of(topic, "k", bytes("v"))));
+        } finally {
+            writer.end();
+        }
+
+        runtime.relay().drain();
+
+        var enqueue = span(s -> s.getName().equals("outbox enqueue " + topic));
+        var step = span(s -> s.getName().equals(STEP));
+        var delivery = delivery(id);
+        assertThat(delivery.getKind()).isEqualTo(SpanKind.CONSUMER);
+        assertThat(delivery.getParentSpanId()).isEqualTo(enqueue.getSpanId());
+        assertThat(delivery.getLinks()).singleElement().satisfies(l -> {
+            assertThat(l.getSpanContext().getSpanId()).isEqualTo(step.getSpanId());
+            assertThat(l.getSpanContext().getTraceId()).isEqualTo(step.getTraceId());
+        });
+    }
+
+    /**
+     * The sender reports each broker ack as it arrives, so each record's delivery span ends there, not at the end of the
+     * call: the call then waits {@code tail} before it returns, and every delivery span ends well before the settle
+     * starts.
+     */
+    @Test
+    void eachRecordEndsAtItsAck() throws Exception {
+        var topic = TestKafka.createTopic(3);
+        var handler = new Handler();
+        var tail = Duration.ofMillis(400);
+        handler.afterSend = records -> {
+            try {
+                Thread.sleep(tail.toMillis());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        };
+        var runtime = start(config().relayEnabled(false), handler);
+        var ids = transactions.inTx(c -> runtime.outbox().sendAll(Stream.of("a", "b", "c")
+                .map(k -> OutboxMessage.of(topic, k, bytes(k))).toList()));
+
+        runtime.relay().drain();
+
+        assertThat(handler.calls).as("handler calls").singleElement()
+                .satisfies(call -> assertThat(call).containsExactlyInAnyOrderElementsOf(ids));
+        var settle = span(s -> s.getName().equals(SETTLE));
+        for (var id : ids) {
+            assertThat(delivery(id).getEndEpochNanos()).as("delivery of %s", id)
+                    .isLessThanOrEqualTo(settle.getStartEpochNanos() - tail.toNanos() / 2);
+        }
+    }
+
+    @Test
+    void messagingSystemIsOutbox() throws Exception {
+        var topic = TestKafka.createTopic(1);
+        var runtime = start(config().relayEnabled(false), new Handler());
+        var id = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of(topic, "k", bytes("v"))));
+
+        runtime.relay().drain();
+
+        assertThat(List.of(span(s -> s.getName().equals("outbox enqueue " + topic)), span(s -> s.getName().equals(STEP)),
+                span(s -> s.getName().equals(SETTLE)), delivery(id)))
+                .allSatisfy(s -> assertThat(s.getAttributes().get(SYSTEM)).as(s.getName()).isEqualTo("outbox"));
+        assertThat(meters.get("outbox.deliver").tag("messaging.system", "outbox").timer().count()).isEqualTo(1);
     }
 
     @Test
@@ -313,12 +462,16 @@ class KafkaTelemetryIT {
         }
     }
 
-    /** As an application wires it: propagating sender and receiver handlers, default tracing, meters. */
+    /**
+     * As an application wires it: propagating sender handler, the outbox's delivery handler before the plain receiver
+     * one, default tracing, meters.
+     */
     private ObservationOutboxTelemetry observed() {
         var observations = ObservationRegistry.create();
         observations.observationConfig()
                 .observationHandler(new ObservationHandler.FirstMatchingCompositeObservationHandler(
                         new PropagatingSenderTracingObservationHandler<>(tracer, propagator),
+                        new OutboxDeliveryTracingObservationHandler(tracer, propagator),
                         new PropagatingReceiverTracingObservationHandler<>(tracer, propagator),
                         new DefaultTracingObservationHandler(tracer)))
                 .observationHandler(new DefaultMeterObservationHandler(meters));

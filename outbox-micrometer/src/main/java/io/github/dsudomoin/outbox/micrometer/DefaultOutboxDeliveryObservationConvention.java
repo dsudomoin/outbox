@@ -7,11 +7,11 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * {@code outbox.deliver}, span {@code outbox deliver <topic>}. Low cardinality: {@code messaging.destination.name}
- * and, once known, {@code outbox.outcome} ({@code delivered}, {@code retry}, {@code permanent}, {@code not_attempted},
- * {@code requeued}, {@code waiting}, or {@code failed} when the handler call ended without outcomes). High
- * cardinality: {@code outbox.message_id}, {@code outbox.attempt} (this attempt, from 1), {@code outbox.delay_ms} and,
- * when the record's shard is known, {@code outbox.shard}.
+ * {@code outbox.deliver}, span {@code outbox deliver <topic>}. Low cardinality: {@code messaging.system}
+ * ({@code outbox}), {@code messaging.destination.name} and, once known, {@code outbox.outcome} ({@code delivered},
+ * {@code retry}, {@code permanent}, {@code not_attempted}, {@code requeued}, {@code waiting}, or {@code failed} when
+ * the handler call ended without outcomes). High cardinality: {@code outbox.message_id}, {@code outbox.attempt}
+ * (this attempt, from 1), {@code outbox.delay_ms} and, when the record's shard is known, {@code outbox.shard}.
  */
 public class DefaultOutboxDeliveryObservationConvention implements OutboxDeliveryObservationConvention {
 
@@ -41,7 +41,10 @@ public class DefaultOutboxDeliveryObservationConvention implements OutboxDeliver
         return context.failed() ? topic.withOutcome("failed") : topic.values();
     }
 
-    /** Computed once per record: the observation asks at start and at stop, and the record and the clock are fixed. */
+    /**
+     * Computed once per record: the observation asks at start and at stop (a stop may run on the handler thread), and
+     * the record and the clock are fixed.
+     */
     @Override
     public KeyValues getHighCardinalityKeyValues(OutboxDeliveryContext context) {
         var cached = context.highCardinality;
@@ -81,7 +84,8 @@ public class DefaultOutboxDeliveryObservationConvention implements OutboxDeliver
     /** The contextual name and the low cardinality values, without an outcome and with each outcome seen. */
     private record Topic(String name, KeyValues values, Map<String, KeyValues> byOutcome) {
         static Topic of(String topic) {
-            return new Topic("outbox deliver " + topic, KeyValues.of("messaging.destination.name", topic),
+            return new Topic("outbox deliver " + topic,
+                    KeyValues.of("messaging.system", "outbox", "messaging.destination.name", topic),
                     new ConcurrentHashMap<>());
         }
 

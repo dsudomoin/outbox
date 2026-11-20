@@ -35,7 +35,10 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
-/** One message's trace from the writer's span through enqueue and delivery to the handler, on Postgres. */
+/**
+ * One message's trace from the writer's span through enqueue and delivery to the handler, on Postgres; the delivery
+ * links to the relay step that made it.
+ */
 class ObservationEndToEndIT {
 
     private final InMemorySpanExporter spans = InMemorySpanExporter.create();
@@ -60,6 +63,7 @@ class ObservationEndToEndIT {
         observations.observationConfig()
                 .observationHandler(new ObservationHandler.FirstMatchingCompositeObservationHandler(
                         new PropagatingSenderTracingObservationHandler<>(tracer, propagator),
+                        new OutboxDeliveryTracingObservationHandler(tracer, propagator),
                         new PropagatingReceiverTracingObservationHandler<>(tracer, propagator),
                         new DefaultTracingObservationHandler(tracer)))
                 .observationHandler(new DefaultMeterObservationHandler(meters));
@@ -82,17 +86,22 @@ class ObservationEndToEndIT {
             }
             parent.end();
             long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
-            while (finished("outbox deliver orders") == null && System.nanoTime() < deadline) {
+            // the step's span ends after its commit, after the delivery's
+            while ((finished("outbox deliver orders") == null || finished("outbox relay step") == null)
+                    && System.nanoTime() < deadline) {
                 Thread.sleep(10);
             }
         } finally {
             runtime.close();
         }
 
-        var enqueue = finished("outbox enqueue");
+        var enqueue = finished("outbox enqueue orders");
         var delivery = finished("outbox deliver orders");
         assertThat(enqueue.getParentSpanId()).isEqualTo(parent.context().spanId());
         assertThat(delivery.getParentSpanId()).isEqualTo(enqueue.getSpanId());
+        assertThat(delivery.getLinks()).singleElement().satisfies(l -> assertThat(spans.getFinishedSpanItems())
+                .filteredOn(s -> s.getSpanId().equals(l.getSpanContext().getSpanId()))
+                .extracting(SpanData::getName).containsExactly("outbox relay step"));
         assertThat(delivery.getTraceId()).isEqualTo(parent.context().traceId());
         assertThat(inScope).containsExactly(delivery.getSpanId());
         assertThat(handed).containsExactly("00-" + delivery.getTraceId() + "-" + delivery.getSpanId() + "-"

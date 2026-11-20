@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.dsudomoin.outbox.OutboxGauge;
 import io.github.dsudomoin.outbox.OutboxHeader;
+import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.Outcome;
@@ -45,7 +46,12 @@ import java.sql.SQLException;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
+import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -80,6 +86,7 @@ class ObservationOutboxTelemetryTest {
         registry.observationConfig()
                 .observationHandler(new ObservationHandler.FirstMatchingCompositeObservationHandler(
                         new PropagatingSenderTracingObservationHandler<>(tracer, propagator),
+                        new OutboxDeliveryTracingObservationHandler(tracer, propagator),
                         new PropagatingReceiverTracingObservationHandler<>(tracer, propagator),
                         new DefaultTracingObservationHandler(tracer)));
         return registry;
@@ -94,30 +101,72 @@ class ObservationOutboxTelemetryTest {
     @Test
     void enqueueContextLandsInHeaders() {
         var parent = tracer.nextSpan().name("parent").start();
-        OutboxTelemetry.Enqueue enqueue;
+        var id = UUID.randomUUID();
+        OutboxTelemetry.Message message;
         List<OutboxHeader> headers;
         try (var scope = tracer.withSpan(parent)) {
-            enqueue = telemetry().enqueueStarted();
-            headers = enqueue.headers(List.of());
+            var enqueue = telemetry().enqueueStarted();
+            message = enqueue.message(OutboxMessage.of("orders", "k", bytes("p")), id, 3);
+            headers = message.headers(List.of());
+            message.inserted();
+            enqueue.finished();
         }
-        enqueue.finished();
         parent.end();
 
-        var span = finished("outbox enqueue");
+        var span = finished("outbox enqueue orders");
         assertThat(span.getKind()).isEqualTo(SpanKind.PRODUCER);
         assertThat(span.getParentSpanId()).isEqualTo(parent.context().spanId());
+        assertThat(attribute(span, "messaging.system")).isEqualTo("outbox");
+        assertThat(attribute(span, "messaging.destination.name")).isEqualTo("orders");
+        assertThat(attribute(span, "outbox.message_id")).isEqualTo(id.toString());
+        assertThat(attribute(span, "outbox.shard")).isEqualTo("3");
         // its own flags: newer OpenTelemetry sets the random trace id flag besides the sampled one
         assertThat(traceparent(headers)).isEqualTo("00-" + span.getTraceId() + "-" + span.getSpanId() + "-"
                 + span.getSpanContext().getTraceFlags().asHex());
     }
 
+    /**
+     * The call starts nothing; each message is observed on its own, current while its insert runs, and its headers
+     * carry its own span.
+     */
+    @Test
+    void eachMessageIsObservedOnItsOwn() throws Exception {
+        var telemetry = telemetry();
+        var empty = telemetry.enqueueStarted();
+        empty.finished();
+        assertThat(meters.find("outbox.enqueue").timer()).as("a call alone").isNull();
+
+        var enqueue = telemetry.enqueueStarted();
+        var a = enqueue.message(OutboxMessage.of("orders", "a", bytes("a")), UUID.randomUUID(), 0);
+        var b = enqueue.message(OutboxMessage.of("orders", "b", bytes("b")), UUID.randomUUID(), 1);
+        var headersA = a.headers(List.of());
+        var headersB = b.headers(List.of());
+        var inside = a.inScope(() -> tracer.currentSpan().context().spanId());
+        assertThat(tracer.currentSpan()).as("the scope is closed after the insert").isNull();
+        a.inserted();
+        b.failed(new SQLException("x"));
+        enqueue.failed(new SQLException("x"));
+
+        var spanA = span(s -> s.getName().equals("outbox enqueue orders")
+                && "0".equals(attribute(s, "outbox.shard")));
+        var spanB = span(s -> s.getName().equals("outbox enqueue orders")
+                && "1".equals(attribute(s, "outbox.shard")));
+        assertThat(inside).isEqualTo(spanA.getSpanId());
+        assertThat(traceparent(headersA)).contains(spanA.getSpanId());
+        assertThat(traceparent(headersB)).contains(spanB.getSpanId());
+        assertThat(spanA.getStatus().getStatusCode()).isNotEqualTo(StatusCode.ERROR);
+        assertThat(spanB.getStatus().getStatusCode()).isEqualTo(StatusCode.ERROR);
+        assertThat(meters.get("outbox.enqueue").timers()).extracting(t -> t.count()).containsOnly(1L);
+    }
+
     @Test
     void messageWithTraceContextKeepsIt() {
-        var enqueue = telemetry().enqueueStarted();
+        var message = telemetry().enqueueStarted()
+                .message(OutboxMessage.of("orders", "k", bytes("p")), UUID.randomUUID(), 0);
         var own = List.of(header("traceparent", "00-" + "1".repeat(32) + "-" + "2".repeat(16) + "-01"));
 
-        assertThat(enqueue.headers(own)).isSameAs(own);
-        enqueue.finished();
+        assertThat(message.headers(own)).isSameAs(own);
+        message.inserted();
     }
 
     @Test
@@ -372,6 +421,8 @@ class ObservationOutboxTelemetryTest {
     void stepObservationIsCurrentUntilItEnds() {
         var stopped = stoppedSteps();
         var step = telemetry().stepStarted(List.of(1, 3));
+        step.fetched(1, 2);
+        step.fetched(3, 5);
 
         var current = observations.getCurrentObservation();
         assertThat(current).isNotNull();
@@ -384,10 +435,216 @@ class ObservationOutboxTelemetryTest {
         var context = stopped.get(0);
         assertThat(context.getName()).isEqualTo("outbox.relay.step");
         assertThat(context.getContextualName()).isEqualTo("outbox relay step");
-        assertThat(context.getLowCardinalityKeyValues()).isEmpty();
-        assertThat(context.getHighCardinalityKeyValues()).containsExactly(KeyValue.of("outbox.shards", "1,3"));
+        assertThat(context.getLowCardinalityKeyValues()).containsExactly(KeyValue.of("messaging.system", "outbox"));
+        assertThat(context.getHighCardinalityKeyValues()).containsExactlyInAnyOrder(
+                KeyValue.of("outbox.shards", "1,3"), KeyValue.of("outbox.records", "7"));
         assertThat(context.getError()).isNull();
-        assertThat(finished("outbox relay step").getStatus().getStatusCode()).isNotEqualTo(StatusCode.ERROR);
+        var span = finished("outbox relay step");
+        assertThat(span.getKind()).isEqualTo(SpanKind.CLIENT);
+        assertThat(span.getStatus().getStatusCode()).isNotEqualTo(StatusCode.ERROR);
+    }
+
+    @Test
+    void aStepOfOneShardCarriesTheShard() {
+        var step = telemetry().stepStarted(List.of(2));
+        step.fetched(2, 4);
+        step.finished();
+
+        var span = finished("outbox relay step");
+        assertThat(attribute(span, "outbox.shard")).isEqualTo("2");
+        assertThat(attribute(span, "outbox.records")).isEqualTo("4");
+    }
+
+    /** The settle is current from its start to its end, a client span under the step, which ends after it. */
+    @Test
+    void settleIsAChildOfTheStepAndCurrentUntilItEnds() {
+        var telemetry = telemetry();
+        var step = telemetry.stepStarted(List.of(1));
+        var stepObservation = observations.getCurrentObservation();
+        var settle = step.settleStarted();
+        assertThat(observations.getCurrentObservation().getContext()).isInstanceOf(OutboxSettleContext.class);
+        assertThat(observations.getCurrentObservation().getContextView().getParentObservation())
+                .isSameAs(stepObservation);
+        settle.committed(4);
+        assertThat(observations.getCurrentObservation()).as("the step again").isSameAs(stepObservation);
+        step.finished();
+        assertThat(observations.getCurrentObservation()).isNull();
+
+        var settleSpan = finished("outbox relay settle");
+        var stepSpan = finished("outbox relay step");
+        assertThat(settleSpan.getKind()).isEqualTo(SpanKind.CLIENT);
+        assertThat(settleSpan.getParentSpanId()).isEqualTo(stepSpan.getSpanId());
+        assertThat(attribute(settleSpan, "outbox.records")).isEqualTo("4");
+        assertThat(attribute(settleSpan, "messaging.system")).isEqualTo("outbox");
+        assertThat(settleSpan.getStatus().getStatusCode()).isNotEqualTo(StatusCode.ERROR);
+        assertThat(stepSpan.getEndEpochNanos()).isGreaterThanOrEqualTo(settleSpan.getEndEpochNanos());
+        assertThat(meters.get("outbox.relay.settle").timer().count()).isEqualTo(1);
+    }
+
+    @Test
+    void failedSettleRecordsTheError() {
+        var step = telemetry().stepStarted(List.of(1));
+        var error = new SQLException("commit");
+        step.settleStarted().failed(3, error);
+        step.failed(error);
+
+        var settle = finished("outbox relay settle");
+        assertThat(settle.getStatus().getStatusCode()).isEqualTo(StatusCode.ERROR);
+        assertThat(attribute(settle, "outbox.records")).isEqualTo("3");
+        assertThat(observations.getCurrentObservation()).isNull();
+        assertThat(tracer.currentSpan()).isNull();
+    }
+
+    @Test
+    void customSettleConventionRenames() {
+        var telemetry = ObservationOutboxTelemetry.builder(observations, new OutboxMetrics(meters))
+                .settleConvention(new OutboxSettleObservationConvention() {
+                    @Override
+                    public String getName() {
+                        return "custom.settle";
+                    }
+                })
+                .build();
+        var step = telemetry.stepStarted(List.of(1));
+        step.settleStarted().committed(1);
+        step.finished();
+
+        assertThat(meters.get("custom.settle").timer().count()).isEqualTo(1);
+        assertThat(spans.getFinishedSpanItems()).extracting(SpanData::getName).contains("custom.settle")
+                .doesNotContain("outbox relay settle");
+    }
+
+    /** The first report ends the record; the second and the call's own outcome change nothing. */
+    @Test
+    void recordFinishedTwiceEndsOnce() {
+        var records = List.of(record(List.of()));
+        var delivery = telemetry().deliveryStarted(records, NOW);
+        var handed = delivery.handed(records);
+
+        delivery.recordFinished(handed.get(0), Outcome.delivered());
+        assertThat(spans.getFinishedSpanItems()).as("ended at the report").hasSize(1);
+        delivery.recordFinished(handed.get(0), Outcome.retry(new IOException("again")));
+        delivery.finished(List.of(Outcome.retry(new IOException("timed out"))));
+
+        assertThat(spans.getFinishedSpanItems()).singleElement()
+                .satisfies(s -> assertThat(attribute(s, "outbox.outcome")).isEqualTo("delivered"));
+        assertThat(meters.get("outbox.deliver").timers()).singleElement()
+                .satisfies(t -> assertThat(t.getId().getTag("outbox.outcome")).isEqualTo("delivered"))
+                .satisfies(t -> assertThat(t.count()).isEqualTo(1));
+    }
+
+    @Test
+    void lateRecordFinishedAfterFinishedIsIgnored() {
+        var records = List.of(record(List.of()), record(List.of(header("traceparent", UNSAMPLED))));
+        var delivery = telemetry().deliveryStarted(records, NOW);
+        var handed = delivery.handed(records);
+        delivery.finished(List.of(Outcome.delivered(), Outcome.delivered()));
+
+        delivery.recordFinished(handed.get(0), Outcome.permanent(new IOException("late")));
+        delivery.recordFinished(handed.get(1), Outcome.delivered()); // not observed
+        delivery.recordFinished(record(List.of()), Outcome.delivered()); // not of this call
+        var failed = telemetry().deliveryStarted(List.of(record(List.of())), NOW);
+        failed.failed(new IllegalStateException("closed"));
+        failed.recordFinished(record(List.of()), Outcome.delivered());
+
+        assertThat(spans.getFinishedSpanItems()).hasSize(2);
+        assertThat(meters.get("outbox.deliver").tag("outbox.outcome", "delivered").timer().count()).isEqualTo(1);
+        assertThat(meters.get("outbox.deliver").tag("outbox.outcome", "failed").timer().count()).isEqualTo(1);
+        assertThat(meters.find("outbox.deliver").tag("outbox.outcome", "permanent").timer()).isNull();
+    }
+
+    /** Each record's report ends it there; the call's end ends the records not reported. */
+    @Test
+    void recordFinishedEndsItsRecordAtOnce() {
+        var records = List.of(record(List.of()), record(List.of()));
+        var delivery = telemetry().deliveryStarted(records, NOW);
+        var handed = delivery.handed(records);
+
+        delivery.recordFinished(handed.get(1), Outcome.retry(new IOException("x")));
+        assertThat(spans.getFinishedSpanItems()).singleElement()
+                .satisfies(s -> assertThat(attribute(s, "outbox.message_id")).isEqualTo(
+                        records.get(1).messageId().toString()))
+                .satisfies(s -> assertThat(s.getStatus().getStatusCode()).isEqualTo(StatusCode.ERROR));
+        delivery.finished(List.of(Outcome.delivered(), Outcome.delivered()));
+
+        assertThat(spans.getFinishedSpanItems()).hasSize(2);
+        assertThat(meters.get("outbox.deliver").tag("outbox.outcome", "retry").timer().count()).isEqualTo(1);
+        assertThat(meters.get("outbox.deliver").tag("outbox.outcome", "delivered").timer().count()).isEqualTo(1);
+    }
+
+    /** Reports on a handler thread racing the call's end on the relay thread: each record stops exactly once. */
+    @Test
+    void recordFinishedRacingTheCallsEndStopsEachRecordOnce() throws Exception {
+        var stops = new ConcurrentHashMap<OutboxDeliveryContext, AtomicInteger>();
+        observations.observationConfig().observationHandler(new ObservationHandler<OutboxDeliveryContext>() {
+            @Override
+            public void onStop(OutboxDeliveryContext context) {
+                stops.computeIfAbsent(context, c -> new AtomicInteger()).incrementAndGet();
+            }
+
+            @Override
+            public boolean supportsContext(Observation.Context context) {
+                return context instanceof OutboxDeliveryContext;
+            }
+        });
+        var telemetry = telemetry();
+        int n = 200;
+        for (int round = 0; round < 20; round++) {
+            var records = IntStream.range(0, n).mapToObj(i -> record(List.of())).toList();
+            var delivery = telemetry.deliveryStarted(records, NOW);
+            var handed = delivery.handed(records);
+            var go = new CountDownLatch(1);
+            var reporter = new Thread(() -> {
+                try {
+                    go.await();
+                } catch (InterruptedException e) {
+                    return;
+                }
+                for (var r : handed) {
+                    delivery.recordFinished(r, Outcome.delivered());
+                }
+            });
+            reporter.start();
+            go.countDown();
+            delivery.finished(records.stream().map(r -> (Outcome) Outcome.retry(new IOException("x"))).toList());
+            reporter.join();
+        }
+
+        assertThat(stops).hasSize(20 * n);
+        assertThat(stops.values()).allSatisfy(c -> assertThat(c).hasValue(1));
+        assertThat(meters.get("outbox.deliver").timers().stream().mapToLong(t -> t.count()).sum()).isEqualTo(20L * n);
+    }
+
+    /**
+     * Inside a step, a delivery parented by its stored context links to the step's span; one without stored context
+     * has the step as parent and no link; one started without a step has no link.
+     */
+    @Test
+    void deliveryLinksToItsStep() {
+        var telemetry = telemetry();
+        var stored = record(List.of(header("traceparent", TRACEPARENT)));
+        var bare = record(List.of());
+        var step = telemetry.stepStarted(List.of(1));
+        var delivery = telemetry.deliveryStarted(step, List.of(stored, bare), NOW);
+        delivery.handed(List.of(stored, bare));
+        delivery.finished(List.of(Outcome.delivered(), Outcome.delivered()));
+        step.finished();
+        var aloneRecord = record(List.of(header("traceparent", TRACEPARENT)));
+        var alone = telemetry.deliveryStarted(List.of(aloneRecord), NOW);
+        alone.finished(List.of(Outcome.delivered()));
+
+        var stepSpan = finished("outbox relay step");
+        var linked = span(s -> stored.messageId().toString().equals(attribute(s, "outbox.message_id")));
+        assertThat(linked.getParentSpanId()).isEqualTo(SPAN_ID);
+        assertThat(linked.getLinks()).singleElement()
+                .satisfies(l -> assertThat(l.getSpanContext().getSpanId()).isEqualTo(stepSpan.getSpanId()));
+        var child = span(s -> bare.messageId().toString().equals(attribute(s, "outbox.message_id")));
+        assertThat(child.getParentSpanId()).isEqualTo(stepSpan.getSpanId());
+        assertThat(child.getLinks()).isEmpty();
+        assertThat(attribute(child, "messaging.system")).isEqualTo("outbox");
+        var unlinked = span(s -> aloneRecord.messageId().toString().equals(attribute(s, "outbox.message_id")));
+        assertThat(unlinked.getParentSpanId()).isEqualTo(SPAN_ID);
+        assertThat(unlinked.getLinks()).isEmpty();
     }
 
     @Test
@@ -474,7 +731,9 @@ class ObservationOutboxTelemetryTest {
         var telemetry = telemetry();
         var bad = new OutboxRecord(2, UUID.randomUUID(), "bad", null, null, List.of(), NOW.minusSeconds(1), 0, 0);
 
-        assertThatThrownBy(telemetry::enqueueStarted).isInstanceOf(IllegalStateException.class);
+        var enqueue = telemetry.enqueueStarted();
+        assertThatThrownBy(() -> enqueue.message(OutboxMessage.of("orders", "k", bytes("p")), UUID.randomUUID(), 0))
+                .isInstanceOf(IllegalStateException.class);
         assertThatThrownBy(() -> telemetry.stepStarted(List.of(1))).isInstanceOf(IllegalStateException.class);
         assertThatThrownBy(() -> telemetry.deliveryStarted(List.of(record(List.of()), bad), NOW))
                 .isInstanceOf(IllegalStateException.class);
@@ -531,8 +790,9 @@ class ObservationOutboxTelemetryTest {
         var telemetry = telemetry();
         var error = new SQLException("x");
 
-        var enqueue = telemetry.enqueueStarted();
-        assertThatThrownBy(() -> enqueue.failed(error)).isInstanceOf(IllegalStateException.class);
+        var message = telemetry.enqueueStarted()
+                .message(OutboxMessage.of("orders", "k", bytes("p")), UUID.randomUUID(), 0);
+        assertThatThrownBy(() -> message.failed(error)).isInstanceOf(IllegalStateException.class);
         var step = telemetry.stepStarted(List.of(1));
         assertThatThrownBy(() -> step.failed(error)).isInstanceOf(IllegalStateException.class);
         var delivery = telemetry.deliveryStarted(List.of(record(List.of()), record(List.of())), NOW);
@@ -663,6 +923,17 @@ class ObservationOutboxTelemetryTest {
 
     private SpanData finished(String name) {
         return spans.getFinishedSpanItems().stream().filter(s -> s.getName().equals(name)).findFirst().orElseThrow();
+    }
+
+    /** The one finished span matching {@code filter}. */
+    private SpanData span(Predicate<SpanData> filter) {
+        var found = spans.getFinishedSpanItems().stream().filter(filter).toList();
+        assertThat(found).hasSize(1);
+        return found.get(0);
+    }
+
+    private static byte[] bytes(String s) {
+        return s.getBytes(UTF_8);
     }
 
     private static String attribute(SpanData span, String key) {
