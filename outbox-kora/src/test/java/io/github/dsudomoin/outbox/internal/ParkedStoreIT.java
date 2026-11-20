@@ -85,7 +85,7 @@ class ParkedStoreIT {
                 new Park(keyed, 1, NOW.plusSeconds(1)),
                 new Head(head, 1, NOW, "e"),
                 new Follower(follower),
-                new Dead(dead, 1, "boom"),
+                new Dead(dead, 1, "boom", "test.Boom"),
                 new Park(unkeyed, 1, NOW.plusSeconds(2)),
                 new Park(followed, 1, NOW.plusSeconds(3)),
                 new Park(failing, 1, NOW.plusSeconds(4)),
@@ -106,7 +106,8 @@ class ParkedStoreIT {
 
         // followed: blocked by a retry head of its key in a retry-pass call; carried: by failing, whose move takes it
         store.apply(c, 0, List.of(new Park(stored, 2, NOW), new Unpark(unkeyed), new Follower(followed),
-                        new Head(failing, 2, LATER, "e"), new Follower(carried), new Dead(poison, 1, "boom")),
+                        new Head(failing, 2, LATER, "e"), new Follower(carried),
+                        new Dead(poison, 1, "boom", "test.Boom")),
                 Set.of(keyed.id(), unkeyed.id(), followed.id(), failing.id(), carried.id(), poison.id()), NOW);
 
         assertThat(parkedRows()).as("re-parked at the new due, even an earlier one; the follower untouched")

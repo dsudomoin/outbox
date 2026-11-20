@@ -67,7 +67,11 @@ public final class BatchClassifier {
     /** A retry row waiting behind its head ({@code next_attempt_at} null). */
     public record Follower(OutboxRecord r) implements Action {}
 
-    public record Dead(OutboxRecord r, int attempts, String error) implements Action {}
+    /**
+     * {@code error} as stored; {@code errorType}, the dead letter's telemetry label: the class name of the permanent
+     * failure's error ({@link #errorType}), or {@link #REQUEUE_LIMIT_TYPE}.
+     */
+    public record Dead(OutboxRecord r, int attempts, String error, String errorType) implements Action {}
 
     /** Parks a main-stream record, or re-parks a parked one, with {@code requeues}, due at {@code dueAt}. */
     public record Park(OutboxRecord r, int requeues, Instant dueAt) implements Action {}
@@ -86,6 +90,8 @@ public final class BatchClassifier {
 
     static final String NOT_ATTEMPTED = "not attempted";
     static final String REQUEUE_LIMIT = "requeue limit reached";
+    /** The {@code errorType} of a dead letter past {@code maxRequeues}. */
+    static final String REQUEUE_LIMIT_TYPE = "requeue_limit";
     /** The furthest a handler's {@code notBefore} may push a retry. */
     static final Duration MAX_NOT_BEFORE = Duration.ofHours(24);
 
@@ -153,10 +159,11 @@ public final class BatchClassifier {
                 }
             } else if (outcome instanceof Outcome.Requeue requeue) {
                 actions.add(requeueLimitReached(r, maxRequeues)
-                        ? new Dead(r, r.attempts(), REQUEUE_LIMIT)
+                        ? new Dead(r, r.attempts(), REQUEUE_LIMIT, REQUEUE_LIMIT_TYPE)
                         : new Park(r, r.requeues() + 1, dueAt(requeueDue, requeue.notBefore(), now)));
             } else if (outcome instanceof Outcome.Permanent p) {
-                actions.add(new Dead(r, r.attempts() + attempts, RetryStore.describe(p.error())));
+                actions.add(new Dead(r, r.attempts() + attempts, RetryStore.describe(p.error()),
+                        errorType(p.error())));
             } else if (outcome instanceof Outcome.Retry retry) {
                 int total = r.attempts() + attempts;
                 var due = now.plus(Backoff.delay(total - 1, retryInitial, retryMax));
@@ -259,5 +266,13 @@ public final class BatchClassifier {
         var cap = now.plus(MAX_NOT_BEFORE);
         var capped = notBefore.isAfter(cap) ? cap : notBefore;
         return capped.isAfter(due) ? capped : due;
+    }
+
+    /**
+     * The telemetry label of a dead letter failed with {@code error}: its class name, never its text, which a
+     * {@code toString} may start with its message.
+     */
+    static String errorType(Throwable error) {
+        return error.getClass().getName();
     }
 }

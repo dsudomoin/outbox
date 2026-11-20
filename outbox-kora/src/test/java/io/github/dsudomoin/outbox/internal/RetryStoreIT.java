@@ -74,7 +74,7 @@ class RetryStoreIT {
                 new Head(unkeyedHead, 2, NOW, "e2"),
                 new Follower(follower),
                 new Head(notDue, 1, NOW.plusSeconds(1), "e3"),
-                new Dead(dead, 1, "boom")), NOW);
+                new Dead(dead, 1, "boom", "test.Boom")), NOW);
         store.apply(c, 1, List.of(new Head(otherShard, 1, NOW, "e")), NOW);
 
         var due = dueHeads(0, NOW, 10);
@@ -341,7 +341,7 @@ class RetryStoreIT {
         var head = record("t", "k");
         var dead = record("t", "d");
         var longError = "x\u0000y" + "z".repeat(3000);
-        store.apply(c, 0, List.of(new Head(head, 1, NOW, longError), new Dead(dead, 1, longError)), NOW);
+        store.apply(c, 0, List.of(new Head(head, 1, NOW, longError), new Dead(dead, 1, longError, "test.Boom")), NOW);
         assertThat(lastError(head.id())).hasSize(2000).startsWith("x?yzzz");
         store.reschedule(c, head, 2, NOW, longError.replace("x", "w"));
         assertThat(lastError(head.id())).as("reschedule").hasSize(2000).startsWith("w?yzzz");
@@ -422,7 +422,7 @@ class RetryStoreIT {
         }
 
         deadThroughEveryPath(store, fromApply, fromRetry, fromParked);
-        store.apply(c, 0, List.of(new Dead(neverRedriven, 1, "boom")), NOW);
+        store.apply(c, 0, List.of(new Dead(neverRedriven, 1, "boom", "test.Boom")), NOW);
 
         assertThat(deadStates()).containsExactly("kept|null|2", "kept|null|5", "kept|null|7", "kept|null|0");
     }
@@ -430,7 +430,8 @@ class RetryStoreIT {
     /** One dead row through each statement that writes one: apply's batch, deadFromRetry, ParkedStore#toDead. */
     private void deadThroughEveryPath(RetryStore retries, OutboxRecord fromApply, OutboxRecord fromRetry,
             OutboxRecord fromParked) throws SQLException {
-        retries.apply(c, 0, List.of(new Dead(fromApply, 1, "boom"), new Head(fromRetry, 1, NOW, "e")), NOW);
+        retries.apply(c, 0, List.of(new Dead(fromApply, 1, "boom", "test.Boom"), new Head(fromRetry, 1, NOW, "e")),
+                NOW);
         retries.deadFromRetry(c, fromRetry, 2, "gave up");
         var parked = new ParkedStore(names, retries);
         parked.apply(c, 0, List.of(new Park(fromParked, 1, NOW)), Set.of(), NOW);

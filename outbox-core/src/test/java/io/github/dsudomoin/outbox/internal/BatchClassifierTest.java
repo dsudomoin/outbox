@@ -35,6 +35,7 @@ class BatchClassifierTest {
     private static final Duration WAIT = Duration.ofSeconds(2);
     private static final Duration WAIT_MAX = Duration.ofMinutes(1);
     private static final RuntimeException DOWN = new RuntimeException("down");
+    private static final String PERMANENT_TYPE = OutboxPermanentException.class.getName();
     private static final Decision PAUSE = new Decision(true, List.of());
 
     private final AtomicLong ids = new AtomicLong();
@@ -99,7 +100,7 @@ class BatchClassifierTest {
                 new Head(k1a, 3, NOW.plus(Duration.ofSeconds(4)), DOWN.toString()),
                 new Follower(k1b),
                 new Follower(k2),
-                new Dead(k3, 3, new OutboxPermanentException("bad").toString())));
+                new Dead(k3, 3, new OutboxPermanentException("bad").toString(), PERMANENT_TYPE)));
     }
 
     @Test
@@ -121,7 +122,7 @@ class BatchClassifierTest {
         assertThat(classify(2, notAttempted(k1a), notAttempted(k1b), permanent(k2))).isEqualTo(advance(
                 new Head(k1a, 0, NOW.plus(INITIAL), "not attempted"),
                 new Follower(k1b),
-                new Dead(k2, 3, new OutboxPermanentException("bad").toString())));
+                new Dead(k2, 3, new OutboxPermanentException("bad").toString(), PERMANENT_TYPE)));
     }
 
     @Test
@@ -144,10 +145,10 @@ class BatchClassifierTest {
         var error = new OutboxPermanentException("bad");
 
         assertThat(classify(0, new Item(k1a, false, Outcome.permanent(error)), delivered(k1b), delivered(k2)))
-                .isEqualTo(advance(new Dead(k1a, 1, error.toString())));
+                .isEqualTo(advance(new Dead(k1a, 1, error.toString(), PERMANENT_TYPE)));
         assertThat(classify(0, new Item(k1a, false, Outcome.permanent(error))))
                 .as("nothing delivered, nothing failing")
-                .isEqualTo(advance(new Dead(k1a, 1, error.toString())));
+                .isEqualTo(advance(new Dead(k1a, 1, error.toString(), PERMANENT_TYPE)));
     }
 
     @Test
@@ -165,7 +166,7 @@ class BatchClassifierTest {
                 .as("a divert")
                 .isEqualTo(advance(new Head(k1, THRESHOLD, NOW.plus(Duration.ofSeconds(4)), recursive)));
         assertThat(classify(0, new Item(k1, false, Outcome.permanent(new Lazy()))))
-                .isEqualTo(advance(new Dead(k1, 1, lazy)));
+                .isEqualTo(advance(new Dead(k1, 1, lazy, Lazy.class.getName())));
         assertThat(classify(0, new Item(k1, false, Outcome.retry(new Asserting())), delivered(k2)))
                 .as("an AssertionError, as an assert does under -ea")
                 .isEqualTo(advance(new Head(k1, 1, NOW.plus(INITIAL), Asserting.class.getName()
@@ -173,7 +174,7 @@ class BatchClassifierTest {
         assertThat(classify(0, new Item(k1, false, Outcome.permanent(new Sneaky()))))
                 .as("a checked exception thrown sneakily, as a Kotlin getter may")
                 .isEqualTo(advance(new Dead(k1, 1, Sneaky.class.getName() + " (its toString() threw "
-                        + IOException.class.getName() + ")")));
+                        + IOException.class.getName() + ")", Sneaky.class.getName())));
     }
 
     /** An exception whose message getter fails an assertion. */
@@ -343,7 +344,8 @@ class BatchClassifierTest {
         var veteran = record("t", "c", 0, 1_000);
 
         assertThat(classify(0, 2, requeue(atLimit), requeue(belowLimit))).isEqualTo(advance(
-                new Dead(atLimit, 4, "requeue limit reached"), // attempts unchanged: a requeue is no attempt
+                // attempts unchanged: a requeue is no attempt
+                new Dead(atLimit, 4, "requeue limit reached", "requeue_limit"),
                 new Park(belowLimit, 2, NOW.plus(DELAY))));
         assertThat(classify(0, requeue(veteran)))
                 .as("maxRequeues 0 never dead-letters")
@@ -367,7 +369,7 @@ class BatchClassifierTest {
                 new Keep(skipped, NOW.plus(DELAY)), // stays parked and lets its key go: afterSkipped is no follower
                 head(failed, 3), // its 2 earlier attempts count: due after backoff(2)
                 new Follower(afterFailed),
-                new Dead(bad, 3, error.toString())));
+                new Dead(bad, 3, error.toString(), PERMANENT_TYPE)));
     }
 
     @Test
@@ -427,8 +429,8 @@ class BatchClassifierTest {
                 .containsExactly(BatchClassifier.orderingKey(c1));
         assertThat(classify(0, permanent(a1), waiting(a2), notAttempted(a3)))
                 .as("a dead row before the wait does not make its key failing")
-                .isEqualTo(advance(new Dead(a1, 1, new OutboxPermanentException("bad").toString()), waitingHead(a2),
-                        new Follower(a3)));
+                .isEqualTo(advance(new Dead(a1, 1, new OutboxPermanentException("bad").toString(), PERMANENT_TYPE),
+                        waitingHead(a2), new Follower(a3)));
     }
 
     @Test

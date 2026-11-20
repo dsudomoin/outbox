@@ -162,7 +162,7 @@ public final class ShardProcessor implements AutoCloseable {
     private static final long UNKNOWN = -1;
     /** The {@code errorType}s of a dead letter whose attempts ran out, and of one past {@code maxRequeues}. */
     private static final String MAX_ATTEMPTS = "max_attempts";
-    private static final String REQUEUE_LIMIT = "requeue_limit";
+    private static final String REQUEUE_LIMIT = BatchClassifier.REQUEUE_LIMIT_TYPE;
 
     private final int internalNamespace;
     private final OutboxConfig.RelayConfig relay;
@@ -1565,7 +1565,7 @@ public final class ShardProcessor implements AutoCloseable {
                 var rows = new ArrayList<OutboxRecord>();
                 // a waiting head spends no attempts: it is asked even past a maxAttempts lowered since it failed
                 if (due.waitingSince() == null && exhausted(head.attempts())) {
-                    dead(c, pass, head, head.attempts(), null, true);
+                    dead(c, pass, head, head.attempts(), null, MAX_ATTEMPTS);
                     pass.record(head);
                     pass.noteFetched(head);
                 } else {
@@ -1914,7 +1914,7 @@ public final class ShardProcessor implements AutoCloseable {
                 done.add(row);
             } else if (outcome instanceof Outcome.Requeue q) { // the rows of its key before it have all left the table
                 if (BatchClassifier.requeueLimitReached(row, requeue.maxRequeues())) {
-                    dead(c, pass, row, row.attempts(), BatchClassifier.REQUEUE_LIMIT, false);
+                    dead(c, pass, row, row.attempts(), BatchClassifier.REQUEUE_LIMIT, REQUEUE_LIMIT);
                 } else {
                     var due = requeueDue(q.notBefore(), now);
                     parked.fromRetry(c, row, row.requeues() + 1, due);
@@ -1924,10 +1924,10 @@ public final class ShardProcessor implements AutoCloseable {
                     pass.requeued = true;
                 }
             } else if (outcome instanceof Outcome.Permanent p) {
-                dead(c, pass, row, attempts, RetryStore.describe(p.error()), false);
+                dead(c, pass, row, attempts, RetryStore.describe(p.error()), BatchClassifier.errorType(p.error()));
             } else if (outcome instanceof Outcome.Retry r) {
                 if (exhausted(attempts)) {
-                    dead(c, pass, row, attempts, RetryStore.describe(r.error()), true);
+                    dead(c, pass, row, attempts, RetryStore.describe(r.error()), MAX_ATTEMPTS);
                     continue;
                 }
                 var due = now.plus(Backoff.delay(row.attempts(), retry.initialDelay(), retry.maxDelay()));
@@ -2004,17 +2004,18 @@ public final class ShardProcessor implements AutoCloseable {
                 pass.parkedWrites.add(new Unpark(row));
             } else if (outcome instanceof Outcome.Requeue q) {
                 if (BatchClassifier.requeueLimitReached(row, requeue.maxRequeues())) {
-                    deadFromParked(c, pass, row, row.attempts(), BatchClassifier.REQUEUE_LIMIT, false);
+                    deadFromParked(c, pass, row, row.attempts(), BatchClassifier.REQUEUE_LIMIT, REQUEUE_LIMIT);
                 } else {
                     pass.parkedWrites.add(new Park(row, row.requeues() + 1, requeueDue(q.notBefore(), now)));
                     telemetry.requeued(row.topic());
                     stayed = true;
                 }
             } else if (outcome instanceof Outcome.Permanent p) {
-                deadFromParked(c, pass, row, attempts, RetryStore.describe(p.error()), false);
+                deadFromParked(c, pass, row, attempts, RetryStore.describe(p.error()),
+                        BatchClassifier.errorType(p.error()));
             } else if (outcome instanceof Outcome.Retry r) {
                 if (exhausted(attempts)) {
-                    deadFromParked(c, pass, row, attempts, RetryStore.describe(r.error()), true);
+                    deadFromParked(c, pass, row, attempts, RetryStore.describe(r.error()), MAX_ATTEMPTS);
                     continue;
                 }
                 var due = now.plus(Backoff.delay(row.attempts(), retry.initialDelay(), retry.maxDelay()));
@@ -2051,54 +2052,34 @@ public final class ShardProcessor implements AutoCloseable {
     }
 
     /**
-     * A null {@code error}: maxAttempts used up, the stored last error stays. {@code exhausted}: its attempts ran out,
-     * whatever its last error.
+     * A null {@code error}: maxAttempts used up, the stored last error stays. {@code errorType}: the telemetry label,
+     * {@code max_attempts} when its attempts ran out, whatever its last error.
      */
     private void dead(Connection c, Pass pass, OutboxRecord row, int attempts, @Nullable String error,
-            boolean exhausted) throws SQLException {
+            String errorType) throws SQLException {
         retries.deadFromRetry(c, row, attempts, error);
         pass.deadLettered = true;
-        deadLettered(row, exhausted ? null : error);
+        deadLettered(row, errorType);
         logDead(row, attempts, error != null ? error : "maxAttempts reached");
     }
 
     private void deadFromParked(Connection c, Pass pass, OutboxRecord row, int attempts, String error,
-            boolean exhausted) throws SQLException {
+            String errorType) throws SQLException {
         parked.toDead(c, row, attempts, error);
         pass.deadLettered = true;
         pass.wroteParked = true;
-        deadLettered(row, exhausted ? null : error);
+        deadLettered(row, errorType);
         logDead(row, attempts, error);
     }
 
     /**
-     * {@link OutboxTelemetry#deadLettered(OutboxRecord, String)} of {@code row}, dead with the stored {@code error};
-     * null: its attempts ran out.
+     * {@link OutboxTelemetry#deadLettered(OutboxRecord, String)} of {@code row}: {@code max_attempts},
+     * {@code requeue_limit} or the class name of its permanent failure's error ({@link BatchClassifier#errorType}).
      */
-    private void deadLettered(OutboxRecord row, @Nullable String error) {
-        if (telemetry != OutboxTelemetry.NONE) { // the error type is a string of its own
-            telemetry.deadLettered(row, error == null ? MAX_ATTEMPTS : errorType(error));
+    private void deadLettered(OutboxRecord row, String errorType) {
+        if (telemetry != OutboxTelemetry.NONE) {
+            telemetry.deadLettered(row, errorType);
         }
-    }
-
-    /**
-     * The error type of a dead letter whose stored error is {@code error}: {@code requeue_limit} for
-     * {@link BatchClassifier#REQUEUE_LIMIT}, else the exception's class name as {@link RetryStore#describe} wrote it,
-     * the text before the first {@code ": "} and the first whitespace; {@code _OTHER} for a text that starts with one.
-     */
-    static String errorType(String error) {
-        if (BatchClassifier.REQUEUE_LIMIT.equals(error)) {
-            return REQUEUE_LIMIT;
-        }
-        int end = error.indexOf(": ");
-        end = end < 0 ? error.length() : end;
-        for (int i = 0; i < end; i++) {
-            if (Character.isWhitespace(error.charAt(i))) {
-                end = i;
-                break;
-            }
-        }
-        return end == 0 ? "_OTHER" : error.substring(0, end);
     }
 
     /**
@@ -2177,7 +2158,7 @@ public final class ShardProcessor implements AutoCloseable {
                 firstHead = firstHead == null ? h : firstHead;
                 heads++;
             } else if (action instanceof Dead d) {
-                deadLettered(d.r(), d.error());
+                deadLettered(d.r(), d.errorType());
                 logDead(d.r(), d.attempts(), d.error());
             } else if (action instanceof Park p) {
                 telemetry.requeued(p.r().topic());

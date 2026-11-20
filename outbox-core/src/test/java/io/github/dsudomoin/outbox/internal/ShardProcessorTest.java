@@ -34,16 +34,26 @@ class ShardProcessorTest {
     }
 
     @Test
-    void deadLetterErrorTypeIsTheStoredClassName() {
-        assertThat(ShardProcessor.errorType(RetryStore.describe(new IllegalStateException("a: b c"))))
+    void deadLetterErrorTypeIsTheClassName() {
+        assertThat(BatchClassifier.errorType(new IllegalStateException("a: b c")))
                 .isEqualTo("java.lang.IllegalStateException");
-        assertThat(ShardProcessor.errorType(RetryStore.describe(new IllegalStateException())))
-                .isEqualTo("java.lang.IllegalStateException");
-        assertThat(ShardProcessor.errorType("com.example.Bad (its toString() threw java.lang.Error)"))
-                .isEqualTo("com.example.Bad");
-        assertThat(ShardProcessor.errorType(BatchClassifier.REQUEUE_LIMIT)).isEqualTo("requeue_limit");
-        assertThat(ShardProcessor.errorType(" odd")).isEqualTo("_OTHER");
-        assertThat(ShardProcessor.errorType("")).isEqualTo("_OTHER");
+        assertThat(BatchClassifier.errorType(new IllegalStateException())).isEqualTo("java.lang.IllegalStateException");
+        assertThat(BatchClassifier.errorType(new FreeText("order 42 of customer 7 failed")))
+                .as("a toString that starts with its message").isEqualTo(FreeText.class.getName());
+        assertThat(BatchClassifier.REQUEUE_LIMIT_TYPE).isEqualTo("requeue_limit");
+    }
+
+    /** An exception whose toString is its message alone. */
+    private static final class FreeText extends RuntimeException {
+
+        FreeText(String message) {
+            super(message);
+        }
+
+        @Override
+        public String toString() {
+            return getMessage();
+        }
     }
 
     @Test
