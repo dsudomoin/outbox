@@ -146,10 +146,11 @@ import org.slf4j.LoggerFactory;
  * {@code batchTimeout} at least {@code delivery.timeout.ms} + 5 s + {@code max.block.ms} so that they end as Kafka's
  * outcomes instead; the Kora and Spring adapters log a WARN at startup when it is shorter.
  *
- * <p>Each record goes to {@code producer.send} in its record scope ({@link OutboxHandler#inRecordScope}), so a span a
- * producer instrumentation starts there is a child of the record's delivery. While the call waits, each record the
- * broker acknowledges is reported delivered ({@link OutboxHandler#recordFinished}) on the calling thread, in ack order;
- * a failure is reported only by the outcomes the call returns. With no delivery hearing reports, nothing is queued.
+ * <p>Within a relay call whose delivery hears reports, each record goes to {@code producer.send} in its record scope
+ * ({@link OutboxHandler#inRecordScope}), so a span a producer instrumentation starts there is a child of the record's
+ * delivery; and while the call waits, each record the broker acknowledges is reported delivered
+ * ({@link OutboxHandler#recordFinished}) on the calling thread, in ack order. A failure is reported only by the
+ * outcomes the call returns. Otherwise the sender enters no scope and queues nothing.
  *
  * <p>A record goes to Kafka with its headers but any named {@code outbox-local}, of whatever value: that name marks
  * a record for a route of the relay, and reaches no Kafka topic, a dead-letter topic included.
@@ -579,7 +580,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
                         }
                     }
                     var explicit = record.key() == null && partition != null ? partition.partition() : null;
-                    send(call.producer, record, producerRecord(record, explicit), acked(call.callback(i)));
+                    send(call, record, producerRecord(record, explicit), acked(call.callback(i)));
                     if (call.refused != null) {
                         refuse(call, i, record, call.refused, false, coolingUntil, refused);
                         call.refused = null;
@@ -610,11 +611,19 @@ public final class KafkaOutboxSender implements AutoCloseable {
         return partitions;
     }
 
-    /** {@code producer.send} in {@code record}'s scope ({@link OutboxHandler#inRecordScope}); throws as it does. */
-    private static void send(Producer<byte[], byte[]> producer, OutboxRecord record,
-            ProducerRecord<byte[], byte[]> producerRecord, Callback callback) {
+    /**
+     * {@code producer.send}, in {@code record}'s scope ({@link OutboxHandler#inRecordScope}) when a delivery hears
+     * reports; throws as it does. Otherwise no scope: {@code Delivery.NONE}'s is the plain call, and outside a relay
+     * call (a dead letter's send) the sender never entered one.
+     */
+    private static void send(Call call, OutboxRecord record, ProducerRecord<byte[], byte[]> producerRecord,
+            Callback callback) {
+        if (call.acks == null) {
+            call.producer.send(producerRecord, callback);
+            return;
+        }
         try {
-            OutboxHandler.inRecordScope(record, () -> producer.send(producerRecord, callback));
+            OutboxHandler.inRecordScope(record, () -> call.producer.send(producerRecord, callback));
         } catch (RuntimeException e) {
             throw e;
         } catch (Exception e) { // send throws none: a scope's own
@@ -927,7 +936,8 @@ public final class KafkaOutboxSender implements AutoCloseable {
         long lastAppend; // caller thread only: when send() last returned an appended record, else the call's entry
         /**
          * Delivered records in ack order, for {@link OutboxHandler#recordFinished}; null when no delivery hears
-         * reports ({@link RecordScope#reports}). Appended under this up to {@code acked}, read by the caller.
+         * reports ({@link RecordScope#reports}), and then no send enters a record scope. Appended under this up to
+         * {@code acked}, read by the caller.
          */
         @Nullable
         final int[] acks;

@@ -8,10 +8,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
+import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.Outcome;
+import io.github.dsudomoin.outbox.internal.RecordScope;
 import io.github.dsudomoin.outbox.internal.TestHandlerCall;
 import jakarta.annotation.Nullable;
 import java.time.Clock;
@@ -26,6 +29,7 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -136,6 +140,79 @@ class KafkaOutboxSenderTest {
         awaitSent(0, 4).completeNext();
         assertThat(second.get(5, SECONDS)).containsExactly(Outcome.delivered());
         assertThat(producers).as("the healthy producer is pooled and reused").hasSize(1);
+    }
+
+    /**
+     * Each ack is reported while the call still waits for the others (record 2 is acked only after record 0's report
+     * was seen), on the calling thread and outside the call's monitor: a callback the report triggers on another
+     * thread completes at once. Each send runs in its record's scope.
+     */
+    @Test
+    void eachAckIsReportedWhileTheCallWaitsOutsideItsMonitor() throws Exception {
+        var sender = sender(DELIVERY_TIMEOUT);
+        var records = List.of(record(1, "a"), record(2, "b"), record(3, "c"));
+        var reported = new CopyOnWriteArrayList<OutboxRecord>();
+        var reportThreads = new CopyOnWriteArrayList<Thread>();
+        var scopes = new AtomicInteger();
+        var callbackDuringReport = new AtomicBoolean();
+        var firstReported = new CountDownLatch(1);
+        var delivery = new OutboxTelemetry.Delivery() {
+            @Override
+            public <T> T inRecordScope(OutboxRecord record, Callable<T> call) throws Exception {
+                scopes.incrementAndGet();
+                return call.call();
+            }
+
+            @Override
+            public void recordFinished(OutboxRecord record, Outcome outcome) {
+                reported.add(record);
+                reportThreads.add(Thread.currentThread());
+                if (record == records.get(0)) { // acks record 1 from another thread: blocks under the call's monitor
+                    var ack = new Thread(() -> producers.get(0).completeNext());
+                    ack.start();
+                    try {
+                        ack.join(2_000);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    callbackDuringReport.set(!ack.isAlive());
+                    firstReported.countDown();
+                }
+            }
+        };
+        var caller = new AtomicReference<Thread>();
+        var result = executor.submit(() -> RecordScope.bound(delivery, () -> {
+            caller.set(Thread.currentThread());
+            return sender.send(records);
+        }));
+        var producer = awaitSent(0, 3);
+        producer.completeNext();
+
+        assertThat(firstReported.await(5, SECONDS)).as("record 0 reported while the call waits").isTrue();
+        assertThat(callbackDuringReport).as("a callback completes during a report").isTrue();
+        producer.completeNext();
+        assertThat(result.get(5, SECONDS)).containsOnly(Outcome.delivered()).hasSize(3);
+        assertThat(reported).containsExactlyElementsOf(records);
+        assertThat(reportThreads).containsOnly(caller.get());
+        assertThat(scopes).hasValue(3);
+    }
+
+    /** With no delivery bound (no relay call: a dead letter's send, say) no send enters a record scope. */
+    @Test
+    void aSendWithNoDeliveryBoundEntersNoRecordScope() throws Exception {
+        var sender = sender(DELIVERY_TIMEOUT);
+        var caller = new AtomicReference<Thread>();
+        var result = executor.submit(() -> {
+            caller.set(Thread.currentThread());
+            OutboxHandler.inRecordScope(record(0, "z"), () -> null); // the fallback scope is there
+            return sender.send(List.of(record(1, "a"), record(2, "b")));
+        });
+        var producer = awaitSent(0, 2);
+        producer.completeNext();
+        producer.completeNext();
+
+        assertThat(result.get(5, SECONDS)).containsExactly(Outcome.delivered(), Outcome.delivered());
+        assertThat(CountingScopeFallback.entered(caller.get())).as("scopes entered").isEqualTo(1);
     }
 
     @Test

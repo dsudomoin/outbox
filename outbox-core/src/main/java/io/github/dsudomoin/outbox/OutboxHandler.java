@@ -129,7 +129,10 @@ public interface OutboxHandler {
      * on the thread the relay called; a report on another thread, or outside a relay call, does nothing. The report
      * does not decide anything: the outcome {@code handleBatch} returns for the record still does, and is still
      * required. The default {@code handleBatch} reports each record it attempts; an override that delivers records
-     * itself reports them the same way.
+     * itself reports them the same way. A handler built on another handler may report a record twice (a decorator
+     * that overrides only {@link #handle} over one that reports itself, such as the Kafka sender's handler, which
+     * reports each ack, before the default {@code handleBatch} reports the record again); the telemetry keeps the
+     * first report.
      */
     static void recordFinished(OutboxRecord record, Outcome outcome) {
         RecordScope.recordFinished(record, outcome);
