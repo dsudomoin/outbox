@@ -25,7 +25,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.DoubleSupplier;
@@ -125,7 +124,7 @@ class QueueStateIT {
             long latestMaxId = read.latest().maxId();
             double perShard = (latestMaxId - before) / (double) SHARDS;
 
-            var state = queueState.read(c, read.latest(), read.positions(), read.ticks());
+            var state = queueState.read(c);
 
             assertThat(state).extracting(ShardQueue::estimated).containsOnly(true);
             assertThat(state.get(0).pending()).isCloseTo(perShard, within(1e-9));
@@ -135,24 +134,66 @@ class QueueStateIT {
             assertThat(state.get(0).oldestSeconds()).isGreaterThanOrEqualTo(0);
             assertThat(queryString(c, "show statement_timeout")).as("the session's own, given back").isEqualTo("7s");
             assertThat(c.getAutoCommit()).isTrue();
-
-            // in the caller's transaction: it stays usable, with its own timeout
-            c.setAutoCommit(false);
-            execute(c, "set local statement_timeout = '8s'");
-            var inTransaction = queueState.read(c, read.latest(), read.positions(), read.ticks());
-            assertThat(inTransaction).extracting(ShardQueue::estimated).containsOnly(true);
-            assertThat(queryString(c, "show statement_timeout")).isEqualTo("8s");
             assertThat(queryLong(c, "select 1")).isEqualTo(1);
-            c.rollback();
-            c.setAutoCommit(true);
 
             // a tick without max_id: unknown
             execute(c, "update " + names.tick() + " set max_id = null where id = " + read.positions().get(0)
                     .effectiveTickId());
-            var unknown = queueState.read(c, read.latest(), read.positions(), read(c).ticks());
+            var unknown = queueState.read(c);
             assertThat(unknown.get(0).pending()).isNaN();
             assertThat(unknown.get(0).estimated()).isTrue();
             assertThat(unknown.get(2).pending()).isEqualTo(1);
+            holder.rollback();
+        }
+    }
+
+    @Test
+    void aStepCommittedAfterTheCursorReadIsCountedAsItLeftTheRows() throws Exception {
+        start(telemetry);
+        var ids = new ArrayList<java.util.UUID>();
+        for (int i = 0; i < 3; i++) {
+            ids.add(send(0));
+        }
+        makeATick();
+        long tick = latestTick().id();
+        // a relay step between maintenance's cursor read and its count: all 3 handed, the last one to the retry table
+        writer.maintenance().gaugesStarted = () -> {
+            try (var step = direct.getConnection()) {
+                step.setAutoCommit(false);
+                new Cursors(names, SHARDS).append(step, new Cursor(0, tick, null, 0, null, 0, null, null));
+                var columns = "id, shard, message_id, topic, key, payload, headers, created_at";
+                execute(step, "insert into " + names.retry() + " (" + columns + ", attempts, next_attempt_at)"
+                        + " select " + columns + ", 1, now() + interval '1 hour' from " + names.base()
+                        + " where message_id = '" + ids.get(2) + "'");
+                step.commit();
+            } catch (SQLException e) {
+                throw new IllegalStateException(e);
+            }
+        };
+
+        assertThat(writer.maintenance().runOnce()).isTrue();
+
+        var state = telemetry.lastState();
+        assertThat(state.get(0)).as("the retry row alone, once")
+                .isEqualTo(new ShardQueue(0, 1, state.get(0).oldestSeconds(), false));
+    }
+
+    @Test
+    void aLockTimeoutBelowTheBudgetEndsInTheEstimate() throws Exception {
+        start(telemetry);
+        send(0);
+        makeATick();
+        var queueState = new QueueState(names, SHARDS, Duration.ofMillis(500));
+        try (var holder = direct.getConnection(); var c = direct.getConnection()) {
+            holder.setAutoCommit(false);
+            execute(holder, "lock table " + names.base() + " in access exclusive mode");
+            execute(c, "set lock_timeout = '50ms'"); // as a role or database default may set it
+
+            var state = queueState.read(c);
+
+            assertThat(state).extracting(ShardQueue::estimated).containsOnly(true);
+            assertThat(state.get(0).pending()).isGreaterThan(0);
+            assertThat(queryString(c, "show lock_timeout")).isEqualTo("50ms");
             holder.rollback();
         }
     }
@@ -165,10 +206,9 @@ class QueueStateIT {
         var reads = new AtomicInteger();
         writer.maintenance().queueState = new QueueState(names, SHARDS, QueueState.BUDGET) {
             @Override
-            List<ShardQueue> read(Connection c, Tick latest, List<Position> positions, Map<Long, Tick> ticks)
-                    throws SQLException {
+            List<ShardQueue> read(Connection c) throws SQLException {
                 reads.incrementAndGet();
-                return super.read(c, latest, positions, ticks);
+                return super.read(c);
             }
         };
 
@@ -219,21 +259,11 @@ class QueueStateIT {
                 + "', now() - interval '" + hoursAgo + " hours', 1, now() + interval '1 hour')");
     }
 
-    private record Read(Tick latest, List<Position> positions, Map<Long, Tick> ticks) {}
+    private record Read(Tick latest, List<Position> positions) {}
 
-    /** What maintenance's cursor read gives the queue state. */
     private Read read(Connection c) throws SQLException {
-        var ticks = new Ticks(names, SHARDS);
-        var latest = ticks.latest(c);
-        var positions = new Cursors(names, SHARDS).positions(c, latest.id());
-        var wanted = new TreeSet<Long>();
-        for (var p : positions) {
-            wanted.add(p.effectiveTickId());
-            if (p.cursor().targetTickId() != null) {
-                wanted.add(p.cursor().targetTickId());
-            }
-        }
-        return new Read(latest, positions, ticks.get(c, wanted));
+        var latest = new Ticks(names, SHARDS).latest(c);
+        return new Read(latest, new Cursors(names, SHARDS).positions(c, latest.id()));
     }
 
     private Tick latestTick() throws SQLException {

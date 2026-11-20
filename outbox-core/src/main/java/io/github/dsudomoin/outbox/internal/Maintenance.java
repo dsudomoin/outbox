@@ -142,6 +142,8 @@ public final class Maintenance {
     private final Duration anchorInterval;
     /** Runs in each anchor transaction after its lock statement; a test's seam. */
     volatile Runnable anchorLocked = () -> {};
+    /** Runs as the gauges step starts; a test's seam. */
+    volatile Runnable gaugesStarted = () -> {};
     private final RetryStore retries;
     private final ParkedStore parked;
     final OrphanRestore orphanRestore; // for a test's seam
@@ -541,10 +543,10 @@ public final class Maintenance {
      * shard fails, so the relay is stopped for it (see {@link #logStranded}). {@code lagFrom}: the tick
      * {@code outbox.shard.lag} measures from, {@code slowest}, or the oldest tick left when some shards are stranded.
      * {@code ignoredCheckpointTick}: the newest checkpoint's tick before this run's when that checkpoint counts for
-     * nothing ({@link Cursors#ignoredCheckpointTick}), else null. {@code ticks}: the ticks read besides L, by id.
+     * nothing ({@link Cursors#ignoredCheckpointTick}), else null.
      */
     private record Read(Tick latest, List<Position> positions, @Nullable Tick slowest, Map<Integer, Long> stranded,
-            Tick lagFrom, @Nullable Long ignoredCheckpointTick, Map<Long, Tick> ticks) {
+            Tick lagFrom, @Nullable Long ignoredCheckpointTick) {
 
         /**
          * {@code outbox.shard.lag}: from the slowest busy shard's effective tick to L, 0 when no shard is busy, and 0
@@ -589,7 +591,7 @@ public final class Maintenance {
                     + " unreliable until new ticks pass that moment; this WARN repeats at most once a minute",
                     names.base(), latest.id(), latest.createdAt(), lagFrom.id(), lagFrom.createdAt());
         }
-        return new Read(latest, positions, slowest, stranded, lagFrom, cursors.ignoredCheckpointTick(c), found);
+        return new Read(latest, positions, slowest, stranded, lagFrom, cursors.ignoredCheckpointTick(c));
     }
 
     /**
@@ -781,6 +783,7 @@ public final class Maintenance {
             });
         }
         step("gauges", () -> {
+            gaugesStarted.run();
             refreshGauges(c, read);
             return null;
         });
@@ -1031,22 +1034,21 @@ public final class Maintenance {
             deadPendingOldest = rs.getDouble(2);
         }
         parkedSize = parked.size(c);
-        refreshQueueState(c, read);
+        refreshQueueState(c);
     }
 
     /**
-     * {@code outbox.pending}, {@code outbox.pending.oldest} and {@link OutboxTelemetry#queueState}, from this run's
-     * cursor read ({@link QueueState}: an exact count within its budget, else estimated); with
+     * {@code outbox.pending}, {@code outbox.pending.oldest} and {@link OutboxTelemetry#queueState} ({@link QueueState}:
+     * the positions read again with the count, an exact count within its budget, else estimated); with
      * {@link OutboxTelemetry#NONE} no statement at all.
      */
-    private void refreshQueueState(Connection c, @Nullable Read read) throws SQLException {
+    private void refreshQueueState(Connection c) throws SQLException {
         if (telemetry == OutboxTelemetry.NONE) {
             return;
         }
         List<OutboxTelemetry.ShardQueue> entries;
         try {
-            entries = read == null ? QueueState.unknown(shards)
-                    : queueState.read(c, read.latest(), read.positions(), read.ticks());
+            entries = queueState.read(c);
         } catch (SQLException | RuntimeException e) {
             pending = Double.NaN; // unknown, not the last count
             pendingOldest = Double.NaN;
