@@ -33,6 +33,7 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     private Duration retryInitial = Duration.ofMillis(50);
     private Duration retryMax = Duration.ofMillis(500);
     private int retryMaxAttempts = 0;
+    private boolean holdPermanent = false;
     private Duration requeueDelay = Duration.ofMillis(100);
     private int maxRequeues = 0;
     private Duration waitDelay = Duration.ofMillis(50);
@@ -362,6 +363,16 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     @Override
     public int maxAttempts() {
         return retryMaxAttempts;
+    }
+
+    @Override
+    public boolean holdPermanent() {
+        return holdPermanent;
+    }
+
+    public TestOutboxConfig holdPermanent(boolean holdPermanent) {
+        this.holdPermanent = holdPermanent;
+        return this;
     }
 
     // RequeueConfig

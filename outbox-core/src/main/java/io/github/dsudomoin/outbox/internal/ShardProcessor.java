@@ -135,6 +135,8 @@ public final class ShardProcessor implements AutoCloseable {
     private final int internalNamespace;
     private final OutboxConfig.RelayConfig relay;
     private final OutboxConfig.RetryConfig retry;
+    /** {@code relay.retry.holdPermanent}: see {@link #callHandler}. */
+    private final boolean holdPermanent;
     private final OutboxConfig.RequeueConfig requeue;
     private final OutboxConfig.WaitConfig waiting;
     private final OutboxHandler handler;
@@ -218,6 +220,7 @@ public final class ShardProcessor implements AutoCloseable {
         this.clock = clock;
         this.relay = config.relay();
         this.retry = relay.retry();
+        this.holdPermanent = retry.holdPermanent();
         this.requeue = relay.requeue();
         this.waiting = relay.waiting();
         this.internalNamespace = names.internalNamespace();
@@ -253,7 +256,7 @@ public final class ShardProcessor implements AutoCloseable {
         this.limits = new AtomicIntegerArray(full);
         this.executor = new ThreadPoolExecutor(0, Math.max(4, 2 * relay.workers()), 60, TimeUnit.SECONDS,
                 new SynchronousQueue<>(), r -> {
-                    var t = new Thread(r, "outbox-handler-" + THREADS.incrementAndGet());
+                    var t = new HandlerThread(r, "outbox-handler-" + THREADS.incrementAndGet(), holdPermanent);
                     t.setDaemon(true);
                     return t;
                 });
@@ -1822,7 +1825,8 @@ public final class ShardProcessor implements AutoCloseable {
      * {@code batchTimeout} is cancelled: nothing is known about any of its records, each a transient failure
      * ({@link #callDeadline()} tells the call when). A call that finds no free handler thread does not run: each
      * record {@link #BUSY}. A Retry or Permanent outcome whose error is an {@link OutboxWaitException} comes back as
-     * the {@link Outcome.Waiting} it means.
+     * the {@link Outcome.Waiting} it means. With {@code relay.retry.holdPermanent} any other Permanent comes back as a
+     * Retry with its error, so every pass and the parked rows hold its key as for a Retry; one ERROR per call says so.
      */
     private List<Outcome> callHandler(List<OutboxRecord> records, OutboxTelemetry.Delivery delivery)
             throws InterruptedException {
@@ -1875,6 +1879,9 @@ public final class ShardProcessor implements AutoCloseable {
                     true);
         }
         Throwable error = null;
+        int held = 0;
+        int firstHeld = -1;
+        Throwable heldError = null; // firstHeld's
         for (int i = 0; i < outcomes.size(); i++) {
             var outcome = outcomes.get(i);
             if (outcome == null) {
@@ -1887,6 +1894,14 @@ public final class ShardProcessor implements AutoCloseable {
                 outcomes.set(i, new Outcome.Waiting(e.kind(), e.getMessage(), null));
                 continue;
             }
+            if (holdPermanent && outcome instanceof Outcome.Permanent p) {
+                outcomes.set(i, Outcome.retry(p.error()));
+                if (held++ == 0) {
+                    firstHeld = i;
+                    heldError = p.error();
+                }
+                continue;
+            }
             outcomes.set(i, onDatabaseClock(outcome));
             if (error == null && outcome instanceof Outcome.Retry r && r.error() instanceof Error) {
                 error = r.error(); // e.g. thrown by handle(): the default handleBatch retries its record alone
@@ -1894,6 +1909,9 @@ public final class ShardProcessor implements AutoCloseable {
         }
         if (error != null) {
             handlerBug("outbox handler failed a record with an Error; that record is retried", error);
+        }
+        if (held > 0) {
+            logHeld(records.get(firstHeld), held, heldError);
         }
         return outcomes;
     }
@@ -1957,10 +1975,15 @@ public final class ShardProcessor implements AutoCloseable {
     /**
      * The outcomes of a call that threw {@code error} or returned an invalid list: a transient failure of every record
      * (pause, halved chunks, probe and divert then isolate the failing one), except a single record failing
-     * permanently or waiting. A {@code bug} (an Error, an invalid list) is logged at ERROR, at most once per 10 s.
+     * permanently (with {@code holdPermanent}, a Retry of that record alone) or waiting. A {@code bug} (an Error, an
+     * invalid list) is logged at ERROR, at most once per 10 s.
      */
     private List<Outcome> failedCall(List<OutboxRecord> records, Throwable error, boolean bug) {
         if (records.size() == 1 && error instanceof OutboxPermanentException) {
+            if (holdPermanent) { // as callHandler holds a returned Permanent
+                logHeld(records.get(0), 1, error);
+                return List.of(Outcome.retry(error));
+            }
             return List.of(Outcome.permanent(error));
         }
         if (records.size() == 1 && error instanceof OutboxWaitException e) {
@@ -2116,6 +2139,38 @@ public final class ShardProcessor implements AutoCloseable {
     private static void logDead(OutboxRecord r, int attempts, String error) {
         log.error("outbox message {} (topic {}, id {}) moved to the dead table after {} attempts: {}",
                 r.messageId(), r.topic(), r.id(), attempts, error);
+    }
+
+    /**
+     * The ERROR of a handler call whose {@code held} Permanent outcomes {@code relay.retry.holdPermanent} turned into
+     * retries, named by the {@code first} of them and its {@code error}.
+     */
+    private static void logHeld(OutboxRecord first, int held, Throwable error) {
+        log.error("outbox handler failed {} records permanently; relay.retry.holdPermanent retries them and the later"
+                + " records of their keys wait, until each is delivered or its key abandoned; first message {}"
+                + " (topic {}, id {}): {}", held, first.messageId(), first.topic(), first.id(),
+                RetryStore.describe(error));
+    }
+
+    /**
+     * True while the handler call running on this thread is a relay's whose {@code relay.retry.holdPermanent} is on: a
+     * Permanent outcome then stops its (topic, key) as a Retry does, so the call skips the later records of that key,
+     * as after a Retry; one it delivered would reach the target ahead of the held record and be handed again behind
+     * it. For the handlers of this repository.
+     */
+    public static boolean holdsPermanent() {
+        return CALL.get() != null && Thread.currentThread() instanceof HandlerThread t && t.holdPermanent;
+    }
+
+    /** A thread of {@link #executor}, which runs only this processor's handler calls. */
+    private static final class HandlerThread extends Thread {
+
+        final boolean holdPermanent;
+
+        HandlerThread(Runnable task, String name, boolean holdPermanent) {
+            super(task, name);
+            this.holdPermanent = holdPermanent;
+        }
     }
 
     @Nullable

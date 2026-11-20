@@ -59,7 +59,9 @@ public interface OutboxHandler {
      * unkeyed records never block each other. While nothing has succeeded yet, it stops after failures on 3 distinct
      * (topic, key) pairs (the target looks down; each failing unkeyed record counts as a pair) and returns
      * {@code NotAttempted} for the rest; so does a call asked to wind down. {@link OutboxPermanentException} gives
-     * {@code Permanent} and does not block the key. {@link OutboxWaitException} gives {@code Waiting} and blocks the
+     * {@code Permanent} and does not block the key, unless the relay holds such records
+     * ({@code outbox.relay.retry.holdPermanent}): then it blocks the key, as a {@code Retry} does, and does not count
+     * toward the 3-pair stop. {@link OutboxWaitException} gives {@code Waiting} and blocks the
      * key, but neither it nor the key's skipped records count toward the 3-pair stop. Anything else {@code handle}
      * throws, an {@link Error} included, gives {@code Retry} and blocks the key (the relay logs a {@code Retry}
      * carrying an Error at ERROR, at most once per 10 s). So the default never fails a whole call.
@@ -84,6 +86,9 @@ public interface OutboxHandler {
                 anyDelivered = true;
             } catch (OutboxPermanentException e) {
                 outcomes.add(Outcome.permanent(e));
+                if (ShardProcessor.holdsPermanent()) { // the relay retries it: the rest of its key waits behind it
+                    blocked.add(key);
+                }
             } catch (OutboxWaitException e) {
                 outcomes.add(new Outcome.Waiting(e.kind(), e.getMessage(), null));
                 blocked.add(key);

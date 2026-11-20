@@ -180,6 +180,24 @@ public interface OutboxConfig {
         default int maxAttempts() {
             return 0;
         }
+
+        /**
+         * Whether a {@link Outcome.Permanent} the handler returns stops its (topic, key) instead of moving the record
+         * to the dead table. Off (the default): the record is dead and its key goes on with the next record. On: the
+         * relay takes every {@code Permanent} as a {@link Outcome.Retry} with the same error, so the record becomes
+         * the retry head of its key and the later records of the key wait behind it; it spends attempts, backs off up
+         * to {@link #maxDelay()} and shows in the {@code outbox.retry.oldest} gauge, and each handler call that held a
+         * record logs an ERROR. With {@link #maxAttempts()} above 0 such a record still goes dead after that many
+         * attempts, as any retried one does: a key is never skipped past its record only with {@code maxAttempts = 0}.
+         * The key moves on once the cause is fixed and the next retry delivers the record, or once
+         * {@link OutboxAdmin#abandonKey} gives it up. The default {@link OutboxHandler#handleBatch} and the Kafka
+         * sender then skip the rest of the key in the call, as after a Retry; a {@code handleBatch} of your own must
+         * answer {@code NotAttempted} for the later records of a key it answered {@code Permanent} for, or they reach
+         * the target ahead of it and are handed again behind it.
+         */
+        default boolean holdPermanent() {
+            return false;
+        }
     }
 
     /** Records the handler set aside with {@link Outcome#requeue()}. */

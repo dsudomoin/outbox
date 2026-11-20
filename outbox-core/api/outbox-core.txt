@@ -211,6 +211,7 @@ package io.github.dsudomoin.outbox {
   }
 
   public static interface OutboxConfig.RetryConfig {
+    method public default boolean holdPermanent();
     method public default java.time.Duration! initialDelay();
     method public default int maxAttempts();
     method public default java.time.Duration! maxDelay();
