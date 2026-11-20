@@ -555,8 +555,9 @@ public final class OutboxRelay implements AutoCloseable {
 
     /**
      * One step of the group of {@code shards} in its own transaction on {@code c}; leaves {@code c} in autocommit,
-     * rolled back on failure. A step that moved a row of any of them to the dead table wakes the dead-letter thread
-     * once committed.
+     * rolled back on failure, the step's telemetry ended with its transaction
+     * ({@link ShardProcessor#tryProcessCommitted}). A step that moved a row of any of them to the dead table wakes the
+     * dead-letter thread once committed.
      */
     private List<ShardResult> processInOwnTransaction(Connection c, List<Integer> shards, long latest, Instant now,
             Instant parkedUntil) throws SQLException, InterruptedException {

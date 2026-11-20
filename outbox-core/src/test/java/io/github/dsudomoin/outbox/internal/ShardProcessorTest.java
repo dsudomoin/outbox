@@ -34,6 +34,19 @@ class ShardProcessorTest {
     }
 
     @Test
+    void deadLetterErrorTypeIsTheStoredClassName() {
+        assertThat(ShardProcessor.errorType(RetryStore.describe(new IllegalStateException("a: b c"))))
+                .isEqualTo("java.lang.IllegalStateException");
+        assertThat(ShardProcessor.errorType(RetryStore.describe(new IllegalStateException())))
+                .isEqualTo("java.lang.IllegalStateException");
+        assertThat(ShardProcessor.errorType("com.example.Bad (its toString() threw java.lang.Error)"))
+                .isEqualTo("com.example.Bad");
+        assertThat(ShardProcessor.errorType(BatchClassifier.REQUEUE_LIMIT)).isEqualTo("requeue_limit");
+        assertThat(ShardProcessor.errorType(" odd")).isEqualTo("_OTHER");
+        assertThat(ShardProcessor.errorType("")).isEqualTo("_OTHER");
+    }
+
+    @Test
     void firstTickIsChosenEvenWhenItDoesNotFit() {
         assertThat(ShardProcessor.chooseTarget(0L, ticks(1, 5000L, 5001L), 100).id()).isEqualTo(1);
         assertThat(ShardProcessor.chooseTarget(0L, ticks(1, 5000L), 100).id()).isEqualTo(1);

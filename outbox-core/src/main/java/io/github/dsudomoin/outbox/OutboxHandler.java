@@ -64,7 +64,9 @@ public interface OutboxHandler {
      * toward the 3-pair stop. {@link OutboxWaitException} gives {@code Waiting} and blocks the
      * key, but neither it nor the key's skipped records count toward the 3-pair stop. Anything else {@code handle}
      * throws, an {@link Error} included, gives {@code Retry} and blocks the key (the relay logs a {@code Retry}
-     * carrying an Error at ERROR, at most once per 10 s). So the default never fails a whole call.
+     * carrying an Error at ERROR, at most once per 10 s). So the default never fails a whole call. After each record
+     * it attempts it reports the record's outcome ({@link #recordFinished}): {@code Delivered}, {@code Permanent},
+     * {@code Waiting} or {@code Retry}; never a {@code NotAttempted}.
      */
     default List<Outcome> handleBatch(List<OutboxRecord> records) {
         var outcomes = new ArrayList<Outcome>(records.size());
@@ -77,29 +79,32 @@ public interface OutboxHandler {
                 outcomes.add(Outcome.notAttempted());
                 continue;
             }
+            Outcome outcome;
             try {
                 inRecordScope(record, () -> {
                     handle(record);
                     return null;
                 });
-                outcomes.add(Outcome.delivered());
+                outcome = Outcome.delivered();
                 anyDelivered = true;
             } catch (OutboxPermanentException e) {
-                outcomes.add(Outcome.permanent(e));
+                outcome = Outcome.permanent(e);
                 if (holdsPermanent()) { // the relay retries it: the rest of its key waits behind it
                     blocked.add(key);
                 }
             } catch (OutboxWaitException e) {
-                outcomes.add(new Outcome.Waiting(e.kind(), e.getMessage(), null));
+                outcome = new Outcome.Waiting(e.kind(), e.getMessage(), null);
                 blocked.add(key);
             } catch (Throwable e) { // an Error too: one record's bug must not fail the records around it
                 if (e instanceof InterruptedException) {
                     Thread.currentThread().interrupt();
                 }
-                outcomes.add(Outcome.retry(e));
+                outcome = Outcome.retry(e);
                 blocked.add(key);
                 failed.add(key);
             }
+            outcomes.add(outcome);
+            recordFinished(record, outcome);
         }
         return outcomes;
     }
@@ -115,6 +120,19 @@ public interface OutboxHandler {
      */
     static <T> T inRecordScope(OutboxRecord record, Callable<T> call) throws Exception {
         return RecordScope.run(record, call);
+    }
+
+    /**
+     * Reports the outcome of {@code record}, one of the records the relay handed to the {@link #handleBatch} call
+     * running on this thread, as soon as the handler knows it, so the telemetry ends the record's delivery there and
+     * not at the end of the call ({@link OutboxTelemetry.Delivery#recordFinished}). Report each record at most once,
+     * on the thread the relay called; a report on another thread, or outside a relay call, does nothing. The report
+     * does not decide anything: the outcome {@code handleBatch} returns for the record still does, and is still
+     * required. The default {@code handleBatch} reports each record it attempts; an override that delivers records
+     * itself reports them the same way.
+     */
+    static void recordFinished(OutboxRecord record, Outcome outcome) {
+        RecordScope.recordFinished(record, outcome);
     }
 
     /**

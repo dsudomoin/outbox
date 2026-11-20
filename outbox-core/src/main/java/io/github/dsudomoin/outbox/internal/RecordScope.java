@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox.internal;
 import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
+import io.github.dsudomoin.outbox.Outcome;
 import jakarta.annotation.Nullable;
 import java.util.ServiceConfigurationError;
 import java.util.ServiceLoader;
@@ -41,6 +42,24 @@ public final class RecordScope {
             } else {
                 CURRENT.set(previous);
             }
+        }
+    }
+
+    /**
+     * Whether a delivery that hears reports is bound to this thread: one other than
+     * {@link OutboxTelemetry.Delivery#NONE}. A handler that would do extra work only to report outcomes early
+     * ({@link #recordFinished}) skips it when false.
+     */
+    public static boolean reports() {
+        var delivery = CURRENT.get();
+        return delivery != null && delivery != OutboxTelemetry.Delivery.NONE;
+    }
+
+    /** {@link OutboxTelemetry.Delivery#recordFinished} of the delivery bound to this thread; nothing outside one. */
+    public static void recordFinished(OutboxRecord record, Outcome outcome) {
+        var delivery = CURRENT.get();
+        if (delivery != null && delivery != OutboxTelemetry.Delivery.NONE) {
+            delivery.recordFinished(record, outcome);
         }
     }
 

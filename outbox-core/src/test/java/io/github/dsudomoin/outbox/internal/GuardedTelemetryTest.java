@@ -158,6 +158,101 @@ class GuardedTelemetryTest {
     }
 
     @Test
+    void throwingStepSettleAndRecordHooksAreLoggedAndIgnored() {
+        try (var err = new CapturedStderr()) {
+            var t = GuardedTelemetry.of(new Throwing());
+            var step = t.stepStarted(List.of(1));
+            assertThatCode(() -> step.fetched(1, 3)).doesNotThrowAnyException();
+            var settle = step.settleStarted();
+            assertThatCode(() -> settle.committed(2)).doesNotThrowAnyException();
+            assertThatCode(() -> settle.failed(2, new IOException("x"))).doesNotThrowAnyException();
+            var delivery = t.deliveryStarted(step, RECORDS, Instant.EPOCH);
+            assertThatCode(() -> delivery.recordFinished(RECORD, Outcome.delivered())).doesNotThrowAnyException();
+            assertThatCode(() -> t.deadLettered(RECORD, "max_attempts")).doesNotThrowAnyException();
+
+            var text = err.text();
+            for (var hook : List.of("RelayStep.fetched", "Settle.committed", "Settle.failed",
+                    "Delivery.recordFinished", "deadLettered")) {
+                assertThat(occurrences(text, "hook " + hook + " failed")).as(hook).isEqualTo(1);
+            }
+        }
+    }
+
+    @Test
+    void throwingSettleStartAndStepDeliveryStartAreIgnored() {
+        try (var err = new CapturedStderr()) {
+            var t = GuardedTelemetry.of(new ThrowingStart());
+            var step = new OutboxTelemetry.RelayStep() {
+                @Override
+                public OutboxTelemetry.Settle settleStarted() {
+                    throw new IllegalStateException("telemetry bug");
+                }
+            };
+            var guarded = GuardedTelemetry.of(new OutboxTelemetry() {
+                @Override
+                public RelayStep stepStarted(List<Integer> shards) {
+                    return step;
+                }
+            });
+            assertThat(guarded.stepStarted(List.of(1)).settleStarted()).isSameAs(OutboxTelemetry.Settle.NONE);
+            assertThat(t.deliveryStarted(OutboxTelemetry.RelayStep.NONE, RECORDS, Instant.EPOCH))
+                    .isSameAs(OutboxTelemetry.Delivery.NONE);
+            var text = err.text();
+            assertThat(occurrences(text, "hook RelayStep.settleStarted failed")).isEqualTo(1);
+            assertThat(occurrences(text, "hook deliveryStarted failed")).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void deliveryStartedGetsTheDelegatesOwnStep() {
+        var own = new OutboxTelemetry.RelayStep() {};
+        var seen = new ArrayList<OutboxTelemetry.RelayStep>();
+        var t = GuardedTelemetry.of(new OutboxTelemetry() {
+            @Override
+            public RelayStep stepStarted(List<Integer> shards) {
+                return own;
+            }
+
+            @Override
+            public Delivery deliveryStarted(RelayStep step, List<OutboxRecord> records, Instant now) {
+                seen.add(step);
+                return Delivery.NONE;
+            }
+        });
+
+        var step = t.stepStarted(List.of(1));
+        t.deliveryStarted(step, RECORDS, Instant.EPOCH);
+        t.deliveryStarted(OutboxTelemetry.RelayStep.NONE, RECORDS, Instant.EPOCH);
+
+        assertThat(step).isNotSameAs(own);
+        assertThat(seen).containsExactly(own, OutboxTelemetry.RelayStep.NONE);
+    }
+
+    @Test
+    void newHooksDefaultToTheOldOnes() {
+        var events = new ArrayList<String>();
+        var t = GuardedTelemetry.of(new OutboxTelemetry() {
+            @Override
+            public Delivery deliveryStarted(List<OutboxRecord> records, Instant now) {
+                events.add("deliveryStarted " + records.size());
+                return Delivery.NONE;
+            }
+
+            @Override
+            public void deadLettered(String topic) {
+                events.add("deadLettered " + topic);
+            }
+        });
+
+        t.deliveryStarted(t.stepStarted(List.of(1)), RECORDS, Instant.EPOCH);
+        t.deadLettered(RECORD, "requeue_limit");
+
+        assertThat(events).containsExactly("deliveryStarted 1", "deadLettered orders");
+        assertThat(t.stepStarted(List.of(1))).isSameAs(OutboxTelemetry.RelayStep.NONE);
+        assertThat(OutboxTelemetry.RelayStep.NONE.settleStarted()).isSameAs(OutboxTelemetry.Settle.NONE);
+    }
+
+    @Test
     void callExceptionsPassThrough() throws Exception {
         var plain = new OutboxTelemetry() {
             @Override
@@ -395,6 +490,11 @@ class GuardedTelemetryTest {
                 }
 
                 @Override
+                public void recordFinished(OutboxRecord record, Outcome outcome) {
+                    throw bug();
+                }
+
+                @Override
                 public void finished(List<Outcome> outcomes) {
                     throw bug();
                 }
@@ -409,6 +509,26 @@ class GuardedTelemetryTest {
         @Override
         public RelayStep stepStarted(List<Integer> shards) {
             return new RelayStep() {
+                @Override
+                public void fetched(int shard, int records) {
+                    throw bug();
+                }
+
+                @Override
+                public Settle settleStarted() {
+                    return new Settle() {
+                        @Override
+                        public void committed(int records) {
+                            throw bug();
+                        }
+
+                        @Override
+                        public void failed(int records, Throwable error) {
+                            throw bug();
+                        }
+                    };
+                }
+
                 @Override
                 public void finished() {
                     throw bug();
@@ -443,6 +563,11 @@ class GuardedTelemetryTest {
 
         @Override
         public void deadLettered(String topic) {
+            throw bug();
+        }
+
+        @Override
+        public void deadLettered(OutboxRecord record, String errorType) {
             throw bug();
         }
 
@@ -515,6 +640,11 @@ class GuardedTelemetryTest {
 
         @Override
         public Delivery deliveryStarted(List<OutboxRecord> records, Instant now) {
+            throw new IllegalStateException("telemetry bug");
+        }
+
+        @Override
+        public Delivery deliveryStarted(RelayStep step, List<OutboxRecord> records, Instant now) {
             throw new IllegalStateException("telemetry bug");
         }
 

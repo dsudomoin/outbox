@@ -178,7 +178,198 @@ class RelayTelemetryIT {
         assertThat(telemetry.relayFailures).hasValue(0);
     }
 
+    @Test
+    void stepEndsAfterItsCommit() throws Exception {
+        var config = new TestOutboxConfig();
+        var events = new Events(transactions, config.table() + "_cursor");
+        var handler = new RecordingHandler();
+        var outbox = start(config, handler, events);
+
+        var id = transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", "k", bytes("m"))));
+        await(Duration.ofSeconds(10), () -> events.ended().stream().anyMatch(Events.Observed::delivered));
+        runtime.close();
+
+        var step = events.single();
+        int shard = shard("k");
+        assertThat(step.log).containsExactly("stepStarted", "fetched(" + shard + ",1)", "deliveryStarted",
+                "recordFinished(" + id + ",Delivered)", "deliveryFinished", "settleStarted", "committed(1)",
+                "finished");
+        assertThat(step.cursorRowsAtFinish).as("the cursor append is committed when the step finishes")
+                .isGreaterThan(step.cursorRowsAtSettle);
+        assertThat(events.foreignSteps).as("deliveryStarted gets the step its stepStarted returned").isZero();
+    }
+
+    @Test
+    void aFailingCommitEndsSettleAndStepFailed() throws Exception {
+        var config = new TestOutboxConfig().workers(1);
+        var cursor = config.table() + "_cursor";
+        var events = new Events(transactions, cursor);
+        var handler = new RecordingHandler();
+        var outbox = start(config, handler, events);
+        var function = config.table() + "_refuse";
+        try (var c = transactions.newConnection()) {
+            TestSql.execute(c, "create function " + function + "() returns trigger language plpgsql as $$ begin"
+                    + " raise exception 'commit refused'; end $$");
+            TestSql.execute(c, "create constraint trigger refuse after insert on " + cursor
+                    + " deferrable initially deferred for each row execute function " + function + "()");
+        }
+
+        transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", "k", bytes("m"))));
+        await(Duration.ofSeconds(10), () -> events.ended().stream().anyMatch(s -> s.log.contains("failed")));
+        runtime.close(); // no step left to contend for the table with the drop
+        try (var c = transactions.newConnection()) {
+            TestSql.execute(c, "drop trigger refuse on " + cursor);
+        }
+
+        var failed = events.ended().stream().filter(s -> s.log.contains("failed")).findFirst().orElseThrow();
+        assertThat(failed.log).endsWith("settleStarted", "settleFailed(1)", "failed").doesNotContain("finished",
+                "committed(1)");
+        assertThat(failed.errors).hasSize(2).allSatisfy(e -> assertThat(e).isSameAs(failed.errors.get(0)));
+        assertThat(failed.errors.get(0)).hasMessageContaining("commit refused");
+    }
+
+    @Test
+    void fetchedCountsEveryRowReadPerShard() throws Exception {
+        String a = "a";
+        String b = "b";
+        for (int i = 0; shard(b) == shard(a); i++) {
+            b = "b" + i;
+        }
+        var config = new TestOutboxConfig();
+        var events = new Events(transactions, config.table() + "_cursor");
+        var handler = new RecordingHandler();
+        var outbox = start(config, handler, events);
+        var messages = new ArrayList<OutboxMessage>();
+        for (int i = 0; i < 3; i++) {
+            messages.add(OutboxMessage.of("orders", a, bytes("a" + i)));
+        }
+        for (int i = 0; i < 2; i++) {
+            messages.add(OutboxMessage.of("orders", b, bytes("b" + i)));
+        }
+
+        transactions.inTx(c -> outbox.sendAll(messages));
+        await(Duration.ofSeconds(10), () -> handler.delivered().size() >= 5);
+        runtime.close();
+
+        assertThat(events.fetched(shard(a))).isEqualTo(3);
+        assertThat(events.fetched(shard(b))).isEqualTo(2);
+        assertThat(events.ended()).allSatisfy(step -> assertThat(step.log.stream()
+                .filter(e -> e.startsWith("fetched(")).map(e -> e.substring(0, e.indexOf(','))))
+                .as("one fetched per shard of a step").doesNotHaveDuplicates());
+    }
+
+    @Test
+    void settledCountsTheRowsTheCommitMoves() throws Exception {
+        var keys = sameShardKeys(3);
+        var config = new TestOutboxConfig();
+        var events = new Events(transactions, config.table() + "_cursor");
+        var first = new java.util.concurrent.atomic.AtomicBoolean(true);
+        OutboxHandler handler = new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {}
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                if (records.size() == 3 && first.compareAndSet(true, false)) {
+                    return List.of(Outcome.delivered(), Outcome.retry(new java.io.IOException("down")),
+                            Outcome.notAttempted());
+                }
+                return java.util.Collections.nCopies(records.size(), Outcome.delivered());
+            }
+        };
+        var outbox = start(config, handler, events);
+        var messages = keys.stream().map(k -> OutboxMessage.of("orders", k, bytes(k))).toList();
+
+        transactions.inTx(c -> outbox.sendAll(messages));
+        await(Duration.ofSeconds(10), () -> !first.get() && events.ended().stream().anyMatch(s -> s.handed == 3));
+        runtime.close();
+
+        var step = events.ended().stream().filter(s -> s.handed == 3).findFirst().orElseThrow();
+        assertThat(step.log).as("delivered and retried move, the trailing not-attempted row is read again")
+                .contains("committed(2)");
+    }
+
+    @Test
+    void recordFinishedReachesTheDelivery() throws Exception {
+        var config = new TestOutboxConfig();
+        var events = new Events(transactions, config.table() + "_cursor");
+        var reports = new CopyOnWriteArrayList<Boolean>();
+        OutboxHandler handler = new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {}
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                reports.add(io.github.dsudomoin.outbox.internal.RecordScope.reports());
+                OutboxHandler.recordFinished(records.get(0), Outcome.delivered());
+                return java.util.Collections.nCopies(records.size(), Outcome.delivered());
+            }
+        };
+        var outbox = start(config, handler, events);
+
+        var id = transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", "k", bytes("m"))));
+        await(Duration.ofSeconds(10), () -> events.ended().stream().anyMatch(Events.Observed::delivered));
+        runtime.close();
+
+        var log = events.single().log;
+        assertThat(log).containsSubsequence("deliveryStarted", "recordFinished(" + id + ",Delivered)",
+                "deliveryFinished");
+        assertThat(events.sameRecord).as("the handed record itself").containsOnly(true).isNotEmpty();
+        assertThat(reports).containsOnly(true);
+        assertThat(io.github.dsudomoin.outbox.internal.RecordScope.reports()).as("outside a call").isFalse();
+        OutboxHandler.recordFinished(events.lastHanded, Outcome.delivered()); // outside a call: nothing, no throw
+        assertThat(events.single().log).isEqualTo(log);
+    }
+
+    @Test
+    void defaultHandleBatchReportsEachAttempt() throws Exception {
+        var keys = sameShardKeys(2);
+        var config = new TestOutboxConfig();
+        var events = new Events(transactions, config.table() + "_cursor");
+        var failed = new java.util.concurrent.atomic.AtomicBoolean();
+        OutboxHandler handler = record -> {
+            if (new String(record.key(), UTF_8).equals(keys.get(1)) && failed.compareAndSet(false, true)) {
+                throw new IllegalStateException("down");
+            }
+        };
+        var outbox = start(config, handler, events);
+        var ids = transactions.inTx(c -> outbox.sendAll(List.of(OutboxMessage.of("orders", keys.get(0), bytes("1")),
+                OutboxMessage.of("orders", keys.get(1), bytes("2")), OutboxMessage.of("orders", keys.get(1),
+                        bytes("3")))));
+        await(Duration.ofSeconds(10), () -> events.ended().stream().anyMatch(s -> s.handed == 3));
+        runtime.close();
+
+        var step = events.ended().stream().filter(s -> s.handed == 3).findFirst().orElseThrow();
+        assertThat(step.log.stream().filter(e -> e.startsWith("recordFinished")).toList()).containsExactly(
+                "recordFinished(" + ids.get(0) + ",Delivered)", "recordFinished(" + ids.get(1) + ",Retry)");
+    }
+
+    @Test
+    void deadLetteredCarriesTheErrorType() throws Exception {
+        var config = new TestOutboxConfig().retry(Duration.ofMillis(20), Duration.ofMillis(100), 1);
+        var events = new Events(transactions, config.table() + "_cursor");
+        OutboxHandler handler = record -> {
+            if (new String(record.key(), UTF_8).equals("permanent")) {
+                throw new OutboxPermanentException("x");
+            }
+            throw new IllegalStateException("down");
+        };
+        var outbox = start(config, handler, events);
+
+        var failing = transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", "failing", bytes("f"))));
+        var permanent = transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", "permanent", bytes("p"))));
+        await(Duration.ofSeconds(15), () -> events.deadLettered.size() >= 2);
+        runtime.close();
+
+        assertThat(events.deadLettered).containsExactlyInAnyOrder(failing + " max_attempts",
+                permanent + " io.github.dsudomoin.outbox.OutboxPermanentException");
+    }
+
     private Outbox start(TestOutboxConfig config, OutboxHandler handler) {
+        return start(config, handler, telemetry);
+    }
+
+    private Outbox start(TestOutboxConfig config, OutboxHandler handler, OutboxTelemetry telemetry) {
         var r = OutboxRuntime.builder(config, transactions, handler).telemetry(telemetry).build();
         runtime = r;
         r.start();
@@ -187,6 +378,18 @@ class RelayTelemetryIT {
 
     private static int shard(String key) {
         return Hashing.shard(Hashing.keyHash("orders", bytes(key)), 4);
+    }
+
+    /** {@code count} distinct keys on one shard. */
+    private static List<String> sameShardKeys(int count) {
+        var keys = new ArrayList<String>();
+        int shard = shard("s0");
+        for (int i = 0; keys.size() < count; i++) {
+            if (shard("s" + i) == shard) {
+                keys.add("s" + i);
+            }
+        }
+        return keys;
     }
 
     private static List<UUID> delivered(RecordingHandler handler) {
@@ -228,6 +431,156 @@ class RelayTelemetryIT {
         /** The failed steps of {@code shard} alone. */
         int failedAlone(int shard) {
             return (int) steps.stream().filter(s -> s.failed.get() > 0 && s.shards.equals(List.of(shard))).count();
+        }
+    }
+
+    /**
+     * The relay steps with work, each with the events of its step, settle and deliveries in order, and the dead
+     * letters; at the settle's start and the step's end it counts the shard's cursor rows on a connection of its own.
+     */
+    private static final class Events implements OutboxTelemetry {
+
+        final List<Observed> steps = new CopyOnWriteArrayList<>();
+        final List<String> deadLettered = new CopyOnWriteArrayList<>();
+        final List<Boolean> sameRecord = new CopyOnWriteArrayList<>();
+        private final JdbcTransactions transactions;
+        private final String cursor;
+        volatile int foreignSteps;
+        @Nullable
+        volatile OutboxRecord lastHanded;
+
+        Events(JdbcTransactions transactions, String cursor) {
+            this.transactions = transactions;
+            this.cursor = cursor;
+        }
+
+        @Override
+        public RelayStep stepStarted(List<Integer> shards) {
+            var step = new Observed();
+            step.log.add("stepStarted");
+            steps.add(step);
+            return step;
+        }
+
+        @Override
+        public Delivery deliveryStarted(RelayStep step, List<OutboxRecord> records, java.time.Instant now) {
+            if (!(step instanceof Observed observed)) {
+                foreignSteps++;
+                return Delivery.NONE;
+            }
+            observed.log.add("deliveryStarted");
+            observed.handed = records.size();
+            return new Delivery() {
+                private volatile List<OutboxRecord> handed = List.of();
+
+                @Override
+                public List<OutboxRecord> handed(List<OutboxRecord> records) {
+                    handed = records;
+                    return records;
+                }
+
+                @Override
+                public void recordFinished(OutboxRecord record, Outcome outcome) {
+                    sameRecord.add(handed.stream().anyMatch(r -> r == record));
+                    lastHanded = record;
+                    observed.log.add("recordFinished(" + record.messageId() + "," + outcome.getClass().getSimpleName()
+                            + ")");
+                }
+
+                @Override
+                public void finished(List<Outcome> outcomes) {
+                    observed.log.add("deliveryFinished");
+                }
+
+                @Override
+                public void failed(Throwable error) {
+                    observed.log.add("deliveryFailed");
+                }
+            };
+        }
+
+        @Override
+        public void deadLettered(OutboxRecord record, String errorType) {
+            deadLettered.add(record.messageId() + " " + errorType);
+        }
+
+        List<Observed> ended() {
+            return steps.stream().filter(s -> s.log.contains("finished") || s.log.contains("failed")).toList();
+        }
+
+        /** The one step that handed records: a step may find work and hand none (a tick of no row of its shard). */
+        Observed single() {
+            var delivering = steps.stream().filter(Observed::delivered).toList();
+            assertThat(delivering).hasSize(1);
+            return delivering.get(0);
+        }
+
+        /** The rows fetched of {@code shard}, all steps together. */
+        int fetched(int shard) {
+            return steps.stream().flatMap(s -> s.log.stream()).filter(e -> e.startsWith("fetched(" + shard + ","))
+                    .mapToInt(e -> Integer.parseInt(e.substring(e.indexOf(',') + 1, e.length() - 1))).sum();
+        }
+
+        private long cursorRows(int shard) {
+            try (var c = transactions.newConnection()) {
+                return TestSql.queryLong(c, "select count(*) from " + cursor + " where shard = " + shard);
+            } catch (java.sql.SQLException e) {
+                throw new IllegalStateException(e);
+            }
+        }
+
+        final class Observed implements RelayStep {
+
+            final List<String> log = new CopyOnWriteArrayList<>();
+            final List<Throwable> errors = new CopyOnWriteArrayList<>();
+            volatile int shard = -1;
+            volatile int handed;
+            volatile long cursorRowsAtSettle = -1;
+            volatile long cursorRowsAtFinish = -1;
+
+            boolean delivered() {
+                return log.contains("deliveryStarted") && (log.contains("finished") || log.contains("failed"));
+            }
+
+            @Override
+            public void fetched(int shard, int records) {
+                this.shard = shard;
+                log.add("fetched(" + shard + "," + records + ")");
+            }
+
+            @Override
+            public Settle settleStarted() {
+                log.add("settleStarted");
+                if (shard >= 0) {
+                    cursorRowsAtSettle = cursorRows(shard);
+                }
+                return new Settle() {
+                    @Override
+                    public void committed(int records) {
+                        log.add("committed(" + records + ")");
+                    }
+
+                    @Override
+                    public void failed(int records, Throwable error) {
+                        errors.add(error);
+                        log.add("settleFailed(" + records + ")");
+                    }
+                };
+            }
+
+            @Override
+            public void finished() {
+                if (shard >= 0) {
+                    cursorRowsAtFinish = cursorRows(shard);
+                }
+                log.add("finished");
+            }
+
+            @Override
+            public void failed(Throwable error) {
+                errors.add(error);
+                log.add("failed");
+            }
         }
     }
 

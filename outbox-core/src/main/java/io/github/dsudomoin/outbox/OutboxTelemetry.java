@@ -35,6 +35,16 @@ public interface OutboxTelemetry {
         return Delivery.NONE;
     }
 
+    /**
+     * One per handler call of the relay {@code step}, the {@link RelayStep} this telemetry's {@link #stepStarted}
+     * returned for it (itself, never a wrapper the outbox put around it; {@link RelayStep#NONE} when that returned
+     * none or failed), on the relay thread, before the records are handed to the handler. The outbox calls only this
+     * one; by default it is {@link #deliveryStarted(List, Instant)}.
+     */
+    default Delivery deliveryStarted(RelayStep step, List<OutboxRecord> records, Instant now) {
+        return deliveryStarted(records, now);
+    }
+
     /** A record delivered, {@code delay} after its {@code createdAt}. */
     default void delivered(String topic, Duration delay) {}
 
@@ -43,6 +53,16 @@ public interface OutboxTelemetry {
 
     /** A record moved to the dead table. */
     default void deadLettered(String topic) {}
+
+    /**
+     * {@code record} moved to the dead table, on the relay thread, before its step commits. {@code errorType}, a small
+     * set that fits a metric label: {@code max_attempts} when its attempts ran out, {@code requeue_limit} when a
+     * requeue went past {@code maxRequeues}, else the class name of the error it failed with, as stored. The outbox
+     * calls only this one; by default it is {@link #deadLettered(String)} of the record's topic.
+     */
+    default void deadLettered(OutboxRecord record, String errorType) {
+        deadLettered(record.topic());
+    }
 
     /** A record set aside with {@link Outcome#requeue()} and parked. */
     default void requeued(String topic) {}
@@ -79,14 +99,18 @@ public interface OutboxTelemetry {
      * steps {@link #stepFinished} measures; a step that locks nothing or finds nothing to do calls neither.
      * {@code shards} is a copy of the shards whose locks the step holds, those without work included. The step's
      * cursor read, its target choice and the retry and parked lookups up to that shard come before this call; its
-     * further database work and handler calls run on this thread (the handler itself on a handler thread) until
-     * {@link RelayStep#finished()} or {@link RelayStep#failed}.
+     * further database work, handler calls ({@link #deliveryStarted(RelayStep, List, Instant)}), its
+     * {@link RelayStep#settleStarted settle} and its transaction's commit or rollback run on this thread (the handler
+     * itself on a handler thread) until {@link RelayStep#finished()} or {@link RelayStep#failed}.
      */
     default RelayStep stepStarted(List<Integer> shards) {
         return RelayStep.NONE;
     }
 
-    /** A relay step of one or more shards ended. */
+    /**
+     * A relay step of one or more shards did its work, its writes included, and its transaction commits next:
+     * {@code duration} leaves the commit out.
+     */
     default void stepFinished(Duration duration) {}
 
     /**
@@ -176,16 +200,64 @@ public interface OutboxTelemetry {
         default void failed(Throwable error) {}
     }
 
-    /** One relay step, ended once on the thread that started it. */
+    /**
+     * One relay step, ended once on the thread that started it, with its transaction: {@link #finished()} once its
+     * COMMIT returned, {@link #failed} once a failed COMMIT rolled back, or as its own work fails, before the rollback.
+     * Its hooks come in this order: {@link #fetched} per shard, then the settle ({@link #settleStarted}, ended before
+     * the step), then the end.
+     */
     interface RelayStep {
 
         RelayStep NONE = new RelayStep() {};
 
-        /** The step's work is done; its transaction commits next, so a commit that fails still ends the step here. */
+        /**
+         * Once per shard of the step with work, after the step's reads of that shard and before its main handler call
+         * (the calls of its due retry and parked rows come earlier): {@code records} rows read for it, distinct within
+         * each part: its due retry heads with the parked rows of their keys, its due parked rows, its main read and
+         * the parked rows merged into that read's call. A row the retry pass hands and the main pass merges again
+         * counts twice; the retry rows a call takes along as followers, and those a later round of the pass promotes,
+         * do not count.
+         */
+        default void fetched(int shard, int records) {}
+
+        /**
+         * Once per step with work, after its last handler call, before it writes the main pass's outcomes and the
+         * cursors (the retry pass writes each call's outcomes before the next call, earlier). Ended once, after the
+         * step's transaction ends and before this step does.
+         */
+        default Settle settleStarted() {
+            return Settle.NONE;
+        }
+
+        /** The step's transaction committed. */
         default void finished() {}
 
-        /** The step failed with {@code error}, which rolls its transaction back. */
+        /** The step failed with {@code error}, which rolls its transaction back (a COMMIT that failed included). */
         default void failed(Throwable error) {}
+    }
+
+    /**
+     * The writes of one relay step, from its last handler call to its transaction's end. {@code records}: the records
+     * whose state the commit records, each once: those handed whose outcome it writes (delivered, retried or diverted
+     * to the retry table, dead, parked or requeued, kept parked, postponed), the main read's rows it moves without a
+     * call (behind their key in the retry table, or held in the parked table), the parked rows it keeps behind one
+     * that stays, and the retry heads it moves to the dead table out of attempts. Not those the next step reads again
+     * (the trailing records a call did not attempt, the records of a paused shard), nor the rows a parked row moved
+     * to the retry table takes along unread.
+     */
+    interface Settle {
+
+        Settle NONE = new Settle() {};
+
+        /** After the step's COMMIT returned, before {@link RelayStep#finished()}. */
+        default void committed(int records) {}
+
+        /**
+         * The step failed with {@code error}, which rolls its transaction back (after a failed COMMIT: once it has),
+         * before {@link RelayStep#failed}: none of the {@code records} it would have recorded is; a step whose writes
+         * failed part way counts those it made.
+         */
+        default void failed(int records, Throwable error) {}
     }
 
     /** One handler call. */
@@ -205,6 +277,16 @@ public interface OutboxTelemetry {
         default <T> T inRecordScope(OutboxRecord record, Callable<T> call) throws Exception {
             return call.call();
         }
+
+        /**
+         * On the handler thread, as soon as the handler knows the outcome of {@code record}, one of the handed records
+         * (the same object): {@link OutboxHandler#recordFinished}, which the default {@code handleBatch} calls after
+         * each record it attempts. At most once per record from a well-behaved handler, before {@link #finished}; a
+         * handler may also report twice, after the relay timed its call out, or a record not of this call. The report
+         * is the handler's word: {@link #finished} still follows with the outcome of every record, and that outcome,
+         * not this one, decides the record's row (a call that fails as a whole retries a record reported delivered).
+         */
+        default void recordFinished(OutboxRecord record, Outcome outcome) {}
 
         /** The call returned {@code outcomes}, one per record in order (a timed-out call's are retries). */
         default void finished(List<Outcome> outcomes) {}

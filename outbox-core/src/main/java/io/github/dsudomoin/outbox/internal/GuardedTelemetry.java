@@ -75,6 +75,20 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         return delivery == Delivery.NONE ? delivery : new GuardedDelivery(delivery);
     }
 
+    /** {@code step} as the delegate returned it: a guard of this telemetry is unwrapped first. */
+    @Override
+    public Delivery deliveryStarted(RelayStep step, List<OutboxRecord> records, Instant now) {
+        var own = step instanceof GuardedRelayStep guarded ? guarded.delegate : step;
+        Delivery delivery;
+        try {
+            delivery = delegate.deliveryStarted(own, records, now);
+        } catch (Throwable e) {
+            warn("deliveryStarted", e);
+            return Delivery.NONE;
+        }
+        return delivery == null || delivery == Delivery.NONE ? Delivery.NONE : new GuardedDelivery(delivery);
+    }
+
     @Override
     public void delivered(String topic, Duration delay) {
         try {
@@ -97,6 +111,15 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     public void deadLettered(String topic) {
         try {
             delegate.deadLettered(topic);
+        } catch (Throwable e) {
+            warn("deadLettered", e);
+        }
+    }
+
+    @Override
+    public void deadLettered(OutboxRecord record, String errorType) {
+        try {
+            delegate.deadLettered(record, errorType);
         } catch (Throwable e) {
             warn("deadLettered", e);
         }
@@ -375,6 +398,27 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         }
 
         @Override
+        public void fetched(int shard, int records) {
+            try {
+                delegate.fetched(shard, records);
+            } catch (Throwable e) {
+                warn("RelayStep.fetched", e);
+            }
+        }
+
+        @Override
+        public Settle settleStarted() {
+            Settle settle;
+            try {
+                settle = delegate.settleStarted();
+            } catch (Throwable e) {
+                warn("RelayStep.settleStarted", e);
+                return Settle.NONE;
+            }
+            return settle == null || settle == Settle.NONE ? Settle.NONE : new GuardedSettle(settle);
+        }
+
+        @Override
         public void finished() {
             try {
                 delegate.finished();
@@ -389,6 +433,33 @@ public final class GuardedTelemetry implements OutboxTelemetry {
                 delegate.failed(error);
             } catch (Throwable e) {
                 warn("RelayStep.failed", e);
+            }
+        }
+    }
+
+    private final class GuardedSettle implements Settle {
+
+        private final Settle delegate;
+
+        GuardedSettle(Settle delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void committed(int records) {
+            try {
+                delegate.committed(records);
+            } catch (Throwable e) {
+                warn("Settle.committed", e);
+            }
+        }
+
+        @Override
+        public void failed(int records, Throwable error) {
+            try {
+                delegate.failed(records, error);
+            } catch (Throwable e) {
+                warn("Settle.failed", e);
             }
         }
     }
@@ -442,6 +513,15 @@ public final class GuardedTelemetry implements OutboxTelemetry {
                 return call.call();
             }
             return result;
+        }
+
+        @Override
+        public void recordFinished(OutboxRecord record, Outcome outcome) {
+            try {
+                delegate.recordFinished(record, outcome);
+            } catch (Throwable e) {
+                warn("Delivery.recordFinished", e);
+            }
         }
 
         @Override
