@@ -112,13 +112,20 @@ public interface OutboxConfig {
          * Bound of one handler call. At 80 % of it the handler thread is interrupted and the call's real outcomes are
          * kept (records it did not start are read again); a call still running at the full timeout is cancelled and
          * all its records are retried, delivered ones included. Per-record timeouts of the handler (HTTP read
-         * timeouts, each {@code byTopic} route's own) must be well below it. At most 24 days. See
+         * timeouts, each {@code byTopic} route's own) must be well below it. Default 130 s, the Kafka sender's
+         * budget with its default producer settings ({@code delivery.timeout.ms} 120 s + 5 s + {@code max.block.ms}
+         * 5 s); a handler without such long calls may set it lower. At most 24 days. See
          * {@link OutboxHandler#handleBatch}.
          */
         default Duration batchTimeout() {
-            return Duration.ofSeconds(30);
+            return Duration.ofSeconds(130);
         }
 
+        /**
+         * On stop, unfinished batches get this long, then their workers are interrupted and the batches are delivered
+         * again later; a step still waiting for its handler then (a Kafka call through an outage, which may take
+         * {@link #batchTimeout()}) is interrupted too, and its records go again. Default 30 s.
+         */
         default Duration shutdownTimeout() {
             return Duration.ofSeconds(30);
         }
@@ -313,11 +320,11 @@ public interface OutboxConfig {
         }
 
         /**
-         * Bound of one hook call; a call cut at it leaves its letters pending, retried with backoff. Default 30 s, at
-         * most 24 days.
+         * Bound of one hook call; a call cut at it leaves its letters pending, retried with backoff. Default 130 s, the
+         * Kafka sender's budget with its default producer settings, as {@code relay.batchTimeout}; at most 24 days.
          */
         default Duration timeout() {
-            return Duration.ofSeconds(30);
+            return Duration.ofSeconds(130);
         }
 
         /**

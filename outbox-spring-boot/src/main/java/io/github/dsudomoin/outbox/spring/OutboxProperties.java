@@ -75,9 +75,12 @@ public record OutboxProperties(
      * @param batchTimeout bound of one handler call. At 80 % of it the handler thread is interrupted and the call's
      *     real outcomes are kept (records it did not start are read again); a call still running at the full timeout
      *     is cancelled and all its records are retried, delivered ones included. Per-record timeouts of the handler
-     *     (HTTP read timeouts, each byTopic route's own) must be well below it. Default 30 s, at most 24 days.
+     *     (HTTP read timeouts, each byTopic route's own) must be well below it. Default 130 s, the Kafka sender's
+     *     budget with its default producer settings (delivery.timeout.ms 120 s + 5 s + max.block.ms 5 s); a handler
+     *     without such long calls may set it lower. At most 24 days.
      * @param shutdownTimeout on stop, unfinished batches get this long, then their workers are interrupted and the
-     *     batches are delivered again later. Default 30 s.
+     *     batches are delivered again later; a step still waiting for its handler then (a Kafka call through an
+     *     outage) is interrupted too, and its records go again. Default 30 s.
      * @param connectionHold how long a relay worker starts steps on one pooled connection under a backlog before it
      *     hands it back and takes another, so the pool can retire it at its max-lifetime. A step started just before
      *     this ends runs on the same connection, up to 4 × batch-timeout: a pool's leak-detection-threshold must
@@ -100,7 +103,7 @@ public record OutboxProperties(
         @DefaultValue("100") int maxTicksPerBatch,
         @DefaultValue("50ms") Duration minTickInterval,
         @DefaultValue("200ms") Duration idlePollInterval,
-        @DefaultValue("30s") Duration batchTimeout,
+        @DefaultValue("130s") Duration batchTimeout,
         @DefaultValue("30s") Duration shutdownTimeout,
         @DefaultValue("1m") Duration connectionHold,
         @DefaultValue("3") int headFailuresBeforeDivert,
@@ -231,7 +234,8 @@ public record OutboxProperties(
      * @param batchSize letters per call of the dead-letter hook, 1..1000 (a redrive batch holds a key lock each).
      *     Default 100.
      * @param timeout bound of one hook call; a call cut at it leaves its letters pending, retried with backoff. Default
-     *     30 s, at most 24 days.
+     *     130 s, the Kafka sender's budget with its default producer settings, as relay.batch-timeout; at most 24
+     *     days.
      * @param retention kept letters older than this, by their failed_at, are deleted by maintenance; 0 = kept forever,
      *     the default; at most 3650 days. Letters still pending for the hook are never deleted. Deleted in portions,
      *     at most a maintenanceInterval per run with the redrive history's cleanup; later runs finish the rest.
@@ -240,7 +244,7 @@ public record OutboxProperties(
      */
     public record DeadLetters(
         @DefaultValue("100") int batchSize,
-        @DefaultValue("30s") Duration timeout,
+        @DefaultValue("130s") Duration timeout,
         @DefaultValue("0s") Duration retention,
         @DefaultValue("30d") Duration redriveHistory
     ) implements DeadLettersConfig {}
