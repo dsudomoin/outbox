@@ -120,8 +120,11 @@ import org.slf4j.LoggerFactory;
  * with Kafka's own outcome. Inside a relay call it waits until 200 ms before the relay cancels the call at
  * {@code batchTimeout}, no longer. A call still waiting then is cut: the sender closes the producer and returns acked
  * records as {@code Delivered}, unacked ones as {@code Retry} (remembered, as above) and the rest as
- * {@code NotAttempted}. Any other interrupt cuts the call at once the same way: the relay's threads shutting down, a
- * second interrupt after the wind-down, a caller outside the relay. A cut turns slow sends into retries, which go
+ * {@code NotAttempted}. The call is cut the same way at once when the relay gives up on it: past {@code batchTimeout},
+ * or when the relay's step is interrupted and rolls back (the relay stopping after its {@code shutdownTimeout}, an
+ * interrupted {@code drain()}), even if that interrupt reaches the handler thread together with the wind-down's. So is
+ * it on any other interrupt: a second one after the wind-down, the relay's handler threads shutting down, a caller
+ * outside the relay. A cut turns slow sends into retries, which go
  * unbatched until a call settles them, and a new producer sends them again (a duplicate when Kafka had written them).
  * Keep {@code batchTimeout} at least {@code delivery.timeout.ms} + 5 s + {@code max.block.ms} so that they end as
  * Kafka's outcomes instead; the Kora and Spring adapters log a WARN at startup when it is shorter.
@@ -316,6 +319,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
             if (ended != Call.Ended.ACKED) {
                 call.cut(switch (ended) {
                     case INTERRUPTED -> "interrupted";
+                    case CANCELLED -> "the relay gave up on the call";
                     case INTERRUPTED_AFTER_WIND_DOWN -> "interrupted after the relay's wind-down";
                     default -> "not acknowledged within " + Duration.ofMillis(NANOSECONDS.toMillis(until - entry));
                 });
@@ -899,15 +903,18 @@ public final class KafkaOutboxSender implements AutoCloseable {
         }
 
         /** How {@link #await} ended. */
-        enum Ended { ACKED, INTERRUPTED, INTERRUPTED_AFTER_WIND_DOWN, LATE }
+        enum Ended { ACKED, INTERRUPTED, CANCELLED, INTERRUPTED_AFTER_WIND_DOWN, LATE }
 
         /**
          * {@code ACKED} once every started record completed or the call closed; otherwise at {@code until} (on
          * {@link System#nanoTime}) or on an interrupt, the flag kept. The relay's wind-down (an interrupt while
          * {@link ShardProcessor#windDownRequested()}) is not one: the records in flight get until {@code until} for
          * Kafka's own outcome, as closing the producer would turn them into retries, which a new producer sends again
-         * (a duplicate when Kafka had written them). Its interrupt is consumed and set again on return; the next one,
-         * as the relay's cancel, ends the wait. A call closed by a failure waits for the rest of its records: the close
+         * (a duplicate when Kafka had written them). Its interrupt is consumed and set again on return; the next one
+         * ends the wait. So does the relay's cancel ({@link ShardProcessor#callCancelled()}), at once, though its
+         * interrupt may come as one with the wind-down's: the relay has let the shard go, and a record still in flight
+         * could be written after a later one of its key. A call closed by a failure waits for the rest of its records:
+         * the close
          * aborts them at once, and the records of the failed batch behind the one that closed it bring their own
          * answers (a refusal among them).
          */
@@ -915,6 +922,9 @@ public final class KafkaOutboxSender implements AutoCloseable {
             boolean windingDown = false;
             try {
                 while (pending > 0 && (!closed || closedBy != null)) {
+                    if (ShardProcessor.callCancelled()) {
+                        return Ended.CANCELLED;
+                    }
                     if (Thread.currentThread().isInterrupted()) {
                         if (windingDown) {
                             return Ended.INTERRUPTED_AFTER_WIND_DOWN;
