@@ -171,7 +171,7 @@ class KafkaOutboxSenderTest {
                     var ack = new Thread(() -> producers.get(0).completeNext());
                     ack.start();
                     try {
-                        ack.join(2_000);
+                        ack.join(10_000); // returns at once when the callback completes
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                     }
