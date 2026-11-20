@@ -36,8 +36,10 @@ public final class KafkaOutboxHandler implements OutboxHandler {
             throw new KafkaException("Kafka send of outbox record " + record.id() + " failed", r.error());
         }
         if (outcome instanceof Outcome.NotAttempted n) {
-            throw new KafkaException(
-                    "outbox record " + record.id() + ": its topic or partition cools down until " + n.notBefore());
+            throw new KafkaException(n.notBefore() != null
+                    ? "outbox record " + record.id() + ": its topic or partition cools down until " + n.notBefore()
+                    : "outbox record " + record.id() + " was not handed to Kafka: the call was interrupted or ran out"
+                            + " of time first");
         }
     }
 
