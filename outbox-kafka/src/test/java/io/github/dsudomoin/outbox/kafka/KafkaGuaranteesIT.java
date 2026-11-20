@@ -56,9 +56,6 @@ class KafkaGuaranteesIT {
     private static final Duration CONSUME_TIMEOUT = Duration.ofSeconds(60);
     /** The suite's {@code delivery.timeout.ms} ({@link TestKafka#shortTimeouts}). */
     private static final Duration DELIVERY_TIMEOUT = Duration.ofSeconds(20);
-    /** The producer setting {@code relay.retry.holdPermanent} needs: one request in flight per connection. */
-    private static final Map<String, String> HELD_IN_ORDER =
-            Map.of(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, "1");
 
     private final JdbcTransactions transactions = new JdbcTransactions(TestDataSources.newDataSource());
     private final List<AutoCloseable> closing = new ArrayList<>(); // senders and runtimes, closed last first
@@ -291,14 +288,14 @@ class KafkaGuaranteesIT {
      * As {@link #aPoisonMessageGoesToTheDeadLetterTopicAndItsKeyContinues}, with {@code relay.retry.holdPermanent}: the
      * broker's refusal stops the key instead. Nothing is dead-lettered, the record after it stays out of the topic
      * while the other key goes on, and once the topic takes larger messages the next retry delivers both, in order.
-     * The producer has one request in flight per connection, as holdPermanent needs: with more, the broker may write
-     * the record after the poison while it refuses the poison.
+     * Kafka's default {@code max.in.flight.requests.per.connection} (5): the sender itself sends a held call with one
+     * request in flight, or the broker could write the record after the poison while it refuses the poison.
      */
     @Test
     void aMessageTooLargeForItsTopicStopsItsKeyWhenPermanentFailuresAreHeld() throws Exception {
         var topic = TestKafka.createTopic("t-" + UUID.randomUUID(), 1, Map.of("max.message.bytes", "1024"));
         var dlq = TestKafka.createTopic(topic + ".dlq", 1, Map.of());
-        var sender = sender(HELD_IN_ORDER);
+        var sender = sender();
         var runtime = start(OutboxRuntime.builder(config().holdPermanent(true), transactions, new Handler(sender))
                 .deadLetterHandler(new KafkaDeadLetterHandler(sender, "{topic}.dlq")));
 
@@ -320,16 +317,14 @@ class KafkaGuaranteesIT {
      * Kafka refuses the message before it sends it (larger than the producer's {@code max.request.size}), so the
      * producer stays open: with {@code relay.retry.holdPermanent} the sender then skips the rest of the key in the
      * call, as after a retriable failure, and the record after it stays out of the topic. A runtime whose producer
-     * takes the message delivers both, in order. One request in flight, as in
-     * {@link #aMessageTooLargeForItsTopicStopsItsKeyWhenPermanentFailuresAreHeld}.
+     * takes the message delivers both, in order.
      */
     @Test
     void aMessageTheProducerRefusesStopsItsKeyWhenPermanentFailuresAreHeld() throws Exception {
         var topic = TestKafka.createTopic("t-" + UUID.randomUUID(), 1, Map.of());
         var dlq = TestKafka.createTopic(topic + ".dlq", 1, Map.of());
         var config = config().holdPermanent(true);
-        var small = sender(Map.of(ProducerConfig.MAX_REQUEST_SIZE_CONFIG, "4096",
-                ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, "1"));
+        var small = sender(Map.of(ProducerConfig.MAX_REQUEST_SIZE_CONFIG, "4096"));
         var runtime = start(OutboxRuntime.builder(config, transactions, new Handler(small))
                 .deadLetterHandler(new KafkaDeadLetterHandler(small, "{topic}.dlq")));
 
@@ -342,7 +337,7 @@ class KafkaGuaranteesIT {
         assertHeld(runtime, topic, dlq, ids);
 
         runtime.close();
-        var sender = sender(HELD_IN_ORDER);
+        var sender = sender();
         var next = start(OutboxRuntime.builder(sameTables(config).holdPermanent(true), transactions,
                 new Handler(sender)).deadLetterHandler(new KafkaDeadLetterHandler(sender, "{topic}.dlq")));
         consumeCommitted(topic, r -> true);

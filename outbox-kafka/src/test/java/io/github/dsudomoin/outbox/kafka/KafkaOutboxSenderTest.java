@@ -46,6 +46,7 @@ import org.apache.kafka.clients.producer.BufferExhaustedException;
 import org.apache.kafka.clients.producer.Callback;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.MockProducer;
+import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.Partitioner;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
@@ -716,6 +717,72 @@ class KafkaOutboxSenderTest {
         assertThat(ids.get(0)).matches("orders-svc-outbox-\\d+");
         assertThat(ids.get(1)).matches("orders-svc-outbox-unbatched-\\d+");
         assertThat(ids.get(2)).matches("orders-svc-outbox-\\d+");
+    }
+
+    /**
+     * A call of a relay that holds permanent failures ({@code relay.retry.holdPermanent}) sends through a pool of its
+     * own, whose producers get the same properties but one request in flight per connection, so the broker cannot write
+     * a later record of a key while it refuses the held one; a call that does not hold them keeps the usual pool. Each
+     * pool reuses its producers.
+     */
+    @Test
+    void aCallThatHoldsPermanentFailuresSendsWithOneRequestInFlight() throws Exception {
+        var seen = new CopyOnWriteArrayList<Map<String, Object>>();
+        var sender = new KafkaOutboxSender(() -> props("bootstrap.servers", "localhost:9092", "client.id", "orders-svc"),
+                recording(seen, true));
+
+        assertThat(sender.send(List.of(record(1, "a")))).containsExactly(Outcome.delivered());
+        assertThat(held(sender, List.of(record(2, "a")))).containsExactly(Outcome.delivered());
+        assertThat(sender.send(List.of(record(3, "a")))).containsExactly(Outcome.delivered());
+        assertThat(held(sender, List.of(record(4, "a")))).containsExactly(Outcome.delivered());
+
+        assertThat(seen).as("one producer per pool").hasSize(2);
+        assertThat(seen.get(0)).doesNotContainKey(MAX_IN_FLIGHT);
+        assertThat((String) seen.get(0).get("client.id")).matches("orders-svc-outbox-\\d+");
+        assertThat((String) seen.get(1).get("client.id")).matches("orders-svc-outbox-held-\\d+");
+        var expected = new HashMap<>(seen.get(0));
+        expected.put(MAX_IN_FLIGHT, "1");
+        expected.put("client.id", seen.get(1).get("client.id"));
+        assertThat(seen.get(1)).isEqualTo(expected);
+        assertThat(producers.get(0).history()).as("the usual pool").hasSize(2);
+        assertThat(producers.get(1).history()).as("the held pool").hasSize(2);
+    }
+
+    /** A held call that holds a remembered record goes unbatched with one request in flight, from a pool of its own. */
+    @Test
+    void aHeldCallOfARememberedRecordSendsUnbatchedWithOneRequestInFlight() throws Exception {
+        var seen = new CopyOnWriteArrayList<Map<String, Object>>();
+        var sender = new KafkaOutboxSender(() -> props("bootstrap.servers", "localhost:9092", "client.id", "orders-svc"),
+                recording(seen, false));
+        var remembered = record(1, keyOnPartition(0));
+        var first = executor.submit(() -> held(sender, List.of(remembered)));
+        awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
+        first.get(5, SECONDS);
+
+        // its partition cools for 1 s, so it is not attempted, but the call holds it
+        assertThat(held(sender, List.of(remembered))).singleElement().isInstanceOf(Outcome.NotAttempted.class);
+        assertThat(seen).hasSize(2);
+        assertThat((String) seen.get(1).get("client.id")).matches("orders-svc-outbox-held-unbatched-\\d+");
+        var expected = new HashMap<>(seen.get(0));
+        expected.put("batch.size", "0");
+        expected.put("client.id", seen.get(1).get("client.id"));
+        assertThat(seen.get(1)).isEqualTo(expected);
+        assertThat(seen.get(1)).containsEntry(MAX_IN_FLIGHT, "1");
+    }
+
+    /** With the user's own one request in flight, a held call needs no producers of its own. */
+    @Test
+    void aUserSettingOfOneRequestInFlightNeedsNoPoolForHeldCalls() throws Exception {
+        var seen = new CopyOnWriteArrayList<Map<String, Object>>();
+        var sender = new KafkaOutboxSender(() -> props("bootstrap.servers", "localhost:9092", MAX_IN_FLIGHT, "1"),
+                recording(seen, true));
+
+        assertThat(sender.send(List.of(record(1, "a")))).containsExactly(Outcome.delivered());
+        assertThat(held(sender, List.of(record(2, "a")))).containsExactly(Outcome.delivered());
+        assertThat(sender.send(List.of(record(3, "a")))).containsExactly(Outcome.delivered());
+
+        assertThat(seen).hasSize(1);
+        assertThat(producers.get(0).history()).hasSize(3);
     }
 
     /** {@code clientIdSuffix=false} hands every producer of both pools the set {@code client.id} as it is. */
@@ -2040,6 +2107,29 @@ class KafkaOutboxSenderTest {
             return outcomes;
         });
         return new RelayCall(handler, executor.submit(handler::call), flagKept);
+    }
+
+    private static final String MAX_IN_FLIGHT = "max.in.flight.requests.per.connection";
+
+    /** {@link KafkaOutboxSender#send} inside a relay call that holds permanent failures. */
+    private static List<Outcome> held(KafkaOutboxSender sender, List<OutboxRecord> records) throws Exception {
+        var outcomes = new AtomicReference<List<Outcome>>();
+        TestHandlerCall.holdingPermanent(Duration.ofSeconds(30), () -> {
+            outcomes.set(sender.send(records));
+            return List.of();
+        }).call();
+        return outcomes.get();
+    }
+
+    /** A producer factory that keeps the properties of each producer it makes in {@code seen}. */
+    private Function<Map<String, Object>, Producer<byte[], byte[]>> recording(List<Map<String, Object>> seen,
+            boolean autoComplete) {
+        return properties -> {
+            seen.add(properties);
+            var producer = new TestProducer(autoComplete, r -> null);
+            producers.add(producer);
+            return producer;
+        };
     }
 
     private Future<List<Outcome>> sendAsync(KafkaOutboxSender sender, List<OutboxRecord> records) {
