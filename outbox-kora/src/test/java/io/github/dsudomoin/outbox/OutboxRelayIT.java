@@ -221,6 +221,44 @@ class OutboxRelayIT {
     }
 
     /**
+     * Under a steady stream of commits the relay ticks about once per {@code minTickInterval}, not every other
+     * interval: its own previous tick, written a few milliseconds into the previous attempt, is younger than the
+     * interval at the next attempt and must not make that attempt skip, or a commit waits about two intervals.
+     */
+    @Test
+    @Tag("timing") // a tick rate: a starved CI runner misses it
+    void ticksUnderLoadComeAboutOncePerMinTickInterval() throws Exception {
+        config.minTickInterval(Duration.ofMillis(50)).idlePollInterval(Duration.ofMillis(200));
+        bootstrap();
+        var handler = new RecordingHandler();
+        var relay = start(handler);
+        var outbox = outbox(relay::wake);
+        awaitParked();
+
+        long before;
+        try (var c = TestDb.connect()) {
+            before = queryLong(c, "select coalesce(max(id), 0) from " + schema.names().tick());
+        }
+        long started = System.nanoTime();
+        int sent = 0;
+        while (System.nanoTime() - started < TimeUnit.SECONDS.toNanos(2)) { // a wake-up every commit
+            send(outbox, msg("t", "k" + sent % 10, "m" + sent));
+            sent++;
+        }
+        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+        long made;
+        try (var c = TestDb.connect()) {
+            made = queryLong(c, "select count(*) from " + schema.names().tick() + " where id > " + before);
+        }
+
+        assertThat(sent).isGreaterThan(200);
+        assertThat(made).as("ticks in %d ms at minTickInterval 50 ms", elapsedMillis)
+                .isGreaterThanOrEqualTo((long) (elapsedMillis / 50 * 0.7));
+        int total = sent;
+        await(Duration.ofSeconds(5), () -> handler.delivered().size() == total);
+    }
+
+    /**
      * A backlog keeps a pass going; the pass still hands its connection back to the pool every bound, so the pool can
      * retire it at maxLifetime and its leak detection sees no borrow longer than the bound and a step.
      */

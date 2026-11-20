@@ -110,6 +110,13 @@ public final class OutboxRelay implements AutoCloseable {
      * commits, which only idle ticks cover.
      */
     private final Duration idleTickAge;
+    /**
+     * A wake-up's tick attempt inserts only when the newest tick is older than this: three quarters of
+     * {@code minTickInterval}, for the reason {@link #idleTickAge} gives. With the full interval this relay's own
+     * previous tick, written a few milliseconds into the previous attempt, is younger than the interval at the next
+     * one, so under a steady stream of commits every other attempt skipped and a commit waited about two intervals.
+     */
+    private final Duration wakeTickAge;
     /** Incremented by every {@link #wake()}. */
     private final AtomicLong wakeups = new AtomicLong();
     /** Incremented by every tick this relay inserts; parked workers wake on it. */
@@ -218,6 +225,7 @@ public final class OutboxRelay implements AutoCloseable {
         this.roundReadSince = System.nanoTime() - roundWaitNanos;
         this.socket = new SocketBound(config.networkTimeout());
         this.idleTickAge = Duration.ofNanos(Math.max(minTickNanos, idleNanos - idleNanos / 4));
+        this.wakeTickAge = Duration.ofNanos(minTickNanos - minTickNanos / 4);
         this.lastTickAttempt = System.nanoTime() - idleNanos; // the first pass ticks
         this.stepStarted = new AtomicLongArray(config.shards());
         this.isolated = new AtomicIntegerArray(config.shards());
@@ -1184,11 +1192,11 @@ public final class OutboxRelay implements AutoCloseable {
      * A tick attempt when {@code idlePollInterval} passed since the last one, or when a wake-up's commit is
      * not yet covered and {@code minTickInterval} passed since the last attempt (so under load at most one attempt per
      * {@code minTickInterval}, a wake-up waiting at most that long). The attempt skips its insert when the newest tick
-     * is younger than {@code minTickInterval} with a wake-up pending, else younger than {@link #idleTickAge}: an idle
-     * tick of another instance then stands for this one's. An inserted tick covers the commits seen before the
-     * attempt; one {@link Ticks#make} skipped for a younger tick covers only those seen {@code minTickInterval} before
-     * it, since that younger tick may predate the rest, which therefore get another attempt {@code minTickInterval}
-     * later. Each inserted tick wakes all workers; one refused for an xid regression refreshes the halt at once.
+     * is younger than {@link #wakeTickAge} with a wake-up pending, else younger than {@link #idleTickAge}: a tick of
+     * another instance then stands for this one's. An inserted tick covers the commits seen before the attempt; one
+     * {@link Ticks#make} skipped for a younger tick covers only those seen {@code minTickInterval} before it (that tick
+     * is at most three quarters of the interval old, so its snapshot comes after them), since that younger tick may
+     * predate the rest, which therefore get another attempt {@code minTickInterval} later. Each inserted tick wakes all workers; one refused for an xid regression refreshes the halt at once.
      * Returns whether it made the attempt.
      */
     private boolean tickIfDue(Connection c, long seen) throws SQLException {
@@ -1200,7 +1208,7 @@ public final class OutboxRelay implements AutoCloseable {
                 return false;
             }
             lastTickAttempt = attempt = now;
-            youngest = wakePending ? relay.minTickInterval() : idleTickAge;
+            youngest = wakePending ? wakeTickAge : idleTickAge;
         }
         var made = ticks.tick(c, youngest);
         if (made == Ticks.Made.REGRESSED) {
