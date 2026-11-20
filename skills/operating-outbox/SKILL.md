@@ -17,7 +17,7 @@ against the library's tables**; run only the README's SQL, on a staging copy fir
 |---|---|---|
 | `outbox.shard.lag` growing | Target down, slow handler, too few workers; ERROR «outbox shards [...] start from ticks [...] that no longer exist»: stranded shards, one `POST /recovery/stranded-shards` | «Обработка сбоев», «Застрявшие шарды» |
 | `outbox.retry.oldest` > N × `relay.retry.maxDelay` (e.g. 30 min at the 5 min default) | A retry head that will not clear: with `maxAttempts = 0` (default) its key retries for ever and its later records queue behind it. `outbox.shard.lag` does not see it (the shard moves on with other keys); the WARN «streams diverted to retry» fired once, at the divert. The age counts from the send, not the first failure: lag growing too means the target is down (row above). Fix the handler or target; clear the key now with `keys/abandon` ([admin-api.md](admin-api.md)) | «Алерты», «Ключ, который не проходит никогда» |
-| `outbox.maintenance.since_success` > 5 × `maintenanceInterval` | One step failing every run, named by its WARN «outbox maintenance step '...' failed» (partitions stall only behind 'finish pending detach', 'partition extension', 'cursor read', 'checkpoint' or 'partition drop', ticks behind 'cursor read', 'checkpoint' or 'tick cleanup'), or no run starts: a session holds the maintenance lock; `transaction_pooling` = 1: a pooler; only WARN «'finish pending detach' ... FINALIZE»: drops stop, it names the sessions with the oldest snapshots; hourly ERROR «over outbox.partitions.maxTailScan»: a hot tail over `maxTailScan` went a whole `tailConversion` window unconverted (at once without a window), every write goes into it and nothing will convert it | «Обслуживание работает там же, где relay» |
+| `outbox.maintenance.since_success` > 5 × `maintenanceInterval` | One step failing every run, named by its WARN «outbox maintenance step '...' failed» (partitions stall only behind 'finish pending detach', 'partition extension', 'cursor read', 'checkpoint' or 'partition drop', ticks behind 'cursor read', 'checkpoint' or 'tick cleanup'), or no run starts: a session or lock-holder transaction holds the maintenance lock; only WARN «'finish pending detach' ... FINALIZE»: drops stop, it names the sessions with the oldest snapshots; hourly ERROR «over outbox.partitions.maxTailScan»: a hot tail over `maxTailScan` went a whole `tailConversion` window unconverted (at once without a window), every write goes into it and nothing will convert it | «Обслуживание работает там же, где relay» |
 | `outbox.inbox.window.remaining` < (`outbox.inbox.premake` − `outbox.inbox.partitionInterval`) / 2 (41 400 s by default), or `outbox.inbox.outside_window` growing faster than usual | The instance's inbox stops deduplicating new ids soon (or did): no instance makes inbox ranges (ERROR «outbox inbox maintenance of ... failed», the cause in it), or this instance's schedule stopped (ERROR «... stopped by a fatal error»: restart). Normally between `premake − partitionInterval − maintenanceInterval` and `premake` (an instance that makes no ranges may lag one more `maintenanceInterval`); with no range left it keeps falling below 0. The counter also counts non-v7 ids | «Алерты», «Потребление через inbox» |
 | `outbox.partitions.xids_left` not NaN | Tail detached: inserts fail at 0 | «Партиции» |
 | `outbox.dead.pending.oldest` > X (X > `relay.retry.maxDelay`) and `outbox.dead.hook.failures` or `outbox.dead.decisions{decision="retry_later"}` growing | Hook failing or putting letters off (Kafka DLQ: a missing DLQ topic, say): letters wait | «Dead letters» |
@@ -55,7 +55,7 @@ Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dash
   records block it until delivered or abandoned), stop all instances (old release too), start
   one with the new value, then the rest; startup refuses while another instance with a different count runs
   («Решардинг», [config-reference.md](../using-outbox/config-reference.md)).
-- **Pool:** `db.maxPoolSize` ≥ own peak + `relay.workers` + 3, + 1 while `drain()` runs. Profiles:
+- **Pool:** `db.maxPoolSize` ≥ own peak + `relay.workers` + 5, + 1 while `drain()` runs. Profiles:
   [sizing-examples.md](../using-outbox/sizing-examples.md).
 - **Heartbeat connection:** in Kora (and in Spring Boot, see below) the heartbeat takes nothing from `db.maxPoolSize`;
   it holds a pool of its own, `<db.poolName>-outbox-heartbeat`, one connection always open: +1 server connection per
@@ -76,7 +76,7 @@ Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dash
 
 Metrics, alerts and procedures are the same. What differs:
 
-- **Pool:** `spring.datasource.hikari.maximum-pool-size` ≥ own peak + `relay.workers` + 3, + 1 while `drain()` runs, +
+- **Pool:** `spring.datasource.hikari.maximum-pool-size` ≥ own peak + `relay.workers` + 5, + 1 while `drain()` runs, +
   one per concurrent `@Transactional` handler call. Hikari's default of 10 is below that at the default 4 workers with
   such handlers (11).
 - **Heartbeat:** by default a copy of the app's Hikari pool, one connection always open, named `<pool>-outbox-heartbeat`

@@ -73,7 +73,7 @@ it by message id within their window.
   `handle`. `OutboxDeadLetterHandler.NONE` is that without a class of its own (`active()` returns `false`).
 - **Isolation.** The hook runs on the thread `outbox-dead-letter-hook`, outside every relay thread and transaction:
   a slow or failing hook never delays delivery. The pass thread `outbox-dead-letters` holds one connection for its
-  whole run, hook call included (the `+ 3` of the pool budget). Letters are locked `for update skip locked`, so two
+  whole run, hook call included (part of the `+ 5` of the pool budget). Letters are locked `for update skip locked`, so two
   instances never hand one letter to the hook at once; order between letters is not guaranteed. The pass runs only
   where the relay runs; with the relay off, only the pass at the end of `drain()` calls the hook.
 - **Wiring.** One component of type `OutboxDeadLetterHandler` (or a subtype) per graph. With `KafkaOutboxModule` it

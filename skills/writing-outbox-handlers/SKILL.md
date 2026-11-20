@@ -175,7 +175,7 @@ class OrderProjection implements OutboxTopicHandler {
   raw `Throwable` that is neither `Exception` nor `Error` commits. A class-level `@Transactional` on a subclass whose
   `handle` comes from an unannotated base runs no transaction.
 - **Pool**: the transaction takes a second connection while the relay holds the step's: + one per concurrent handler
-  call, so `2 × relay.workers + 3` plus own peak for sequential handlers (11 at the defaults, Hikari's default is 10).
+  call, so `2 × relay.workers + 5` plus own peak for sequential handlers (13 at the defaults, Hikari's default is 10).
 - An `outbox.send` inside it joins it: the follow-up commits with the effects.
 
 ## Waiting and contract versions

@@ -30,7 +30,7 @@ on Apple M5 Pro cores and a single Kafka broker with replication factor 1. Your 
 
 | Quantity | Formula | Source |
 |---|---|---|
-| Pool per instance | `db.maxPoolSize` = own need + `relay.workers` + 3 (+1 while `drain()` runs); the 3 are outbox maintenance, inbox maintenance and the dead-letter thread. Besides: after an upgrade the one-time `<table>_dead_due` build (thread `outbox-dead-index`) holds one while it runs. The heartbeat takes none from it: in Kora it has a pool of its own of one connection (`outbox.heartbeat.dedicatedConnection`, default `true`) | README «Размер пула соединений» |
+| Pool per instance | `db.maxPoolSize` = own need + `relay.workers` + 5 (+1 while `drain()` runs); the 5 are outbox maintenance (2: work + lock holder), inbox maintenance (2) and the dead-letter thread. Besides: the start takes one more while it runs, an admin repair call one for the call, and after an upgrade the one-time `<table>_dead_due` build (thread `outbox-dead-index`) holds two while it runs. The heartbeat takes none from it: in Kora it has a pool of its own of one connection (`outbox.heartbeat.dedicatedConnection`, default `true`) | README «Размер пула соединений» |
 | Postgres connections | Σ over services and instances of `maxPoolSize` + 1 per outbox instance (the heartbeat's own connection) + other clients + `superuser_reserved_connections` (3) ≤ `max_connections` (Postgres default 100); the + 1 also counts against the role's `CONNECTION LIMIT` and a pooler's per-user pool | Postgres, README «Размер пула соединений» |
 | Advisory lock slots | `max_locks_per_transaction × (max_connections + max_prepared_transactions)` ≥ concurrent writer transactions × distinct keys each + other locks | README «max_locks_per_transaction для массовой отправки» |
 | Kafka call budget | `batchTimeout ≥ delivery.timeout.ms + 5 s + max.block.ms` (defaults 120 + 5 + 5 = 130 s) | `KafkaOutboxSender` |
@@ -72,7 +72,7 @@ service's own peak need 8 connections.
 
 ```hocon
 db {
-  maxPoolSize = 13              # own 8 + relay.workers 2 + 3
+  maxPoolSize = 15              # own 8 + relay.workers 2 + 5
 }
 outbox {
   table = "orders.outbox"       # outbox.shards unset: 256 for a new outbox
@@ -88,7 +88,7 @@ kafka-topics.sh --bootstrap-server "$KAFKA" --create --topic orders --partitions
   --replication-factor 3 --config min.insync.replicas=2 --config unclean.leader.election.enable=false
 ```
 
-**Postgres:** 2 × (13 + 1 heartbeat) = 28 connections. Each transaction holds 1 key lock, so the default
+**Postgres:** 2 × (15 + 1 heartbeat) = 32 connections. Each transaction holds 1 key lock, so the default
 `max_locks_per_transaction` (64) is enough.
 
 **Why these numbers:** the default shard count costs nothing extra here: idle cost is about 1 / 0.2 s = 5 write
@@ -108,7 +108,7 @@ Writer service:
 
 ```hocon
 db {
-  maxPoolSize = 26              # own 20 + relay.workers 3 + 3
+  maxPoolSize = 28              # own 20 + relay.workers 3 + 5
 }
 outbox {
   table = "orders.outbox"       # outbox.shards unset: 256
@@ -126,7 +126,7 @@ Consumer service (`InboxModule` alone):
 
 ```hocon
 db {
-  maxPoolSize = 9               # 4 listener threads (one transaction per poll) + 1 inbox maintenance + own 4
+  maxPoolSize = 10              # 4 listener threads (one transaction per poll) + 2 inbox maintenance (work + lock holder) + own 4
 }
 outbox.inbox {
   table = "billing.inbox"       # defaults: partitionInterval 1h, premake 24h, retention 24h
@@ -150,7 +150,7 @@ kafka-topics.sh --bootstrap-server "$KAFKA" --create --topic orders --partitions
 
 **Postgres:**
 
-- Connections: 3 × (26 + 1 heartbeat) + 3 × 9 = 108 (an inbox-only service has no heartbeat). That is above the
+- Connections: 3 × (28 + 1 heartbeat) + 3 × 10 = 117 (an inbox-only service has no heartbeat). That is above the
   default `max_connections` (100) before any other client, so raise it (the bench used 300).
 - Locks: ≤ 3 keys per transaction, so the default `max_locks_per_transaction` is enough. Send several keyed messages
   of one transaction with one `sendAll`.
@@ -175,7 +175,7 @@ kafka-topics.sh --bootstrap-server "$KAFKA" --create --topic orders --partitions
 
 ```hocon
 db {
-  maxPoolSize = 15              # own 6 + 2 writers + relay.workers 4 + 3
+  maxPoolSize = 17              # own 6 + 2 writers + relay.workers 4 + 5
 }
 outbox {
   table = "imports.outbox"      # outbox.shards unset: 256
@@ -226,7 +226,7 @@ kafka-topics.sh --bootstrap-server "$KAFKA" --create --topic imports --partition
 
 ```hocon
 db {
-  maxPoolSize = 26              # own 20 + relay.workers 3 + 3
+  maxPoolSize = 28              # own 20 + relay.workers 3 + 5
 }
 outbox {
   table = "orders.outbox"       # outbox.shards unset: 256
@@ -263,7 +263,7 @@ httpClient.audit {
   ([concurrent-delivery.md](../writing-outbox-handlers/concurrent-delivery.md)), or publish audit to Kafka and call
   HTTP from a consumer.
 - Concurrent variant for 2 000 orders/s with one audit event each (4 000 rows/s, about half of them audit): `workers`
-  4, `batchSize` 400, P = 200 requests in flight per call, `db.maxPoolSize` = own 20 + 4 + 3 = 27. Estimates, not
+  4, `batchSize` 400, P = 200 requests in flight per call, `db.maxPoolSize` = own 20 + 4 + 5 = 29. Estimates, not
   measured:
   - Calls running: min(256, 3 × 4) = 12, and 8 with one instance down (2 × 4).
   - A call carries ≈ 200 audit records, one round of P: ≈ 0.3 s plus ≈ 0.05 s for the database step and the Kafka
@@ -285,7 +285,7 @@ httpClient.audit {
 
 ```hocon
 db {
-  maxPoolSize = 7               # test code 2 + relay.workers 1 + 3 + 1 for drain()
+  maxPoolSize = 9               # test code 2 + relay.workers 1 + 5 + 1 for drain()
 }
 outbox {
   table = "outbox_orders_it"    # unique per test class when classes share one database

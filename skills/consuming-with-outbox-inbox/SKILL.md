@@ -110,5 +110,5 @@ Consume-only service: `InboxModule` alone, no `OutboxModule`, no handler. By def
 table: the DB role needs `CREATE` and ownership. With migrations (`outbox.schema.bootstrap = false`, the output of
 `OutboxSql.inbox(config, "<app role>")` in a Flyway or Liquibase migration) the app role is DML-only and a
 `JdbcDatabase` tagged `@Tag(OutboxOwner.class)` owns the table (using-outbox, `config-reference.md`). Either way:
-direct or session-mode connections (no transaction pooling), Postgres 14+, and the same `outbox.inbox.table` on every
+direct, session-mode or transaction-mode pooler connections (see using-outbox, Connections), Postgres 14+, and the same `outbox.inbox.table` on every
 instance.

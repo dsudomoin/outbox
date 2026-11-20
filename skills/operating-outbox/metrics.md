@@ -46,10 +46,11 @@ README «Наблюдаемость» → «Контракт по этапам»
 | `outbox.partitions.xids_left` | gauge | | xids left before inserts fail while the tail is detached; NaN while attached. |
 | `outbox.partitions.retained` | gauge | | Attached ranges entirely below the one holding the current xid: passed, not dropped yet; 0 after a run normally. Counts ranges a shard behind keeps too. When ≥ 2 of them lie above the latest tick's xmin (kept with every shard past them) for 3 runs in a row, a WARN «outbox keeps N ranges of ...» (at most once a minute) names the cluster's oldest xid holders; another role's session is named without `pg_read_all_stats` too, with its state and transaction age hidden. |
 | `outbox.partitions.orphaned` | gauge | | Detached ranges kept because they hold rows. |
-| `outbox.maintenance.transaction_pooling` | gauge | | 1 when the last maintenance run detected a transaction pooler. |
+| `outbox.maintenance.transaction_pooling` | gauge | | Always 0, deprecated: the library works behind a transaction pooler and no longer detects one. Kept so dashboards and alerts keep working; to be removed in a later release. |
 | `outbox.maintenance.since_success` | gauge, seconds | | Since the last finished maintenance run on any instance. |
 | `outbox.inbox.outside_window` | counter | | Ids accepted without dedup (outside the window, or not UUIDv7). |
-| `outbox.inbox.maintenance.transaction_pooling`, `outbox.inbox.partitions.orphaned` | gauges | | The same for the inbox. |
+| `outbox.inbox.partitions.orphaned` | gauge | | The same for the inbox. |
+| `outbox.inbox.maintenance.transaction_pooling` | gauge | | Always 0, deprecated, like `outbox.maintenance.transaction_pooling`. |
 | `outbox.inbox.window.remaining` | gauge, seconds | | Until the top of this instance's dedup window (database clock); newer ids are accepted without dedup. Every inbox maintenance run refreshes the window. NaN before the inbox starts; with no range left it keeps falling from the last window's top, below 0. Read at scrape time. |
 
 Outbox gauges are refreshed by maintenance every `outbox.partitions.maintenanceInterval` on the instance that runs
@@ -91,8 +92,8 @@ this instance runs with outbox.shards = M ...»), a heartbeat connection source 
 can: a standby, a read-only role or missing rights («outbox heartbeat connection source of ... cannot write ...»; both at
 most hourly, the source is checked again after 5 × `maintenanceInterval`), the xid regression, a detached tail,
 a swap not run on 10 due runs or with ranges running out (hourly, names the cause), a hot tail over `maxTailScan`
-outside the window (hourly), a window that ended without converting it («... ended without a conversion», once), orphans
-and transaction pooling. WARN «outbox tick made without its shard set» (at most once a minute): a partition is held by
+outside the window (hourly), a window that ended without converting it («... ended without a conversion», once) and orphans.
+WARN «outbox tick made without its shard set» (at most once a minute): a partition is held by
 an `ACCESS EXCLUSIVE` lock (`ALTER TABLE`, `VACUUM FULL`, `TRUNCATE`, a manual `LOCK`), so ticks step every shard and
 lag grows while it lasts.
 

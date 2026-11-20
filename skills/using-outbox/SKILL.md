@@ -192,7 +192,7 @@ spring:
   datasource:
     hikari:
       pool-name: app            # the heartbeat pool's name derives from it
-      maximum-pool-size: 20     # own peak + relay.workers + 3; more with @Transactional handlers
+      maximum-pool-size: 20     # own peak + relay.workers + 5; more with @Transactional handlers
   kafka:
     bootstrap-servers: kafka-1:9092
 outbox:
@@ -318,10 +318,14 @@ for ops:
    `REASSIGN OWNED BY`: it moves everything the role owns in the database, the app's own tables included.
    `pg_read_all_stats` recommended for the role that runs maintenance; no role `statement_timeout` of
    seconds.
-3. **Connections**: direct or session-mode pooler for whatever runs startup and maintenance. Behind transaction pooling
-   only the app's own `DataSource` may go, with `prepareThreshold=0`, the `search_path` set on the role or a
-   schema-qualified `outbox.table`, and a direct owner database (the split above).
-   `db.maxPoolSize` ≥ the service's own peak + `relay.workers` + 3 (+ 1 while `drain()` runs). Leave `outbox.shards`
+3. **Connections**: direct, session-mode or transaction-mode pooler (pgbouncer, Odyssey), nothing is set for the
+   session and no session advisory lock is used. Behind a transaction-mode pooler: `prepareThreshold=0` on the
+   DataSource (or a pooler that keeps prepared statements: pgbouncer 1.21+ with `max_prepared_statements` > 0), the
+   `search_path` set on the role or a schema-qualified `outbox.table`, and a pooler pool per user of at least instances
+   × (`relay.workers` + 5) plus the service's own load. Start checks the prepared statements and fails naming the fix.
+   The `CONCURRENTLY` statements (detach, `<table>_dead_due` build) run under the role's `statement_timeout`.
+   Maintenance locks live in a lock-holder transaction on a second connection: a maintenance run takes two.
+   `db.maxPoolSize` ≥ the service's own peak + `relay.workers` + 5 (+ 1 while `drain()` runs). Leave `outbox.shards`
    unset (256 for a new outbox). The heartbeat's own pool adds one server connection per instance: count it into
    `max_connections`, the role's `CONNECTION LIMIT` and a pooler's per-user pool. A limit sized to exactly instances
    × `maxPoolSize`: raise it by 1 per instance before the upgrade, or set
@@ -345,7 +349,7 @@ for ops:
    `kafka-topics.sh --bootstrap-server "$KAFKA" --create --topic <topic> --partitions <N> --replication-factor 3 --config min.insync.replicas=2 --config unclean.leader.election.enable=false`
 7. **Relay** enabled on at least one instance: maintenance and the dead-letter pass run only there.
 8. **Alerts**: `outbox.shard.lag` growing, `outbox.dead.size > 0`, `outbox.maintenance.since_success > 5 ×
-   maintenanceInterval`, `outbox.maintenance.transaction_pooling = 1`, `outbox.partitions.premade < 2`, `overflow = 1`,
+   maintenanceInterval`, `outbox.partitions.premade < 2`, `overflow = 1`,
    `xids_left` not NaN, `orphaned > 0`, `retained ≥ 2` over 3 runs, `outbox.waiting.oldest > 900`
    (`relay.waiting.alertAfter`), `outbox.retry.oldest > N × relay.retry.maxDelay` (e.g. 30 min at the 5 min default),
    `outbox.messages.contract_rejected` or `outbox.messages.route_rejected` growing, `outbox.messages.route_unchecked`
