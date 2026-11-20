@@ -201,6 +201,9 @@ class XidRecoveryIT {
         var outbox = outbox(relay);
         send(outbox, msg("t", "x", "first"));
         await(Duration.ofSeconds(5), () -> count(names.dead()) == 1);
+        // the run the relay started with holds the maintenance lock until it ends: a run of ours completes only after
+        // it, and the run below then is the one that meets the rewound sequence
+        await(Duration.ofSeconds(10), maintenance::runOnce);
         try (var c = TestDb.connect()) { // a live repoint onto a copy whose outbox id sequence was not carried
             execute(c, "alter table " + names.base() + " alter column id restart with 1");
         }
