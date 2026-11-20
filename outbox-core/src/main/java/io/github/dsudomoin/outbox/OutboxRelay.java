@@ -139,12 +139,11 @@ public final class OutboxRelay implements AutoCloseable {
     private final AtomicIntegerArray failedAlone;
     private final AtomicLongArray retryAfter;
     /**
-     * Per shard, the rows its next step is expected to read: {@code batchSize} while its batch is unfinished and after
-     * a step that left it untouched (unread behind a cut, or not attempted); else the rows its last batch delivered (0
-     * before it delivered any). A group
-     * takes shards until their rows would pass {@code batchSize}, which a group's read and call share, so a busy or
-     * slow shard is stepped alone (a cut read leaves the shards after it untouched and its own rest to be read again)
-     * while many shards with a few rows each share one step. In memory, per relay instance; {@link #batchRows}: what
+     * Per shard, the rows its next step is expected to read: {@code batchSize} while its batch is unfinished; else the
+     * rows its last batch delivered (0 before it delivered any), kept by a step that left it untouched (unread behind a
+     * cut, or not attempted). A group takes shards until their rows would pass {@code batchSize}, which a group's read
+     * and call share, so a shard with an unfinished batch is stepped alone (a cut read leaves the shards after it
+     * untouched and its own rest to be read again) while shards that finish their batches share steps. In memory, per relay instance; {@link #batchRows}: what
      * the batch in progress delivered so far.
      */
     private final AtomicIntegerArray expected;
@@ -550,14 +549,14 @@ public final class OutboxRelay implements AutoCloseable {
         }
     }
 
-    /** {@code shards} in groups of at most {@link #MAX_GROUP} whose {@link #expected} rows fit in {@code batchSize}. */
+    /** {@code shards} in groups of at most {@link #MAX_GROUP} whose {@link #expected} rows stay below {@code batchSize}. */
     private List<List<Integer>> groups(List<Integer> shards) {
         var groups = new ArrayList<List<Integer>>();
         var group = new ArrayList<Integer>();
         long rows = 0;
         for (var shard : shards) {
             if (!group.isEmpty() && (group.size() == MAX_GROUP || busy(group.get(group.size() - 1)) || busy(shard)
-                    || rows + expected.get(shard) > relay.batchSize())) {
+                    || rows + expected.get(shard) >= relay.batchSize())) {
                 groups.add(group);
                 group = new ArrayList<>();
                 rows = 0;
@@ -572,13 +571,15 @@ public final class OutboxRelay implements AutoCloseable {
     }
 
     /**
-     * Expected to read more than {@code batchSize / 16} rows: such a shard steps alone. Its step's own statements cost
-     * little next to its rows, while a group of a few such shards would share one {@code batchSize} read, be cut, and
-     * read the rest of its shards again (bulk at 32 shards, about 600 rows a shard per batch, lagged several ticks
-     * behind stepping shards alone); grouping pays off for many shards with a few rows each.
+     * Its batch is unfinished, or it was left untouched with a batch in progress: it holds at least a {@code batchSize}
+     * read, so it steps alone. Every other shard is packed by its {@link #expected} rows: a group's read takes the
+     * shards in order and stops inside one shard at most, so only that one and the shards after it read again. A
+     * lower bound for stepping alone (more than {@code batchSize / 16} rows, as before) kept the relay in a slow mode
+     * under steady load: with every shard stepping alone, a cycle grew long enough for each to gather that many rows
+     * again.
      */
     private boolean busy(int shard) {
-        return expected.get(shard) > relay.batchSize() / 16;
+        return expected.get(shard) >= relay.batchSize();
     }
 
     /** Untouched by its step: it has work, and the step delivered none of it (unread behind a cut, not attempted). */
@@ -588,6 +589,10 @@ public final class OutboxRelay implements AutoCloseable {
 
     /** Updates {@link #expected} from the results of one step of {@code group}. */
     private void learn(List<Integer> group, List<ShardResult> results) {
+        int largest = 0; // the most rows a shard of this step delivered
+        for (var result : results) {
+            largest = Math.max(largest, result.delivered());
+        }
         for (int i = 0; i < group.size(); i++) {
             var result = results.get(i);
             int shard = group.get(i);
@@ -597,13 +602,12 @@ public final class OutboxRelay implements AutoCloseable {
             } else if (result.status() == ShardStatus.PROGRESS && rows > 0) {
                 expected.set(shard, rows); // its batch ended
                 batchRows.set(shard, 0);
+            } else if (untouched(result)) {
+                // unread behind a cut or not attempted: it goes back ahead of the others, expecting at least what the
+                // largest shard read with it delivered, so the next group stays below the cut (with every estimate
+                // still unknown, groups would be cut again and again behind their first shard)
+                expected.set(shard, Math.max(expected.get(shard), largest));
             } // else nothing new about its rows: nothing to do, paused or locked elsewhere
-            if (untouched(result)) {
-                // unread behind a cut or not attempted: alone next, not in a group cut again; a shard that kept the
-                // call or the read from shards after it ends its batch or moves to the latest tick, so they sort ahead
-                // of it in the next round
-                expected.set(shard, relay.batchSize());
-            }
         }
     }
 
@@ -752,7 +756,7 @@ public final class OutboxRelay implements AutoCloseable {
      * this relay whose pass sees that tick: each takes the next group of shards in candidate order
      * ({@link Worker#candidates}, {@link #take}). A shard a step left with work (not caught up to the step's tick)
      * goes back to the end of the round current when the step ends, those the step left untouched ahead of the others
-     * and alone ({@link #expected}). A shard that kept a group's call or read to itself (a slow call wound down at the
+     * ({@link #expected}). A shard that kept a group's call or read to itself (a slow call wound down at the
      * soft deadline, a hot shard filling the read, the default handler's stop after 3 failing keys) is behind them:
      * it ends its batch or moves on, so in the next round, which sorts by effective tick afresh, the shards it left
      * unread sort ahead of it. A new tick ends the round: the next pass reads the cursors again.
@@ -783,8 +787,8 @@ public final class OutboxRelay implements AutoCloseable {
         }
 
         /**
-         * The next group, empty when the round is done: at most {@link #groupSize} shards, and no more than fit in
-         * {@code batchSize} by their {@link #expected} rows (at least one; a {@link #busy} shard alone); each is
+         * The next group, empty when the round is done: at most {@link #groupSize} shards whose {@link #expected} rows stay
+         * below {@code batchSize} (at least one; a {@link #busy} shard alone); each is
          * {@link #inFlight} until its step
          * ends. A shard another worker steps is passed over and {@link #wanted}: that step puts it into the round
          * current then. A shard a sibling stepped after the read at this round's tick or a newer one is skipped: its
@@ -816,7 +820,7 @@ public final class OutboxRelay implements AutoCloseable {
                     continue;
                 }
                 boolean alone = isolated.get(shard) == 1 || busy(shard);
-                if (!group.isEmpty() && (alone || rows + expected.get(shard) > relay.batchSize())) {
+                if (!group.isEmpty() && (alone || rows + expected.get(shard) >= relay.batchSize())) {
                     break;
                 }
                 if (!inFlight.compareAndSet(shard, 0, 1)) { // taken from another round just now: the check above

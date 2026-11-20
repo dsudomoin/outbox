@@ -320,8 +320,9 @@ public final class ShardProcessor implements AutoCloseable {
      * Each shard is classified on its own, with these rules across shards:
      * <ul>
      *   <li>The read takes at most {@code batchSize} rows in all; when it is cut there and the shards' limits add up
-     *   to more, a shard with rows is mid-batch at its last row, and a shard without is untouched (it may simply be
-     *   unread). When the limits fit in {@code batchSize}, nothing is cut: every shard read all it asked for.</li>
+     *   to more, it stopped inside the last shard that returned rows, which is mid-batch at its last row: a shard
+     *   before it read all it asked for, and a shard after it is untouched (it may simply be unread). When the limits
+     *   fit in {@code batchSize}, nothing is cut: every shard read all it asked for.</li>
      *   <li>When the call attempted any record, a shard whose handed rows all came back NotAttempted without
      *   {@code notBefore} (the default handler stopping after other shards' failing keys, a wind-down) is untouched.
      *   The default handler's stop after 3 failing keys counts keys across the whole call, so it can straddle two
@@ -505,11 +506,20 @@ public final class ShardProcessor implements AutoCloseable {
             boolean cut = budgeted ? batch.bytesCut() || rowCut : rowCut;
             var shared = new ArrayList<Step>(reads.size());
             var alone = new ArrayList<Step>();
-            for (var s : reads) {
+            // a cut read stops inside one shard at most, in the order of the reads (BatchReader.readMany): a shard
+            // before the last that returned rows read all it asked for, so only that one and those after it are cut
+            int lastWithRows = -1;
+            for (int i = 0; i < reads.size(); i++) {
+                if (!batch.rows().get(reads.get(i).shard).isEmpty()) {
+                    lastWithRows = i;
+                }
+            }
+            for (int i = 0; i < reads.size(); i++) {
+                var s = reads.get(i);
                 s.rows = new ArrayList<>(batch.rows().get(s.shard));
-                s.cut = cut;
-                boolean finished = !cut && s.rows.size() < s.limit;
-                if (s.probe && !cut && s.rows.size() == 1 && s.rows.get(0).blocked()) {
+                s.cut = cut && i >= lastWithRows;
+                boolean finished = !s.cut && s.rows.size() < s.limit;
+                if (s.probe && !s.cut && s.rows.size() == 1 && s.rows.get(0).blocked()) {
                     finished = readBehindABlockedRow(inTx, s);
                 }
                 s.segments.add(new Segment(s.cursor.tickId(), s.target, 0, s.rows.size(), finished));

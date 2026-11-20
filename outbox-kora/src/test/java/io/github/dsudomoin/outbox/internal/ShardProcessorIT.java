@@ -4569,25 +4569,27 @@ class ShardProcessorIT {
         }
         long t = tick();
 
-        // 10 rows in all: shards 0 and 1 fill the read; 2..4 are not read, or read empty, and stay as they were
-        assertThat(processGroup(0, 1, 2, 3, 4)).containsExactly(new ShardResult(PROGRESS, 5, false),
+        // 10 rows in all: shards 0 and 1 fill the read. It stops inside shard 1 at most, so shard 0, read before it,
+        // read all it asked for and ends its batch; shard 1 stays mid-batch; 2..4 are not read and stay as they were
+        assertThat(processGroup(0, 1, 2, 3, 4)).containsExactly(new ShardResult(PROGRESS, 5, true),
                 new ShardResult(PROGRESS, 5, false), new ShardResult(PROGRESS, 0, true),
                 new ShardResult(PROGRESS, 0, true), new ShardResult(PROGRESS, 0, true));
         var ids = handler.delivered().stream().map(OutboxRecord::id).toList();
-        assertThat(cursor(0)).isEqualTo(new Cursor(0, t0, t, ids.get(4), null, 0, null, null));
+        assertThat(cursor(0)).isEqualTo(new Cursor(0, t, null, 0, null, 0, null, null));
         assertThat(cursor(1)).isEqualTo(new Cursor(1, t0, t, ids.get(9), null, 0, null, null));
         for (int s = 2; s < 5; s++) {
             assertThat(cursorRows(s)).as("shard %d untouched", s).isEqualTo(1);
         }
 
-        // shards 0 and 1 read nothing more, but the read is cut again by 2 and 3: they stay mid-batch
-        assertThat(processGroup(0, 1, 2, 3, 4)).containsExactly(new ShardResult(PROGRESS, 0, false),
-                new ShardResult(PROGRESS, 0, false), new ShardResult(PROGRESS, 5, false),
+        // shard 0 has no work; shard 1 reads nothing more and, read before the cut, ends its batch; the read is cut
+        // again inside shard 3, so 2 ends its batch and 3 stays mid-batch
+        assertThat(processGroup(0, 1, 2, 3, 4)).containsExactly(new ShardResult(NO_WORK, 0, true),
+                new ShardResult(PROGRESS, 0, true), new ShardResult(PROGRESS, 5, true),
                 new ShardResult(PROGRESS, 5, false), new ShardResult(PROGRESS, 0, true));
-        assertThat(cursor(0)).isEqualTo(new Cursor(0, t0, t, ids.get(4), null, 0, null, null));
+        assertThat(cursor(1)).isEqualTo(new Cursor(1, t, null, 0, null, 0, null, null));
 
-        assertThat(processGroup(0, 1, 2, 3, 4)).containsExactly(new ShardResult(PROGRESS, 0, true),
-                new ShardResult(PROGRESS, 0, true), new ShardResult(PROGRESS, 0, true),
+        assertThat(processGroup(0, 1, 2, 3, 4)).containsExactly(new ShardResult(NO_WORK, 0, true),
+                new ShardResult(NO_WORK, 0, true), new ShardResult(NO_WORK, 0, true),
                 new ShardResult(PROGRESS, 0, true), new ShardResult(PROGRESS, 5, true));
         for (int s = 0; s < 5; s++) {
             assertThat(cursor(s)).isEqualTo(new Cursor(s, t, null, 0, null, 0, null, null));
@@ -4600,7 +4602,8 @@ class ShardProcessorIT {
 
     /**
      * A read cut by {@code batchBytes} is a cut at its row, though no limit was reached: the shard it stopped in is
-     * mid-batch at its last row handed, the shards after it untouched, and nothing is skipped.
+     * mid-batch at its last row handed, the shards before it read all they asked for, the shards after it are
+     * untouched, and nothing is skipped.
      */
     @Test
     void aByteCutInsideAGroupLeavesItsShardMidBatchAndTheLaterOnesUntouched() throws Exception {
@@ -4608,12 +4611,13 @@ class ShardProcessorIT {
         long t0 = cursor(0).tickId();
         long t = tick();
 
-        // 7 rows fit: shard 0's 5 and shard 1's first 2; 2 and 3 are not read and stay as they were
-        assertThat(processGroup(0, 1, 2, 3)).containsExactly(new ShardResult(PROGRESS, 5, false),
+        // 7 rows fit: shard 0's 5, which ends its batch, and shard 1's first 2; 2 and 3 are not read and stay as
+        // they were
+        assertThat(processGroup(0, 1, 2, 3)).containsExactly(new ShardResult(PROGRESS, 5, true),
                 new ShardResult(PROGRESS, 2, false), new ShardResult(PROGRESS, 0, true),
                 new ShardResult(PROGRESS, 0, true));
         var ids = handler.delivered().stream().map(OutboxRecord::id).toList();
-        assertThat(cursor(0)).isEqualTo(new Cursor(0, t0, t, ids.get(4), null, 0, null, null));
+        assertThat(cursor(0)).isEqualTo(new Cursor(0, t, null, 0, null, 0, null, null));
         assertThat(cursor(1)).isEqualTo(new Cursor(1, t0, t, ids.get(6), null, 0, null, null));
         assertThat(cursorRows(2)).as("untouched").isEqualTo(1);
         assertThat(cursorRows(3)).as("untouched").isEqualTo(1);

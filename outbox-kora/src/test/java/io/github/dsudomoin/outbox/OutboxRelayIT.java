@@ -221,6 +221,42 @@ class OutboxRelayIT {
     }
 
     /**
+     * Shards that each finish a batch of a hundred rows share steps, ten to a {@code batchSize} of 1000, instead of
+     * stepping one by one as shards expected to read more than {@code batchSize / 16} rows did: stepping every shard
+     * alone made each cycle long enough for every shard to gather that many rows again, so the relay stayed in that
+     * mode under steady load.
+     */
+    @Test
+    void shardsThatFinishTheirBatchesShareSteps() throws Exception {
+        config.shards(16).workers(1).batchSize(1000).idlePollInterval(Duration.ofSeconds(30));
+        bootstrap();
+        var handler = new RecordingHandler();
+        var relay = start(handler);
+        var outbox = outbox(relay::wake);
+        awaitParked();
+        var keys = new ArrayList<String>();
+        var perShard = new int[16];
+        for (int i = 0; keys.size() < 16 * 100; i++) {
+            var key = "k" + i;
+            int shard = Hashing.shard(Hashing.keyHash("t", key.getBytes(UTF_8)), 16);
+            if (perShard[shard] < 100) {
+                perShard[shard]++;
+                keys.add(key);
+            }
+        }
+        // the first batch of each shard: the relay learns a hundred rows a shard
+        send(outbox, keys.stream().map(k -> msg("t", k, "a")).toArray(OutboxMessage[]::new));
+        await(Duration.ofSeconds(10), () -> handler.delivered().size() == keys.size());
+        awaitParked();
+        handler.reset();
+
+        send(outbox, keys.stream().map(k -> msg("t", k, "b")).toArray(OutboxMessage[]::new));
+        await(Duration.ofSeconds(10), () -> handler.delivered().size() == keys.size());
+
+        assertThat(handler.batches()).as("handler calls for 16 shards of 100 rows at batchSize 1000").hasSizeLessThan(5);
+    }
+
+    /**
      * Under a steady stream of commits the relay ticks about once per {@code minTickInterval}, not every other
      * interval: its own previous tick, written a few milliseconds into the previous attempt, is younger than the
      * interval at the next attempt and must not make that attempt skip, or a commit waits about two intervals.
@@ -1983,7 +2019,8 @@ class OutboxRelayIT {
         }
 
         // the first wave, with nothing known: a step cut behind its first shards leaves the rest untouched, and those
-        // then step alone (not in groups that are cut again, each progressing a shard or two)
+        // then expect what the first ones held, so they step alone (not in groups that are cut again, each
+        // progressing a shard or two)
         assertThat(waves.get(0).stream().mapToInt(List::size).sum()).as("shards stepped in the first wave")
                 .isLessThanOrEqualTo(3 * 32);
         // 600 rows a shard: two do not fit in one batchSize read, which would be cut after the first (the rest of
@@ -1992,9 +2029,9 @@ class OutboxRelayIT {
                 .allSatisfy(group -> assertThat(group).hasSize(1));
         assertThat(waves.get(3).stream().mapToInt(List::size).max().orElse(0)).as("largest step of the second wave"
                 + " of 1 row a shard").isGreaterThanOrEqualTo(16);
-        // 100 rows a shard, more than batchSize / 16: ten would fit in one read, but each steps alone
-        assertThat(waves.get(5)).as("steps of the second wave of 100 rows a shard").isNotEmpty()
-                .allSatisfy(group -> assertThat(group).hasSize(1));
+        // 100 rows a shard: nine stay below one batchSize read, so the 32 shards take four steps, not one each
+        assertThat(waves.get(5)).as("steps of the second wave of 100 rows a shard").hasSizeLessThanOrEqualTo(5)
+                .allSatisfy(group -> assertThat(group).hasSizeLessThanOrEqualTo(9));
         assertIdOrderPerKey(handler.delivered());
     }
 
