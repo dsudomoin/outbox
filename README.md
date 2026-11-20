@@ -4923,7 +4923,7 @@ Boot](#метрики-и-трассы-в-spring-boot)); без фреймвор�
 
 | Метр | Тип | Теги | Значение |
 |---|---|---|---|
-| `outbox.messages.enqueued` | counter | `topic` | Сообщения, чья транзакция записи закоммичена: счёт идёт после коммита, по одному на сообщение, откатившиеся не считаются (`EnqueueTelemetryIT#enqueuedOnlyAfterCommit`, `#enqueuedNeverForARollback`). `send(connection, …)` на соединении не из транзакции привязки считается сразу после вставки: коммита библиотека не видит (`#foreignConnectionCountsAtInsert`). Не вычисляйте отставание как enqueued − delivered; используйте `outbox.shard.lag`. |
+| `outbox.messages.enqueued` | counter | `topic` | Сообщения, чья транзакция записи закоммичена: счёт идёт после коммита, по одному на сообщение, откатившиеся не считаются (`EnqueueTelemetryIT#enqueuedOnlyAfterCommit`, `#enqueuedNeverForARollback`). `send(connection, …)` на соединении не из транзакции привязки считается сразу после вставки: коммита библиотека не видит (`#foreignConnectionCountsAtInsert`). Не вычисляйте отставание как enqueued − delivered; используйте `outbox.pending` (объём) и `outbox.shard.lag` (отставание). |
 | `outbox.messages.delivered` | counter | `topic` | Записи, о доставке которых сообщил обработчик. |
 | `outbox.messages.failed` | counter | `topic`, `outcome` = `retry` / `dead` | Записи, отведённые в retry-таблицу (или снова не прошедшие в ней), и записи, ушедшие в dead letters. |
 | `outbox.messages.requeued` | counter | `topic` | Записи, отложенные через `Outcome.requeue()`: каждый раз, включая повторные. `requeue` сверх `maxRequeues` считается в `failed{outcome="dead"}`. |
@@ -4976,14 +4976,14 @@ Boot](#метрики-и-трассы-в-spring-boot)); без фреймвор�
 ### Трассировка
 
 В Spring Boot трассы идут через Micrometer Observation ([Контракт по этапам](#контракт-по-этапам)). В Kora, с `Tracer` в
-графе, на каждом этапе свой span (без `Tracer` поведение прежнее: сохраняется трасса писателя и ничего больше):
+графе, на каждом этапе свой span (без `Tracer` span-ов нет: `send` сохраняет трассу текущего контекста Kora, а `handle` выполняется в контексте Kora с сохранённой трассой записи):
 
 1. **`outbox enqueue <topic>`**, kind `PRODUCER`, по одному на сообщение. Родитель — span текущего контекста Kora, без
    него — корневой span. Его контекст сохраняется в заголовках сообщения (`traceparent`, `tracestate`), если у сообщения
    нет своего `traceparent`; вставка одиночного `send` идёт в контексте Kora с этим span-ом. Атрибуты
    `messaging.system=outbox`, `messaging.destination.name`, `outbox.message_id`, `outbox.shard`
    (`KoraOutboxTelemetryTest#enqueueSpanPerMessageIsTheStoredParent`).
-2. **`outbox relay step`**, kind `CLIENT`, на шаг relay; текущий в контексте Kora на потоке шага до коммита включительно.
+2. **`outbox relay step`**, kind `CLIENT`, на шаг relay; текущий в контексте Kora на потоке шага до конца коммита; если упала сама работа шага, span заканчивается с ошибкой до отката.
    Атрибуты `outbox.shards`, `outbox.shard` (если шаг держит один шард), `outbox.records`. Его дочерний span —
    **`outbox relay settle`**, тоже `CLIENT`, от последнего вызова обработчика до конца коммита или отката
    (`KoraOutboxTelemetryTest#stepAndSettleSpansAreClient`).
@@ -4997,7 +4997,8 @@ Boot](#метрики-и-трассы-в-spring-boot)); без фреймвор�
 4. Обработчик получает запись, в которой заголовки трассы заменены на заголовки span-а доставки. Обработчик Kafka
    пересылает их, поэтому Kafka-потребитель на Kora продолжает ту же трассу; `handleBatch` по умолчанию выполняет `handle`
    в контексте Kora, несущем этот span, поэтому клиенты Kora, вызванные из него, тоже продолжают трассу. Свой
-   `handleBatch` получает тот же контекст для записи через `OutboxHandler.inRecordScope(record, () -> ...)`.
+   `handleBatch` получает тот же контекст для записи через `OutboxHandler.inRecordScope(record, () -> ...)`. Он же должен сообщать исход каждой записи через
+   `OutboxHandler.recordFinished(record, outcome)`, иначе span её доставки заканчивается только с концом вызова.
 
 С parent-based сэмплером (по умолчанию в OpenTelemetry) span-ы доставки сэмплируются, если была сэмплирована трасса
 писателя. Несэмплированные span-ы всё равно создаются на каждую запись — небольшая цена на потоке relay.
@@ -5017,15 +5018,15 @@ Boot](#метрики-и-трассы-в-spring-boot)); без фреймвор�
   `#failedInsertReachesTheMessage`). `enqueued(topic)` вызывается на сообщение после коммита транзакции записи
   (`OutboxTransactions#afterCommitEach` — действие на каждый экземпляр, без проверки дубликатов:
   `JdbcTransactionsIT#afterCommitEachRunsEveryInstanceOnceAfterTheCommit`).
-- Шаг relay: `stepStarted` и `RelayStep`. `RelayStep#fetched(shard, records)` — прочитанные шардом записи, каждая один раз,
+- Шаг relay: `stepStarted` и `RelayStep`. `RelayStep#fetched(shard, records)` — записи шарда, прочитанные шагом, каждая один раз,
   с последователями повторов (`RelayTelemetryIT#fetchedCountsEveryRowReadPerShard`);
   `RelayStep#settleStarted()` возвращает `Settle` (`committed(records)`, `failed(records, e)`): от конца последнего вызова
-  обработчика до конца коммита или отката; `finished()` и `failed(e)` вызываются после коммита или отката
+  обработчика до конца коммита или отката; `finished()` — после коммита; `failed(e)` — после отката упавшего коммита, а если упала сама работа шага, до отката
   (`RelayTelemetryIT#stepEndsAfterItsCommit`, `#aFailingCommitEndsSettleAndStepFailed`).
 - Вызов обработчика: `deliveryStarted(step, records, now)` (знает свой шаг), область каждой записи и исходы.
   `Delivery#recordFinished(record, outcome)` и статический `OutboxHandler.recordFinished(record, outcome)` — способ
   обработчика сообщить исход записи, как только он известен, на потоке обработчика; по умолчанию `handleBatch` сообщает
-  каждую попытку. Сообщение может прийти позже конца вызова или дважды — берётся первое, а исход строки решает relay
+  каждую попытку. Сообщение может прийти позже конца вызова (даже после `RelayStep#finished()`), дважды или для чужой записи: реализация должна быть потокобезопасной и учитывать только первое. Исход строки всё равно решает outcome, который вернул `handleBatch`
   (`RelayTelemetryIT#recordFinishedReachesTheDelivery`, `#defaultHandleBatchReportsEachAttempt`).
 - События на исход, шаг и сбой: `deadLettered(record, errorType)` (`max_attempts`, `requeue_limit` или класс исключения:
   `RelayTelemetryIT#deadLetteredCarriesTheErrorType`), `stepFinished`, `relayFailed` и прочие.
@@ -5036,22 +5037,20 @@ Boot](#метрики-и-трассы-в-spring-boot)); без фреймвор�
 
 Всё, что бросит реализация, включая `AssertionError` и проверяемое исключение в обход компилятора, пишется в WARN одной
 строкой, без стека, не чаще раза в 10 с на хук, и не мешает ни отправке, ни relay. Наружу выходит только
-`VirtualMachineError`, кроме `StackOverflowError`. С `OutboxTelemetry.NONE` новых аллокаций на сообщение и запись, новых
-запросов и регистраций после коммита нет.
+`VirtualMachineError`, кроме `StackOverflowError`. С `OutboxTelemetry.NONE` телеметрия не добавляет ни аллокаций на сообщение и запись, ни запросов, ни действий после коммита.
 
 В Kora метрики и span-ы выше даёт `KoraOutboxTelemetry`: метры через `OutboxMetrics` из `outbox-micrometer`, span-ы
 через `Tracer`. В Spring Boot `ObservationOutboxTelemetry` собирается сам. Без фреймворка передайте реализацию в
 `OutboxRuntime.builder(...).telemetry(...)`, например `new OutboxMetrics(registry)` для тех же метров. Реализация только
 на SPI, без Micrometer, — `MessagingConventionsTelemetry` в тестах `outbox-kafka`: на API OpenTelemetry она отдаёт span-ы
-и метрики по семантическим соглашениям для messaging (запись, чтение шага, доставка, расчёт; `messaging.system=outbox`)
+и метрики по семантическим соглашениям для messaging (запись, чтение шага, доставка, фиксация шага; `messaging.system=outbox`)
 и проверяется в `MessagingConventionsIT`.
 
 Sender Kafka вызывает `producer.send` каждой записи внутри её области, когда доставка привязана к телеметрии (не с
 `OutboxTelemetry.NONE` и не вне вызова relay): продюсер, инструментированный через фабрику (инструментация Kafka в
 OpenTelemetry, interceptors), начинает свой span дочерним к span-у доставки
 (`KafkaRecordScopeIT#sendRunsInTheRecordScope`, `MessagingConventionsIT#kafkaSpanIsAChildOfDeliver`). Каждое
-подтверждение брокера sender передаёт через `OutboxHandler.recordFinished(record, delivered)`, пока вызов ждёт; сбои
-рано не сообщаются (`KafkaRecordScopeIT#eachAckEndsItsRecordBeforeTheCallReturns`, `#aFailedSendIsNotReportedEarly`).
+подтверждение брокера sender передаёт через `OutboxHandler.recordFinished(record, delivered)`, пока вызов ждёт; о сбоях sender заранее не сообщает: их исход приходит с концом вызова (`KafkaRecordScopeIT#eachAckEndsItsRecordBeforeTheCallReturns`, `#aFailedSendIsNotReportedEarly`).
 
 ### Micrometer Observation
 
@@ -5078,7 +5077,7 @@ var runtime = OutboxRuntime.builder(config, transactions, handler).telemetry(tel
   шарды через запятую, `outbox.records` — число прочитанных записей, `outbox.shard`, если шаг держит один шард; с
   низкой — `messaging.system=outbox`. Пока шаг идёт, наблюдение текущее на потоке шага. Заканчивается после коммита
   (`KafkaTelemetryIT#stepSpanIsClientAndEndsAfterCommit`).
-- `outbox.relay.settle` (span `outbox relay settle`) — расчёт шага: дочернее наблюдение шага, kind `CLIENT`, текущее от
+- `outbox.relay.settle` (span `outbox relay settle`) — фиксация шага: дочернее наблюдение шага, kind `CLIENT` (с одним `DefaultTracingObservationHandler` — `INTERNAL`, как у шага), текущее от
   конца последнего вызова обработчика до конца коммита или отката; ключ `outbox.records`
   (`KafkaTelemetryIT#settleSpanIsAChildOfTheStep`). Имя и ключи меняет `settleConvention(...)`
   (`DefaultOutboxSettleObservationConvention`; `ObservationOutboxTelemetryTest#customSettleConventionRenames`).
@@ -5125,8 +5124,7 @@ var runtime = OutboxRuntime.builder(config, transactions, handler).telemetry(tel
   220–271 тыс. msg/s) пропускная способность и WAL тоже те же; по умолчанию задержка доставки p50 0,086–0,088 с и p99
   0,148–0,149 с, как у Kora (0,086–0,091 с и 0,148–0,170 с, один выброс p99 0,216 с). С `observeUnsampled(true)`
   приложение тратит на 0,5 ядра больше, а задержка p50 0,096 с и p99 0,174 с (один прогон итогового кода). Эти числа
-  сняты до span-ов записи на каждое сообщение, расчёта и link-ов; цену новой формы покажут новые замеры в том же
-  разделе.
+  сняты до span-ов записи на каждое сообщение, фиксации и link-ов.
 
 ### Контракт по этапам
 
@@ -5139,8 +5137,8 @@ relay-воркер `outbox-relay-N` или поток, вызвавший `Outbo
 | Этап | Когда и где | Observation: наблюдение и span | Kora: span | Метры |
 |---|---|---|---|---|
 | Запись | Одно на **сообщение**, на потоке писателя, внутри его транзакции, после проверок вызова и перед вставкой | `outbox.enqueue`, span `outbox enqueue <topic>`, kind `PRODUCER` (`SenderContext`). Низкая кардинальность: `messaging.destination.name`; высокая: `outbox.message_id`, `outbox.shard`. Propagating-обработчик приложения кладёт контекст в заголовки (`traceparent`, `tracestate`); сообщение со своими `traceparent`/`b3` оставляет их. Вне любого span-а это корневой span, и контекст всё равно сохраняется. Наблюдение текущее на время вставки одиночного `send`; `sendAll` вставляет все сообщения одним запросом | `outbox enqueue <topic>`, kind `PRODUCER`, родитель — span текущего контекста Kora, без него корневой; контекст сохраняется, если у сообщения нет своего `traceparent`. Атрибуты `messaging.destination.name`, `outbox.message_id`, `outbox.shard`. Вставка одиночного `send` идёт в контексте Kora с этим span-ом | `outbox.messages.enqueued{topic}` на сообщение после коммита, откатившиеся не считаются; `outbox.messages.contract_rejected{topic,type,version}` и `outbox.messages.route_rejected{topic}` на отвергнутое проверкой при записи, `outbox.messages.route_unchecked{topic}` на пропущенное ею без проверки |
-| Шаг relay | Одно на шаг, нашедший работу хотя бы в одном заблокированном шарде (те же шаги, что меряет `outbox.batch.duration`); шаг, ничего не заблокировавший, наблюдения не создаёт. На потоке шага, от первого шарда с работой (чтение курсоров, выбор цели и поиск повторов и отложенных записей до этого шарда — раньше) **до конца коммита или отката** | `outbox.relay.step`, span `outbox relay step`, kind `CLIENT` (с propagating-обработчиком отправителя; только с `DefaultTracingObservationHandler` — `INTERNAL`); на relay-воркере — корень своей трассы, у `drain()`, вызванного внутри наблюдения, — дочерний span. Высокая кардинальность: `outbox.shards` — заблокированные шарды через запятую, `outbox.records` — прочитанные записи, `outbox.shard` — если шаг держит один шард. Пока шаг идёт, наблюдение текущее, и JDBC-наблюдения приложения для его запросов (если оно их пишет) становятся дочерними. Ошибка шага, в том числе коммита, записывается в наблюдение | `outbox relay step`, kind `CLIENT`, текущий в контексте Kora на потоке шага до конца коммита или отката. Атрибуты `outbox.shards`, `outbox.shard` (один шард), `outbox.records` | `outbox.batch.duration` (без коммита), `outbox.shard.paused`; `outbox.relay.failures` считает и сбои вне шага (проход relay) |
-| Расчёт | Одно на шаг: от конца последнего вызова обработчика до конца его коммита или отката; на потоке шага | `outbox.relay.settle`, span `outbox relay settle`, kind `CLIENT`, дочерний к шагу и текущий всё это время. Высокая кардинальность: `outbox.records` — записи, которые двигает коммит. Откат или падающий коммит записывается в наблюдение | `outbox relay settle`, kind `CLIENT`, дочерний к шагу; атрибут `outbox.records` | — |
+| Шаг relay | Одно на шаг, нашедший работу хотя бы в одном заблокированном шарде (те же шаги, что меряет `outbox.batch.duration`); шаг, ничего не заблокировавший, наблюдения не создаёт. На потоке шага, от первого шарда с работой (чтение курсоров, выбор цели и поиск повторов и отложенных записей до этого шарда — раньше) **до конца коммита** (при упавшей работе шага — до ошибки, до отката) | `outbox.relay.step`, span `outbox relay step`, kind `CLIENT` (с propagating-обработчиком отправителя; только с `DefaultTracingObservationHandler` — `INTERNAL`); на relay-воркере — корень своей трассы, у `drain()`, вызванного внутри наблюдения, — дочерний span. Высокая кардинальность: `outbox.shards` — заблокированные шарды через запятую, `outbox.records` — прочитанные записи, `outbox.shard` — если шаг держит один шард. Пока шаг идёт, наблюдение текущее, и JDBC-наблюдения приложения для его запросов (если оно их пишет) становятся дочерними. Ошибка шага, в том числе коммита, записывается в наблюдение | `outbox relay step`, kind `CLIENT`, текущий в контексте Kora на потоке шага до конца коммита или отката. Атрибуты `outbox.shards`, `outbox.shard` (один шард), `outbox.records` | `outbox.batch.duration` (без коммита), `outbox.shard.paused`; `outbox.relay.failures` считает и сбои вне шага (проход relay) |
+| Фиксация | Одно на шаг: от конца последнего вызова обработчика до конца его коммита или отката; на потоке шага | `outbox.relay.settle`, span `outbox relay settle`, kind `CLIENT` (`INTERNAL` с одним `DefaultTracingObservationHandler`), дочерний к шагу и текущий всё это время. Высокая кардинальность: `outbox.records` — записи, которые двигает коммит. Откат или падающий коммит записывается в наблюдение | `outbox relay settle`, kind `CLIENT`, дочерний к шагу; атрибут `outbox.records` | — |
 | Доставка записи | Одно на запись вызова обработчика: начинается на потоке шага перед вызовом, заканчивается, когда обработчик сообщил исход записи (Kafka — её подтверждение брокера), иначе в конце вызова | `outbox.deliver`, span `outbox deliver <topic>`, kind `CONSUMER` (`ReceiverContext`). Родитель — сохранённый при записи контекст, без него — span шага; плюс link на span шага, если родитель — сохранённый контекст. По умолчанию наблюдения нет у записи, чья сохранённая W3C-трасса не сэмплирована (`observeUnsampled(true)` — есть у каждой). Низкая кардинальность: `messaging.destination.name`, `outbox.outcome`; высокая: `outbox.message_id`, `outbox.attempt` (эта попытка, с 1), `outbox.delay_ms`, `outbox.shard` (шард записи; нет, если неизвестен). С `tracing(...)` обработчик получает запись с заголовками этого span-а, а в `inRecordScope` наблюдение текущее | `outbox deliver <topic>`, kind `CONSUMER`, родитель и link — как у Observation. Атрибуты `messaging.destination.name`, `outbox.message_id`, `outbox.shard`, `outbox.attempt`, `outbox.delay_ms`, `outbox.outcome`. Обработчик получает запись с заголовками span-а, а `handle` — контекст Kora с ним | — |
 | Исходы | По одному на запись, когда relay разбирает outcomes вызова, до коммита шага | `outbox.outcome` = `delivered`, `retry`, `permanent`, `not_attempted`, `requeued`, `waiting`; `failed`, если вызов кончился без outcomes (прерван, relay закрывается). Ошибки `retry`, `permanent` и `failed` записываются в наблюдение | Те же значения `outbox.outcome`, кроме `failed`: прерванный вызов даёт span-ам статус ERROR с исключением. Ошибки `retry` и `permanent` — тоже ERROR | `outbox.messages.delivered{topic}`, `outbox.delivery.delay{topic}`, `outbox.messages.failed{topic,outcome}` (`retry`, `dead`), `outbox.messages.requeued{topic}`, `outbox.messages.waiting{topic,kind}`; решения хука — `outbox.dead.decisions{decision}`, его сбои — `outbox.dead.hook.failures` |
 | Курсор, лаг и очередь | Шаг шарда пишет строку курсора (прогресс или пауза); gauges обновляет обслуживание раз в `maintenanceInterval` на инстансе, который его выполняет | Нет | Нет | `outbox.shard.lag` (самый медленный шард, с), `outbox.pending` и `outbox.pending.oldest` (сумма и максимум по шардам), `outbox.retry.size`, `outbox.retry.oldest`, `outbox.waiting.size`, `outbox.waiting.oldest`, `outbox.parked.size`, `outbox.dead.size`, `outbox.dead.pending`, `outbox.dead.pending.oldest`, gauges партиций и обслуживания |
@@ -5152,15 +5150,15 @@ relay-воркер `outbox-relay-N` или поток, вызвавший `Outbo
 
 **Родитель и link.** Span доставки — дочерний к span-у записи (Observation: `outbox enqueue <topic>`; Kora: span
 писателя), поэтому трасса одна: писатель, relay и потребитель Kafka, который продолжает её по `traceparent` записи
-(`KafkaEndToEndIT#traceparentReachesConsumer`). Кроме родителя у span-а доставки есть link на span шага: из трассы
-писателя видно, каким шагом запись доставлена, и из шага видны все его доставки. Link пропадает, когда шаг и есть родитель
+(`KafkaEndToEndIT#traceparentReachesConsumer`). Кроме родителя у span-а доставки есть link на span шага: из span-а
+доставки видно, каким шагом запись доставлена. Link-а нет, когда шаг и есть родитель
 (записи без сохранённого контекста), и когда сохранённого родителя не прочитать (последний `traceparent` некорректен и
 нет B3). Когда один вызов обработчика несёт записи разных трасс, span доставки каждой записи остаётся в своей трассе и
 все они ссылаются на один span шага
 (`KafkaTelemetryIT#oneCallWithRecordsFromThreeTracesKeepsEachTrace`, для Kora —
 `KoraOutboxTelemetryTest#eachRecordOfACallKeepsItsOwnTrace`). Если нужна отдельная трасса доставки со ссылкой на трассу
-писателя, сделайте её в своём обработчике Observation: переопределите `customizeExtractedSpan` у
-`PropagatingReceiverTracingObservationHandler` для `OutboxDeliveryContext` (`setNoParent()` и `addLink(...)`).
+писателя, сделайте её в своём обработчике Observation: переопределите `customizeExtractedSpan` в наследнике `OutboxDeliveryTracingObservationHandler` (`setNoParent()` и
+`addLink(...)`); в Spring Boot объявите его бином — он заменит наш.
 
 **Запись без контекста трассы.** Через `ObservationOutboxTelemetry` с propagating-обработчиком отправителя в реестре
 контекст сохраняется всегда: `send` вне любого span-а начинает корневой span `outbox enqueue <topic>`, и доставка
@@ -5174,11 +5172,10 @@ span `outbox relay step` шага, который её доставил, и по
 внутри наблюдения, span шага — дочерний. Span-ы доставки следуют решению о трассе
 писателя: с parent-based сэмплером они сэмплированы, если сэмплирована трасса записи.
 
-**Шаг заканчивается после коммита.** Наблюдение шага и расчёта останавливается после коммита или отката транзакции
-шага, а не до него. Коммит, который падает, заканчивает расчёт и шаг с ошибкой
+**Шаг заканчивается после коммита.** Наблюдения шага и фиксации останавливаются после коммита, а при упавшем коммите — после отката. Если упала сама работа шага, наблюдение заканчивается с ошибкой до отката. Коммит, который падает, заканчивает фиксацию и шаг с ошибкой
 (`RelayTelemetryIT#aFailingCommitEndsSettleAndStepFailed`; откат, сам бросивший `Error`, заканчивает их тоже:
 `#aRollbackThatThrowsAnErrorStillEndsTheSettleAndTheStep`). Сам сбой считается в `outbox.relay.failures`, если это был
-шаг одного шарда или потеряно соединение. `outbox.batch.duration` по-прежнему меряет работу шага без коммита. Span-ы
+шаг одного шарда или потеряно соединение. `outbox.batch.duration` меряет работу шага без коммита. Span-ы
 доставки и `outbox.messages.delivered` записей откатившегося шага при повторной доставке появляются снова.
 
 **Шаг без записей.** Шаг, который только двигает курсор (например, тик пришёл, пока предыдущий шаг шарда ещё шёл),
@@ -5194,7 +5191,7 @@ span-у шага.
 (`ObservationOutboxTelemetryTest#customConventionRenames`, `ObservationOutboxTelemetryTest#meterFilterRenamesGauge`).
 Имена span-ов Kora фиксированы.
 
-**Выключить наблюдение шага или расчёта** можно по имени, предикатом Micrometer:
+**Выключить наблюдение шага или фиксации** можно по имени, предикатом Micrometer:
 
 ```java
 observationRegistry.observationConfig()
@@ -5222,7 +5219,7 @@ failed, retried in a later pass»); по ERROR [застрявших шардо�
 - `KafkaTelemetryIT#relayStepsAreObservedAndFailuresCounted` — span шага и `outbox.relay.failures`, когда backend шага
   убит;
 - `KafkaTelemetryIT#enqueueSpanPerMessage`, `#stepSpanIsClientAndEndsAfterCommit`, `#settleSpanIsAChildOfTheStep`,
-  `#deliverLinksToItsStep` — span-ы записи, шага, расчёта и доставки с link;
+  `#deliverLinksToItsStep` — span-ы записи, шага, фиксации и доставки с link;
 - `KafkaTelemetryIT#aRecordWithoutTraceContextHasTheStepAsParentAndNoLink` — родитель доставки с контекстом и без него;
 - `KafkaTelemetryIT#shardOnDeliverySpans` — `outbox.shard` на span-ах доставки;
 - `MessagingConventionsIT#expectedSpansAndMetrics`, `#contextIsRestoredFromTheRow`, `#deliverLinksToFetch`,

@@ -11,7 +11,7 @@ meters come from `OutboxMetrics` (`outbox-micrometer`) passed to
 `outbox.enqueue` per message (span `outbox enqueue <topic>`, PRODUCER), `outbox.relay.step` per relay step that finds
 work, the steps `outbox.batch.duration` times (span `outbox relay step`, CLIENT, a trace root on a relay worker, ends
 after the step's commit; high-cardinality `outbox.shards`, `outbox.records`), `outbox.relay.settle` per step (CLIENT,
-child of the step, from the last handler call to the end of the commit) and `outbox.deliver` per observed record (span
+child of the step, from the last handler call to the end of the commit or rollback) and `outbox.deliver` per observed record (span
 kind CONSUMER, parent = the stored trace, else the step, plus a link to the step's span; ends at the record's own report,
 for Kafka its broker ack; tags `messaging.system`, `messaging.destination.name`, `outbox.outcome`; high-cardinality
 `outbox.shard`). The Kora telemetry with a `Tracer` produces the same four spans. By default a record whose
@@ -22,7 +22,7 @@ README «Наблюдаемость» → «Контракт по этапам»
 
 | Meter | Type | Tags | Meaning |
 |---|---|---|---|
-| `outbox.messages.enqueued` | counter | `topic` | Counted per message after the business transaction commits; a rolled-back one is not counted (a `send(connection, ...)` on a connection that is not the binding's transaction counts right after the insert). Do not compute backlog as enqueued − delivered; use `outbox.shard.lag`. |
+| `outbox.messages.enqueued` | counter | `topic` | Counted per message after the business transaction commits; a rolled-back one is not counted (a `send(connection, ...)` on a connection that is not the binding's transaction counts right after the insert). Do not compute backlog as enqueued − delivered; use `outbox.pending` (volume) and `outbox.shard.lag` (lag). |
 | `outbox.messages.delivered` | counter | `topic` | Records the handler reported delivered. |
 | `outbox.messages.failed` | counter | `topic`, `outcome` = `retry` / `dead` | Records diverted to (or failing again in) the retry table, and records moved to dead letters. |
 | `outbox.messages.requeued` | counter | `topic` | Records the handler set aside with `Outcome.requeue()`, every requeue counted. Not a failure; the requeue past `relay.requeue.maxRequeues` counts as `failed{outcome="dead"}` instead. |
@@ -103,8 +103,8 @@ an `ACCESS EXCLUSIVE` lock (`ALTER TABLE`, `VACUUM FULL`, `TRUNCATE`, a manual `
 lag grows while it lasts.
 
 Tracing (with an OpenTelemetry `Tracer` in the graph): `outbox enqueue <topic>` (PRODUCER, one per message, parent =
-the current Kora context's span; its context is stored as `traceparent`), `outbox relay step` (CLIENT, until after the
+the current Kora context's span; its context is stored as `traceparent` unless the message carries its own), `outbox relay step` (CLIENT, until after the
 commit) with its child `outbox relay settle` (CLIENT), and one `outbox deliver <topic>` (CONSUMER) per delivery
-attempt: parent = the stored context, else the step, with a link to the step span. Delivery attributes
+attempt: parent = the stored context, else the step, with a link to the step span when the stored context is the parent. Delivery attributes
 `messaging.system`, `messaging.destination.name`, `outbox.message_id`, `outbox.shard`, `outbox.attempt`,
 `outbox.delay_ms`, `outbox.outcome` (`delivered`, `retry`, `permanent`, `not_attempted`, `requeued`, `waiting`).
