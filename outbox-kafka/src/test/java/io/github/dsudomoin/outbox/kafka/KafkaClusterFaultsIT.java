@@ -538,8 +538,9 @@ class KafkaClusterFaultsIT {
         var properties = new Properties();
         properties.putAll(cluster.clientProperties(true));
         properties.put(ProducerConfig.CLIENT_ID_CONFIG, "outbox-" + closing.size());
-        if (DELIVERY_TIMEOUT != null) {
+        if (DELIVERY_TIMEOUT != null) { // with the sender's request timeout, which it sets only next to its own
             properties.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, DELIVERY_TIMEOUT);
+            properties.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, "15000");
         }
         var sender = new KafkaOutboxSender(() -> properties);
         closing.add(sender);
