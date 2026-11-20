@@ -4,10 +4,7 @@ import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.IdentityHashMap;
 import java.util.List;
-import java.util.Set;
 import java.util.function.Consumer;
 import javax.sql.DataSource;
 import org.slf4j.Logger;
@@ -95,13 +92,27 @@ public final class JdbcTransactions implements OutboxTransactions {
 
     @Override
     public void afterCommit(Runnable action) {
+        var tx = transaction();
+        for (var registered : tx.afterCommit) {
+            if (registered == action) {
+                return;
+            }
+        }
+        tx.afterCommit.add(action);
+    }
+
+    /** Added without the duplicate check of {@link #afterCommit}. */
+    @Override
+    public void afterCommitEach(Runnable action) {
+        transaction().afterCommit.add(action);
+    }
+
+    private Transaction transaction() {
         var tx = current.get();
         if (tx == null) {
             throw new IllegalStateException("not inside JdbcTransactions.inTx(...)");
         }
-        if (tx.registered.add(action)) {
-            tx.afterCommit.add(action);
-        }
+        return tx;
     }
 
     @Override
@@ -158,9 +169,7 @@ public final class JdbcTransactions implements OutboxTransactions {
 
     private static final class Transaction {
         final Connection connection;
-        /** In registration order; {@link #registered} holds the same instances, for an O(1) duplicate check. */
         final List<Runnable> afterCommit = new ArrayList<>(1);
-        final Set<Runnable> registered = Collections.newSetFromMap(new IdentityHashMap<>(4));
 
         Transaction(Connection connection) {
             this.connection = connection;

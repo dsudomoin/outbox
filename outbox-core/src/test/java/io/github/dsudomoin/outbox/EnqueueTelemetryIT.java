@@ -94,13 +94,7 @@ class EnqueueTelemetryIT {
     @Test
     void failedInsertReachesTheMessage() throws Exception {
         var outbox = start(telemetry, transactions);
-        try (var c = transactions.newConnection()) {
-            var function = config.table() + "_boom";
-            TestSql.execute(c, "create function " + function + "() returns trigger language plpgsql as $$ begin"
-                    + " if new.topic = 'boom' then raise exception 'boom refused'; end if; return new; end $$");
-            TestSql.execute(c, "create trigger boom before insert on " + config.table()
-                    + " for each row execute function " + function + "()");
-        }
+        refuseTopicBoom();
 
         assertThatThrownBy(() -> transactions.inTx(c -> outbox.send(OutboxMessage.of("boom", "k", bytes("p")))))
                 .isInstanceOf(OutboxSqlException.class)
@@ -109,8 +103,32 @@ class EnqueueTelemetryIT {
                     assertThat(telemetry.messages).hasSize(1);
                     assertThat(telemetry.messages.get(0).failure).isSameAs(e);
                 });
-        assertThat(telemetry.events).containsExactly("enqueueStarted", "message boom", "message failed boom",
+        assertThat(telemetry.events).containsExactly("enqueueStarted", "message boom", "enqueue headers",
+                "message headers boom", "message failed boom", "enqueue failed");
+        assertThat(telemetry.enqueued).isEmpty();
+    }
+
+    @Test
+    void failedSendAllReachesEveryMessage() throws Exception {
+        var outbox = start(telemetry, transactions);
+        refuseTopicBoom();
+        var messages = List.of(OutboxMessage.of("orders", "k1", bytes("a")), OutboxMessage.of("boom", bytes("b")),
+                OutboxMessage.of("orders", "k2", bytes("c")));
+
+        assertThatThrownBy(() -> transactions.inTx(c -> outbox.sendAll(messages)))
+                .isInstanceOf(OutboxSqlException.class)
+                .hasMessageContaining("boom refused")
+                .satisfies(e -> assertThat(telemetry.messages).hasSize(3)
+                        .allSatisfy(m -> assertThat(m.failure).isSameAs(e)));
+
+        assertThat(telemetry.events).as("each message's handle before its headers, as in send").containsExactly(
+                "enqueueStarted",
+                "message orders", "enqueue headers", "message headers orders",
+                "message boom", "enqueue headers", "message headers boom",
+                "message orders", "enqueue headers", "message headers orders",
+                "message failed orders", "message failed boom", "message failed orders",
                 "enqueue failed");
+        assertThat(telemetry.messages).noneMatch(m -> m.inserted);
         assertThat(telemetry.enqueued).isEmpty();
     }
 
@@ -177,17 +195,48 @@ class EnqueueTelemetryIT {
 
         for (int tx = 0; tx < 2; tx++) {
             recording.registered.clear();
-            transactions.inTx(c -> {
-                outbox.send(OutboxMessage.of("orders", "k1", bytes("a")));
-                outbox.send(OutboxMessage.of("orders", bytes("b")));
-                outbox.sendAll(List.of(OutboxMessage.of("orders", "k2", bytes("c")), OutboxMessage.of("audit",
-                        bytes("d"))));
-                return null;
-            });
+            recording.each.clear();
+            sendFourInThreeCalls(outbox);
 
             Set<Runnable> distinct = Collections.newSetFromMap(new IdentityHashMap<>());
             distinct.addAll(recording.registered);
             assertThat(distinct).as("the wake-up hook only").hasSize(1);
+            assertThat(recording.each).as("no counting action").isEmpty();
+        }
+    }
+
+    @Test
+    void countingRegistersOneActionPerCallThroughAfterCommitEach() {
+        var recording = new RecordingTransactions(transactions);
+        var outbox = start(telemetry, recording);
+
+        sendFourInThreeCalls(outbox);
+
+        Set<Runnable> distinct = Collections.newSetFromMap(new IdentityHashMap<>());
+        distinct.addAll(recording.registered);
+        assertThat(distinct).as("the wake-up hook only").hasSize(1);
+        assertThat(recording.each).as("one counting action per call").hasSize(3).doesNotContainAnyElementsOf(distinct);
+        assertThat(telemetry.enqueued).containsExactly("orders", "orders", "orders", "audit");
+    }
+
+    private void sendFourInThreeCalls(Outbox outbox) {
+        transactions.inTx(c -> {
+            outbox.send(OutboxMessage.of("orders", "k1", bytes("a")));
+            outbox.send(OutboxMessage.of("orders", bytes("b")));
+            outbox.sendAll(List.of(OutboxMessage.of("orders", "k2", bytes("c")), OutboxMessage.of("audit",
+                    bytes("d"))));
+            return null;
+        });
+    }
+
+    /** A {@code BEFORE INSERT} trigger on the outbox table that raises for topic {@code boom}. */
+    private void refuseTopicBoom() throws SQLException {
+        try (var c = transactions.newConnection()) {
+            var function = config.table() + "_boom";
+            TestSql.execute(c, "create function " + function + "() returns trigger language plpgsql as $$ begin"
+                    + " if new.topic = 'boom' then raise exception 'boom refused'; end if; return new; end $$");
+            TestSql.execute(c, "create trigger boom before insert on " + config.table()
+                    + " for each row execute function " + function + "()");
         }
     }
 
@@ -274,6 +323,7 @@ class EnqueueTelemetryIT {
                     return new Message() {
                         @Override
                         public List<OutboxHeader> headers(List<OutboxHeader> headers) {
+                            events.add("message headers " + seen.topic);
                             var added = new ArrayList<>(headers);
                             added.add(TRACE);
                             return added;
@@ -308,6 +358,12 @@ class EnqueueTelemetryIT {
                 }
 
                 @Override
+                public List<OutboxHeader> headers(List<OutboxHeader> headers) {
+                    events.add("enqueue headers");
+                    return headers;
+                }
+
+                @Override
                 public void failed(Throwable error) {
                     events.add("enqueue failed");
                 }
@@ -320,10 +376,11 @@ class EnqueueTelemetryIT {
         }
     }
 
-    /** {@link JdbcTransactions} that records every after-commit registration. */
+    /** {@link JdbcTransactions} that records every after-commit registration, {@code afterCommitEach} apart. */
     private static final class RecordingTransactions implements OutboxTransactions {
 
         final List<Runnable> registered = new CopyOnWriteArrayList<>();
+        final List<Runnable> each = new CopyOnWriteArrayList<>();
         private final JdbcTransactions delegate;
 
         RecordingTransactions(JdbcTransactions delegate) {
@@ -340,6 +397,12 @@ class EnqueueTelemetryIT {
         public void afterCommit(Runnable action) {
             registered.add(action);
             delegate.afterCommit(action);
+        }
+
+        @Override
+        public void afterCommitEach(Runnable action) throws SQLException {
+            each.add(action);
+            delegate.afterCommitEach(action);
         }
 
         @Override

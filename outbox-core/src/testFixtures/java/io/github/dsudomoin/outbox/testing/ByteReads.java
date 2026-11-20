@@ -52,6 +52,11 @@ public final class ByteReads {
             }
 
             @Override
+            public void afterCommitEach(Runnable action) throws SQLException {
+                db.afterCommitEach(action);
+            }
+
+            @Override
             public String transactionHint() {
                 return db.transactionHint();
             }

@@ -22,6 +22,11 @@ public final class TestDatabase extends JdbcDatabase implements OutboxTransactio
     }
 
     @Override
+    public void afterCommitEach(Runnable action) throws SQLException {
+        binding.afterCommitEach(action);
+    }
+
+    @Override
     public String transactionHint() {
         return binding.transactionHint();
     }

@@ -62,6 +62,38 @@ class KoraOutboxTransactionsTest {
     }
 
     @Test
+    void afterCommitEachRunsEveryInstanceOnceAfterTheCommit() {
+        var runs = new AtomicInteger();
+
+        db.inTx((SqlRunnable) () -> {
+            for (int i = 0; i < 3; i++) {
+                transactions.afterCommitEach(runs::incrementAndGet);
+            }
+            assertThat(runs).as("not before the commit").hasValue(0);
+        });
+
+        assertThat(runs).hasValue(3);
+    }
+
+    @Test
+    void afterCommitEachNeverAfterRollback() {
+        var runs = new AtomicInteger();
+
+        assertThatThrownBy(() -> db.inTx((SqlRunnable) () -> {
+            transactions.afterCommitEach(runs::incrementAndGet);
+            transactions.afterCommitEach(runs::incrementAndGet);
+            throw new IllegalStateException("rollback");
+        })).hasMessageContaining("rollback");
+
+        assertThat(runs).hasValue(0);
+    }
+
+    @Test
+    void afterCommitEachOutsideTransactionFails() {
+        assertThatThrownBy(() -> transactions.afterCommitEach(() -> {})).isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
     void afterCommitOutsideTransactionFails() {
         assertThatThrownBy(() -> transactions.afterCommit(() -> {})).isInstanceOf(IllegalStateException.class);
     }

@@ -114,6 +114,34 @@ class JdbcTransactionsIT {
     }
 
     @Test
+    void afterCommitEachRunsEveryInstanceOnceAfterTheCommit() {
+        var runs = new AtomicInteger();
+
+        transactions.inTx(c -> {
+            for (int i = 0; i < 3; i++) {
+                transactions.afterCommitEach(runs::incrementAndGet);
+            }
+            assertThat(runs).as("not before the commit").hasValue(0);
+            return null;
+        });
+
+        assertThat(runs).hasValue(3);
+    }
+
+    @Test
+    void afterCommitEachNeverAfterRollback() {
+        var runs = new AtomicInteger();
+
+        assertThatThrownBy(() -> transactions.inTx(c -> {
+            transactions.afterCommitEach(runs::incrementAndGet);
+            transactions.afterCommitEach(runs::incrementAndGet);
+            throw new IllegalStateException("rollback");
+        })).hasMessage("rollback");
+
+        assertThat(runs).hasValue(0);
+    }
+
+    @Test
     void currentConnectionIsNullOutsideInTx() {
         Connection inside = transactions.inTx(c -> c);
 

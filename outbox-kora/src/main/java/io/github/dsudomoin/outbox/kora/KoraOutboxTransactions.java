@@ -40,14 +40,25 @@ public final class KoraOutboxTransactions implements OutboxTransactions {
     /** A Kora post-commit action of the transaction's context, added once per {@code action} instance. */
     @Override
     public void afterCommit(Runnable action) throws SQLException {
-        var ctx = db.currentConnectionContext();
-        if (ctx == null) {
-            throw new IllegalStateException("not inside JdbcConnectionFactory.inTx(...)");
-        }
+        var ctx = context();
         var hook = new AfterCommit(action);
         if (!ctx.postCommitActions().contains(hook)) {
             ctx.addPostCommitAction(hook);
         }
+    }
+
+    /** A Kora post-commit action, added without the linear duplicate check of {@link #afterCommit}. */
+    @Override
+    public void afterCommitEach(Runnable action) throws SQLException {
+        context().addPostCommitAction(new AfterCommit(action));
+    }
+
+    private ConnectionContext context() {
+        var ctx = db.currentConnectionContext();
+        if (ctx == null) {
+            throw new IllegalStateException("not inside JdbcConnectionFactory.inTx(...)");
+        }
+        return ctx;
     }
 
     @Override

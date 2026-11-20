@@ -21,6 +21,15 @@ public interface OutboxTransactions extends ConnectionSource {
      */
     void afterCommit(Runnable action) throws SQLException;
 
+    /**
+     * Runs {@code action} once after the commit of the caller's transaction, never after a rollback; the caller
+     * registers each instance at most once per transaction, so implementations may skip the duplicate check. Only
+     * inside a transaction.
+     */
+    default void afterCommitEach(Runnable action) throws SQLException {
+        afterCommit(action);
+    }
+
     /** How the application opens a transaction, for error messages: "Outbox.send must be called inside {hint}". */
     String transactionHint();
 

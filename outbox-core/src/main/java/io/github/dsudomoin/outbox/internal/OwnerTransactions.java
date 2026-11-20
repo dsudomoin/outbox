@@ -35,6 +35,11 @@ public record OwnerTransactions(OutboxTransactions application, ConnectionSource
     }
 
     @Override
+    public void afterCommitEach(Runnable action) throws SQLException {
+        application.afterCommitEach(action);
+    }
+
+    @Override
     public String transactionHint() {
         return application.transactionHint();
     }

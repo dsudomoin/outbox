@@ -129,6 +129,7 @@ public final class PgOutbox implements Outbox, Contracts.TypedSend {
         if (n == 0) {
             return List.of();
         }
+        guard.require(names, shards); // before any handle: insertAll checks again
         var local = new boolean[n];
         for (int i = 0; i < n; i++) {
             var m = messages.get(i);
@@ -146,11 +147,13 @@ public final class PgOutbox implements Outbox, Contracts.TypedSend {
                 var m = messages.get(i);
                 ids[i] = UuidV7.next(clock.millis());
                 int shard = shardOf(m);
-                var headers = enqueue.headers(m.headers());
+                List<OutboxHeader> headers;
                 if (handles != null) {
                     handles[i] = enqueue.message(m, ids[i], shard);
                     started = i + 1;
-                    headers = handles[i].headers(headers);
+                    headers = handles[i].headers(enqueue.headers(m.headers()));
+                } else {
+                    headers = enqueue.headers(m.headers());
                 }
                 rows.add(new Resender.Row(ids[i], shard, m.topic(), m.key(), m.payload(),
                         HeaderCodec.encode(marked(local[i], headers))));
@@ -179,7 +182,7 @@ public final class PgOutbox implements Outbox, Contracts.TypedSend {
             for (int i = 0; i < n; i++) {
                 topics[i] = messages.get(i).topic();
             }
-            afterCommit(() -> {
+            afterCommitEach(() -> {
                 for (var topic : topics) {
                     telemetry.enqueued(topic);
                 }
@@ -305,19 +308,23 @@ public final class PgOutbox implements Outbox, Contracts.TypedSend {
      * commit.
      */
     private void wakeUpAfterCommit() {
-        afterCommit(wakeUpHook);
+        try {
+            db.afterCommit(wakeUpHook);
+        } catch (SQLException e) {
+            throw db.translate(e);
+        }
     }
 
     /** {@code enqueued(topic)} after the commit, unless the telemetry is off: a new action per call, each runs. */
     private void countAfterCommit(String topic) {
         if (telemetry != OutboxTelemetry.NONE) {
-            afterCommit(() -> telemetry.enqueued(topic));
+            afterCommitEach(() -> telemetry.enqueued(topic));
         }
     }
 
-    private void afterCommit(Runnable action) {
+    private void afterCommitEach(Runnable action) {
         try {
-            db.afterCommit(action);
+            db.afterCommitEach(action);
         } catch (SQLException e) {
             throw db.translate(e);
         }
