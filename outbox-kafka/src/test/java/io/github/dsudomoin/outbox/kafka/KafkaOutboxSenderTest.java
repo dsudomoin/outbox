@@ -1905,6 +1905,52 @@ class KafkaOutboxSenderTest {
         }
     }
 
+    /**
+     * As {@link #idleUnbatchedProducersCloseWhenAClosedCallSettlesTheLastRememberedRecord}, for the unbatched pool of
+     * held calls: once nothing is remembered its idle producers are closed too.
+     */
+    @Test
+    void idleHeldUnbatchedProducersCloseOnceNothingIsRemembered() throws Exception {
+        var clock = new TestClock();
+        var sender = new KafkaOutboxSender(CONFIG, recording(new CopyOnWriteArrayList<>(), false), clock, clock);
+        var x = record(1, keyOnPartition(0, "a"));
+        var first = heldAsync(sender, List.of(x));
+        awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
+        first.get(5, SECONDS);
+        clock.advance(Duration.ofSeconds(1)); // the partition's cooldown ends
+
+        var second = heldAsync(sender, List.of(x));
+        var heldUnbatched = awaitSent(1, 1);
+        heldUnbatched.completeNext();
+        assertThat(second.get(5, SECONDS)).containsExactly(Outcome.delivered());
+        assertThat(heldUnbatched.closed()).as("nothing is remembered now").isTrue();
+    }
+
+    /** {@code close()} closes the idle producers of the held pools, batched and unbatched, as of the others. */
+    @Test
+    void releaseClosesTheProducersOfTheHeldPools() throws Exception {
+        var clock = new TestClock();
+        var sender = new KafkaOutboxSender(CONFIG, recording(new CopyOnWriteArrayList<>(), false), clock, clock);
+        var remembered = record(1, keyOnPartition(0, "a"));
+        var first = heldAsync(sender, List.of(remembered));
+        awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
+        first.get(5, SECONDS);
+        // its partition cools, so nothing is sent, but the call holds it: a producer of the held unbatched pool
+        assertThat(held(sender, List.of(remembered))).singleElement().isInstanceOf(Outcome.NotAttempted.class);
+        var heldUnbatched = producers.get(1);
+        var second = heldAsync(sender, List.of(record(2, keyOnPartition(1, "b"))));
+        var heldBatched = awaitSent(2, 1);
+        heldBatched.completeNext();
+        assertThat(second.get(5, SECONDS)).containsExactly(Outcome.delivered());
+        assertThat(heldUnbatched.closed()).as("pooled, a record still remembered").isFalse();
+        assertThat(heldBatched.closed()).as("pooled").isFalse();
+
+        sender.close();
+
+        assertThat(heldUnbatched.closed()).isTrue();
+        assertThat(heldBatched.closed()).isTrue();
+    }
+
     @Test
     void releaseClosesPooledProducers() throws Exception {
         var sender = sender(DELIVERY_TIMEOUT);

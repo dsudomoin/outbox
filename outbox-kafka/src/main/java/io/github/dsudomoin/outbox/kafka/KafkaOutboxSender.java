@@ -204,11 +204,18 @@ public final class KafkaOutboxSender implements AutoCloseable {
      */
     public KafkaOutboxSender(KafkaOutboxConfig config,
             Function<Map<String, Object>, Producer<byte[], byte[]>> producers) {
-        this(producerConfig(config.driverProperties()), config.clientIdSuffix(), producers);
+        this(producerConfig(config.driverProperties()), config.clientIdSuffix(), producers, Clock.systemUTC(),
+                System::nanoTime);
+    }
+
+    /** For tests: the four pools of the public constructors, on {@code clock} and {@code nanos}. */
+    KafkaOutboxSender(KafkaOutboxConfig config, Function<Map<String, Object>, Producer<byte[], byte[]>> producers,
+            Clock clock, LongSupplier nanos) {
+        this(producerConfig(config.driverProperties()), config.clientIdSuffix(), producers, clock, nanos);
     }
 
     private KafkaOutboxSender(ProducerConfig config, boolean suffix,
-            Function<Map<String, Object>, Producer<byte[], byte[]>> producers) {
+            Function<Map<String, Object>, Producer<byte[], byte[]>> producers, Clock clock, LongSupplier nanos) {
         this(() -> producers.apply(properties(config, suffix ? "-outbox-" : null)),
                 () -> producers.apply(unbatched(properties(config, suffix ? "-outbox-unbatched-" : null))),
                 config.getInt(MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION) == 1 ? null
@@ -216,7 +223,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
                 config.getInt(MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION) == 1 ? null : () -> producers.apply(
                         unbatched(oneInFlight(properties(config, suffix ? "-outbox-held-unbatched-" : null)))),
                 Duration.ofMillis(config.getInt(DELIVERY_TIMEOUT_MS_CONFIG)),
-                Duration.ofMillis(config.getLong(MAX_BLOCK_MS_CONFIG)), Clock.systemUTC(), System::nanoTime);
+                Duration.ofMillis(config.getLong(MAX_BLOCK_MS_CONFIG)), clock, nanos);
     }
 
     /** {@code properties} with {@code batch.size=0}: see the class javadoc. */
