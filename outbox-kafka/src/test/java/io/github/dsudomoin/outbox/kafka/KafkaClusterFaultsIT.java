@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.DeadLetterFilter;
 import io.github.dsudomoin.outbox.JdbcTransactions;
+import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRecord;
@@ -155,8 +156,9 @@ class KafkaClusterFaultsIT {
     }
 
     /**
-     * (b60) as (b), for 60 s: longer than the producer's {@code delivery.timeout.ms} (20 s), so every record handed
-     * during the fault expires at least once.
+     * (b60) as (b), for 60 s: longer than a 20 s {@code delivery.timeout.ms} (the default before 120 s, or
+     * {@code -Doutbox.test.kafka.deliveryTimeoutMs=20000}), so every record handed during the fault then expires at
+     * least once; the 120 s default rides it out.
      */
     @Test
     @Timeout(value = 5, unit = TimeUnit.MINUTES)
@@ -209,7 +211,7 @@ class KafkaClusterFaultsIT {
     }
 
     /**
-     * (b2-60) as (b2), for 60 s, longer than the producer's {@code delivery.timeout.ms}: what the leaders appended
+     * (b2-60) as (b2), for 60 s, longer than a 20 s {@code delivery.timeout.ms}: what the leaders appended
      * before the controller fenced the dead node commits when the in-sync set shrinks, but its producer is never told,
      * and its records go again from another producer once their batches expire.
      */
@@ -251,7 +253,7 @@ class KafkaClusterFaultsIT {
     }
 
     /**
-     * (c60) as (c), for 60 s, longer than the producer's {@code delivery.timeout.ms}: the partitions the frozen node
+     * (c60) as (c), for 60 s, longer than a 20 s {@code delivery.timeout.ms}: the partitions the frozen node
      * leads take nothing, the others should keep their latency ({@code maxLatencyMsByPartition}).
      */
     @Test
@@ -604,12 +606,15 @@ class KafkaClusterFaultsIT {
     }
 
     /**
-     * A fresh table; the sender bounds a call by {@code delivery.timeout.ms} + 5 s + {@code max.block.ms} (30 s by
-     * default), so the relay gives it as long.
+     * A fresh table; the sender bounds a call by {@code delivery.timeout.ms} + 5 s + {@code max.block.ms}, so the relay
+     * gives it as long: the library's defaults (130 s) for the sender's, else that sum.
      */
     private static TestOutboxConfig config() {
-        var timeout = DELIVERY_TIMEOUT == null ? Duration.ofSeconds(30)
-                : Duration.ofMillis(Long.parseLong(DELIVERY_TIMEOUT)).plusSeconds(10);
+        if (DELIVERY_TIMEOUT == null) {
+            return new TestOutboxConfig().batchTimeout(new OutboxConfig.RelayConfig() {}.batchTimeout())
+                    .deadLettersTimeout(new OutboxConfig.DeadLettersConfig() {}.timeout());
+        }
+        var timeout = Duration.ofMillis(Long.parseLong(DELIVERY_TIMEOUT)).plusSeconds(10);
         return new TestOutboxConfig().batchTimeout(timeout).deadLettersTimeout(timeout);
     }
 
