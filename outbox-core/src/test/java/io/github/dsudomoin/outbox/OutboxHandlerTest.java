@@ -103,6 +103,34 @@ class OutboxHandlerTest {
                 p -> assertThat(p.error()).isSameAs(error));
     }
 
+    /**
+     * A wait a handler reports as a Retry or Permanent is the Waiting the relay makes of it at the call's end, held or
+     * not, so the early report and the call's end agree.
+     */
+    @Test
+    void aReportedFailureCarryingAWaitIsReportedAsTheWaitingTheRelayMakesOfIt() throws Exception {
+        var wait = new OutboxWaitException("not yet");
+        var records = List.of(record(1, "k", "a"), record(2, "l", "b"));
+        var reported = new CopyOnWriteArrayList<Outcome>();
+        var delivery = new OutboxTelemetry.Delivery() {
+            @Override
+            public void recordFinished(OutboxRecord record, Outcome outcome) {
+                reported.add(outcome);
+            }
+        };
+        java.util.concurrent.Callable<List<Outcome>> body = () -> RecordScope.bound(delivery, () -> {
+            OutboxHandler.recordFinished(records.get(0), Outcome.retry(wait));
+            OutboxHandler.recordFinished(records.get(1), Outcome.permanent(wait));
+            return List.of();
+        });
+
+        new TestHandlerCall(BATCH_TIMEOUT, body).call();
+        TestHandlerCall.holdingPermanent(BATCH_TIMEOUT, body).call();
+
+        var waiting = new Outcome.Waiting(wait.kind(), wait.getMessage(), null);
+        assertThat(reported).containsExactly(waiting, waiting, waiting, waiting);
+    }
+
     private static OutboxRecord record(long id, String key, String payload) {
         return new OutboxRecord(id, UUID.randomUUID(), "t", key.getBytes(UTF_8), payload.getBytes(UTF_8), List.of(),
                 Instant.now(), 0, 0);

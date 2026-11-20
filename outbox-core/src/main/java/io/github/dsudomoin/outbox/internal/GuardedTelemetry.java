@@ -356,7 +356,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
             }
         }
 
-        /** As {@link GuardedDelivery#inRecordScope}, and a second run of the insert refused: it would write twice. */
+        /** As {@link GuardedDelivery#inRecordScope}, which also refuses a second run: it would write twice. */
         @Override
         public <T> T inScope(Callable<T> insert) throws Exception {
             var tracked = new TrackedCall<>(insert, true);
@@ -509,9 +509,10 @@ public final class GuardedTelemetry implements OutboxTelemetry {
             }
         }
 
+        /** A second run of the call refused: it would hand the record to its target twice. */
         @Override
         public <T> T inRecordScope(OutboxRecord record, Callable<T> call) throws Exception {
-            var tracked = new TrackedCall<>(call, false);
+            var tracked = new TrackedCall<>(call, true);
             T result;
             try {
                 result = delegate.inRecordScope(record, tracked);

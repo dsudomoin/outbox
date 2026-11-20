@@ -133,9 +133,10 @@ public interface OutboxHandler {
      * itself reports them the same way. A handler built on another handler may report a record twice (a decorator
      * that overrides only {@link #handle} over one that reports itself, such as the Kafka sender's handler, which
      * reports each ack, before the default {@code handleBatch} reports the record again); the telemetry keeps the
-     * first report. In a call whose relay holds permanent failures ({@link #holdsPermanent}) a reported
-     * {@code Permanent} reaches the telemetry as the {@code Retry} with its error that the relay makes of the returned
-     * one.
+     * first report. The telemetry gets the outcome the relay makes of the returned one: a {@code Retry} or
+     * {@code Permanent} whose error is an {@link OutboxWaitException} as its {@code Waiting}, and in a call whose relay
+     * holds permanent failures ({@link #holdsPermanent}) any other {@code Permanent} as the {@code Retry} with its
+     * error.
      */
     static void recordFinished(OutboxRecord record, Outcome outcome) {
         RecordScope.recordFinished(record, outcome);

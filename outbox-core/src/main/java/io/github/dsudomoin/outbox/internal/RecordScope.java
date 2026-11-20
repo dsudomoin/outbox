@@ -4,6 +4,7 @@ import io.github.dsudomoin.outbox.InternalApi;
 import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
+import io.github.dsudomoin.outbox.OutboxWaitException;
 import io.github.dsudomoin.outbox.Outcome;
 import jakarta.annotation.Nullable;
 import java.util.ServiceConfigurationError;
@@ -65,16 +66,28 @@ public final class RecordScope {
     }
 
     /**
-     * {@link OutboxTelemetry.Delivery#recordFinished} of the delivery bound to this thread; nothing outside one. In a
-     * call whose relay holds permanent failures ({@link ShardProcessor#holdsPermanent}) a {@code Permanent} is reported
-     * as the {@code Retry} with its error that the relay makes of it, so the early report and the call's end agree.
+     * {@link OutboxTelemetry.Delivery#recordFinished} of the delivery bound to this thread; nothing outside one. The
+     * outcome is reported as the relay takes the returned one: a {@code Retry} or {@code Permanent} whose error is an
+     * {@link OutboxWaitException} as the {@code Waiting} it means, and in a call whose relay holds permanent failures
+     * ({@link ShardProcessor#holdsPermanent}) any other {@code Permanent} as the {@code Retry} with its error, so the
+     * early report and the call's end agree.
      */
     public static void recordFinished(OutboxRecord record, Outcome outcome) {
         var delivery = CURRENT.get();
         if (delivery != null && delivery != OutboxTelemetry.Delivery.NONE) {
-            delivery.recordFinished(record, outcome instanceof Outcome.Permanent p && ShardProcessor.holdsPermanent()
-                    ? Outcome.retry(p.error()) : outcome);
+            delivery.recordFinished(record, asTheRelayTakesIt(outcome));
         }
+    }
+
+    /** {@code outcome} as {@code ShardProcessor.callHandler} takes it from a call, before the database clock. */
+    private static Outcome asTheRelayTakesIt(Outcome outcome) {
+        var thrown = outcome instanceof Outcome.Retry r ? r.error()
+                : outcome instanceof Outcome.Permanent p ? p.error() : null;
+        if (thrown instanceof OutboxWaitException e) {
+            return new Outcome.Waiting(e.kind(), e.getMessage(), null);
+        }
+        return outcome instanceof Outcome.Permanent p && ShardProcessor.holdsPermanent() ? Outcome.retry(p.error())
+                : outcome;
     }
 
     /** {@code call} in the record scope of the delivery bound to this thread; outside one, the fallback's. */

@@ -330,6 +330,29 @@ class GuardedTelemetryTest {
     }
 
     @Test
+    void callRunsOnceWhenScopeCallsItTwice() throws Exception {
+        var calls = new AtomicInteger();
+        var twice = new OutboxTelemetry() {
+            @Override
+            public Delivery deliveryStarted(List<OutboxRecord> records, Instant now) {
+                return new Delivery() {
+                    @Override
+                    public <T> T inRecordScope(OutboxRecord record, Callable<T> call) throws Exception {
+                        call.call();
+                        return call.call();
+                    }
+                };
+            }
+        };
+        var delivery = GuardedTelemetry.of(twice).deliveryStarted(RECORDS, Instant.EPOCH);
+        try (var err = new CapturedStderr()) {
+            assertThat(delivery.inRecordScope(RECORD, calls::incrementAndGet)).isEqualTo(1);
+            assertThat(err.text()).contains("Delivery.inRecordScope");
+        }
+        assertThat(calls).as("a second run would hand the record to its target twice").hasValue(1);
+    }
+
+    @Test
     void callRunsOnceWhenScopeThrowsBeforeIt() throws Exception {
         var calls = new AtomicInteger();
         var delivery = GuardedTelemetry.of(new ScopeThrowing(false)).deliveryStarted(RECORDS, Instant.EPOCH);
