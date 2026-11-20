@@ -432,6 +432,26 @@ class BatchClassifierTest {
     }
 
     @Test
+    void aCallAsksToComeBackOnlyWhenTheFirstRowOfEveryFailingKeyWasNotAttemptedWithATime() {
+        var early = NOW.plusSeconds(1);
+        var late = NOW.plusSeconds(4);
+        var a1 = record("t", "a");
+        var a2 = record("t", "a");
+        var b = record("t", "b");
+
+        assertThat(BatchClassifier.askedToComeBack(List.of(new Item(a1, false, Outcome.notAttempted(late)),
+                new Item(a2, false, Outcome.retry(DOWN)), new Item(b, false, Outcome.notAttempted(early)),
+                waiting(record("t", "c")), permanent(record("t", "d")), blocked(record("t", "e")))))
+                .as("the earliest; the rows after a key's first, waits, dead and blocked rows do not count")
+                .isEqualTo(early);
+        assertThat(BatchClassifier.askedToComeBack(List.of(new Item(a1, false, Outcome.notAttempted(late)),
+                retry(b)))).as("a key tried and failed").isNull();
+        assertThat(BatchClassifier.askedToComeBack(List.of(new Item(a1, false, Outcome.notAttempted(late)),
+                notAttempted(b)))).as("a key not attempted with no time").isNull();
+        assertThat(BatchClassifier.askedToComeBack(List.of(waiting(a1), permanent(b)))).as("no failing key").isNull();
+    }
+
+    @Test
     void aParkedRowThatWaitsBecomesAWaitingHead() {
         var veteran = record("t", "k", 2, 3);
         var after = record("t", "k");

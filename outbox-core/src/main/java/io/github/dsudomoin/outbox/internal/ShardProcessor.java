@@ -986,14 +986,25 @@ public final class ShardProcessor implements AutoCloseable {
             // only parked rows read: the position stays, as on a pause
             next = position(s, read);
         } // else no progress: a batch in progress keeps its target, a fresh one is not stored (lastId is still 0)
-        if (failedAttempt(items)) { // paused, or a single failing key diverted: either way back off
+        boolean failed = failedAttempt(items);
+        var askedFor = failed ? BatchClassifier.askedToComeBack(items) : null;
+        var decided = now.plus(Duration.ofNanos(System.nanoTime() - started)); // not from the start of a slow call
+        if (askedFor != null && askedFor.isAfter(decided)) {
+            // the target tried nothing and said when to come back: no failed attempt, so the backoff, the failures and
+            // the limit stay; a time already past is a failed attempt, or a target answering so would spin the shard
+            var until = BatchClassifier.dueAt(decided, askedFor, now).truncatedTo(ChronoUnit.MICROS);
+            next = next.withPause(until, cursor.failures());
+            s.status = ShardStatus.PAUSED;
+            telemetry.shardPaused();
+            log.debug("outbox shard {} paused until {}: nothing attempted, the target asked to come back then", shard,
+                    until);
+        } else if (failed) { // paused, or a single failing key diverted: either way back off
             if (cursor.failures() == 0) {
                 failedFirst.set(shard, firstRetried(items, parkedCount));
             }
             limits.set(shard, Math.max(1, s.limit / 2));
             var backoff = Backoff.delay(cursor.failures(), retry.initialDelay(), retry.maxDelay());
-            var until = now.plus(Duration.ofNanos(System.nanoTime() - started)).plus(backoff)
-                    .truncatedTo(ChronoUnit.MICROS); // from the decision, not from the start of a slow call
+            var until = decided.plus(backoff).truncatedTo(ChronoUnit.MICROS);
             next = next.withPause(until, cursor.failures() + 1);
             s.status = ShardStatus.PAUSED;
             telemetry.shardPaused();

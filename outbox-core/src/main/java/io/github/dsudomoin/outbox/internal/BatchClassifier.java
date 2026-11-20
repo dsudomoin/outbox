@@ -206,6 +206,33 @@ public final class BatchClassifier {
     }
 
     /**
+     * When a call that delivered nothing asked to be made again: the earliest {@code notBefore} of the first rows of
+     * its {@linkplain #failingKeys failing} pairs, when every one of them is a NotAttempted with a {@code notBefore}
+     * (the target tried none of them, e.g. a Kafka partition cooling down); null when any of them is a Retry or a
+     * NotAttempted without one, or when no pair fails. For a call {@link #failingKeys} found failing.
+     */
+    @Nullable
+    static Instant askedToComeBack(List<Item> items) {
+        var seen = new HashSet<Object>();
+        Instant earliest = null;
+        for (var item : items) {
+            var outcome = item.outcome();
+            if (item.dbBlocked() || outcome instanceof Outcome.Delivered || outcome instanceof Outcome.Permanent
+                    || outcome instanceof Outcome.Requeue || !seen.add(orderingKey(item.record()))
+                    || outcome instanceof Outcome.Waiting) {
+                continue; // as failingKeys: not handed, its key goes on, a later row of the pair, or a wait
+            }
+            if (!(outcome instanceof Outcome.NotAttempted skipped) || skipped.notBefore() == null) {
+                return null;
+            }
+            if (earliest == null || skipped.notBefore().isBefore(earliest)) {
+                earliest = skipped.notBefore();
+            }
+        }
+        return earliest;
+    }
+
+    /**
      * Until a waiting record is handed again: a quarter of the time it has {@code waited}, at least {@code delay} and
      * at most {@code maxDelay}, so a long wait is asked about less often.
      */
