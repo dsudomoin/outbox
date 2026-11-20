@@ -2,6 +2,7 @@ package io.github.dsudomoin.outbox.internal;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
+import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRuntime;
@@ -30,15 +31,16 @@ import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
  * drain rates.
  *
  * <p>Not part of the build: {@code ./gradlew :outbox-kora:test -Pbenchmark --tests '*DrainBenchmark'}; properties
- * {@code bench.rows} (2 000 000), {@code bench.shards} (256), {@code bench.batchSize} (1000), {@code bench.workers}
- * (4), {@code bench.tickEveryMs} (0).
+ * {@code bench.rows} (2 000 000), {@code bench.shards} (256), {@code bench.batchSize} (the library's, 10 000),
+ * {@code bench.workers} (4), {@code bench.tickEveryMs} (0).
  */
 @Tag("benchmark")
 class DrainBenchmark {
 
     private static final int ROWS = Integer.getInteger("bench.rows", 2_000_000);
     private static final int SHARDS = Integer.getInteger("bench.shards", 256);
-    private static final int BATCH = Integer.getInteger("bench.batchSize", 1000);
+    private static final int BATCH = Integer.getInteger("bench.batchSize",
+            new OutboxConfig.RelayConfig() {}.batchSize());
     private static final int WORKERS = Integer.getInteger("bench.workers", 4);
     private static final int TICK_EVERY_MS = Integer.getInteger("bench.tickEveryMs", 0);
     private static final int WRITERS = 4;

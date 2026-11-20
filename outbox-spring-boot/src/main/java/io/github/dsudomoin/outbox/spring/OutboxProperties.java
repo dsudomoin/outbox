@@ -62,7 +62,8 @@ public record OutboxProperties(
      *     works. Default 4.
      * @param batchSize rows per chunk read and per handler call. Keep batchSize × the handler's time per record well
      *     below batch-timeout: a longer call is cut at its soft deadline and the shard moves on only by the records the
-     *     handler finished. Default 1000.
+     *     handler finished. A handler that spends a few milliseconds on each record sets it to 1000 or lower.
+     *     Default 10000.
      * @param batchBytes bytes per chunk read and per handler call, as batch-size bounds its rows: a row counts its
      *     payload, key and headers as stored, and a call takes rows while they fit, at least one, so a row larger than
      *     this goes alone. Parked and retry rows of a call get as much again, so a call holds at most about twice this.
@@ -98,7 +99,7 @@ public record OutboxProperties(
     public record Relay(
         @DefaultValue("true") boolean enabled,
         @DefaultValue("4") int workers,
-        @DefaultValue("1000") int batchSize,
+        @DefaultValue("10000") int batchSize,
         @DefaultValue("16777216") long batchBytes,
         @DefaultValue("100") int maxTicksPerBatch,
         @DefaultValue("50ms") Duration minTickInterval,

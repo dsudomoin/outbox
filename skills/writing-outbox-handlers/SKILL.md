@@ -18,6 +18,9 @@ batchSize × p99(one record) ≤ 0.8 × batchTimeout − per-record timeout
 
 p99 2 s, request timeout 5 s, defaults: (104 − 5) / 2 → `batchSize` ≤ 49, Kafka included.
 
+The default `batchSize` is 10 000, sized for Kafka and other bulk targets. A handler spending a few ms per record
+(one request per record) sets 1000 or lower; a failed step redelivers every record of its call.
+
 A sequential handler delivers at most min(shards, instances × workers) / mean seconds per record (2 × 4 / 0.3 s ≈
 26 msg/s), whatever the `batchSize`. If too low, follow every rule in [concurrent-delivery.md](concurrent-delivery.md).
 The soft deadline is a safety net, not flow control.

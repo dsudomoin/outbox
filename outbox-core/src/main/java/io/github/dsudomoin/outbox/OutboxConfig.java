@@ -77,10 +77,13 @@ public interface OutboxConfig {
         /**
          * Rows per chunk read and per handler call. Keep {@code batchSize ×} the handler's time per record well below
          * {@link #batchTimeout()}: a longer call is cut at its soft deadline and the shard moves on only by the records
-         * the handler finished.
+         * the handler finished. A handler that spends a few milliseconds on each record (one request per record) sets
+         * it to 1000 or lower: at 10 000 its call outlives the soft deadline, and a failed step hands all of its
+         * records again. Draining a backlog, a read of 10 000 rows sorts on disk under Postgres's default
+         * {@code work_mem} of 4 MB, a few per cent slower than in memory: see the README on {@code work_mem}.
          */
         default int batchSize() {
-            return 1000;
+            return 10_000;
         }
 
         /**

@@ -5,10 +5,11 @@
 # count, so no idle window follows a load phase (autovacuum, vacuum after drops and full-page writes of a load run would
 # land in it). Then per shard count the load phases: bulk (2 writers x 10 000 messages, noop handler, no consumer) and
 # low-load at 100 and 1000 msg/s (order mode, Kafka handler, consumer 12 threads, as low-load.sh). The relay at the
-# library defaults: workers 4 and batchSize 1000 set (the bench app's own defaults are 8 and 2000), every other outbox
-# setting unset. Each phase: WARMUP s, then a STEADY s window. PHASES (default "background idle load") picks the
-# phases to run. WAL_SPLIT=1 splits each idle window's WAL with pg_waldump (wal_split below). Appends its section (in
-# Russian) to RESULTS.
+# library defaults: workers 4 set (the bench app's own default is 8) and batchSize 1000 (the bench app's is 2000; the
+# library's was 1000 before 10 000, kept for comparison with earlier runs), every other outbox setting unset. Each
+# phase: WARMUP s, then a STEADY s window. PHASES (default "background idle load") picks the phases to run.
+# WAL_SPLIT=1 splits each idle window's WAL with pg_waldump (wal_split below). Appends its section (in Russian) to
+# RESULTS.
 source "$(dirname "$0")/lib.sh"
 WARMUP=${WARMUP:-60}
 STEADY=${STEADY:-180}
@@ -210,14 +211,14 @@ out << EOF
 
 Запуск $started UTC, коммит \`$commit\`, шарды: $RUNS.
 
-Библиотека на настройках по умолчанию (relay workers 4, \`batchSize = 1000\`, \`minTickInterval = 50ms\`,
-\`idlePollInterval = 200ms\`, партиции по умолчанию), меняется только \`outbox.shards\`. Каждый прогон: новая
-таблица outbox, ${WARMUP} с прогрева, затем окно ${STEADY} с. Сначала тихие прогоны: фон, затем простой для всех
-чисел шардов, чтобы окно простоя не шло сразу после нагрузки (autovacuum, очистка после удаления таблиц и full-page
-writes нагрузочного прогона попали бы в него); затем для каждого числа шардов bulk и малая нагрузка 100 и 1000 msg/s.
-xid/с — прирост следующего xid кластера (транзакции с записью), WAL B/с — прирост \`pg_current_wal_lsn()\`,
-коммитов/с — прирост \`pg_stat_database.xact_commit\` базы (вместе с читающими транзакциями, postgres-exporter
-включён). CPU БД — среднее по \`docker stats\` (200 % = оба CPU).
+Библиотека на настройках по умолчанию (relay workers 4, \`minTickInterval = 50ms\`, \`idlePollInterval = 200ms\`,
+партиции по умолчанию), кроме \`batchSize = 1000\` (прежнее значение по умолчанию, для сравнения с прошлыми прогонами);
+меняется только \`outbox.shards\`. Каждый прогон: новая таблица outbox, ${WARMUP} с прогрева, затем окно ${STEADY} с.
+Сначала тихие прогоны: фон, затем простой для всех чисел шардов, чтобы окно простоя не шло сразу после нагрузки
+(autovacuum, очистка после удаления таблиц и full-page writes нагрузочного прогона попали бы в него); затем для каждого
+числа шардов bulk и малая нагрузка 100 и 1000 msg/s. xid/с — прирост следующего xid кластера (транзакции с записью), WAL
+B/с — прирост \`pg_current_wal_lsn()\`, коммитов/с — прирост \`pg_stat_database.xact_commit\` базы (вместе с читающими
+транзакциями, postgres-exporter включён). CPU БД — среднее по \`docker stats\` (200 % = оба CPU).
 
 ### Простой
 

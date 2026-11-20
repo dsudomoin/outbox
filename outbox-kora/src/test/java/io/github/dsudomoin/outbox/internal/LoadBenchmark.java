@@ -2,6 +2,7 @@ package io.github.dsudomoin.outbox.internal;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
+import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRuntime;
@@ -38,9 +39,9 @@ import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
  *
  * <p>Not part of the build: {@code ./gradlew :outbox-kora:test -Pbenchmark --tests '*LoadBenchmark'}; properties
  * {@code bench.shards} (256), {@code bench.writers} (16), {@code bench.perTx} (1), {@code bench.rate} (2200),
- * {@code bench.keys} (1000), {@code bench.batchSize} (1000), {@code bench.minTickMs} (50), {@code bench.warmup} (15 s),
- * {@code bench.seconds} (30 s), and {@code bench.jdbcUrl}, {@code bench.user}, {@code bench.password} for a Postgres of
- * your own.
+ * {@code bench.keys} (1000), {@code bench.batchSize} (the library's, 10 000), {@code bench.minTickMs} (50),
+ * {@code bench.warmup} (15 s), {@code bench.seconds} (30 s), and {@code bench.jdbcUrl}, {@code bench.user},
+ * {@code bench.password} for a Postgres of your own.
  */
 @Tag("benchmark")
 class LoadBenchmark {
@@ -50,7 +51,8 @@ class LoadBenchmark {
     private static final int PER_TX = Integer.getInteger("bench.perTx", 1);
     private static final int RATE = Integer.getInteger("bench.rate", 2200);
     private static final int KEYS = Integer.getInteger("bench.keys", 1000);
-    private static final int BATCH = Integer.getInteger("bench.batchSize", 1000);
+    private static final int BATCH = Integer.getInteger("bench.batchSize",
+            new OutboxConfig.RelayConfig() {}.batchSize());
     private static final int MIN_TICK_MS = Integer.getInteger("bench.minTickMs", 50);
     private static final int WARMUP = Integer.getInteger("bench.warmup", 15);
     private static final int SECONDS = Integer.getInteger("bench.seconds", 30);

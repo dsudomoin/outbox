@@ -17,8 +17,8 @@ import org.postgresql.ds.PGSimpleDataSource;
 
 /**
  * A backlog of medium-sized messages, as a target's outage leaves one, met by a service with a usual heap and the
- * library's defaults (4 workers, batches of 1000): the relay must work it off, not run out of memory on it. 400 MB
- * written and a JVM of its own: only with {@code -Poutbox.test.chaos}.
+ * library's defaults (4 workers, batches of up to 10 000 rows and 16 MiB): the relay must work it off, not run out of
+ * memory on it. 400 MB written and a JVM of its own: only with {@code -Poutbox.test.chaos}.
  */
 @Tag("chaos")
 class LargeBacklogIT {

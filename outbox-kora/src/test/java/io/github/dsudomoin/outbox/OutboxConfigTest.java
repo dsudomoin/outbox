@@ -70,7 +70,7 @@ class OutboxConfigTest {
 
         assertThat(config.table()).isEqualTo("orders_outbox");
         assertThat(config.relay().workers()).isEqualTo(2);
-        assertThat(config.relay().batchSize()).isEqualTo(1000);
+        assertThat(config.relay().batchSize()).isEqualTo(10_000);
         assertThat(config.relay().retry().initialDelay()).isEqualTo(Duration.ofSeconds(1));
         assertThat(config.partitions().xidsPerPartition()).isEqualTo(16_777_216L);
         assertThat(config.inbox().table()).isEqualTo("inbox");
@@ -287,7 +287,7 @@ class OutboxConfigTest {
         var relay = config.relay();
         assertThat(relay.enabled()).isTrue();
         assertThat(relay.workers()).isEqualTo(4);
-        assertThat(relay.batchSize()).isEqualTo(1000);
+        assertThat(relay.batchSize()).isEqualTo(10_000);
         assertThat(relay.batchBytes()).isEqualTo(16L * 1024 * 1024);
         assertThat(relay.maxTicksPerBatch()).isEqualTo(100);
         assertThat(relay.minTickInterval()).isEqualTo(Duration.ofMillis(50));

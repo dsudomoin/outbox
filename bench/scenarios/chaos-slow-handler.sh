@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # chaos slow-handler: 1 instance whose Kafka handler sleeps HANDLER_DELAY_MS per record before each
-# handleBatch (DelayedHandler), with the library's default batchSize (1000) and batchTimeout (30 s), at RATE msg/s
+# handleBatch (DelayedHandler), with batchSize 1000 (the library's default before 10 000, kept for comparison with
+# earlier runs) and the default batchTimeout (30 s), at RATE msg/s
 # (order mode) for DURATION s. 8 relay workers × 1000 / (1000 × 20 ms) ≈ 400 msg/s of handler capacity, so RATE above it
 # builds a backlog that must drain after the load stops.
 # Pass: clean; duplicates at most 5 % of the consumed messages (no duplicate storm).
@@ -10,8 +11,8 @@ RATE=${RATE:-600}
 DELAY=${HANDLER_DELAY_MS:-20}
 
 chaos_begin slow-handler bench_chaos_slow_handler 1 "Режим заказов, 1 экземпляр, $RATE msg/s в течение $DURATION с; \
-обработчик Kafka спит $DELAY мс на каждую запись перед каждым пакетом, \`batchSize = 1000\`, \`batchTimeout = 30 s\` \
-(значения по умолчанию)" \
+обработчик Kafka спит $DELAY мс на каждую запись перед каждым пакетом, \`batchSize = 1000\` \
+(прежнее значение по умолчанию), \`batchTimeout = 30 s\` (по умолчанию)" \
   HANDLER_DELAY_MS="$DELAY" OUTBOX_RELAY_BATCH_SIZE=1000
 chaos_load 1 "$RATE" "$CHAOS_WRITERS"
 chaos_for "$DURATION"

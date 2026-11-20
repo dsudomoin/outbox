@@ -49,7 +49,7 @@ on Apple M5 Pro cores and a single Kafka broker with replication factor 1. Your 
 Rough sizing: **256 suits typical services.** Go lower only for tiny installs. More than 256 is rarely needed; 1024
 works but costs bulk throughput at saturation. Many shards are cheap: idle shards write nothing.
 
-Measured with library defaults (one instance, workers 4, `batchSize` 1000), RESULTS «Под нагрузкой после исправлений
+Measured with the library defaults of the time (one instance, workers 4, `batchSize` 1000, now 10 000), RESULTS «Под нагрузкой после исправлений
 ревью (fix round 1)» and «Простой после чекпоинтов»:
 
 | shards | 1 000 msg/s, Kafka: p50 / p99, DB CPU (of 200 %) | bulk, noop handler: delivered msg/s, p50 | idle xid/s |
@@ -207,7 +207,7 @@ kafka-topics.sh --bootstrap-server "$KAFKA" --create --topic imports --partition
 
 **Why these numbers:**
 
-- 256 shards with relay defaults (`batchSize` 1000) delivered 288–289k msg/s at p50 0.40 s, p99 1.0–1.1 s and 196 %
+- 256 shards with the relay defaults of the time (`batchSize` 1000, now 10 000) delivered 288–289k msg/s at p50 0.40 s, p99 1.0–1.1 s and 196 %
   DB CPU (2 writers × 10 000 per transaction, payload 100 B, noop handler; RESULTS «Под нагрузкой после исправлений
   ревью (fix round 1)»). The Kafka handler adds producer work: re-check with `outbox.shard.lag`.
 - A relay batch covers about `batchSize × shards` ids.

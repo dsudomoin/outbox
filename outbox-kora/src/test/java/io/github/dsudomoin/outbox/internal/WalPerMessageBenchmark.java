@@ -4,6 +4,7 @@ import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
+import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRuntime;
@@ -57,7 +58,8 @@ class WalPerMessageBenchmark {
     @Test
     void oneMessagePerTransaction() throws Exception {
         // the library's defaults, as a service that sets none runs them
-        var config = new TestOutboxConfig().shards(SHARDS).workers(4).batchSize(1000)
+        var config = new TestOutboxConfig().shards(SHARDS).workers(4)
+                .batchSize(new OutboxConfig.RelayConfig() {}.batchSize())
                 .minTickInterval(Duration.ofMillis(MIN_TICK_MS)).idlePollInterval(Duration.ofMillis(200))
                 .batchTimeout(Duration.ofSeconds(30)).maintenanceInterval(Duration.ofSeconds(30))
                 .xidsPerPartition(16_777_216L).premake(64).retry(Duration.ofSeconds(1), Duration.ofMinutes(5), 0);
