@@ -72,8 +72,13 @@ import org.slf4j.LoggerFactory;
  * a record that fails its whole call deep in a chunk is soon read alone; a requeue or a wait is neither. After
  * {@code headFailuresBeforeDivert} failed attempts in a row the shard probes: it reads the head row alone, in a call
  * of its own, and merges no parked row into it, so a slow or poison head is diverted as a single failing key, and a
- * down target loses at most one row to the retry table per (backed-off) probe; the rows of keys already there, ahead of
- * that head, follow in the same step, up to {@code batchSize}, as they need no call. Handler calls run on this processor's own bounded pool of
+ * down target loses at most one row to the retry table per probe, backed off; the rows of keys already there, ahead of
+ * that head, follow in the same step, up to {@code batchSize}, as they need no call. A step whose call tried nothing
+ * and asked to come back (each failing key's first row NotAttempted with a {@code notBefore}, as the Kafka sender
+ * answers for a cooling partition) pauses until the earliest of them instead of backing off, halves no limit and
+ * charges no row an attempt, but counts towards the probe and the divert up to {@code divertAt}: a key that keeps
+ * asking so is diverted too (its head due at its {@code notBefore}), and its probes are paced by the target, not by
+ * the doubling backoff. Handler calls run on this processor's own bounded pool of
  * daemon threads, each bounded by {@code batchTimeout}. A call that throws (an Error included) or returns an invalid
  * outcome list fails each of its records transiently (a call shared by several shards fails none of them: each is
  * called alone next), so a poison record takes that same path and no handler failure reaches the caller. The caller
@@ -990,10 +995,14 @@ public final class ShardProcessor implements AutoCloseable {
         var askedFor = failed ? BatchClassifier.askedToComeBack(items) : null;
         var decided = now.plus(Duration.ofNanos(System.nanoTime() - started)); // not from the start of a slow call
         if (askedFor != null && askedFor.isAfter(decided)) {
-            // the target tried nothing and said when to come back: no failed attempt, so the backoff, the failures and
-            // the limit stay; a time already past is a failed attempt, or a target answering so would spin the shard
+            // the target tried nothing and said when to come back: the shard waits until then, its limit stays, and
+            // no row is charged an attempt; a time already past is a failed attempt, or a target answering so would
+            // spin the shard. The step still counts towards probe mode and the divert of a single key, up to divertAt,
+            // so rows of a key that keeps cooling cannot hold the keys behind them; the backoff a later failure starts
+            // from stays bounded by that
             var until = BatchClassifier.dueAt(decided, askedFor, now).truncatedTo(ChronoUnit.MICROS);
-            next = next.withPause(until, cursor.failures());
+            int failures = cursor.failures();
+            next = next.withPause(until, failures < divertAt ? failures + 1 : failures);
             s.status = ShardStatus.PAUSED;
             telemetry.shardPaused();
             log.debug("outbox shard {} paused until {}: nothing attempted, the target asked to come back then", shard,
