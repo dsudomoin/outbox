@@ -5,10 +5,10 @@ description: Use when writing or reviewing an OutboxTopicHandler, TypedOutboxTop
 
 # Writing outbox handlers
 
-A `handleBatch` call gets `outbox.relay.batchTimeout` (default 30 s): at 80 % the relay asks it to wind down and
-interrupts the thread, at 100 % it abandons the call and retries every record, delivered ones included.
+A `handleBatch` call gets `outbox.relay.batchTimeout` (default 130 s): at 80 % (104 s) the relay asks it to wind
+down and interrupts the thread, at 100 % it abandons the call and retries every record, delivered ones included.
 **A handler is correct only if one call normally finishes well inside 80 % of `batchTimeout`**, with a per-request
-timeout well below it (Kora's default: 2 min).
+timeout well below it (Kora's default, 2 min, is above the 104 s: set your own).
 
 ## The batch budget
 
@@ -16,7 +16,7 @@ timeout well below it (Kora's default: 2 min).
 batchSize × p99(one record) ≤ 0.8 × batchTimeout − per-record timeout
 ```
 
-p99 2 s, request timeout 5 s, defaults: (24 − 5) / 2 → `batchSize` ≤ 9, Kafka included.
+p99 2 s, request timeout 5 s, defaults: (104 − 5) / 2 → `batchSize` ≤ 49, Kafka included.
 
 A sequential handler delivers at most min(shards, instances × workers) / mean seconds per record (2 × 4 / 0.3 s ≈
 26 msg/s), whatever the `batchSize`. If too low, follow every rule in [concurrent-delivery.md](concurrent-delivery.md).
@@ -27,7 +27,7 @@ The soft deadline is a safety net, not flow control.
 | Target answer | `handle` | `handleBatch` |
 |---|---|---|
 | Success | return | `Outcome.delivered()` |
-| Never succeeds (4xx except 408/429) | throw `OutboxPermanentException` | `Outcome.permanent(e)`: to `<table>_dead`, key continues |
+| Never succeeds (4xx except 408/429) | throw `OutboxPermanentException` | `Outcome.permanent(e)`: to `<table>_dead`, key continues; under `relay.retry.holdPermanent` held as a `Retry` (below) |
 | Transient (5xx, 408, IO) | throw anything else | `Outcome.retry(e)`: key blocked, backoff 1 s → 5 min |
 | 429 / Retry-After | throw: plain backoff only | `Outcome.retry(e, notBefore)`, capped at 24 h |
 | Not tried | | `Outcome.notAttempted()`, spends no attempt |
@@ -48,6 +48,12 @@ The soft deadline is a safety net, not flow control.
 - one `Outcome` per record, input order, no nulls;
 - never throw: a thrown call retries all its records;
 - after a (topic, key) fails or waits, its later records in the call are `notAttempted()`;
+- while `OutboxHandler.holdsPermanent()` is true (`outbox.relay.retry.holdPermanent`), a `Permanent` counts as a
+  failure of its key too: the relay retries the record, so never deliver a later record of that key in the same call,
+  or it reaches the target ahead of the held one and comes again behind it. It is false outside the relay's handler
+  thread, so read it there, not in a callback of an async client. Do not count such a record toward a «target down»
+  stop: the target answered. A route's own attempt cap that returns `Permanent` stops bounding anything under hold
+  (the record is held again each time); only `relay.retry.maxAttempts` does. Both examples do this;
 - catch `OutboxWaitException` before any catch-all: `new Outcome.Waiting(e.kind(), e.getMessage(), null)` keeps its
   reason and kind (`decode(record)` and `record.contractVersion()` throw it with kind `contract`); block the key, but
   do not count it toward a «target down» stop, since a wait says nothing about the target. The relay also turns a

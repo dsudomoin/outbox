@@ -29,7 +29,8 @@ import java.util.concurrent.TimeoutException;
 /**
  * POSTs the records of topic "audit" concurrently, at most IN_FLIGHT per handleBatch call; the rules it follows are in
  * concurrent-delivery.md. Wired as AuditHandler.java is (a @Component in Kora, builder.route(...) without); for
- * Retry-After see there.
+ * Retry-After see there. Under outbox.relay.retry.holdPermanent (OutboxHandler.holdsPermanent()) a Permanent blocks
+ * the rest of its key in the call, as a Retry does.
  */
 public final class ConcurrentAuditHandler implements OutboxTopicHandler {
 
@@ -68,6 +69,7 @@ public final class ConcurrentAuditHandler implements OutboxTopicHandler {
         var probes = new ArrayList<Integer>();
         var permits = new Semaphore(IN_FLIGHT);
         boolean probing = targetDown;
+        boolean held = OutboxHandler.holdsPermanent(); // read on this thread: the request threads never see it
         try {
             for (int i = 0; i < n && !OutboxHandler.windDownRequested(); i++) {
                 var record = records.get(i);
@@ -79,7 +81,9 @@ public final class ConcurrentAuditHandler implements OutboxTopicHandler {
                     }
                     var before = limited(records.get(previous), result(records.get(previous), decided[previous],
                             sends[previous]));
-                    if (!(before instanceof Outcome.Delivered || before instanceof Outcome.Permanent)) {
+                    // a Permanent lets the key go on, unless the relay holds it (outbox.relay.retry.holdPermanent): it
+                    // is retried, so the rest of its key waits behind it
+                    if (!(before instanceof Outcome.Delivered || before instanceof Outcome.Permanent && !held)) {
                         decided[i] = Outcome.notAttempted(); // the key failed or waits earlier in this call
                         continue;
                     }
@@ -188,7 +192,12 @@ public final class ConcurrentAuditHandler implements OutboxTopicHandler {
         return outcome instanceof Outcome.Delivered || outcome instanceof Outcome.Permanent;
     }
 
-    /** Dead-letters this route's records after MAX_ATTEMPTS failed deliveries. */
+    /**
+     * Dead-letters this route's records after MAX_ATTEMPTS failed deliveries. Under outbox.relay.retry.holdPermanent
+     * that Permanent is held as any other: the record stays the head of its key and comes back with the relay's
+     * backoff, answering Permanent again each time, so MAX_ATTEMPTS no longer bounds it; only relay.retry.maxAttempts
+     * does, for every route. A route that must give up on its own cannot do it under holdPermanent.
+     */
     private static Outcome limited(OutboxRecord record, Outcome outcome) {
         return outcome instanceof Outcome.Retry retry && record.attempts() + 1 >= MAX_ATTEMPTS
                 ? Outcome.permanent(retry.error())

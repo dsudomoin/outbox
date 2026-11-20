@@ -67,7 +67,10 @@ public final class AuditHandler implements OutboxTopicHandler {
         throw new IOException("audit answered HTTP " + code); // 5xx, 408: retried with backoff
     }
 
-    /** Same contract as the default: one outcome per record, in order, and never a thrown exception. */
+    /**
+     * Same contract as the default: one outcome per record, in order, and never a thrown exception; a Permanent blocks
+     * its key only while the relay holds permanent failures (OutboxHandler.holdsPermanent()).
+     */
     @Override
     public List<Outcome> handleBatch(List<OutboxRecord> records) {
         var outcomes = new ArrayList<Outcome>(records.size());
@@ -91,6 +94,11 @@ public final class AuditHandler implements OutboxTopicHandler {
                 anyDelivered = true;
             } catch (OutboxPermanentException e) {
                 outcomes.add(Outcome.permanent(e)); // to <table>_dead; the key continues
+                if (key != null && OutboxHandler.holdsPermanent()) {
+                    // outbox.relay.retry.holdPermanent: the relay retries it, so its key waits behind it; not a
+                    // failure of the target either
+                    blockedKeys.add(key);
+                }
             } catch (OutboxWaitException e) { // another release handles it: no attempt spent, never dead by itself
                 outcomes.add(new Outcome.Waiting(e.kind(), e.getMessage(), null));
                 if (key != null) {
