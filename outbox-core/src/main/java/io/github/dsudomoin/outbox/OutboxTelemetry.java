@@ -100,8 +100,9 @@ public interface OutboxTelemetry {
      * {@code shards} is a copy of the shards whose locks the step holds, those without work included. The step's
      * cursor read, its target choice and the retry and parked lookups up to that shard come before this call; its
      * further database work, handler calls ({@link #deliveryStarted(RelayStep, List, Instant)}), its
-     * {@link RelayStep#settleStarted settle} and its transaction's commit or rollback run on this thread (the handler
-     * itself on a handler thread) until {@link RelayStep#finished()} or {@link RelayStep#failed}.
+     * {@link RelayStep#settleStarted settle} and its transaction's commit, or the rollback of a failed COMMIT, run on
+     * this thread (the handler itself on a handler thread) until {@link RelayStep#finished()} or
+     * {@link RelayStep#failed}. When the step's own work fails, the settle and the step end before the rollback.
      */
     default RelayStep stepStarted(List<Integer> shards) {
         return RelayStep.NONE;
@@ -247,8 +248,9 @@ public interface OutboxTelemetry {
 
         /**
          * Once per step with work, after its last handler call, before it writes the main pass's outcomes and the
-         * cursors (the retry pass writes each call's outcomes before the next call, earlier). Ended once, after the
-         * step's transaction ends and before this step does.
+         * cursors (the retry pass writes each call's outcomes before the next call, earlier). Ended once, before this
+         * step is: after its COMMIT returned, or after the rollback of a failed COMMIT; when the step's own work
+         * fails, before the rollback.
          */
         default Settle settleStarted() {
             return Settle.NONE;
