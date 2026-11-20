@@ -33,7 +33,7 @@ on Apple M5 Pro cores and a single Kafka broker with replication factor 1. Your 
 | Pool per instance | `db.maxPoolSize` = own need + `relay.workers` + 3 (+1 while `drain()` runs); the 3 are outbox maintenance, inbox maintenance and the dead-letter thread. Besides: after an upgrade the one-time `<table>_dead_due` build (thread `outbox-dead-index`) holds one while it runs. The heartbeat takes none from it: in Kora it has a pool of its own of one connection (`outbox.heartbeat.dedicatedConnection`, default `true`) | README «Размер пула соединений» |
 | Postgres connections | Σ over services and instances of `maxPoolSize` + 1 per outbox instance (the heartbeat's own connection) + other clients + `superuser_reserved_connections` (3) ≤ `max_connections` (Postgres default 100); the + 1 also counts against the role's `CONNECTION LIMIT` and a pooler's per-user pool | Postgres, README «Размер пула соединений» |
 | Advisory lock slots | `max_locks_per_transaction × (max_connections + max_prepared_transactions)` ≥ concurrent writer transactions × distinct keys each + other locks | README «max_locks_per_transaction для массовой отправки» |
-| Kafka call budget | `batchTimeout ≥ delivery.timeout.ms + 5 s + max.block.ms` (defaults 20 + 5 + 5 = 30 s) | `KafkaOutboxSender` |
+| Kafka call budget | `batchTimeout ≥ delivery.timeout.ms + 5 s + max.block.ms` (defaults 120 + 5 + 5 = 130 s) | `KafkaOutboxSender` |
 | Dead-letter hook budget | `deadLetters.timeout` ≥ the same sum with the Kafka DLQ | README «Kafka DLQ» |
 | Handler call budget | `batchSize × p99(record) ≤ 0.8 × batchTimeout − per-record timeout` | `OutboxHandler`, `OutboxConfig` |
 | Sequential handler throughput | ≤ min(shards, instances × workers) / mean seconds per record | Little's law; RESULTS «chaos: slow-handler» |
@@ -94,7 +94,7 @@ kafka-topics.sh --bootstrap-server "$KAFKA" --create --topic orders --partitions
 **Why these numbers:** the default shard count costs nothing extra here: idle cost is about 1 / 0.2 s = 5 write
 transactions per second per cluster at any shard count (5.1 xid/s measured), and one instance with 4 workers carried
 1 000 msg/s at 26–31 % DB CPU. Two workers per instance keep a stalled handler call from holding all delivery.
-Producer timeouts stay at the defaults, so `batchTimeout` 30 s meets 20 + 5 + 5.
+Producer timeouts and `batchTimeout` stay at the defaults, so `batchTimeout` 130 s meets 120 + 5 + 5.
 
 ## 2. Typical service with an inbox consumer
 
@@ -232,7 +232,7 @@ outbox {
   table = "orders.outbox"       # outbox.shards unset: 256
   relay {
     workers = 3
-    batchSize = 75              # (0.8 × 30 s − 1 s) / 0.3 s = 76; with p99 2 s and a 5 s timeout: (24 − 5) / 2 → 9
+    batchSize = 75              # (0.8 × 130 s − 1 s) / 0.3 s = 343 is the call budget; see below for 75
     # retry.maxAttempts stays 0: orders need per-user order; the audit handler dead-letters its own records
   }
   kafka.driverProperties {
@@ -249,8 +249,13 @@ httpClient.audit {
 
 **Why these numbers:**
 
-- The batch budget gives `batchSize` 75; it also caps Kafka records per call, and orders in a chunk wait behind the
-  audit route of the same call.
+- The call budget, (0.8 × 130 s − 1 s) / 0.3 s ≈ 343 (≈ 49 for the 2 s variant with a 5 s timeout), is not the
+  only limit. Routes of a `byTopic` call run one after another, and the Kafka route hands records over only in the
+  call's first 9 s (`batchTimeout` − 1 s − `delivery.timeout.ms`, 130 − 1 − 120), so that Kafka can answer them before
+  the cut ahead of the relay's cancel. Orders of a call whose audit route runs past that are not handed over: they
+  go to the retry table and wait for its next pass. 75 audit records at 0.3 s each take 22.5 s, so watch the route's
+  call time and lower `batchSize` if it often runs past 9 s. `batchSize` also caps Kafka records per call, and orders
+  in a chunk wait behind the audit route of the same call.
 - Sequential throughput is at most min(256, 3 × 3) / 0.3 s = 30 audit msg/s (≈ 4.5 msg/s at 2 s). RESULTS «chaos:
   slow-handler» shows the cap: 20 ms per record with 8 workers (≤ 400 msg/s) moved about 380 msg/s end to end
   (178 080 orders in 300 s of load plus 167 s of drain) against 600 offered, and relay lag reached 204 s.
@@ -265,7 +270,8 @@ httpClient.audit {
     route. With one instance down, 8 × 400 / 0.35 s ≈ 9 100 rows/s, ≈ 2.3× the 4 000 needed.
   - In flight at the audit service: ≈ 600 on average (2 000/s × 0.3 s), at most 12 × 200 = 2 400. Give its owner the
     cap: a retry pass after an outage hands up to 400 due heads per call, all audit, still limited to P.
-  - Deadline: at worst ceil(400 / 200) × the 1 s request timeout = 2 s (plus connect time), far inside 24 s.
+  - Deadline: at worst ceil(400 / 200) × the 1 s request timeout = 2 s (plus connect time), inside the Kafka
+    route's 9 s window and far inside the 104 s soft deadline.
 - `relay.retry.maxAttempts` is global. A record moved to `<table>_dead` lets the later records of its key go on, and
   a redrive delivers it after them, so with a Kafka route that needs per-key order keep `maxAttempts` = 0 and alert
   on `outbox.shard.lag`. Bound only the HTTP route, in its handler: return `Outcome.permanent(e)` instead of

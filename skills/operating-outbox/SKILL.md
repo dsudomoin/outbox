@@ -85,7 +85,9 @@ Metrics, alerts and procedures are the same. What differs:
 - **Stop:** the web server and the listeners stop first, then the outbox, synchronously, within
   `outbox.relay.shutdown-timeout` and about a second more on a live database (longer on a hung one, up to SIGKILL); `spring.lifecycle.timeout-per-shutdown-phase` does not cut
   it. Set `terminationGracePeriodSeconds` above `preStop` + that phase timeout per phase + `shutdown-timeout` + a couple
-  of seconds; the default 30 s is too little. SIGKILL loses nothing: unrecorded records are delivered again.
+  of seconds; the default 30 s is too little. SIGKILL loses nothing: unrecorded records are delivered again. A step
+  still waiting for a Kafka call at `shutdown-timeout` (a broker outage: up to `batch-timeout`) is interrupted too, and
+  its records go again, duplicates of those the broker had already written.
 - **Secrets:** `/actuator/configprops` with `show-values=always` prints `outbox.kafka.driver-properties` values.
 - **Spans:** Boot 4.1 needs `spring-boot-micrometer-tracing` and a bridge, Boot 3.5 a bridge.
 - **Admin HTTP:** [admin-api.md](admin-api.md), «Spring Boot».

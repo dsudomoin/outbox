@@ -34,8 +34,8 @@ outbox {
 | `maxTicksPerBatch` | `100` | ≥ 1. |
 | `minTickInterval` | `50ms` | ≥ 0. Under load, at most one tick per interval. |
 | `idlePollInterval` | `200ms` | > 0. Idle tick rate; how fast a commit on another instance is noticed. |
-| `batchTimeout` | `30s` | > 0, ≤ 24 days. Bound of one handler call: wind-down at 80 %, abandoned (all records retried) at 100 %. With Kafka ≥ `delivery.timeout.ms + 5 s + max.block.ms`. `drain()` gives up after 4 × this + 10 s without progress, longer than a relay step runs: a step over several shards starts a shard's retry pass until it has spent `batchTimeout`, one started just before runs up to 2 × `batchTimeout`, and the main pass's shared call up to another `batchTimeout`. |
-| `shutdownTimeout` | `30s` | ≥ 0. Grace for in-flight batches at shutdown; then they are interrupted and redelivered later. `close()` spends up to about 8 s more: interrupted workers and the instance row's delete (a locked row or an exhausted pool is left to expire). |
+| `batchTimeout` | `130s` | > 0, ≤ 24 days. Bound of one handler call: wind-down at 80 %, abandoned (all records retried) at 100 %. With Kafka ≥ `delivery.timeout.ms + 5 s + max.block.ms`; the default is that budget with the default producer settings, a handler without such long calls may set it lower. `drain()` gives up after 4 × this + 10 s (530 s by default) without progress, longer than a relay step runs: a step over several shards starts a shard's retry pass until it has spent `batchTimeout`, one started just before runs up to 2 × `batchTimeout`, and the main pass's shared call up to another `batchTimeout`. |
+| `shutdownTimeout` | `30s` | ≥ 0. Grace for in-flight batches at shutdown; then they are interrupted and redelivered later, a step still waiting for a Kafka call through an outage included. `close()` spends up to about 8 s more: interrupted workers and the instance row's delete (a locked row or an exhausted pool is left to expire). |
 | `connectionHold` | `1m` | > 0. Under a backlog a relay worker starts steps on one pooled connection for this long, then hands it back and takes another, so the pool can retire it at `maxLifetime`. A step started just before the end runs on the same connection, up to 4 × `batchTimeout` (see `batchTimeout`), so a pool's `leakDetectionThreshold` must exceed `connectionHold` + 4 × `batchTimeout`; to keep leak detection below a minute lower both. |
 | `headFailuresBeforeDivert` | `3` | ≥ 1. Consecutive failures before a shard isolates a single failing key. |
 | `cursorAnchorInterval` | `1h` | > 0 and ≥ `partitions.maintenanceInterval`. Maintenance writes an idle shard one cursor row this often; ticks are kept about this long (at most about 10 000: a shard that far behind is anchored at the next run), so a rollback to the previous release resumes from these anchors. |
@@ -114,7 +114,7 @@ The dead-letter hook and the dead table (writing-outbox-handlers, `dead-letter-h
 | Key | Default | Rule and meaning |
 |---|---|---|
 | `batchSize` | `100` | 1..1000. Letters per hook call; also key locks per redrive transaction. |
-| `timeout` | `30s` | > 0, ≤ 24 days. Bound of one hook call; a call past it leaves its letters pending with backoff `relay.retry.initialDelay` doubling to `maxDelay`. With the Kafka DLQ ≥ `delivery.timeout.ms + 5 s + max.block.ms`, else a WARN at startup. |
+| `timeout` | `130s` | > 0, ≤ 24 days. Bound of one hook call (by default the Kafka sender's budget, as `relay.batchTimeout`); a call past it leaves its letters pending with backoff `relay.retry.initialDelay` doubling to `maxDelay`. With the Kafka DLQ ≥ `delivery.timeout.ms + 5 s + max.block.ms`, else a WARN at startup. |
 | `retention` | `0` | 0..3650 days. Maintenance deletes `kept` letters older than this by `failed_at`; `0` keeps them forever. `pending` and `scheduled` letters are never deleted. Deleted in portions, at most `maintenanceInterval` per run; later runs finish the rest. |
 | `redriveHistory` | `30d` | > 0, ≤ 3650 days. How long `<table>_redriven` remembers a message's redrive count, which a letter that dies again carries in `redrives`. Old entries go in portions, within the same per-run budget as `retention`. |
 
@@ -235,7 +235,7 @@ gets `client.id` unchanged, and their JMX metrics collide (see the end of this s
 |---|---|
 | Forced | `enable.idempotence=true`, `acks=all`, byte-array key and value serializers |
 | Rejected | `transactional.id`; `partitioner.class`; `partitioner.ignore.keys=true`; `acks` other than `all`/`-1`; `enable.idempotence=false`; `max.in.flight.requests.per.connection` > 5; `delivery.timeout.ms` < `linger.ms + request.timeout.ms`; anything Kafka's `ProducerConfig` rejects |
-| Defaults when unset | `delivery.timeout.ms=20000`, then (only if that was unset) `request.timeout.ms=15000`; `max.block.ms=5000`; `enable.metrics.push=false` |
+| Defaults when unset | `delivery.timeout.ms=120000`; `max.block.ms=5000`; `enable.metrics.push=false`; `request.timeout.ms` is Kafka's own, 30 s |
 
 **Outcomes.** `RecordTooLargeException`, `InvalidRecordException` (a null key on a compacted topic among them) and
 `InvalidTopicException` are permanent (dead letters); an `InvalidTopicException` sends every record of its topic in

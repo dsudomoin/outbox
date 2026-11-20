@@ -38,7 +38,7 @@ it by message id within their window.
 ## The rules
 
 - **A failed call fails all its letters.** A call that throws (an `Error` too), returns an invalid list (null, wrong
-  size, a null element) or runs past `outbox.deadLetters.timeout` (30 s; it is interrupted and abandoned) leaves every
+  size, a null element) or runs past `outbox.deadLetters.timeout` (130 s; it is interrupted and abandoned) leaves every
   one of its letters `pending`, decided letters included. When one letter cannot be handled now (its target is down,
   say), return `retryLater(e)` for it and decide the rest: throw only when nothing can be decided.
 - **At least once.** A failed call is repeated after a backoff (`relay.retry.initialDelay` doubling to `maxDelay`)
@@ -103,7 +103,7 @@ module's hook publishes each letter through the relay's producers:
 - **Duplicates.** A broker refusal after the append closes the producer: batch-mates still in flight are sent again in
   the same call and may land twice. DLQ consumers deduplicate by `outbox-message-id`.
 - Create DLQ topics before deploy when the broker does not auto-create them; until then the letters of those topics
-  wait `pending`, while the others go to their DLQ topics. Keep `outbox.deadLetters.timeout` ≥ `delivery.timeout.ms + 5 s + max.block.ms` (30 s by default), else
+  wait `pending`, while the others go to their DLQ topics. Keep `outbox.deadLetters.timeout` ≥ `delivery.timeout.ms + 5 s + max.block.ms` (130 s by default), else
   a WARN at startup: a cut call repeats acknowledged letters too.
 
 ## Alerts

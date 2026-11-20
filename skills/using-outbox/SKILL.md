@@ -142,7 +142,7 @@ no route check.
 
 ## Config rules
 
-- `outbox.relay.batchTimeout ≥ delivery.timeout.ms + 5 s + max.block.ms` (defaults 20 + 5 + 5 = 30 s).
+- `outbox.relay.batchTimeout ≥ delivery.timeout.ms + 5 s + max.block.ms` (defaults 120 + 5 + 5 = 130 s, the default `batchTimeout`).
 - `outbox.relay.waiting { delay = 1s, maxDelay = 5m, alertAfter = 15m }`: how often a record that waits for another
   release is handed again (a quarter of its wait, within `delay`..`maxDelay`) and when its WARN becomes an ERROR
   ([config-reference.md](config-reference.md)). Defaults fit; alert on `outbox.waiting.oldest > alertAfter`.
