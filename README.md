@@ -2197,11 +2197,16 @@ letters, написанные одним мажором, читает друго
   `spring-boot-micrometer-tracing`: обработчиков трассировки в его actuator-стартере нет. Код обработчика выполняется в
   области наблюдения доставки. Span-ы по этапам — в [Контракте по этапам](#контракт-по-этапам).
 - `management.observations.enable.outbox.relay.step=false` выключает наблюдение шага, `…enable.outbox.relay.settle=false` —
-  наблюдение расчёта, а `outbox.telemetry.observe-unsampled` управляет несэмплированными записями. Обработчик, который
-  связывает span доставки со span-ом шага (`OutboxDeliveryTracingObservationHandler`), адаптер регистрирует сам
-  (`@Order(999)`, перед обработчиком получателя Boot; `TelemetryIT#deliverySpanLinksToTheStepSpan`).
-- Бины `OutboxEnqueueObservationConvention`, `OutboxDeliveryObservationConvention`, `OutboxStepObservationConvention`
-  меняют имена и ключи наблюдений. Свой бин `OutboxTelemetry` заменяет всё.
+  наблюдение фиксации шага, а `outbox.telemetry.observe-unsampled` управляет несэмплированными записями. Обработчик,
+  который связывает span доставки со span-ом шага (`OutboxDeliveryTracingObservationHandler`), адаптер регистрирует сам
+  (`@Order(999)`, перед обработчиком получателя Boot; `TelemetryIT#deliverySpanLinksToTheStepSpan`), если в контексте
+  есть обработчик получателя — Boot-а или приложения. Обработчик получателя Boot при этом остаётся для всех остальных
+  получателей. Свой бин-наследник `OutboxDeliveryTracingObservationHandler` заменяет наш; ему нужен `@Order` меньше
+  1000, например `@Order(999)`, иначе доставки первым забирает обработчик трассировки Boot по умолчанию
+  (`TelemetryIT#theAppsOwnDeliveryHandlerWins`).
+- Бины `OutboxEnqueueObservationConvention`, `OutboxDeliveryObservationConvention`, `OutboxStepObservationConvention`,
+  `OutboxSettleObservationConvention` меняют имена и ключи наблюдений (`TelemetryIT#conventionBeanUsed`). Свой бин
+  `OutboxTelemetry` заменяет всё.
 
 ### Админ-API в Spring Boot
 
@@ -5084,8 +5089,9 @@ var runtime = OutboxRuntime.builder(config, transactions, handler).telemetry(tel
 - `outbox.deliver` (span `outbox deliver <topic>`) — одно наблюдение на доставляемую запись сэмплированной трассы
   (с `observeUnsampled(true)` — на каждую, см. ниже). Это наблюдение получателя (`ReceiverContext`), kind `CONSUMER`:
   родитель — контекст, сохранённый при отправке, без него — span шага. Link на span шага ставит
-  `OutboxDeliveryTracingObservationHandler` (наследует `PropagatingReceiverTracingObservationHandler`; зарегистрируйте
-  его перед обычным обработчиком получателя, адаптер Spring Boot делает это сам). Link есть, только если сохранённый
+  `OutboxDeliveryTracingObservationHandler` (span он строит как `PropagatingReceiverTracingObservationHandler`, но сам
+  им не является, поэтому обработчик получателя Boot не вытесняет; зарегистрируйте его перед обычным обработчиком
+  получателя, адаптер Spring Boot делает это сам). Link есть, только если сохранённый
   родитель читается: последний `traceparent` записи корректен или есть контекст B3
   (`KafkaTelemetryIT#deliverLinksToItsStep`, `ObservationOutboxTelemetryTest#noLinkForAMalformedTraceparent`,
   `TelemetryIT#deliverySpanLinksToTheStepSpan`). Ключи с низкой кардинальностью: `messaging.system=outbox`,
@@ -5157,8 +5163,10 @@ relay-воркер `outbox-relay-N` или поток, вызвавший `Outbo
 все они ссылаются на один span шага
 (`KafkaTelemetryIT#oneCallWithRecordsFromThreeTracesKeepsEachTrace`, для Kora —
 `KoraOutboxTelemetryTest#eachRecordOfACallKeepsItsOwnTrace`). Если нужна отдельная трасса доставки со ссылкой на трассу
-писателя, сделайте её в своём обработчике Observation: переопределите `customizeExtractedSpan` в наследнике `OutboxDeliveryTracingObservationHandler` (`setNoParent()` и
-`addLink(...)`); в Spring Boot объявите его бином — он заменит наш.
+писателя, сделайте её в своём обработчике Observation: переопределите `customizeDeliverySpan` в наследнике
+`OutboxDeliveryTracingObservationHandler` (`setNoParent()` и `addLink(...)`). В Spring Boot объявите его бином с
+`@Order` меньше 1000, например `@Order(999)`: он заменит наш. Без такого порядка доставки первым забирает обработчик
+трассировки Boot по умолчанию, и наследник их не увидит (`TelemetryIT#theAppsOwnDeliveryHandlerWins`).
 
 **Запись без контекста трассы.** Через `ObservationOutboxTelemetry` с propagating-обработчиком отправителя в реестре
 контекст сохраняется всегда: `send` вне любого span-а начинает корневой span `outbox enqueue <topic>`, и доставка

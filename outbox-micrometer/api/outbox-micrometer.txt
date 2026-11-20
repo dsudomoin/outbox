@@ -59,9 +59,13 @@ package io.github.dsudomoin.outbox.micrometer {
     method public default boolean supportsContext(io.micrometer.observation.Observation.Context!);
   }
 
-  public class OutboxDeliveryTracingObservationHandler extends io.micrometer.tracing.handler.PropagatingReceiverTracingObservationHandler<io.github.dsudomoin.outbox.micrometer.OutboxDeliveryContext!> {
+  public class OutboxDeliveryTracingObservationHandler implements io.micrometer.tracing.handler.TracingObservationHandler<io.github.dsudomoin.outbox.micrometer.OutboxDeliveryContext!> {
     ctor public OutboxDeliveryTracingObservationHandler(io.micrometer.tracing.Tracer!, io.micrometer.tracing.propagation.Propagator!);
-    method public io.micrometer.tracing.Span.Builder! customizeExtractedSpan(io.github.dsudomoin.outbox.micrometer.OutboxDeliveryContext!, io.micrometer.tracing.Span.Builder!);
+    method protected io.micrometer.tracing.Span.Builder! customizeDeliverySpan(io.github.dsudomoin.outbox.micrometer.OutboxDeliveryContext!, io.micrometer.tracing.Span.Builder!);
+    method public io.micrometer.tracing.Tracer! getTracer();
+    method public void onError(io.github.dsudomoin.outbox.micrometer.OutboxDeliveryContext!);
+    method public void onStart(io.github.dsudomoin.outbox.micrometer.OutboxDeliveryContext!);
+    method public void onStop(io.github.dsudomoin.outbox.micrometer.OutboxDeliveryContext!);
   }
 
   public final class OutboxEnqueueContext extends io.micrometer.observation.transport.SenderContext<java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!> {

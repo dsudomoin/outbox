@@ -21,6 +21,7 @@ import io.github.dsudomoin.outbox.micrometer.OutboxDeliveryObservationConvention
 import io.github.dsudomoin.outbox.micrometer.OutboxDeliveryTracingObservationHandler;
 import io.github.dsudomoin.outbox.micrometer.OutboxEnqueueObservationConvention;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.micrometer.OutboxSettleObservationConvention;
 import io.github.dsudomoin.outbox.micrometer.OutboxStepObservationConvention;
 import io.github.dsudomoin.outbox.protobuf.ProtobufOutbox;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -82,15 +83,18 @@ import org.springframework.core.type.AnnotatedTypeMetadata;
  * <p>
  * The telemetry is Micrometer's over the context's {@code ObservationRegistry} and {@code MeterRegistry}, each if any,
  * traced with its {@code Tracer} and {@code Propagator} if both exist, named by its
- * {@link OutboxEnqueueObservationConvention}, {@link OutboxDeliveryObservationConvention} and
- * {@link OutboxStepObservationConvention} beans, if any. An app's own {@link OutboxTelemetry} bean replaces it.
- * With both tracing beans, an {@link OutboxDeliveryTracingObservationHandler} links each delivery span to its step's
- * span; ordered ahead of Boot's receiver handler, which stays for every other receiver. An app's own one replaces it.
+ * {@link OutboxEnqueueObservationConvention}, {@link OutboxDeliveryObservationConvention},
+ * {@link OutboxSettleObservationConvention} and {@link OutboxStepObservationConvention} beans, if any. An app's own
+ * {@link OutboxTelemetry} bean replaces it.
+ * With both tracing beans and a receiver tracing handler (Boot's or the app's), an
+ * {@link OutboxDeliveryTracingObservationHandler} links each delivery span to its step's span; ordered ahead of Boot's
+ * receiver handler, which stays for every other receiver. An app's own one replaces it; it needs an {@code @Order}
+ * below 1000 (as {@code @Order(999)}), or Boot's default tracing handler takes the deliveries first.
  */
 @AutoConfiguration(afterName = {
     "org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration", // Boot 3
     "org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration", // Boot 4
-    // the Tracer and Propagator are defined by then, and Boot's receiver handler, which backs off for ours
+    // the Tracer, the Propagator and Boot's receiver handler, which ours goes with, are defined by then
     "org.springframework.boot.actuate.autoconfigure.tracing.MicrometerTracingAutoConfiguration", // Boot 3
     "org.springframework.boot.micrometer.tracing.autoconfigure.MicrometerTracingAutoConfiguration" // Boot 4
 })
@@ -113,6 +117,7 @@ public final class OutboxAutoConfiguration {
             ObjectProvider<ObservationRegistry> observations, ObjectProvider<MeterRegistry> meters,
             ObjectProvider<OutboxEnqueueObservationConvention> enqueueConvention,
             ObjectProvider<OutboxDeliveryObservationConvention> deliveryConvention,
+            ObjectProvider<OutboxSettleObservationConvention> settleConvention,
             ObjectProvider<OutboxStepObservationConvention> stepConvention, ObjectProvider<TelemetryTracing> tracing) {
         var builder = ObservationOutboxTelemetry.builder(observations.getIfAvailable(() -> ObservationRegistry.NOOP),
                 new OutboxMetrics(meters.getIfAvailable()))
@@ -120,6 +125,7 @@ public final class OutboxAutoConfiguration {
                 .observeUnsampled());
         enqueueConvention.ifAvailable(builder::enqueueConvention);
         deliveryConvention.ifAvailable(builder::deliveryConvention);
+        settleConvention.ifAvailable(builder::settleConvention);
         stepConvention.ifAvailable(builder::stepConvention);
         tracing.ifAvailable(t -> t.apply(builder));
         return builder.build();
@@ -152,10 +158,13 @@ public final class OutboxAutoConfiguration {
 
         /**
          * Ahead of Boot's receiver handler ({@code @Order(1000)}) in Boot's first-matching group of tracing handlers,
-         * so that it, not Boot's, takes the deliveries.
+         * so that it, not Boot's, takes the deliveries. Only beside a receiver handler: without one the context
+         * registers its tracing handlers itself, and ours would be a standalone handler that traces each delivery a
+         * second time.
          */
         @Bean
-        @ConditionalOnBean({io.micrometer.tracing.Tracer.class, io.micrometer.tracing.propagation.Propagator.class})
+        @ConditionalOnBean({io.micrometer.tracing.Tracer.class, io.micrometer.tracing.propagation.Propagator.class,
+            io.micrometer.tracing.handler.PropagatingReceiverTracingObservationHandler.class})
         @ConditionalOnMissingBean(OutboxDeliveryTracingObservationHandler.class)
         @Order(999)
         OutboxDeliveryTracingObservationHandler outboxDeliveryTracingObservationHandler(

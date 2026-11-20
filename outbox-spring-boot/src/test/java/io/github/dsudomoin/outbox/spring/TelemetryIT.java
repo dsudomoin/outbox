@@ -14,11 +14,14 @@ import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.OutboxTopicHandler;
 import io.github.dsudomoin.outbox.micrometer.DefaultOutboxDeliveryObservationConvention;
 import io.github.dsudomoin.outbox.micrometer.DefaultOutboxEnqueueObservationConvention;
+import io.github.dsudomoin.outbox.micrometer.DefaultOutboxSettleObservationConvention;
 import io.github.dsudomoin.outbox.micrometer.DefaultOutboxStepObservationConvention;
 import io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry;
 import io.github.dsudomoin.outbox.micrometer.OutboxDeliveryObservationConvention;
 import io.github.dsudomoin.outbox.micrometer.OutboxDeliveryTracingObservationHandler;
+import io.github.dsudomoin.outbox.micrometer.OutboxDeliveryContext;
 import io.github.dsudomoin.outbox.micrometer.OutboxEnqueueObservationConvention;
+import io.github.dsudomoin.outbox.micrometer.OutboxSettleObservationConvention;
 import io.github.dsudomoin.outbox.micrometer.OutboxStepObservationConvention;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -26,6 +29,7 @@ import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.micrometer.observation.Observation;
 import io.micrometer.observation.ObservationRegistry;
+import io.micrometer.tracing.Span;
 import io.micrometer.tracing.Tracer;
 import io.micrometer.tracing.handler.PropagatingReceiverTracingObservationHandler;
 import io.micrometer.tracing.propagation.Propagator;
@@ -33,6 +37,7 @@ import io.micrometer.tracing.otel.bridge.OtelBaggageManager;
 import io.micrometer.tracing.otel.bridge.OtelCurrentTraceContext;
 import io.micrometer.tracing.otel.bridge.OtelPropagator;
 import io.micrometer.tracing.otel.bridge.OtelTracer;
+import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
 import io.opentelemetry.context.propagation.ContextPropagators;
@@ -60,6 +65,7 @@ import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.annotation.Order;
 import org.springframework.core.env.Environment;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -196,6 +202,32 @@ class TelemetryIT {
                 }
             };
         }
+
+        @Bean
+        OutboxSettleObservationConvention settleConvention() {
+            return new DefaultOutboxSettleObservationConvention() {
+                @Override
+                public String getName() {
+                    return "custom.settle";
+                }
+            };
+        }
+    }
+
+    /** The app's own delivery handler as the README describes it: a subclass, ordered ahead of Boot's handlers. */
+    @Configuration(proxyBeanMethods = false)
+    static class OwnDeliveryHandler {
+
+        @Bean
+        @Order(999)
+        OutboxDeliveryTracingObservationHandler ownDeliveryHandler(Tracer tracer, Propagator propagator) {
+            return new OutboxDeliveryTracingObservationHandler(tracer, propagator) {
+                @Override
+                protected Span.Builder customizeDeliverySpan(OutboxDeliveryContext context, Span.Builder builder) {
+                    return builder.tag("test.own", "yes");
+                }
+            };
+        }
     }
 
     /** No Boot auto-configuration but the outbox's: no registries or tracing, as an app without the actuator has. */
@@ -270,7 +302,7 @@ class TelemetryIT {
         traced().withUserConfiguration(TestApps.WithRoute.class).run(context -> {
             assertThat(context).hasNotFailed().hasSingleBean(OutboxDeliveryTracingObservationHandler.class);
             assertThat(context.getBeansOfType(PropagatingReceiverTracingObservationHandler.class))
-                .as("Boot's own receiver handler beside ours").hasSize(2);
+                .as("Boot's own receiver handler beside ours").hasSize(1);
             var spans = context.getBean(InMemorySpanExporter.class);
 
             Observation.createNotStarted("test.parent", context.getBean(ObservationRegistry.class))
@@ -298,17 +330,26 @@ class TelemetryIT {
         runner().withUserConfiguration(TestApps.WithRoute.class).run(context -> {
             assertThat(context).hasNotFailed().doesNotHaveBean(Traced.class).hasSingleBean(Tracer.class)
                 .hasSingleBean(Propagator.class).hasSingleBean(OutboxDeliveryTracingObservationHandler.class);
-            assertThat(context.getBeansOfType(PropagatingReceiverTracingObservationHandler.class)).hasSize(2);
+            assertThat(context.getBeansOfType(PropagatingReceiverTracingObservationHandler.class)).hasSize(1);
         });
     }
 
+    /** It replaces ours and takes the deliveries; Boot's receiver handler stays for every other receiver. */
     @Test
     void theAppsOwnDeliveryHandlerWins() {
-        traced().withUserConfiguration(TestApps.WithRoute.class)
-            .withBean("ownDeliveryHandler", OutboxDeliveryTracingObservationHandler.class,
-                () -> new OutboxDeliveryTracingObservationHandler(Tracer.NOOP, Propagator.NOOP))
-            .run(context -> assertThat(context).hasNotFailed()
-                .hasSingleBean(OutboxDeliveryTracingObservationHandler.class).hasBean("ownDeliveryHandler"));
+        traced().withUserConfiguration(TestApps.WithRoute.class, OwnDeliveryHandler.class).run(context -> {
+            assertThat(context).hasNotFailed().hasSingleBean(OutboxDeliveryTracingObservationHandler.class)
+                .hasBean("ownDeliveryHandler");
+            assertThat(context.getBeansOfType(PropagatingReceiverTracingObservationHandler.class).values())
+                .as("Boot's own receiver handler").singleElement()
+                .isNotInstanceOf(OutboxDeliveryTracingObservationHandler.class);
+            var spans = context.getBean(InMemorySpanExporter.class);
+
+            send(context, "orders");
+
+            assertThat(awaitSpan(spans, "outbox deliver orders").getAttributes().get(AttributeKey.stringKey("test.own")))
+                .isEqualTo("yes");
+        });
     }
 
     @Test
@@ -402,10 +443,12 @@ class TelemetryIT {
                 assertThat(timerCount(meters, "custom.enqueue")).isOne();
                 assertThat(timerCount(meters, "custom.deliver")).isOne();
                 assertThat(timerCount(meters, "custom.step")).isPositive();
+                assertThat(timerCount(meters, "custom.settle")).isPositive();
             });
             assertThat(meters.find("outbox.enqueue").timer()).isNull();
             assertThat(meters.find("outbox.deliver").timer()).isNull();
             assertThat(meters.find("outbox.relay.step").timer()).isNull();
+            assertThat(meters.find("outbox.relay.settle").timer()).isNull();
         });
     }
 
@@ -436,6 +479,16 @@ class TelemetryIT {
                 var route = context.getBean(TestApps.OrdersRoute.class);
                 await().atMost(WAIT).untilAsserted(() -> assertThat(route.delivered()).containsExactly(id));
             });
+    }
+
+    /** As an app that registers its own tracing handlers: ours would trace each delivery a second time. */
+    @Test
+    void noDeliveryHandlerWithoutAReceiverHandler() {
+        bare().withUserConfiguration(Traced.class, TestApps.WithRoute.class).run(context -> {
+            assertThat(context).hasNotFailed().hasSingleBean(Tracer.class).hasSingleBean(Propagator.class)
+                .doesNotHaveBean(PropagatingReceiverTracingObservationHandler.class)
+                .doesNotHaveBean(OutboxDeliveryTracingObservationHandler.class);
+        });
     }
 
     @Test
