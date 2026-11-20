@@ -192,7 +192,9 @@ public final class KafkaOutboxSender implements AutoCloseable {
      * {@code producers} makes each producer the sender pools, from the validated properties (the forced and defaulted
      * ones set): the application's own Kafka client factory, e.g. one that adds its metrics or interceptors. It must
      * build each producer from the properties it receives: the sender passes {@code batch.size=0} for its second pool
-     * (see the class javadoc), and a factory that builds from its own configuration silently loses that. A set
+     * and {@code max.in.flight.requests.per.connection=1} for the pools of held calls (see the class javadoc), and a
+     * factory that builds from its own configuration silently loses them: oversized records share producer batches
+     * again, and a held record may reach its topic after a later record of its key. A set
      * {@code client.id} arrives with a per-producer suffix unless {@link KafkaOutboxConfig#clientIdSuffix} is false.
      *
      * <p>Each call must return a new producer that nobody else uses, and {@code close(Duration.ZERO)} on it must close
