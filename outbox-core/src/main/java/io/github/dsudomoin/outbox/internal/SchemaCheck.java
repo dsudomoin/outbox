@@ -40,9 +40,7 @@ final class SchemaCheck {
         boolean autoCommit = app.getAutoCommit();
         app.setAutoCommit(false);
         try {
-            try (var st = app.createStatement()) {
-                st.execute("set local quote_all_identifiers = off");
-            }
+            Sql.execute(app, "set local quote_all_identifiers = off");
             check(app, ddl, required, table, render);
         } catch (Throwable e) {
             try {
@@ -180,11 +178,7 @@ final class SchemaCheck {
      */
     static void warnIfAppCanCreateWhereOwnerResolves(Connection app, Connection owner, String table)
             throws SQLException {
-        String role;
-        try (var st = app.createStatement(); var rs = st.executeQuery("select current_user")) {
-            rs.next();
-            role = rs.getString(1);
-        }
+        String role = string(app, "select current_user", null);
         var schemas = new ArrayList<String>();
         var revokes = new ArrayList<String>();
         String ownerRole = null;

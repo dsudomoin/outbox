@@ -17,7 +17,6 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
@@ -646,9 +645,7 @@ public final class XidPartitions {
     /** The tail is not over maxTailScan, or no longer the one seen so: nothing stuck, for every instance. */
     private void notOversized(Connection c) throws SQLException {
         stuckAt = null;
-        try (var st = c.createStatement()) {
-            st.executeUpdate(clearOversized);
-        }
+        execute(c, clearOversized);
     }
 
     static long relationSize(Connection c, String table) throws SQLException {
@@ -1509,7 +1506,7 @@ public final class XidPartitions {
             }
             hole = regressed(c, current) ? null : new long[] {from, hole[1]};
         }
-        return new State(current, oldest, upper, ahead, retainedTo.size(),
+        return new State(current, oldest, upper, ahead,
                 retainedTo.stream().mapToLong(Long::longValue).toArray(),
                 PartitionDdl.attachment(c, names.base(), names.tail()), tailLower,
                 hole == null ? null : hole[0], hole == null ? null : hole[1]);
@@ -1571,8 +1568,12 @@ public final class XidPartitions {
      * below the tail, from the lower bound of the current xid's range when that one is gone too, null when none or
      * after an xid regression.
      */
-    record State(long current, long oldest, @Nullable Long upper, int ahead, int retained, long[] retainedTo,
+    record State(long current, long oldest, @Nullable Long upper, int ahead, long[] retainedTo,
             Attachment tail, @Nullable Long tailLower, @Nullable Long holeLower, @Nullable Long holeUpper) {
+
+        int retained() {
+            return retainedTo.length;
+        }
 
         /** Retained ranges with an upper bound above {@code xmin}: kept even with every shard at a tick of it. */
         int retainedAbove(long xmin) {

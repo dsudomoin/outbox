@@ -409,29 +409,21 @@ public final class PartitionDdl {
 
     private static boolean dropIfEmptyElseAttachBounded(Connection c, String parent, String table, String from,
             @Nullable String to, Duration lockTimeout, Duration statementTimeout) throws SQLException {
-        boolean empty;
-        c.setAutoCommit(false);
-        try (var st = c.createStatement()) {
-            st.execute("set transaction isolation level read committed");
-            LockHolder.fenceCurrent(c);
-            st.execute("set local lock_timeout = " + lockTimeout.toMillis());
-            st.execute("set local statement_timeout = " + statementTimeout.toMillis());
-            st.execute("set local idle_in_transaction_session_timeout = " + workIdle(lockTimeout).toMillis()
-                    + Ticks.noTransactionTimeout(c));
-            st.execute("lock table " + name(table) + " in access exclusive mode");
-            try (var rs = st.executeQuery("select 1 from " + name(table) + " limit 1")) {
-                empty = !rs.next();
+        boolean empty = transaction(c, workIdle(lockTimeout), () -> {
+            try (var st = c.createStatement()) {
+                st.execute("set local lock_timeout = " + lockTimeout.toMillis() + "; set local statement_timeout = "
+                        + statementTimeout.toMillis());
+                st.execute("lock table " + name(table) + " in access exclusive mode");
+                boolean none;
+                try (var rs = st.executeQuery("select 1 from " + name(table) + " limit 1")) {
+                    none = !rs.next();
+                }
+                st.execute(none
+                        ? "drop table " + name(table)
+                        : "alter table " + name(parent) + " attach partition " + name(table) + " " + bounds(from, to));
+                return none;
             }
-            st.execute(empty
-                    ? "drop table " + name(table)
-                    : "alter table " + name(parent) + " attach partition " + name(table) + " " + bounds(from, to));
-            c.commit();
-        } catch (SQLException | RuntimeException e) {
-            c.rollback();
-            throw e;
-        } finally {
-            c.setAutoCommit(true);
-        }
+        });
         if (empty) {
             log.info("dropped partition {}", table);
         } else {
@@ -501,31 +493,23 @@ public final class PartitionDdl {
     private static boolean dropUnlessFoundBounded(
             Connection c, String table, String find, @Nullable String bound, Duration lockTimeout)
             throws SQLException {
-        boolean found;
-        c.setAutoCommit(false);
-        try (var st = c.createStatement()) {
-            // first: a repeatable-read default would fix the snapshot at the first read, and the second would miss rows
-            st.execute("set transaction isolation level read committed");
-            LockHolder.fenceCurrent(c);
-            st.execute("set local lock_timeout = " + lockTimeout.toMillis());
-            st.execute("set local statement_timeout = " + lockTimeout.plus(DDL_MARGIN).toMillis());
-            st.execute("set local idle_in_transaction_session_timeout = " + workIdle(lockTimeout).toMillis()
-                    + Ticks.noTransactionTimeout(c));
-            found = finds(c, table, find, bound);
-            if (!found) {
+        // read committed (transaction): a repeatable-read default would fix the snapshot at the first read, and the
+        // second would miss rows
+        boolean found = transaction(c, workIdle(lockTimeout), () -> {
+            try (var st = c.createStatement()) {
+                st.execute("set local lock_timeout = " + lockTimeout.toMillis() + "; set local statement_timeout = "
+                        + lockTimeout.plus(DDL_MARGIN).toMillis());
+                if (finds(c, table, find, bound)) {
+                    return true;
+                }
                 st.execute("lock table " + name(table) + " in access exclusive mode");
-                found = finds(c, table, find, bound);
-            }
-            if (!found) {
+                if (finds(c, table, find, bound)) {
+                    return true;
+                }
                 st.execute("drop table " + name(table));
+                return false;
             }
-            c.commit();
-        } catch (SQLException | RuntimeException e) {
-            c.rollback();
-            throw e;
-        } finally {
-            c.setAutoCommit(true);
-        }
+        });
         if (!found) {
             log.info("dropped partition {}, detached earlier but never dropped", table);
         }
@@ -543,7 +527,7 @@ public final class PartitionDdl {
         }
     }
 
-    private static boolean exists(Connection c, String table) throws SQLException {
+    static boolean exists(Connection c, String table) throws SQLException {
         try (var ps = c.prepareStatement("select to_regclass(?) is not null")) {
             ps.setString(1, table);
             try (var rs = ps.executeQuery()) {
@@ -602,19 +586,8 @@ public final class PartitionDdl {
     /** {@link #execute(Connection, Duration, String)} with its own {@code statementTimeout}, zero for none. */
     static void execute(Connection c, Duration lockTimeout, Duration statementTimeout, String sql)
             throws SQLException {
-        execute(c, lockTimeout, statementTimeout, sql, null);
-    }
-
-    /** {@link #execute(Connection, Duration, Duration, String)}, its warnings to {@code warnings} if given. */
-    static void execute(Connection c, Duration lockTimeout, Duration statementTimeout, String sql,
-            @Nullable java.util.function.Consumer<java.sql.SQLWarning> warnings) throws SQLException {
         withTimeouts(c, lockTimeout, statementTimeout, () -> {
-            try (var st = c.createStatement()) {
-                st.execute(sql);
-                if (warnings != null) {
-                    warnings.accept(st.getWarnings());
-                }
-            }
+            Sql.execute(c, sql);
             return null;
         });
     }
@@ -629,10 +602,8 @@ public final class PartitionDdl {
             Sql.SqlFunction0<T> body) throws SQLException {
         return SocketBound.atLeast(c, statementTimeout, () -> c.getAutoCommit()
                 ? transaction(c, Maintenance.ABANDONED_AFTER, () -> {
-                    try (var st = c.createStatement()) {
-                        st.execute("set local lock_timeout = " + lockTimeout.toMillis() + "; set local"
-                                + " statement_timeout = " + statementTimeout.toMillis());
-                    }
+                    Sql.execute(c, "set local lock_timeout = " + lockTimeout.toMillis() + "; set local"
+                            + " statement_timeout = " + statementTimeout.toMillis());
                     return body.apply();
                 })
                 : withLocalTimeouts(c, lockTimeout, statementTimeout, body));
@@ -652,11 +623,9 @@ public final class PartitionDdl {
         c.setAutoCommit(false);
         T result;
         try {
-            try (var st = c.createStatement()) {
-                // first: isolation must precede every query of the transaction
-                st.execute("set transaction isolation level read committed; set local"
-                        + " idle_in_transaction_session_timeout = " + idle.toMillis() + Ticks.noTransactionTimeout(c));
-            }
+            // first: isolation must precede every query of the transaction
+            Sql.execute(c, "set transaction isolation level read committed; set local"
+                    + " idle_in_transaction_session_timeout = " + idle.toMillis() + Ticks.noTransactionTimeout(c));
             LockHolder.fenceCurrent(c);
             result = body.apply();
             c.commit();
@@ -758,9 +727,7 @@ public final class PartitionDdl {
     /** {@code SET LOCAL} back to what the transaction had: its own {@code SET LOCAL}, else the session's default. */
     private static void restore(Connection c, String setting, @Nullable String sessionValue) throws SQLException {
         if (sessionValue == null) {
-            try (var st = c.createStatement()) {
-                st.execute("set local " + setting + " to default");
-            }
+            Sql.execute(c, "set local " + setting + " to default");
             return;
         }
         try (var ps = c.prepareStatement("select set_config(?, ?, true)")) {

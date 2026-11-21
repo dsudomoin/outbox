@@ -31,7 +31,7 @@ public record SchemaObjects(List<Table> tables) {
     public record Index(String name, String definition, int since) {}
 
     /** {@code name}: unqualified. */
-    public record Check(String name, String definition, int since) {}
+    public record Check(String name, String definition) {}
 
     public static SchemaObjects outbox(TableNames n) {
         var message = List.of(
@@ -109,8 +109,8 @@ public record SchemaObjects(List<Table> tables) {
                                 column("redrives", "integer", true, "0"))),
                         List.of("primary key (id)"),
                         List.of(new Check(n.unqualified(n.dead()) + "_status",
-                                "check (status in ('pending', 'kept', 'scheduled'))", 1)),
-                        List.of(new Index(n.dead() + "_due", "(due_at) where due_at is not null", 1))),
+                                "check (status in ('pending', 'kept', 'scheduled'))")),
+                        List.of(index(n.dead() + "_due", "(due_at) where due_at is not null"))),
                 plain(n.redriven(), List.of(
                         column("message_id", "uuid", true),
                         column("redrives", "integer", true),

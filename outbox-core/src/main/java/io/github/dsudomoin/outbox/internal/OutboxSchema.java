@@ -1,5 +1,7 @@
 package io.github.dsudomoin.outbox.internal;
 
+import static io.github.dsudomoin.outbox.internal.Sql.execute;
+
 import io.github.dsudomoin.outbox.ConnectionSource;
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxTransactions;
@@ -559,9 +561,7 @@ public final class OutboxSchema implements AutoCloseable {
                       dirty      bit varying,
                       shards     smallint[]
                     )""");
-            if (!columnExists(c, n.tick(), "max_id")) { // a tick table made before max_id: a metadata-only change
-                ddl(c, "alter table " + n.tick() + " add column if not exists max_id bigint");
-            }
+            addColumn(c, n.tick(), "max_id", "bigint"); // a tick table made before max_id: a metadata-only change
             addColumn(c, n.tick(), "dirty", "bit varying"); // made before dirty: likewise; its ticks stay null (all)
             // the shard sets dirty replaces, kept for the previous release beside or after this one: it inserts them
             // in every tick and reads them (null: every shard, as this version leaves them). Made again where an
@@ -581,9 +581,8 @@ public final class OutboxSchema implements AutoCloseable {
                       parked_due_at  timestamptz,
                       primary key (shard, seq)
                     )""");
-            if (!columnExists(c, n.cursor(), "parked_due_at")) { // made before requeue: metadata-only, rows get null
-                ddl(c, "alter table " + n.cursor() + " add column if not exists parked_due_at timestamptz");
-            }
+            // made before requeue: metadata-only, rows get null
+            addColumn(c, n.cursor(), "parked_due_at", "timestamptz");
             // maintenance's checkpoint, which moves idle shards on without cursor rows (Cursors); none until its run
             ddl(c, "create table if not exists " + n.checkpoint() + """
                      (
@@ -609,9 +608,7 @@ public final class OutboxSchema implements AutoCloseable {
                       requeues        int not null default 0,
                       waiting_since   timestamptz
                     )""");
-            if (!columnExists(c, n.retry(), "requeues")) { // made before requeue: likewise, a constant default
-                ddl(c, "alter table " + n.retry() + " add column if not exists requeues int not null default 0");
-            }
+            addColumn(c, n.retry(), "requeues", "int not null default 0"); // made before requeue: a constant default
             addColumn(c, n.retry(), "waiting_since", "timestamptz"); // made before WAIT: rows get null, not waiting
             createIndex(c, n.retry() + "_key", n.retry() + " (shard, topic, key, id)");
             createIndex(c, n.retry() + "_due",
@@ -668,7 +665,7 @@ public final class OutboxSchema implements AutoCloseable {
             // on a dead table with rows (kept forever by default) the build would hold dead inserts and outlast the
             // statement_timeout: Maintenance builds it concurrently, and the pass claims by a scan meanwhile
             String deadDue = n.dead() + "_due";
-            if (indexMissing(c, deadDue)) {
+            if (!PartitionDdl.exists(c, deadDue)) {
                 if (PartitionDdl.hasRows(c, n.dead())) {
                     log.info("outbox index {} is missing on {}, which holds rows: maintenance builds it concurrently"
                             + " in its next run", deadDue, n.dead());
@@ -786,22 +783,16 @@ public final class OutboxSchema implements AutoCloseable {
                     + " new value." + keep);
         }
         awaitNoTicks(c, n, from, to, keep);
-        c.setAutoCommit(false);
-        try {
+        // read committed (PartitionDdl.transaction) whatever the session default: under repeatable read the lock
+        // statement would fix the snapshot before SHARE is granted, so the checks and the new tick would miss a write
+        // committed while the reshard waited for it, and its row would be read under its old shard. Cut off by the
+        // network, it must not hold writers behind its SHARE lock (its idle timeout)
+        PartitionDdl.transaction(c, Maintenance.ABANDONED_AFTER, () -> {
             try {
-                // read committed whatever the session default: under repeatable read the lock statement would fix the
-                // snapshot before SHARE is granted, so the checks and the new tick would miss a write committed while
-                // the reshard waited for it, and its row would be read under its old shard
-                try (var st = c.createStatement()) {
-                    st.execute("set transaction isolation level read committed");
-                    LockHolder.fenceCurrent(c);
-                    // cut off by the network, it must not hold writers behind its SHARE lock; each lock wait within
-                    // the bootstrap's lock_timeout, the drain checks' scans within its statement_timeout
-                    st.execute("set local idle_in_transaction_session_timeout = "
-                            + Maintenance.ABANDONED_AFTER.toMillis() + "; set local lock_timeout = "
-                            + LOCK_TIMEOUT.toMillis() + "; set local statement_timeout = " + STATEMENT_TIMEOUT.toMillis()
-                            + Ticks.noTransactionTimeout(c));
-                }
+                // each lock wait within the bootstrap's lock_timeout, the drain checks' scans within its
+                // statement_timeout
+                execute(c, "set local lock_timeout = " + LOCK_TIMEOUT.toMillis() + "; set local statement_timeout = "
+                        + STATEMENT_TIMEOUT.toMillis());
                 try (var ps = c.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {
                     for (int lock : List.of(TableNames.LOCK_MAINTENANCE, TableNames.LOCK_SWAP, TableNames.LOCK_TICK)) {
                         ps.setInt(1, n.internalNamespace());
@@ -809,9 +800,7 @@ public final class OutboxSchema implements AutoCloseable {
                         ps.execute();
                     }
                 }
-                try (var st = c.createStatement()) {
-                    st.execute("lock table " + n.base() + " in share mode"); // held writes wait for the commit
-                }
+                execute(c, "lock table " + n.base() + " in share mode"); // held writes wait for the commit
             } catch (SQLException e) {
                 if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
                     throw e;
@@ -845,17 +834,8 @@ public final class OutboxSchema implements AutoCloseable {
                 ps.setInt(1, to);
                 ps.executeUpdate();
             }
-            c.commit();
-        } catch (SQLException | RuntimeException e) {
-            try {
-                c.rollback();
-            } catch (SQLException cleanup) {
-                e.addSuppressed(cleanup);
-            }
-            throw e;
-        } finally {
-            c.setAutoCommit(true);
-        }
+            return null;
+        });
         log.info("outbox resharded {} from {} to {} shards: it was drained, and every shard's cursor starts at a new"
                 + " tick; dead letters keep their old shard until redriven", n.base(), from, to);
     }
@@ -1025,7 +1005,7 @@ public final class OutboxSchema implements AutoCloseable {
     }
 
     private void createIndex(Connection c, String index, String definition) throws SQLException {
-        if (!indexMissing(c, index)) {
+        if (PartitionDdl.exists(c, index)) {
             return; // CREATE INDEX IF NOT EXISTS would still queue a SHARE lock behind running writers
         }
         try {
@@ -1033,16 +1013,6 @@ public final class OutboxSchema implements AutoCloseable {
         } catch (SQLException e) {
             if (!DUPLICATE_TABLE.equals(e.getSQLState())) { // made meanwhile, by a dead-index build
                 throw e;
-            }
-        }
-    }
-
-    private static boolean indexMissing(Connection c, String index) throws SQLException {
-        try (var ps = c.prepareStatement("select to_regclass(?) is null")) {
-            ps.setString(1, index);
-            try (var rs = ps.executeQuery()) {
-                rs.next();
-                return rs.getBoolean(1);
             }
         }
     }
