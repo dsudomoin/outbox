@@ -2,8 +2,8 @@ package prodcheck.shop;
 
 import io.github.dsudomoin.outbox.OutboxRelay;
 import java.util.Map;
-import java.util.Set;
 import prodcheck.common.Controls;
+import prodcheck.common.DeadLetterPolicy;
 import ru.tinkoff.kora.common.Component;
 import ru.tinkoff.kora.http.common.HttpMethod;
 import ru.tinkoff.kora.http.common.annotation.HttpRoute;
@@ -73,7 +73,7 @@ public final class ShopController {
     @HttpRoute(method = HttpMethod.PUT, path = "/hook")
     public HttpServerResponse putHook(HttpServerRequest r) {
         var mode = Controls.param(r, "mode");
-        if (mode == null || !Set.of("ok", "throw", "hang", "bad-list").contains(mode)) {
+        if (mode == null || !DeadLetterPolicy.MODES.contains(mode)) {
             return Controls.json(400, Map.of("message", "mode must be ok, throw, hang or bad-list"));
         }
         hook.mode = mode;

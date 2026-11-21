@@ -62,7 +62,7 @@ public final class LoadGenerator {
     private final JdbcConnectionFactory db;
     private final String app;
     private final String instance;
-    private final Map<String, Sender> senders;
+    private final Sender sender;
 
     private final LongAdder committed = new LongAdder();
     private final LongAdder rolledBack = new LongAdder();
@@ -73,24 +73,15 @@ public final class LoadGenerator {
     private volatile Settings settings;
     private final List<Thread> threads = new ArrayList<>();
 
-    public LoadGenerator(JdbcConnectionFactory db, String app, String instance, Map<String, Sender> senders) {
+    public LoadGenerator(JdbcConnectionFactory db, String app, String instance, Sender sender) {
         this.db = db;
         this.app = app;
         this.instance = instance;
-        this.senders = senders;
-    }
-
-    public Sender sender(String outbox) {
-        var sender = senders.get(outbox);
-        if (sender == null) {
-            throw new IllegalArgumentException("unknown outbox " + outbox + ", this app has " + senders.keySet());
-        }
-        return sender;
+        this.sender = sender;
     }
 
     public synchronized void start(Settings settings) {
         stop();
-        sender(settings.outbox());
         stop = false;
         this.settings = settings;
         for (var i = 0; i < settings.writers(); i++) {
@@ -134,7 +125,6 @@ public final class LoadGenerator {
     }
 
     private void write(Settings s) {
-        var sender = sender(s.outbox());
         var perTxNanos = s.rate() > 0 ? (long) (s.txMessages() * s.writers() * 1e9 / s.rate()) : 0;
         var next = System.nanoTime();
         var counts = new Counts();
@@ -208,15 +198,21 @@ public final class LoadGenerator {
         try {
             db.inTx(c -> {
                 // one fixed key: the whole batch takes consecutive seqs under the key's row lock, so its order is checked
-                var last = s.bulkKey() == null ? 0 : Ledger.nextSeqs(c, drafts.get(0).topic(), s.bulkKey(), drafts.size());
+                var seqs = new long[drafts.size()];
+                if (s.bulkKey() != null) {
+                    var last = Ledger.nextSeqs(c, drafts.get(0).topic(), s.bulkKey(), drafts.size());
+                    for (var i = 0; i < seqs.length; i++) {
+                        seqs[i] = last - seqs.length + 1 + i;
+                    }
+                }
                 var messages = new ArrayList<OutboxMessage>(drafts.size());
                 for (var i = 0; i < drafts.size(); i++) {
                     var d = drafts.get(i);
-                    messages.add(sender.message(d.topic(), d.key(), s.bulkKey() == null ? 0 : last - drafts.size() + 1 + i, d.tag()));
+                    messages.add(sender.message(d.topic(), d.key(), seqs[i], d.tag()));
                 }
                 var ids = sender.outbox().sendAll(messages);
                 for (var i = 0; i < ids.size(); i++) {
-                    rows.add(row(sender, ids.get(i), drafts.get(i), s.bulkKey() == null ? 0 : last - drafts.size() + 1 + i));
+                    rows.add(row(sender, ids.get(i), drafts.get(i), seqs[i]));
                 }
                 Ledger.sent(c, rows);
                 finish(s, rollback);

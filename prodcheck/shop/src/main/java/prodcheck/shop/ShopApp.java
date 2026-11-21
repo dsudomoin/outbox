@@ -11,7 +11,9 @@ import java.util.Map;
 import java.util.Set;
 import prodcheck.common.ApiKeyAuthorizer;
 import prodcheck.common.Controls;
+import prodcheck.common.DeadLetterPolicy;
 import prodcheck.common.HandlerControl;
+import prodcheck.common.LedgerRoute;
 import ru.tinkoff.kora.application.graph.KoraApplication;
 import ru.tinkoff.kora.common.KoraApp;
 import ru.tinkoff.kora.common.Tag;
@@ -62,6 +64,11 @@ public interface ShopApp extends HoconConfigModule, LogbackModule, JdbcDatabaseM
 
     default DeadLetterPolicy deadLetterPolicy(ProdcheckConfig config) {
         return new DeadLetterPolicy(config.hook().equals("policy"));
+    }
+
+    default LedgerRoute ledgerHandler(@Tag(TargetDb.class) JdbcDatabase targetDb, HandlerControl control,
+            ProdcheckConfig config) {
+        return new LedgerRoute(targetDb, control, config.instance());
     }
 
     default HandlerControl handlerControl() {

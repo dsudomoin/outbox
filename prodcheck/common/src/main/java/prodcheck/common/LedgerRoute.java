@@ -1,28 +1,21 @@
-package prodcheck.shop;
+package prodcheck.common;
 
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxTopicHandler;
 import java.util.Set;
-import prodcheck.common.Event;
-import prodcheck.common.HandlerControl;
-import prodcheck.common.Ledger;
-import ru.tinkoff.kora.common.Component;
-import ru.tinkoff.kora.common.Tag;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
+import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 
-/** A database target: its own pool, the dedupe and the effect in one target transaction. */
-@Component
-public final class LedgerHandler implements OutboxTopicHandler {
+/** A database target: its own pool, the arrival in one target transaction, the dedupe and the effect in another. */
+public final class LedgerRoute implements OutboxTopicHandler {
 
-    private final JdbcDatabase targetDb;
+    private final JdbcConnectionFactory targetDb;
     private final HandlerControl control;
     private final String instance;
 
-    public LedgerHandler(@Tag(ShopApp.TargetDb.class) JdbcDatabase targetDb, HandlerControl control,
-            ShopApp.ProdcheckConfig config) {
+    public LedgerRoute(JdbcConnectionFactory targetDb, HandlerControl control, String instance) {
         this.targetDb = targetDb;
         this.control = control;
-        this.instance = config.instance();
+        this.instance = instance;
     }
 
     @Override

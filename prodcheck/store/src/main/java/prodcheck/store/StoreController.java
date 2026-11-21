@@ -2,7 +2,6 @@ package prodcheck.store;
 
 import io.github.dsudomoin.outbox.OutboxRelay;
 import java.util.Map;
-import java.util.Set;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -14,6 +13,7 @@ import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import prodcheck.common.Controls;
+import prodcheck.common.DeadLetterPolicy;
 
 /** shop's control routes. */
 @RestController
@@ -77,7 +77,7 @@ final class StoreController {
     @PutMapping("/hook")
     ResponseEntity<String> putHook(@RequestParam MultiValueMap<String, String> q) {
         var mode = Controls.param(q, "mode");
-        if (mode == null || !Set.of("ok", "throw", "hang", "bad-list").contains(mode)) {
+        if (mode == null || !DeadLetterPolicy.MODES.contains(mode)) {
             return http(Controls.reply(400, Map.of("message", "mode must be ok, throw, hang or bad-list")));
         }
         hook.mode = mode;

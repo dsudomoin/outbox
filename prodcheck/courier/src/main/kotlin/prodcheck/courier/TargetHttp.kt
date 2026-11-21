@@ -59,7 +59,7 @@ class TargetHttp(
     }
 
     /** The statuses of the records, in order; sink = topic. */
-    fun postBatch(records: List<OutboxRecord>, oneTx: Boolean = false): List<Int> {
+    fun postBatch(records: List<OutboxRecord>, oneTx: Boolean): List<Int> {
         val items = records.map {
             val e = Event.of(it, it.topic(), instance)
             BatchItem(e.id, e.sink, e.topic, e.key, e.seq, e.tag, e.contract, e.instance)

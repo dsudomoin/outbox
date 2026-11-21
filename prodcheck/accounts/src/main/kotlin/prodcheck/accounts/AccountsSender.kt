@@ -29,7 +29,6 @@ class AccountsSender(
     override fun send(topic: String, key: String?, seq: Long, tag: String): UUID =
         producer.send(topic, key, envelope(seq, tag), headers(seq))
 
-
     override fun message(topic: String, key: String?, seq: Long, tag: String): OutboxMessage =
         OutboxMessage(topic, key?.toByteArray(Charsets.UTF_8), envelope(seq, tag).toByteArray(), headers(seq))
 

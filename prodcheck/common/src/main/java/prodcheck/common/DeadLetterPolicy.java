@@ -1,4 +1,4 @@
-package prodcheck.shop;
+package prodcheck.common;
 
 import io.github.dsudomoin.outbox.DeadLetter;
 import io.github.dsudomoin.outbox.DeadLetterDecision;
@@ -6,15 +6,19 @@ import io.github.dsudomoin.outbox.OutboxDeadLetterHandler;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
-import prodcheck.common.Payload;
+import java.util.Set;
 
 /** {@code prodcheck.hook = policy}: decides by the payload's tag. {@code PUT /hook} makes it misbehave. */
 public final class DeadLetterPolicy implements OutboxDeadLetterHandler {
 
-    private final boolean active;
-    volatile String mode = "ok";
+    /** What {@code PUT /hook} takes. */
+    public static final Set<String> MODES = Set.of("ok", "throw", "hang", "bad-list");
 
-    DeadLetterPolicy(boolean active) {
+    private final boolean active;
+    /** One of {@link #MODES}, set by {@code PUT /hook}. */
+    public volatile String mode = "ok";
+
+    public DeadLetterPolicy(boolean active) {
         this.active = active;
     }
 

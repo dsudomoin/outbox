@@ -15,16 +15,7 @@ public final class Ledger {
     private Ledger() {}
 
     public static long nextSeq(Connection c, String topic, String key) throws SQLException {
-        try (var ps = c.prepareStatement("""
-                insert into pc_key_seq (topic, key, seq) values (?, ?, 1)
-                on conflict (topic, key) do update set seq = pc_key_seq.seq + 1 returning seq""")) {
-            ps.setString(1, topic);
-            ps.setString(2, key);
-            try (var rs = ps.executeQuery()) {
-                rs.next();
-                return rs.getLong(1);
-            }
-        }
+        return nextSeqs(c, topic, key, 1);
     }
 
     /** Takes {@code n} seqs of the key at once; the last one. */

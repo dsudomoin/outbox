@@ -45,7 +45,8 @@ public final class Controls {
         this.app = app;
         this.instance = instance;
         this.senders = senders;
-        senders.keySet().stream().sorted().forEach(outbox -> loads.put(outbox, new LoadGenerator(db, app, instance, senders)));
+        senders.keySet().stream().sorted()
+                .forEach(outbox -> loads.put(outbox, new LoadGenerator(db, app, instance, senders.get(outbox))));
         this.handlers = handlers;
     }
 
@@ -307,10 +308,6 @@ public final class Controls {
     @Nullable
     public static String param(HttpServerRequest r, String name) {
         return param(r.queryParams(), name);
-    }
-
-    public static String param(HttpServerRequest r, String name, String orElse) {
-        return param(r.queryParams(), name, orElse);
     }
 
     public static HttpServerResponse json(int status, Object body) {

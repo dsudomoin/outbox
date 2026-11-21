@@ -33,7 +33,12 @@ public final class EventsController {
 
     @Json
     public record BatchItem(UUID id, String sink, String topic, @Nullable String key, long seq, String tag,
-            int contract, String instance) {}
+            int contract, String instance) {
+
+        Event event() {
+            return new Event(sink, id, topic, key, seq, tag, instance, contract);
+        }
+    }
 
     @Json
     public record BatchResult(UUID id, int status) {}
@@ -72,8 +77,7 @@ public final class EventsController {
     public List<BatchResult> batch(@Json List<BatchItem> items) {
         var results = new ArrayList<BatchResult>(items.size());
         for (var item : items) {
-            var event = new Event(item.sink(), item.id(), item.topic(), item.key(), item.seq(), item.tag(),
-                    item.instance(), item.contract());
+            var event = item.event();
             int status;
             try {
                 status = process(event);
@@ -95,8 +99,7 @@ public final class EventsController {
     public List<BatchResult> batchTx(@Json List<BatchItem> items) {
         db.inTx(c -> {
             for (var item : items) {
-                var event = new Event(item.sink(), item.id(), item.topic(), item.key(), item.seq(), item.tag(),
-                        item.instance(), item.contract());
+                var event = item.event();
                 Ledger.arrival(c, event);
                 effectOrDouble(c, event);
             }

@@ -17,10 +17,13 @@ import org.springframework.beans.factory.config.BeanPostProcessor;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import prodcheck.common.Controls;
+import prodcheck.common.DeadLetterPolicy;
 import prodcheck.common.HandlerControl;
+import prodcheck.common.LedgerRoute;
 
 /** The Spring Boot twin of shop-n: the same routes, topics, contracts and control routes. */
 @SpringBootApplication
@@ -63,6 +66,18 @@ public class StoreApp {
                 return bean;
             }
         };
+    }
+
+    @Bean
+    DeadLetterPolicy deadLetterPolicy(@Value("${prodcheck.hook}") String hook) {
+        return new DeadLetterPolicy(hook.equals("policy"));
+    }
+
+    @Bean
+    LedgerRoute ledgerHandler(@Qualifier(TARGET_DB) DataSource targetDb, HandlerControl control,
+            @Value("${prodcheck.instance}") String instance) {
+        var jdbc = new SpringJdbc(targetDb, new TransactionTemplate(new DataSourceTransactionManager(targetDb)));
+        return new LedgerRoute(jdbc, control, instance);
     }
 
     @Bean
