@@ -310,11 +310,9 @@ public final class Heartbeat {
      * network dropped has moved on, and a backend left in it would hold the instance's row against every later beat.
      * A transaction's settings, so none leaks.
      */
-    private static void lockTimeout(Connection c) throws SQLException {
-        try (var st = c.createStatement()) {
-            st.execute("set local lock_timeout = " + Maintenance.SHARDS_LOCK_TIMEOUT.toMillis()
-                    + "; set local idle_in_transaction_session_timeout = " + Maintenance.ABANDONED_AFTER.toMillis());
-        }
+    static void lockTimeout(Connection c) throws SQLException {
+        Sql.execute(c, "set local lock_timeout = " + Maintenance.SHARDS_LOCK_TIMEOUT.toMillis()
+                + "; set local idle_in_transaction_session_timeout = " + Maintenance.ABANDONED_AFTER.toMillis());
     }
 
     /** Looked up once per JVM: {@code HOSTNAME} (set in containers), else a lookup that may take seconds. */

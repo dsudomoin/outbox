@@ -481,12 +481,12 @@ class OutboxAdminIT {
                     .isInstanceOf(IllegalArgumentException.class);
         }
 
-        assertThat(exists(victim)).isTrue();
-        assertThat(exists(unrelated)).isTrue();
+        assertThat(MaintenanceIT.exists(victim)).isTrue();
+        assertThat(MaintenanceIT.exists(unrelated)).isTrue();
         assertThat(count(precreated)).as("nothing moved").isOne();
         assertThat(ranges()).extracting(Bound::name).contains(attached);
-        assertThat(exists(attached + "_id")).as("nothing run on the attached range").isFalse();
-        assertThat(exists(precreated + "_id")).isFalse();
+        assertThat(MaintenanceIT.exists(attached + "_id")).as("nothing run on the attached range").isFalse();
+        assertThat(MaintenanceIT.exists(precreated + "_id")).isFalse();
         assertThat(outboxMessageIds()).isEmpty();
         assertThat(wakes).hasValue(0);
     }
@@ -501,7 +501,7 @@ class OutboxAdminIT {
 
         assertThat(admin.restoreOrphan(orphan, 20)).isEqualTo(2);
 
-        assertThat(exists(orphan)).as("dropped").isFalse();
+        assertThat(MaintenanceIT.exists(orphan)).as("dropped").isFalse();
         assertThat(outboxMessageIds()).containsExactly(at, above);
         assertThat(admin.status().orphans()).isEmpty();
         assertThat(wakes).hasValue(1);
@@ -521,7 +521,7 @@ class OutboxAdminIT {
                     .isEqualTo(3000);
         }
 
-        assertThat(exists(orphan)).as("dropped").isFalse();
+        assertThat(MaintenanceIT.exists(orphan)).as("dropped").isFalse();
         assertThat(outboxMessageIds()).hasSize(3000);
     }
 
@@ -537,7 +537,7 @@ class OutboxAdminIT {
                     .isEqualTo(3000);
         }
 
-        assertThat(exists(orphan)).as("dropped").isFalse();
+        assertThat(MaintenanceIT.exists(orphan)).as("dropped").isFalse();
     }
 
     /** A scan cut all the same says so, with the table's size and what to run by hand, and keeps every row. */
@@ -596,7 +596,7 @@ class OutboxAdminIT {
         }
 
         assertThat(admin.orphanRestore.scanSlowdown).as("the first time again").isOne();
-        assertThat(exists(orphan)).as("dropped").isFalse();
+        assertThat(MaintenanceIT.exists(orphan)).as("dropped").isFalse();
     }
 
     /**
@@ -700,7 +700,7 @@ class OutboxAdminIT {
                     .isInstanceOf(IllegalArgumentException.class);
         }
 
-        assertThat(exists(orphan)).isTrue();
+        assertThat(MaintenanceIT.exists(orphan)).isTrue();
         assertThat(count(orphan)).isEqualTo(2);
         assertThat(admin.status().orphans()).containsExactly(new Orphan(orphan, OrphanKind.FOREIGN));
         assertThat(outboxMessageIds()).isEmpty();
@@ -876,7 +876,7 @@ class OutboxAdminIT {
         }
         assertThat(new Maintenance(db, names, config, new OutboxMetrics(null)).runOnce()).isTrue();
         for (var table : strangers) {
-            assertThat(exists(table)).as("empty, yet not dropped as a foreign orphan would be").isTrue();
+            assertThat(MaintenanceIT.exists(table)).as("empty, yet not dropped as a foreign orphan would be").isTrue();
         }
     }
 
@@ -1566,15 +1566,9 @@ class OutboxAdminIT {
         }
     }
 
-    private long count(String table) throws SQLException {
+    static long count(String table) throws SQLException {
         try (var c = TestDb.connect()) {
             return queryLong(c, "select count(*) from " + table);
-        }
-    }
-
-    private static boolean exists(String table) throws SQLException {
-        try (var c = TestDb.connect()) {
-            return queryString(c, "select to_regclass(?)::text", table) != null;
         }
     }
 

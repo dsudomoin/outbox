@@ -7,7 +7,6 @@
 source "$(dirname "$0")/lib.sh"
 RATE=${RATE:-4000}
 table=bench_relay_crash
-env_=("${SINGLE_ENV[@]}" OUTBOX_TABLE="$table")
 
 log relay-crash
 fresh_app relay-crash "$table" "${SINGLE_ENV[@]}"
@@ -33,7 +32,7 @@ psql_q "drop table if exists bench_crash_pending;
 pending=$(psql_q "select count(*) from bench_crash_pending")
 last_tick=$(psql_q "select max(id) from ${table}_tick")
 launched=$(now)
-app_start relay-crash "${env_[@]}"
+app_start relay-crash "${SINGLE_ENV[@]}" OUTBOX_TABLE="$table"
 ready=$(now)
 load "$RATE" "$WRITERS"
 relay="" e2e=""

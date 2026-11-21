@@ -20,9 +20,6 @@ import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
-import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.net.ServerSocket;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
@@ -65,7 +62,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
     private JdbcDatabase db;
 
     private final HttpClient client = HttpClient.newHttpClient();
-    private final int port = freePort();
+    private final int port = AdminCoexistenceIT.freePort();
 
     @Override
     public KoraConfigModification config() {
@@ -85,7 +82,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
                 httpServer { publicApiHttpPort = %d, privateApiHttpPort = %d }
                 openapi.management.file = ["openapi/kora-outbox-admin.yaml"]
                 """.formatted(TestDataSources.jdbcUrl(), TestDataSources.user(), TestDataSources.password(),
-                TestSql.uniqueTable(), port, freePort()));
+                TestSql.uniqueTable(), port, AdminCoexistenceIT.freePort()));
     }
 
     @Test
@@ -751,11 +748,4 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         return s.getBytes(UTF_8);
     }
 
-    private static int freePort() {
-        try (var socket = new ServerSocket(0)) {
-            return socket.getLocalPort();
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
-    }
 }

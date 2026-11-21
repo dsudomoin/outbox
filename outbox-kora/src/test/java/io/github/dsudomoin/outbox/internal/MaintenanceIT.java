@@ -16,7 +16,6 @@ import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.JdbcTransactions;
-import io.github.dsudomoin.outbox.OutboxTransactions;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Park;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Attachment;
@@ -49,7 +48,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
@@ -2598,7 +2596,7 @@ class MaintenanceIT {
                 .orElseThrow();
     }
 
-    private static boolean exists(String table) throws SQLException {
+    static boolean exists(String table) throws SQLException {
         try (var c = TestDb.connect()) {
             return queryString(c, "select (to_regclass(?) is not null)::text", table).equals("true");
         }
@@ -2684,7 +2682,7 @@ class MaintenanceIT {
         }
     }
 
-    private static long currentXid() throws SQLException {
+    static long currentXid() throws SQLException {
         try (var c = TestDb.connect()) {
             return TestSql.currentXid(c);
         }

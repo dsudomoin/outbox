@@ -186,9 +186,7 @@ public final class AdminRows {
 
     public List<Long> deadIds() throws SQLException {
         try (var c = connections.newConnection()) {
-            // named v: an output column named id would make "order by id" sort the text
-            return TestSql.queryStrings(c, "select id::text as v from " + names.dead() + " order by id").stream()
-                    .map(Long::valueOf).toList();
+            return TestSql.queryLongs(c, "select id from " + names.dead() + " order by id");
         }
     }
 

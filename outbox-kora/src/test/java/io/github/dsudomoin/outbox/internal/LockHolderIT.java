@@ -158,7 +158,7 @@ class LockHolderIT {
 
     @Test
     void theLeftoverCheckSeesASessionSettingAndLock() throws Exception {
-        try (var c = pooler.connect(new Properties())) {
+        try (var c = pooler.connect()) {
             TestSql.execute(c, "set lock_timeout = 1234");
             TestSql.execute(c, "select pg_advisory_lock(" + ns + ", 7)");
         }

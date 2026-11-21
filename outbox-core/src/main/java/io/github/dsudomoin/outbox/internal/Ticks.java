@@ -8,10 +8,8 @@ import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
-import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.TreeMap;
@@ -629,7 +627,7 @@ public final class Ticks {
     /**
      * What a fresh batch of each shard chooses its target from: {@code skipped}, keyed by shard, and {@code ticks}, the
      * ticks after each shard's start, each once, keyed by id; all without their snapshots ({@link Tick#snapshot()}
-     * null), snapshots unread.
+     * null).
      */
     public record Fresh(Map<Integer, Tick> skipped, NavigableMap<Long, Tick> ticks) {}
 

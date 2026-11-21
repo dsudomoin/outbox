@@ -193,7 +193,6 @@ class FatalErrorIT {
         return letters.stream().map(l -> DeadLetterDecision.keep()).toList();
     }
 
-    /** Topic "t" keys, one on each of {@code shards} shards. */
     private static long workersAlive() {
         return Thread.getAllStackTraces().keySet().stream().map(Thread::getName)
                 .filter(n -> n.startsWith("outbox-relay-")).count();

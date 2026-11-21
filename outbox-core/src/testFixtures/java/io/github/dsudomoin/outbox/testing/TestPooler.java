@@ -54,7 +54,6 @@ public final class TestPooler implements AutoCloseable {
                 listen_port = %d
                 auth_type = scram-sha-256
                 auth_file = /etc/pgbouncer/userlist.txt
-                auth_user = %s
                 pool_mode = transaction
                 default_pool_size = %d
                 max_client_conn = 1000
@@ -62,8 +61,7 @@ public final class TestPooler implements AutoCloseable {
                 max_prepared_statements = %d
                 query_wait_timeout = 30
                 ignore_startup_parameters = extra_float_digits
-                """.formatted(TestDataSources.containerAddress(), PORT, TestDataSources.user(), serverConnections,
-                maxPreparedStatements);
+                """.formatted(TestDataSources.containerAddress(), PORT, serverConnections, maxPreparedStatements);
         var users = "\"" + TestDataSources.user() + "\" \"" + TestDataSources.password() + "\"\n";
         @SuppressWarnings("resource") // closed by close()
         var c = new GenericContainer<>(System.getProperty("outbox.test.pgbouncer", "edoburu/pgbouncer:v1.26.1-p0"))
@@ -84,14 +82,13 @@ public final class TestPooler implements AutoCloseable {
     }
 
     /** A new connection through pgbouncer as {@link TestDataSources#user()}. */
-    public Connection connect(Properties properties) throws SQLException {
+    public Connection connect() throws SQLException {
         var p = new Properties();
-        p.putAll(properties);
         p.setProperty("user", TestDataSources.user());
         p.setProperty("password", TestDataSources.password());
         p.setProperty("connectTimeout", "30");
         p.setProperty("socketTimeout", "60");
-        p.setProperty("prepareThreshold", p.getProperty("prepareThreshold", "0"));
+        p.setProperty("prepareThreshold", "0");
         return DriverManager.getConnection(jdbcUrl(), p);
     }
 
@@ -165,7 +162,7 @@ public final class TestPooler implements AutoCloseable {
         try {
             var seen = new java.util.HashSet<Integer>();
             for (int i = 0; i < serverConnections; i++) {
-                var c = connect(new Properties());
+                var c = connect();
                 open.add(c);
                 c.setAutoCommit(false); // holds its server session until the commit below
                 try (var st = c.createStatement(); var rs = st.executeQuery("select pg_backend_pid()")) {

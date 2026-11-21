@@ -4,12 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import org.junit.jupiter.api.Test;
 
-class TestDbTest {
-
-    @Test
-    void uniqueTableIsShortLowercaseHex() {
-        assertThat(TestSql.uniqueTable()).matches("ob_[0-9a-f]{10}").isNotEqualTo(TestSql.uniqueTable());
-    }
+class TestOutboxConfigTest {
 
     @Test
     void testConfigDefaultsToIsolatedTables() {

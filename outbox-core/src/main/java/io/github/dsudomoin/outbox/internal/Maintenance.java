@@ -427,8 +427,7 @@ public final class Maintenance {
     private static <T> T briefly(Connection c, SqlFunction0<T> body) throws SQLException {
         c.setAutoCommit(false);
         try {
-            execute(c, "set local lock_timeout = " + SHARDS_LOCK_TIMEOUT.toMillis() // a transaction's: no leak
-                    + "; set local idle_in_transaction_session_timeout = " + ABANDONED_AFTER.toMillis());
+            Heartbeat.lockTimeout(c);
             var result = body.apply();
             c.commit();
             return result;

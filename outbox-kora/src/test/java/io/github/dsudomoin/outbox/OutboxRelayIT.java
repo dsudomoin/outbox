@@ -5,8 +5,8 @@ import static io.github.dsudomoin.outbox.testing.Handlers.eachRecord;
 import static io.github.dsudomoin.outbox.testing.TestDb.opening;
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
+import static io.github.dsudomoin.outbox.testing.TestSql.queryLongs;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
-import static io.github.dsudomoin.outbox.testing.TestSql.queryStrings;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -190,9 +190,7 @@ class OutboxRelayIT {
             } else if (sql.contains("pg_try_advisory_xact_lock")) { // a shard step
                 lockingWorkers.add(Thread.currentThread().getName());
             }
-        }), record -> {
-            delivered.incrementAndGet();
-        });
+        }), record -> delivered.incrementAndGet());
         relay.start();
         var outbox = outbox(relay::wake);
         awaitParked();
@@ -600,8 +598,8 @@ class OutboxRelayIT {
         }
 
         try (var c = TestDb.connect()) {
-            var ids = queryStrings(c, "select id from " + schema.names().tick() + " where id > " + before);
-            assertThat(ids).as("ticks above the start").isNotEmpty().allMatch(id -> made.contains(Long.parseLong(id)));
+            var ids = queryLongs(c, "select id from " + schema.names().tick() + " where id > " + before);
+            assertThat(ids).as("ticks above the start").isNotEmpty().allMatch(made::contains);
         }
         long runs = elapsed / TimeUnit.SECONDS.toNanos(1) + 1;
         assertThat(roundTrips).as("round trips of %d runs at most", runs).isLessThanOrEqualTo((int) (2 * runs));
@@ -1708,9 +1706,7 @@ class OutboxRelayIT {
         config.shards(1).batchTimeout(Duration.ofSeconds(2)); // 400 ms past the soft deadline
         bootstrap();
         var healthy = new RecordingHandler();
-        OutboxHandler hanging = record -> {
-            Thread.sleep(60_000); // interrupted at the soft deadline
-        };
+        OutboxHandler hanging = record -> Thread.sleep(60_000); // interrupted at the soft deadline
         var relay = start(OutboxHandler.byTopic(Map.of("slow", hanging), healthy));
         var messages = new ArrayList<OutboxMessage>();
         IntStream.range(0, 10).forEach(i -> messages.add(msg("ok", "k" + i, "a" + i)));

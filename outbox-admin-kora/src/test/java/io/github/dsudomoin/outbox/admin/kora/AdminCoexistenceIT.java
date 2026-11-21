@@ -297,7 +297,7 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
         return client.send(request.build(), BodyHandlers.ofString());
     }
 
-    private static int freePort() {
+    static int freePort() {
         try (var socket = new ServerSocket(0)) {
             return socket.getLocalPort();
         } catch (IOException e) {

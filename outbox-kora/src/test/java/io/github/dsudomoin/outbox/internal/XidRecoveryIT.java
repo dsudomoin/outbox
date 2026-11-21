@@ -22,7 +22,6 @@ import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
-import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.sql.Connection;
@@ -189,7 +188,7 @@ class XidRecoveryIT {
         relay.start();
         var outbox = outbox(relay);
         send(outbox, msg("t", "x", "first"));
-        await(Duration.ofSeconds(5), () -> count(names.dead()) == 1);
+        await(Duration.ofSeconds(5), () -> OutboxAdminIT.count(names.dead()) == 1);
         // the run the relay started with holds the maintenance lock until it ends: a run of ours completes only after
         // it, and the run below then is the one that meets the rewound sequence
         await(Duration.ofSeconds(10), maintenance::runOnce);
@@ -204,7 +203,7 @@ class XidRecoveryIT {
             assertThat(err.text()).contains("ERROR").contains(names.base());
         }
         send(outbox, msg("t", "x", "second")); // without the raise, its id is the dead letter's: 23505 on every step
-        await(Duration.ofSeconds(10), () -> count(names.dead()) == 2);
+        await(Duration.ofSeconds(10), () -> OutboxAdminIT.count(names.dead()) == 2);
     }
 
     @Test
@@ -225,7 +224,7 @@ class XidRecoveryIT {
         assertThat(maintenance.halted()).isTrue();
         assertThat(haltRows()).isOne();
         assertThat(tickExists(forged)).isTrue();
-        assertThat(count(names.base())).isEqualTo(100);
+        assertThat(OutboxAdminIT.count(names.base())).isEqualTo(100);
         try (var err = new CapturedStderr()) {
             bootstrap(); // a restart starts halted with the same ERROR
 
@@ -502,7 +501,7 @@ class XidRecoveryIT {
         }
         assertThat(maintenance.halted()).isTrue();
         assertThat(tickExists(forged)).isTrue();
-        assertThat(count(names.base())).isEqualTo(5);
+        assertThat(OutboxAdminIT.count(names.base())).isEqualTo(5);
     }
 
     @Test
@@ -544,7 +543,7 @@ class XidRecoveryIT {
         }
         assertThat(maintenance.halted()).isTrue();
         assertThat(tickExists(forged)).isTrue();
-        assertThat(count(names.base())).isEqualTo(5);
+        assertThat(OutboxAdminIT.count(names.base())).isEqualTo(5);
     }
 
     @Test
@@ -560,7 +559,7 @@ class XidRecoveryIT {
             // overriding: from Postgres 17 a partition has the outbox's identity column
             execute(c, "insert into " + range.name() + " (id, shard, xid, message_id, topic) overriding system value"
                     + " values (1000000, 0, '" + range.from() + "', '" + orphanId + "', 't')");
-            while (currentXid() < Long.parseLong(range.to())) { // writers have moved on to the next range
+            while (MaintenanceIT.currentXid() < Long.parseLong(range.to())) { // writers have moved on to the next range
                 TestDb.burnXids(200);
             }
             execute(c, "alter table " + names.base() + " detach partition " + range.name() + " concurrently");
@@ -572,21 +571,21 @@ class XidRecoveryIT {
 
         assertThat(maintenance.runOnce()).isTrue(); // the recovery
         var setAside = names.base() + "_o" + range.from();
-        assertThat(exists(range.name())).isFalse();
-        assertThat(exists(setAside)).isTrue();
-        assertThat(count(setAside)).isOne();
+        assertThat(MaintenanceIT.exists(range.name())).isFalse();
+        assertThat(MaintenanceIT.exists(setAside)).isTrue();
+        assertThat(OutboxAdminIT.count(setAside)).isOne();
         try (var err = new CapturedStderr()) {
             assertThat(maintenance.runOnce()).isTrue(); // the next run's orphan sweep keeps it
 
             assertThat(err.text()).contains("ERROR").contains(setAside)
                     .contains("OutboxAdmin.restoreOrphan(\"" + setAside + "\", fromXid)");
         }
-        assertThat(exists(setAside)).isTrue();
+        assertThat(MaintenanceIT.exists(setAside)).isTrue();
         assertThat(registry.get("outbox.partitions.orphaned").gauge().value()).isEqualTo(1);
         try (var c = TestDb.connect()) {
             assertThat(maintenance.orphanRestore.restore(c, setAside, 0, Duration.ofSeconds(5))).isOne();
         }
-        assertThat(exists(setAside)).isFalse();
+        assertThat(MaintenanceIT.exists(setAside)).isFalse();
         assertThat(MaintenanceIT.count(names.base(), List.of(orphanId))).isOne();
     }
 
@@ -620,7 +619,7 @@ class XidRecoveryIT {
         assertThat(maintenance.runOnce()).isTrue();
         assertThat(maintenance.halted()).isFalse();
         assertThat(haltRows()).isZero();
-        assertThat(exists(standalone)).as("empty: dropped").isFalse();
+        assertThat(MaintenanceIT.exists(standalone)).as("empty: dropped").isFalse();
     }
 
     @Test
@@ -653,7 +652,7 @@ class XidRecoveryIT {
         var held = send(outbox, msg("t", "r", "head"), msg("t", "r", "follower"));
         var parked = send(outbox, msg("t", "p", "parked"));
         await(Duration.ofSeconds(5), // the head diverted with its follower, p requeued
-                () -> count(names.retry()) == 2 && MaintenanceIT.count(names.parked(), parked) == 1);
+                () -> OutboxAdminIT.count(names.retry()) == 2 && MaintenanceIT.count(names.parked(), parked) == 1);
         try (var c = TestDb.connect()) { // a parked row whose outbox range is gone: its id above every outbox id
             execute(c, "insert into " + names.parked() + " (id, shard, message_id, topic, key, created_at, due_at)"
                     + " values (1000000000, 0, gen_random_uuid(), 't', convert_to('q', 'UTF8'), now(),"
@@ -679,7 +678,7 @@ class XidRecoveryIT {
                 .filteredOn(p -> p.equals("head") || p.equals("follower"))
                 .containsExactly("head", "follower");
         assertThat(recording.delivered()).filteredOn(r -> parked.contains(r.messageId())).as("once").hasSize(1);
-        await(Duration.ofSeconds(5), () -> count(names.retry()) == 0);
+        await(Duration.ofSeconds(5), () -> OutboxAdminIT.count(names.retry()) == 0);
     }
 
     @Test
@@ -801,7 +800,7 @@ class XidRecoveryIT {
             assertThatThrownBy(admin::recoverXidRegression).isInstanceOf(IllegalStateException.class)
                     .hasMessageStartingWith("maintenance or another outbox admin recovery call is running, retry");
         }
-        assertThat(count(names.base())).as("nothing re-sent").isEqualTo(3);
+        assertThat(OutboxAdminIT.count(names.base())).as("nothing re-sent").isEqualTo(3);
         assertThat(wakes).hasValue(0);
     }
 
@@ -871,7 +870,7 @@ class XidRecoveryIT {
 
             assertThat(err.text()).contains("recovered: 0 rows re-sent");
         }
-        assertThat(count(names.checkpoint())).as("checkpoints go with the cursors").isZero();
+        assertThat(OutboxAdminIT.count(names.checkpoint())).as("checkpoints go with the cursors").isZero();
     }
 
     @Test
@@ -880,13 +879,15 @@ class XidRecoveryIT {
         bootstrap();
         send(outbox(null), messages("m", 3));
         forgeRegression();
-        TestDb.burnXids((int) (1000 - currentXid() % 1000) + 100); // the recovery's xids early in a range: no bridge
+        // the recovery's xids early in a range: no bridge
+        TestDb.burnXids((int) (1000 - MaintenanceIT.currentXid() % 1000) + 100);
         var recovery = new XidRecovery(names, config);
         try (var writer = TestDb.connect(); var c = TestDb.connect()) {
             writer.setAutoCommit(false);
             recovery.betweenReads = rc -> {
                 long xid = queryLong(writer, "select pg_current_xact_id()::text::bigint");
-                while (currentXid() < xid / 1000 * 1000 + 1000) { // the next read sees the next range's xids
+                // the next read sees the next range's xids
+                while (MaintenanceIT.currentXid() < xid / 1000 * 1000 + 1000) {
                     TestDb.burnXids(200);
                 }
             };
@@ -897,7 +898,7 @@ class XidRecoveryIT {
                     + " 't')"); // no partition for its xid: SQLState 23514
             writer.commit();
         }
-        assertThat(count(names.base())).isEqualTo(4);
+        assertThat(OutboxAdminIT.count(names.base())).isEqualTo(4);
     }
 
     @Test
@@ -947,8 +948,8 @@ class XidRecoveryIT {
 
             assertThat(PartitionDdl.standalone(c, names.base(), "_o[0-9]+")).as("nothing set aside").isEmpty();
         }
-        assertThat(exists(empty)).as("not dropped").isTrue();
-        assertThat(count(withRow)).isOne();
+        assertThat(MaintenanceIT.exists(empty)).as("not dropped").isTrue();
+        assertThat(OutboxAdminIT.count(withRow)).isOne();
     }
 
     @Test
@@ -995,7 +996,7 @@ class XidRecoveryIT {
         assertThat(maintenance.halted()).as("this instance resumes at once").isFalse();
         assertThat(wakes).hasValue(1);
         assertThat(haltRows()).isZero();
-        assertThat(count(names.base())).isEqualTo(5);
+        assertThat(OutboxAdminIT.count(names.base())).isEqualTo(5);
     }
 
     /** The session died before the commit: the halt stays, the call says to call again, and calling again recovers. */
@@ -1091,7 +1092,7 @@ class XidRecoveryIT {
     /** {@link #forgeRegression()} with the tick made at {@code createdAt}. */
     private long forgeRegression(String createdAt) throws SQLException {
         try (var c = TestDb.connect()) {
-            long xmax = currentXid() + 1_000_000_000L;
+            long xmax = MaintenanceIT.currentXid() + 1_000_000_000L;
             c.setAutoCommit(false);
             new Ticks(names, config.shards()).lockForTest(c);
             long id = queryLong(c, "insert into " + names.tick() + " (snapshot, created_at) values ('" + xmax + ":"
@@ -1156,30 +1157,12 @@ class XidRecoveryIT {
     }
 
     private long haltRows() throws SQLException {
-        return count(names.halt());
-    }
-
-    private static long count(String table) throws SQLException {
-        try (var c = TestDb.connect()) {
-            return queryLong(c, "select count(*) from " + table);
-        }
+        return OutboxAdminIT.count(names.halt());
     }
 
     private List<Bound> ranges() throws SQLException {
         try (var c = TestDb.connect()) {
             return PartitionDdl.listRanges(c, names.base());
-        }
-    }
-
-    private static boolean exists(String table) throws SQLException {
-        try (var c = TestDb.connect()) {
-            return queryString(c, "select (to_regclass(?) is not null)::text", table).equals("true");
-        }
-    }
-
-    private static long currentXid() throws SQLException {
-        try (var c = TestDb.connect()) {
-            return TestSql.currentXid(c);
         }
     }
 

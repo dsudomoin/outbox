@@ -474,13 +474,11 @@ class TicksIT {
             xid(c); // a later xid ends, so the running one lies below xmax
             ticks.make(c, Duration.ZERO);
             var middle = ticks.latest(c);
-            ticks.make(c, Duration.ZERO);
-            var last = ticks.latest(c);
             running.rollback();
             running.close();
             assertThat(middle.snapshot().xip()).isNotEmpty();
 
-            var many = ticks.get(c, List.of(first.id(), middle.id(), last.id() + 100));
+            var many = ticks.get(c, List.of(first.id(), middle.id(), middle.id() + 100));
             assertThat(many).containsOnlyKeys(first.id(), middle.id());
             assertThat(many.get(first.id())).usingRecursiveComparison().isEqualTo(first);
             assertThat(many.get(middle.id())).as("as the single get reads it").usingRecursiveComparison()

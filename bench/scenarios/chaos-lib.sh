@@ -32,7 +32,6 @@ chaos_begin() {
   for i in $(seq 1 "$N"); do : > "$LOGS/chaos-$NAME-$i.log"; done # this run's logs only (restarts append)
   chaos_start 1
   psql_q "truncate orders, bench_rolled_back, bench_consumed" > /dev/null # only this run's rows are reconciled
-  INBOX_FILTER="and i.consumer = ''" # the bench consumer is unscoped: consumer ''
   for ((i = 2; i <= N; i++)); do chaos_start "$i"; done # not seq: BSD `seq 2 1` counts down
   MARK=$(mark "chaos-$NAME" "chaos $NAME: $TEXT")
   T0=$(now)
@@ -242,12 +241,13 @@ reconcile_orders() {
       $(relay_passed "$TABLE" "created_at > '$STOPPED_AT'")" 2> /dev/null | tr '|' ' ')" || true
     cur=""
     if [ "$lag" = 0 ] && [ "${retry:-}" = 0 ] && [ "${paused:-}" = 0 ] && [ "${passed:-}" = t ]; then
+      # the bench consumer is unscoped: consumer ''
       cur=$(psql_q "set work_mem = '256MB';
         select (select count(*) from orders o where not exists
-            (select 1 from inbox i where i.message_id = o.message_id $INBOX_FILTER)),
+            (select 1 from inbox i where i.message_id = o.message_id and i.consumer = '')),
           (select count(*) from bench_rolled_back r where exists
-            (select 1 from inbox i where i.message_id = r.message_id $INBOX_FILTER)),
-          (select count(*) from inbox i where i.message_id >= '$RUN_UUID' $INBOX_FILTER)" | tr '|' ' ') || cur=""
+            (select 1 from inbox i where i.message_id = r.message_id and i.consumer = '')),
+          (select count(*) from inbox i where i.message_id >= '$RUN_UUID' and i.consumer = '')" | tr '|' ' ') || cur=""
     fi
     if [ -n "$cur" ] && [ "$cur" = "$prev" ]; then R_DRAINED=$(now); break; fi
     prev=$cur

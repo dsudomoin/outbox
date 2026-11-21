@@ -600,9 +600,10 @@ class OperationsUnderLoadIT {
     private Bound relayedRange(Connection c, Connection pin) throws Exception {
         long deadline = System.nanoTime() + BOUND.toNanos();
         var ticks = new Ticks(names, config.shards());
+        var cursors = new Cursors(names, config.shards());
         while (true) {
             long latest = ticks.latest(c).id();
-            long tick = Cursors.busyTick(new Cursors(names, config.shards()).positions(c, latest), latest);
+            long tick = Cursors.busyTick(cursors.positions(c, latest), latest);
             long horizon = ticks.get(c, tick).snapshot().xmin();
             var range = PartitionDdl.listRanges(c, names.base()).stream()
                     .filter(b -> b.to() != null && Long.parseLong(b.to()) <= horizon)

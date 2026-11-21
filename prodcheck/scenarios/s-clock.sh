@@ -1,6 +1,7 @@
 # Clock skew. The README: partitions do not depend on clocks; times in the retry and parked tables are the database's;
 # message ids are UUIDv7 of the writer's clock, and the inbox window goes by them.
 SKEWED=kora-outbox-prodcheck-skewed # the sender with the skewed clock
+SKEWED_TARGET=kora-outbox-prodcheck-skewed-target # the receiver with the skewed clock
 ftime() { docker exec "$PG" sh -c "echo '$1' > /tmp/faketime.rc"; fault "часы базы: $1"; }
 
 s_db_clock() { # the database's clock jumps forward and back under load, with a failing key in the retry table
@@ -91,9 +92,8 @@ skewed_shop() { # skewed_shop OFFSET [INSTANCE]: the sender in a container on po
 }
 
 skewed_target() { # skewed_target OFFSET: the receiver and its inbox in a container on the target's ports
-  local name=kora-outbox-prodcheck-skewed-target
-  docker rm -f "$name" > /dev/null 2>&1 || true
-  docker run -d --name "$name" -p 127.0.0.1:9090:9090 -p 127.0.0.1:9095:9095 -v "$PC/target/build/install/target:/app:ro" \
+  docker rm -f "$SKEWED_TARGET" > /dev/null 2>&1 || true
+  docker run -d --name "$SKEWED_TARGET" -p 127.0.0.1:9090:9090 -p 127.0.0.1:9095:9095 -v "$PC/target/build/install/target:/app:ro" \
     -e HTTP_PORT=9090 -e METRICS_PORT=9095 -e INSTANCE_NAME="target$1" \
     -e POSTGRES_URL=jdbc:postgresql://host.docker.internal:55433/outbox \
     -e LD_PRELOAD="$FAKETIME_LIB/libfaketimeMT.so.1" -e FAKETIME="$1" -e FAKETIME_DONT_FAKE_MONOTONIC=1 \
@@ -144,15 +144,15 @@ s_inbox_clock_sender() { # the sender's clock is off: the ids' time, so the dedu
 
 s_inbox_clock_receiver() { # the receiver's clock is off: its partitions and its window; the ids are right
   pc_begin inbox-clock-receiver
-  AFTER='docker rm -f kora-outbox-prodcheck-skewed-target'
+  AFTER="docker rm -f $SKEWED_TARGET"
   pc_shop 1001
-  local offset per="" a b name=kora-outbox-prodcheck-skewed-target
+  local offset per="" a b
   skewed_target +0
   pc_load 1001 'rate=100&writers=2&keys=30&topics=payments'
   for offset in +2h -2h +3d -3d +0; do
     a=$(doubles)
-    docker stop -t 10 "$name" > /dev/null
-    inbox_logs "$name"
+    docker stop -t 10 "$SKEWED_TARGET" > /dev/null
+    inbox_logs "$SKEWED_TARGET"
     skewed_target "$offset"
     fault "получатель с часами $offset"
     sleep 15
@@ -162,7 +162,7 @@ s_inbox_clock_receiver() { # the receiver's clock is off: its partitions and its
   done
   check "$(passes effects_grow 5)" "доставка идёт после всех сдвигов"
   tfault 'dropPercent=0'
-  inbox_logs "$name"
+  inbox_logs "$SKEWED_TARGET"
   inbox_verdict "$per"
   pc_finish --no-time-checks --timeout 120
 }
