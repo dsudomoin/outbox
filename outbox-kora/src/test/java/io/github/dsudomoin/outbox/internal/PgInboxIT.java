@@ -12,13 +12,13 @@ import io.github.dsudomoin.outbox.ConnectionSource;
 import io.github.dsudomoin.outbox.Inbox;
 import io.github.dsudomoin.outbox.OutboxSql;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
-import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.Intercepting;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -40,7 +40,6 @@ import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
@@ -154,11 +153,11 @@ class PgInboxIT {
     void oldIdOutsideWindowAcceptedWithoutInsert() throws Exception {
         start();
         long now = System.currentTimeMillis();
-        var old = v7(now - Duration.ofDays(30).toMillis());
-        var future = v7(now + Duration.ofDays(30).toMillis());
+        var old = UuidV7.next(now - Duration.ofDays(30).toMillis());
+        var future = UuidV7.next(now + Duration.ofDays(30).toMillis());
         // ids within one interval of the partitions' edges are outside too: the window is conservative
-        var belowLowest = v7(lowest() + HOUR / 2);
-        var nearTop = v7(highest() - HOUR / 2);
+        var belowLowest = UuidV7.next(lowest() + HOUR / 2);
+        var nearTop = UuidV7.next(highest() - HOUR / 2);
 
         for (var id : List.of(old, future, belowLowest, nearTop)) {
             assertThat(accept(id)).as("first %s", id).isTrue();
@@ -220,8 +219,8 @@ class PgInboxIT {
     void acceptAllTakesOutsideIdsWithoutInsert() throws Exception {
         start();
         long now = System.currentTimeMillis();
-        var old = v7(now - Duration.ofDays(30).toMillis());
-        var future = v7(now + Duration.ofDays(30).toMillis());
+        var old = UuidV7.next(now - Duration.ofDays(30).toMillis());
+        var future = UuidV7.next(now + Duration.ofDays(30).toMillis());
         var v4 = UUID.randomUUID();
         var inWindow = UuidV7.next();
 
@@ -493,7 +492,7 @@ class PgInboxIT {
             attach(c, expired.get(0), hour - 6 * HOUR);
             attach(c, expired.get(1), hour - 5 * HOUR);
             try (var ps = c.prepareStatement("insert into " + table() + " (message_id) values (?)")) {
-                ps.setObject(1, v7(hour - 5 * HOUR + 1)); // expired rows go with their partition
+                ps.setObject(1, UuidV7.next(hour - 5 * HOUR + 1)); // expired rows go with their partition
                 ps.executeUpdate();
             }
             // an interrupted drop left the upper one detach-pending: the lower one's detach fails (55000) until
@@ -526,7 +525,7 @@ class PgInboxIT {
         start();
         long hour = lowest() + 2 * HOUR;
         var expired = List.of(table() + "_old1", table() + "_old2");
-        var unrelated = TestDb.uniqueTable();
+        var unrelated = TestSql.uniqueTable();
         try (var c = TestDb.connect(); var reader = TestDb.connect(); var report = TestDb.connect()) {
             attach(c, expired.get(0), hour - 6 * HOUR);
             attach(c, expired.get(1), hour - 5 * HOUR);
@@ -561,7 +560,7 @@ class PgInboxIT {
         start();
         long hour = lowest() + 2 * HOUR;
         var expired = List.of(table() + "_old1", table() + "_old2");
-        var view = TestDb.uniqueTable();
+        var view = TestSql.uniqueTable();
         try (var c = TestDb.connect(); var reader = TestDb.connect(); var err = new CapturedStderr()) {
             attach(c, expired.get(0), hour - 6 * HOUR);
             attach(c, expired.get(1), hour - 5 * HOUR);
@@ -597,7 +596,7 @@ class PgInboxIT {
         try (var c = TestDb.connect()) {
             attach(c, expired, hour - 5 * HOUR);
             try (var ps = c.prepareStatement("insert into " + table() + " (message_id) values (?)")) {
-                ps.setObject(1, v7(hour - 5 * HOUR + 1));
+                ps.setObject(1, UuidV7.next(hour - 5 * HOUR + 1));
                 ps.executeUpdate();
             }
             // a run killed after its DETACH went through, before its DROP
@@ -627,11 +626,7 @@ class PgInboxIT {
     @Test
     void pendingDetachInsideTheWindowIsNeverDropped() throws Exception {
         start();
-        var range = ranges().stream() // the range now falls in
-                .filter(b -> millis(b.from()) <= System.currentTimeMillis()
-                        && System.currentTimeMillis() < millis(b.to()))
-                .findFirst()
-                .orElseThrow();
+        var range = rangeOf(System.currentTimeMillis()); // the range now falls in
         var id = UuidV7.next();
         assertThat(accept(id)).isTrue();
         try (var reader = TestDb.connect(); var operator = TestDb.connect()) {
@@ -905,7 +900,7 @@ class PgInboxIT {
         // a second instance starts before maintenance ran: its partitions span the expired ranges
         var second = new PgInbox(db, config, new OutboxMetrics(registry));
         second.start();
-        var expiredId = v7(hour - 3 * HOUR + HOUR / 2);
+        var expiredId = UuidV7.next(hour - 3 * HOUR + HOUR / 2);
         assertThat(accept(second, expiredId)).isTrue();
         assertThat(accept(second, expiredId)).as("not deduplicated: its range may go any moment").isTrue();
         assertThat(rows()).isZero();
@@ -920,7 +915,7 @@ class PgInboxIT {
     void maintenanceExtendsPremadeAndRefreshesWindow() throws Exception {
         config.inboxPremake(Duration.ofHours(2));
         start();
-        var nextTop = v7(highest() + HOUR / 2);
+        var nextTop = UuidV7.next(highest() + HOUR / 2);
         assertThat(accept(nextTop)).isTrue();
         assertThat(rows()).isZero();
         // premake grows (a config change on restart takes the same path): maintenance extends, the window follows
@@ -938,12 +933,7 @@ class PgInboxIT {
     @Test
     void anInstanceWhoseOwnerSourceFailsStillTakesTheWindowAnotherInstanceExtended() throws Exception {
         var broken = new AtomicBoolean();
-        refreshesWithTheOwnerBroken(broken, () -> {
-            if (broken.get()) { // a rotated owner password: the owner's pool no longer connects
-                throw new SQLException("password authentication failed", "28P01");
-            }
-            return TestDb.connect();
-        });
+        refreshesWithTheOwnerBroken(broken, brokenWhen(broken));
     }
 
     @Test
@@ -970,15 +960,10 @@ class PgInboxIT {
     @Test
     void theWindowGaugeKeepsFallingOnceNoRangeIsLeft() throws Exception {
         var broken = new AtomicBoolean();
-        inbox = new PgInbox(db, new OwnerTransactions(db, () -> {
-            if (broken.get()) { // no instance makes ranges any more
-                throw new SQLException("password authentication failed", "28P01");
-            }
-            return TestDb.connect();
-        }), config, new OutboxMetrics(registry));
+        inbox = new PgInbox(db, new OwnerTransactions(db, brokenWhen(broken)), config, new OutboxMetrics(registry));
         inbox.start();
         long top = highest() - HOUR;
-        broken.set(true);
+        broken.set(true); // no instance makes ranges any more
         try (var c = TestDb.connect()) { // every range gone: by retention, or an operator's detach
             for (var b : ranges()) {
                 execute(c, "alter table " + table() + " detach partition " + b.name());
@@ -1010,7 +995,8 @@ class PgInboxIT {
 
             assertThatThrownBy(stale::runMaintenance).as("the run itself fails");
 
-            var id = v7(top + HOUR / 2); // above the old window's top (top - 1h), below the new one's (top + 1h)
+            // above the old window's top (top - 1h), below the new one's (top + 1h)
+            var id = UuidV7.next(top + HOUR / 2);
             assertThat(accept(stale, id)).isTrue();
             assertThat(accept(stale, id)).isFalse();
             assertThat(rows()).isEqualTo(1);
@@ -1206,11 +1192,14 @@ class PgInboxIT {
         return UuidV7.lowerBound(millis).toString();
     }
 
-    /** A v7 id of {@code millis}. */
-    private static UUID v7(long millis) {
-        var r = ThreadLocalRandom.current();
-        return new UUID((millis << 16) | 0x7000L | (r.nextLong() & 0x0FFFL),
-                (r.nextLong() & 0x3FFF_FFFF_FFFF_FFFFL) | 0x8000_0000_0000_0000L);
+    /** The owner's connections, failing once {@code broken} as a rotated owner password makes the owner's pool. */
+    private static ConnectionSource brokenWhen(AtomicBoolean broken) {
+        return () -> {
+            if (broken.get()) {
+                throw new SQLException("password authentication failed", "28P01");
+            }
+            return TestDb.connect();
+        };
     }
 
     /** A standalone table {@code name} shaped like the inbox, as a range left detached would be. */

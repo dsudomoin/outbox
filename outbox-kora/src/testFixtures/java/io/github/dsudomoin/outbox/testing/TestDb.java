@@ -30,18 +30,6 @@ public final class TestDb {
 
     private TestDb() {}
 
-    public static String jdbcUrl() {
-        return TestDataSources.jdbcUrl();
-    }
-
-    public static String user() {
-        return TestDataSources.user();
-    }
-
-    public static String password() {
-        return TestDataSources.password();
-    }
-
     /** Kora pool over the test container; the caller closes it with {@code release()}. */
     public static TestDatabase newDatabase(int maxPoolSize) {
         return newDatabase(maxPoolSize, new Properties());
@@ -49,12 +37,13 @@ public final class TestDb {
 
     /** {@link #newDatabase(int)} with pgjdbc connection properties, e.g. {@code defaultRowFetchSize}. */
     public static TestDatabase newDatabase(int maxPoolSize, Properties dsProperties) {
-        return newDatabase(jdbcUrl(), user(), password(), maxPoolSize, dsProperties);
+        return newDatabase(TestDataSources.jdbcUrl(), TestDataSources.user(), TestDataSources.password(), maxPoolSize,
+                dsProperties);
     }
 
     /** {@link #newDatabase(int)} logged in as {@code role}, made by {@link #newLoginRole()}. */
     public static TestDatabase newDatabase(int maxPoolSize, String role) {
-        return newDatabase(jdbcUrl(), role, role, maxPoolSize, new Properties());
+        return newDatabase(TestDataSources.jdbcUrl(), role, role, maxPoolSize, new Properties());
     }
 
     /** Kora pool over any database, e.g. the bench stand's; the caller closes it with {@code release()}. */
@@ -75,6 +64,14 @@ public final class TestDb {
         return role;
     }
 
+    /** Connection properties that log in as {@code role}, made by {@link #newLoginRole()}. */
+    public static Properties login(String role) {
+        var login = new Properties();
+        login.setProperty("user", role);
+        login.setProperty("password", role);
+        return login;
+    }
+
     /** {@link #newDatabase(String, String, String, int)} with pgjdbc connection properties. */
     public static TestDatabase newDatabase(
             String jdbcUrl, String user, String password, int maxPoolSize, Properties dsProperties) {
@@ -83,7 +80,8 @@ public final class TestDb {
 
     /** The config of a {@link #newDatabase(int)} pool, for a test's own {@code JdbcDatabase} over the container. */
     public static JdbcDatabaseConfig config(int maxPoolSize) {
-        return config(jdbcUrl(), user(), password(), maxPoolSize, new Properties());
+        return config(TestDataSources.jdbcUrl(), TestDataSources.user(), TestDataSources.password(), maxPoolSize,
+                new Properties());
     }
 
     private static JdbcDatabaseConfig config(
@@ -140,11 +138,6 @@ public final class TestDb {
         };
     }
 
-    /** {@code ob_} + 10 random lowercase hex digits. */
-    public static String uniqueTable() {
-        return TestSql.uniqueTable();
-    }
-
     /** Plain autocommit JDBC connection, outside any Kora pool. */
     public static Connection connect() throws SQLException {
         return connect(new Properties());
@@ -153,12 +146,12 @@ public final class TestDb {
     /** {@link #connect()} with pgjdbc connection properties, e.g. {@code ApplicationName}, or as another role. */
     public static Connection connect(Properties properties) throws SQLException {
         var p = new Properties();
-        p.setProperty("user", user());
-        p.setProperty("password", password());
+        p.setProperty("user", TestDataSources.user());
+        p.setProperty("password", TestDataSources.password());
         p.setProperty("connectTimeout", "30"); // a server that does not answer fails the test, not hangs the run
         p.setProperty("loginTimeout", "30");
         p.putAll(properties);
-        return DriverManager.getConnection(jdbcUrl(), p);
+        return DriverManager.getConnection(TestDataSources.jdbcUrl(), p);
     }
 
     /**

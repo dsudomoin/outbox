@@ -3,17 +3,17 @@ package io.github.dsudomoin.outbox.internal;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.time.Duration;
 
-/** What the benchmarks share: the relay's config, their database, and the traceparent their messages carry. */
+/** What the benchmarks share: the relay's config and their database. */
 final class Bench {
 
     /** With {@code bench.user} and {@code bench.password}: a Postgres of your own; null for the tests' one. */
     static final String URL = System.getProperty("bench.jdbcUrl");
-    static final String TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
 
     private Bench() {}
 
@@ -38,5 +38,19 @@ final class Bench {
     static Connection connect() throws SQLException {
         return URL == null ? TestDb.connect() : DriverManager.getConnection(URL, System.getProperty("bench.user"),
                 System.getProperty("bench.password"));
+    }
+
+    /** The current WAL insert position. */
+    static String lsn(Connection c) throws SQLException {
+        return TestSql.queryString(c, "select pg_current_wal_insert_lsn()::text");
+    }
+
+    /** Nearest-rank quantile of sorted nanoseconds, in ms; NaN when there are none. */
+    static double ms(long[] sorted, double q) {
+        if (sorted.length == 0) {
+            return Double.NaN;
+        }
+        int i = Math.min(sorted.length - 1, (int) Math.ceil(q * sorted.length) - 1);
+        return sorted[Math.max(0, i)] / 1e6;
     }
 }

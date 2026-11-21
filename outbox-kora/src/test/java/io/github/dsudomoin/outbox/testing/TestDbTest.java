@@ -8,7 +8,7 @@ class TestDbTest {
 
     @Test
     void uniqueTableIsShortLowercaseHex() {
-        assertThat(TestDb.uniqueTable()).matches("ob_[0-9a-f]{10}").isNotEqualTo(TestDb.uniqueTable());
+        assertThat(TestSql.uniqueTable()).matches("ob_[0-9a-f]{10}").isNotEqualTo(TestSql.uniqueTable());
     }
 
     @Test

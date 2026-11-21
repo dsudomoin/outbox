@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import java.sql.Connection;
@@ -23,9 +24,9 @@ class JdbcTransactionsOnAPoolIT {
             TestSql.execute(c, "create table " + table + " (id int)");
         }
         var config = new HikariConfig();
-        config.setJdbcUrl(TestDb.jdbcUrl());
-        config.setUsername(TestDb.user());
-        config.setPassword(TestDb.password());
+        config.setJdbcUrl(TestDataSources.jdbcUrl());
+        config.setUsername(TestDataSources.user());
+        config.setPassword(TestDataSources.password());
         config.setMaximumPoolSize(1);
         try (var pool = new HikariDataSource(config)) {
             var failing = new AtomicBoolean(true);

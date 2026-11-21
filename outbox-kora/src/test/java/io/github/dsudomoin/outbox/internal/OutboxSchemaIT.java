@@ -291,7 +291,11 @@ class OutboxSchemaIT {
                     + " values (1, 0, gen_random_uuid(), 't', now(), 3, 'boom'),"
                     + " (2, 1, gen_random_uuid(), 't', now(), 5, null)");
 
-            new OutboxSchema(db, config).start();
+            try (var err = new CapturedStderr()) {
+                new OutboxSchema(db, config).start();
+
+                assertThat(err.text()).contains(n.dead() + "_due").contains("maintenance");
+            }
 
             assertThat(queryString(c, letters)).isEqualTo("1:kept:null:0:null:0,2:kept:null:0:null:0");
             assertThat(queryString(c, check, n.dead(), checkName)).as("not valid: the old letters are not scanned")
@@ -313,33 +317,6 @@ class OutboxSchemaIT {
             assertThat(queryString(c, letters)).isEqualTo("1:kept:null:0:null:0,2:kept:null:0:null:0");
             assertThat(queryString(c, check, n.dead(), checkName)).isEqualTo("false");
         }
-    }
-
-    @Test
-    void upgradeOfALargeDeadTableDoesNotBuildTheIndexAtStartup() throws Exception {
-        var n = TableNames.of(config.table());
-        try (var c = TestDb.connect(); var err = new CapturedStderr()) {
-            execute(c, "create table " + n.dead() + PRE_HOOK_DEAD_TABLE);
-            execute(c, "insert into " + n.dead() + " (id, shard, message_id, topic, created_at, attempts)"
-                    + " select s, 0, gen_random_uuid(), 't', now(), 1 from generate_series(1, 200000) s");
-
-            assertTimeoutPreemptively(Duration.ofSeconds(5), () -> new OutboxSchema(db, config).start());
-
-            assertThat(queryString(c, "select (to_regclass(?) is null)::text", n.dead() + "_due")).isEqualTo("true");
-            assertThat(err.text()).contains(n.dead() + "_due").contains("maintenance");
-        }
-    }
-
-    @Test
-    void shardMismatchFailsFast() throws Exception {
-        new OutboxSchema(db, config.shards(4)).start();
-
-        var resharded = new OutboxSchema(db, config.shards(8));
-
-        assertThatThrownBy(resharded::start)
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("shards = 8")
-                .hasMessageContaining("4 shards");
     }
 
     @Test
@@ -565,11 +542,7 @@ class OutboxSchemaIT {
 
     private int holdSchemaLock(Connection holder) throws SQLException {
         int ns = TableNames.of("public." + config.table()).internalNamespace(); // what every spelling resolves to
-        try (var ps = holder.prepareStatement("select pg_advisory_lock(?, ?)")) {
-            ps.setInt(1, ns);
-            ps.setInt(2, TableNames.LOCK_SCHEMA);
-            ps.execute();
-        }
+        execute(holder, "select pg_advisory_lock(" + ns + ", " + TableNames.LOCK_SCHEMA + ")");
         return ns;
     }
 

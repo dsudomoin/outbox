@@ -2,6 +2,7 @@ package io.github.dsudomoin.outbox;
 
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
+import static io.github.dsudomoin.outbox.testing.TestSql.queryLongs;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryStrings;
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -598,10 +599,11 @@ class OperationsUnderLoadIT {
      */
     private Bound relayedRange(Connection c, Connection pin) throws Exception {
         long deadline = System.nanoTime() + BOUND.toNanos();
+        var ticks = new Ticks(names, config.shards());
         while (true) {
-            long latest = new Ticks(names, config.shards()).latest(c).id();
+            long latest = ticks.latest(c).id();
             long tick = Cursors.busyTick(new Cursors(names, config.shards()).positions(c, latest), latest);
-            long horizon = new Ticks(names, config.shards()).get(c, tick).snapshot().xmin();
+            long horizon = ticks.get(c, tick).snapshot().xmin();
             var range = PartitionDdl.listRanges(c, names.base()).stream()
                     .filter(b -> b.to() != null && Long.parseLong(b.to()) <= horizon)
                     .min(Comparator.comparingLong(b -> Long.parseLong(b.from())));
@@ -721,14 +723,9 @@ class OperationsUnderLoadIT {
     }
 
     private Set<Long> deadIds() throws SQLException {
-        var ids = new HashSet<Long>();
-        try (var c = TestDb.connect(); var st = c.createStatement();
-                var rs = st.executeQuery("select id from " + names.dead())) {
-            while (rs.next()) {
-                ids.add(rs.getLong(1));
-            }
+        try (var c = TestDb.connect()) {
+            return new HashSet<>(queryLongs(c, "select id from " + names.dead()));
         }
-        return ids;
     }
 
     private static List<Bound> inboxRanges(String table) throws SQLException {
@@ -750,11 +747,8 @@ class OperationsUnderLoadIT {
 
     /** A v7 id of a random time in {@code range}. */
     private static UUID v7(Bound range) {
-        var r = ThreadLocalRandom.current();
         long from = millis(range.from());
-        long millis = from + r.nextLong(millis(range.to()) - from);
-        return new UUID((millis << 16) | 0x7000L | (r.nextLong() & 0x0FFFL),
-                (r.nextLong() & 0x3FFF_FFFF_FFFF_FFFFL) | 0x8000_0000_0000_0000L);
+        return UuidV7.next(from + ThreadLocalRandom.current().nextLong(millis(range.to()) - from));
     }
 
     private static boolean exists(String table) throws SQLException {

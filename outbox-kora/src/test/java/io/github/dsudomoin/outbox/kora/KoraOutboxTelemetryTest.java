@@ -407,6 +407,8 @@ class KoraOutboxTelemetryTest {
         assertThat(message).isSameAs(OutboxTelemetry.Message.NONE);
         assertThat(message.headers(enqueue.headers(List.of())))
                 .as("the writer's trace is stored").containsExactly(header("traceparent", TRACEPARENT));
+        var own = List.of(header("traceparent", "00-" + "1".repeat(32) + "-" + "2".repeat(16) + "-01"));
+        assertThat(enqueue.headers(own)).as("a message's own trace is kept").isSameAs(own);
         Context.clear();
         var before = Context.current();
         var step = telemetry.stepStarted(List.of(0));
@@ -436,17 +438,6 @@ class KoraOutboxTelemetryTest {
         var traceId = RecordScope.bound(delivery, () -> RecordScope.run(record,
                 () -> OpentelemetryContext.getSpan().getSpanContext().getTraceId()));
         assertThat(traceId).isEqualTo(TRACE_ID);
-    }
-
-    @Test
-    void enqueueAddsCurrentTraceUnlessTheMessageHasOne() {
-        var telemetry = new KoraOutboxTelemetry(new OutboxMetrics(null), null);
-        TestTracing.activateSpan();
-        var enqueue = telemetry.enqueueStarted();
-
-        assertThat(enqueue.headers(List.of())).containsExactly(header("traceparent", TRACEPARENT));
-        var own = List.of(header("traceparent", "00-" + "1".repeat(32) + "-" + "2".repeat(16) + "-01"));
-        assertThat(enqueue.headers(own)).isSameAs(own);
     }
 
     @Test

@@ -4,7 +4,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
-import io.github.dsudomoin.outbox.testing.TestDb;
+import io.github.dsudomoin.outbox.testing.TestDataSources;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.test.extension.junit5.KoraAppTest;
@@ -36,8 +37,8 @@ class ShutdownOrderIT implements KoraAppTestConfigModifier {
                   shards = 4
                   inbox.table = %s
                 }
-                """.formatted(TestDb.jdbcUrl(), TestDb.user(), TestDb.password(), TestDb.uniqueTable(),
-                TestDb.uniqueTable()));
+                """.formatted(TestDataSources.jdbcUrl(), TestDataSources.user(), TestDataSources.password(),
+                TestSql.uniqueTable(), TestSql.uniqueTable()));
     }
 
     @Test

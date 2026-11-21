@@ -11,6 +11,7 @@ import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.wiring.TypedTestApp.AppCode;
@@ -31,7 +32,7 @@ import ru.tinkoff.kora.test.extension.junit5.TestComponent;
 @KoraAppTest(TypedTestApp.class)
 class TypedOutboxIT implements KoraAppTestConfigModifier {
 
-    private final String table = TestDb.uniqueTable();
+    private final String table = TestSql.uniqueTable();
 
     @TestComponent
     private JdbcDatabase db;
@@ -58,7 +59,7 @@ class TypedOutboxIT implements KoraAppTestConfigModifier {
                   table = %s
                   relay.enabled = false
                 }
-                """.formatted(TestDb.jdbcUrl(), TestDb.user(), TestDb.password(), table));
+                """.formatted(TestDataSources.jdbcUrl(), TestDataSources.user(), TestDataSources.password(), table));
     }
 
     @Test

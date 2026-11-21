@@ -17,6 +17,7 @@ import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
@@ -64,11 +65,13 @@ class BatchReaderIT {
         var p = tick();
         var a = begin();
         var aId = outbox.send(a, OutboxMessage.of("t", "a", bytes("a")));
+        long aXid = queryLong(a, "select pg_current_xact_id()::text::bigint");
         var b = OutboxMessage.of("t", "b", PAYLOAD).withHeader("h", bytes("v")).withHeader("null", null);
         var bId = sendCommitted(b);
         var c = tick();
         a.commit();
         var d = tick();
+        assertThat(c.xip()).as("a is in flight at c").contains(aXid);
 
         var pc = read(0, p, c, 0, 100, true);
         assertThat(messageIds(pc)).containsExactly(bId);
@@ -82,23 +85,6 @@ class BatchReaderIT {
         assertThat(pc.get(0).blocked()).isFalse();
         assertThat(messageIds(read(0, c, d, 0, 100, true))).containsExactly(aId);
         assertThat(read(1, p, d, 0, 100, true)).as("another shard").isEmpty();
-    }
-
-    @Test
-    void inFlightAtPrevAppearsWhenCommitted() throws Exception {
-        bootstrap();
-        var o = tick();
-        var a = begin();
-        var aId = outbox.send(a, OutboxMessage.of("t", "a", bytes("a")));
-        long aXid = queryLong(a, "select pg_current_xact_id()::text::bigint");
-        var bId = sendCommitted(OutboxMessage.of("t", "b", PAYLOAD)); // xid above a's, committed before p
-        var p = tick();
-        assertThat(p.xip()).as("a is in flight at p, below p's xmax").contains(aXid);
-        a.commit();
-        var c = tick();
-
-        assertThat(messageIds(read(0, o, p, 0, 100, true))).containsExactly(bId);
-        assertThat(messageIds(read(0, p, c, 0, 100, true))).containsExactly(aId);
     }
 
     @Test
@@ -535,8 +521,6 @@ class BatchReaderIT {
      */
     private TreeSet<String> partitionsInPlan(Connection c, boolean checkBlocked, PgSnapshot prev, PgSnapshot target,
             boolean budgeted) throws SQLException {
-        var used = new TreeSet<String>();
-        var partition = partitionName();
         execute(c, "set plan_cache_mode = force_custom_plan");
         try (var ps = c.prepareStatement("explain " + (budgeted ? reader.budgetedSql(checkBlocked)
                 : reader.sql(checkBlocked)))) {
@@ -545,16 +529,8 @@ class BatchReaderIT {
             } else {
                 reader.bind(ps, 0, prev, target, 0, 100);
             }
-            try (var rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    var m = partition.matcher(rs.getString(1));
-                    while (m.find()) {
-                        used.add(m.group());
-                    }
-                }
-            }
+            return partitionsIn(ps);
         }
-        return used;
     }
 
     /**
@@ -597,24 +573,13 @@ class BatchReaderIT {
      * ran (pruned ones are left out of the plan or marked never executed).
      */
     private TreeSet<String> partitionsScanned(Connection c, List<ShardRead> reads) throws SQLException {
-        var used = new TreeSet<String>();
-        var partition = partitionName();
         c.setAutoCommit(false);
         try (var ps = c.prepareStatement("explain (analyze) " + reader.manySql(true))) {
             reader.bindMany(ps, reads, 1000);
-            try (var rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    var line = rs.getString(1);
-                    var m = partition.matcher(line);
-                    while (m.find() && !line.contains("never executed")) {
-                        used.add(m.group());
-                    }
-                }
-            }
+            return partitionsIn(ps);
         } finally {
             c.rollback();
         }
-        return used;
     }
 
     /**
@@ -623,8 +588,6 @@ class BatchReaderIT {
      */
     private TreeSet<String> partitionsPlanned(Connection c, List<ShardRead> reads, boolean budgeted)
             throws SQLException {
-        var planned = new TreeSet<String>();
-        var partition = partitionName();
         c.setAutoCommit(false);
         try (var ps = c.prepareStatement("explain " + (budgeted ? reader.budgetedManySql(true) : reader.manySql(true)))) {
             execute(c, "set local plan_cache_mode = force_custom_plan");
@@ -633,23 +596,29 @@ class BatchReaderIT {
             } else {
                 reader.bindMany(ps, reads, 1000);
             }
-            try (var rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    var m = partition.matcher(rs.getString(1));
-                    while (m.find()) {
-                        planned.add(m.group());
-                    }
-                }
-            }
+            return partitionsIn(ps);
         } finally {
             c.rollback();
         }
-        return planned;
     }
 
-    /** A range partition's unqualified name. */
-    private Pattern partitionName() {
-        return Pattern.compile(Pattern.quote(names.unqualified(names.partitionPrefix())) + "\\d+");
+    /** The range partitions an EXPLAIN names, leaving out lines marked never executed. */
+    private TreeSet<String> partitionsIn(PreparedStatement ps) throws SQLException {
+        var partition = Pattern.compile(Pattern.quote(names.unqualified(names.partitionPrefix())) + "\\d+");
+        var found = new TreeSet<String>();
+        try (var rs = ps.executeQuery()) {
+            while (rs.next()) {
+                var line = rs.getString(1);
+                if (line.contains("never executed")) {
+                    continue;
+                }
+                var m = partition.matcher(line);
+                while (m.find()) {
+                    found.add(m.group());
+                }
+            }
+        }
+        return found;
     }
 
     /** The outbox's range partitions. */

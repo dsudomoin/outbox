@@ -466,8 +466,8 @@ class OutboxAdminIT {
     void restoreOrphanRefusesWhatIsNotAStandaloneRange() throws Exception {
         var attached = ranges().stream().filter(b -> b.to() != null).findFirst().orElseThrow().name();
         var precreated = names.partitionPrefix() + tailLower(); // as the extension makes them before its swap
-        var unrelated = TestDb.uniqueTable();
-        var victim = TestDb.uniqueTable();
+        var unrelated = TestSql.uniqueTable();
+        var victim = TestSql.uniqueTable();
         try (var c = TestDb.connect()) {
             PartitionDdl.create(c, names.base(), precreated, Duration.ofSeconds(5));
             orphanRow(precreated, 1, 0, "pre");
@@ -1417,7 +1417,7 @@ class OutboxAdminIT {
      * {@code table} runs under; its name.
      */
     private String idleBoundOnDelete(String table) throws SQLException {
-        var seen = TestDb.uniqueTable();
+        var seen = TestSql.uniqueTable();
         execute("create table " + seen + " (setting text)");
         execute("create function " + seen + "_f() returns trigger language plpgsql as $$ begin insert into " + seen
                 + " values (current_setting('idle_in_transaction_session_timeout')); return null; end $$");
@@ -1561,13 +1561,9 @@ class OutboxAdminIT {
     }
 
     private List<Long> longs(String sql) throws SQLException {
-        var all = new ArrayList<Long>();
-        try (var c = TestDb.connect(); var st = c.createStatement(); var rs = st.executeQuery(sql)) {
-            while (rs.next()) {
-                all.add(rs.getLong(1));
-            }
+        try (var c = TestDb.connect()) {
+            return TestSql.queryLongs(c, sql);
         }
-        return all;
     }
 
     private long count(String table) throws SQLException {

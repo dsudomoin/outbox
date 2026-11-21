@@ -16,6 +16,7 @@ import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import java.sql.SQLException;
 import java.time.Duration;
@@ -34,7 +35,7 @@ import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 class TableSpellingIT {
 
     private final TestDatabase db = TestDb.newDatabase(8);
-    private final String table = TestDb.uniqueTable();
+    private final String table = TestSql.uniqueTable();
     private final TestOutboxConfig plainConfig = new TestOutboxConfig().table(table).shards(1);
     private final TestOutboxConfig qualifiedConfig = new TestOutboxConfig().table("public." + table).shards(1);
     private final ExecutorService pool = Executors.newFixedThreadPool(2);
@@ -58,7 +59,7 @@ class TableSpellingIT {
 
     @Test
     void anUnqualifiedNameResolvesThroughTheSearchPath() throws Exception {
-        var schemaName = TestDb.uniqueTable();
+        var schemaName = TestSql.uniqueTable();
         try (var c = TestDb.connect()) {
             execute(c, "create schema " + schemaName);
         }
@@ -140,14 +141,11 @@ class TableSpellingIT {
 
     @Test
     void inboxOfEitherSpellingWaitsForTheOtherOnesLock() throws Exception {
-        var inbox = TestDb.uniqueTable();
+        var inbox = TestSql.uniqueTable();
         var holderNamespace = TableNames.of("public." + inbox).internalNamespace(); // what the qualified one locks
         try (var holder = TestDb.connect()) {
-            try (var ps = holder.prepareStatement("select pg_advisory_lock(?, ?)")) {
-                ps.setInt(1, holderNamespace);
-                ps.setInt(2, TableNames.LOCK_INBOX_MAINTENANCE);
-                ps.execute();
-            }
+            execute(holder, "select pg_advisory_lock(" + holderNamespace + ", " + TableNames.LOCK_INBOX_MAINTENANCE
+                    + ")");
 
             var plainInbox = new PgInbox(db, new TestOutboxConfig().inboxTable(inbox), new OutboxMetrics(null));
 

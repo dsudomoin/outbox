@@ -4,7 +4,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.Inbox;
 import io.github.dsudomoin.outbox.internal.UuidV7;
-import io.github.dsudomoin.outbox.testing.TestDb;
+import io.github.dsudomoin.outbox.testing.TestDataSources;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
@@ -32,7 +33,8 @@ class InboxModuleIT implements KoraAppTestConfigModifier {
                   poolName = "inbox-wiring"
                 }
                 outbox.inbox.table = %s
-                """.formatted(TestDb.jdbcUrl(), TestDb.user(), TestDb.password(), TestDb.uniqueTable()));
+                """.formatted(TestDataSources.jdbcUrl(), TestDataSources.user(), TestDataSources.password(),
+                TestSql.uniqueTable()));
     }
 
     @Test

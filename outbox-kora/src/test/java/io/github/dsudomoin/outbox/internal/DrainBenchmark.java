@@ -7,9 +7,10 @@ import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
-import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
+import io.github.dsudomoin.outbox.testing.TestTracing;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -56,11 +57,11 @@ class DrainBenchmark {
 
     @Test
     void drain() throws Exception {
-        var table = TestDb.uniqueTable();
+        var table = TestSql.uniqueTable();
         var writerConfig = config(table).relayEnabled(false);
         var payload = new byte[PAYLOAD];
         new Random(1).nextBytes(payload);
-        var traceparent = Bench.TRACEPARENT.getBytes(UTF_8);
+        var traceparent = TestTracing.TRACEPARENT.getBytes(UTF_8);
         long fillStarted;
         long fillNanos;
         try (var writer = OutboxRuntime.builder(writerConfig, db, record -> {}).telemetry(TestTelemetry.kora())

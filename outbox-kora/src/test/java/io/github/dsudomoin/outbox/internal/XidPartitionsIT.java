@@ -18,6 +18,7 @@ import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -196,7 +197,7 @@ class XidPartitionsIT {
         var writers = committingWriters(names, done, errors);
 
         var blockers = new ArrayList<String>();
-        try (var c = TestDb.connect(login(TestDb.newLoginRole()))) {
+        try (var c = TestDb.connect(TestDb.login(TestDb.newLoginRole()))) {
             for (int i = 0; i < 4; i++) {
                 var blocker = partitions.swapBlocker(c);
                 if (blocker != null) {
@@ -220,7 +221,7 @@ class XidPartitionsIT {
         var names = bootstrap(config);
         var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1));
 
-        try (var holder = TestDb.connect(); var c = TestDb.connect(login(TestDb.newLoginRole()))) {
+        try (var holder = TestDb.connect(); var c = TestDb.connect(TestDb.login(TestDb.newLoginRole()))) {
             holder.setAutoCommit(false); // just begun, but its age is hidden from the maintenance role
             queryLong(holder, "select count(*) from " + names.base());
 
@@ -240,7 +241,7 @@ class XidPartitionsIT {
         dump.setProperty("ApplicationName", "pg_dump");
 
         try (var holder = TestDb.connect(); var pgDump = TestDb.connect(dump);
-                var c = TestDb.connect(login(TestDb.newLoginRole()))) {
+                var c = TestDb.connect(TestDb.login(TestDb.newLoginRole()))) {
             holder.setAutoCommit(false); // hidden from the maintenance role, so it is sampled again after 2 s
             queryLong(holder, "select count(*) from " + names.base());
             var errors = new ConcurrentLinkedQueue<Throwable>();
@@ -363,7 +364,7 @@ class XidPartitionsIT {
 
     @Test
     void hotTailOfASchemaQualifiedOutboxIsConverted() throws Exception {
-        var config = new TestOutboxConfig().table("public." + TestDb.uniqueTable()).xidsPerPartition(1000).premake(4);
+        var config = new TestOutboxConfig().table("public." + TestSql.uniqueTable()).xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
         var partitions = new XidPartitions(names, config.partitions());
 
@@ -1426,9 +1427,7 @@ class XidPartitionsIT {
             while (partitions.premadeAhead(c) >= config.premake() / 2) { // ranges running out: the ERROR is due
                 TestDb.burnXids(200);
             }
-            if (currentXid(c) % 1000 > 600) {
-                TestDb.burnXids(500);
-            }
+            roomInTheRange(c, 600);
             partitions.inHold = "raise exception 'boom';";
 
             String log;
@@ -1542,9 +1541,7 @@ class XidPartitionsIT {
             while (partitions.premadeAhead(c) >= config.premake() / 2) { // ranges running out: the ERROR is due
                 TestDb.burnXids(200);
             }
-            if (currentXid(c) % 1000 > 600) {
-                TestDb.burnXids(500);
-            }
+            roomInTheRange(c, 600);
             execute(step, "set application_name = 'slow-relay-step'");
             long stepPid = queryLong(step, "select pg_backend_pid()");
             step.setAutoCommit(false); // a relay step in flight, past the quiesce timeout
@@ -1638,7 +1635,7 @@ class XidPartitionsIT {
             }
             var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1));
 
-            try (var holder = TestDb.connect(); var c = TestDb.connect(login(role))) {
+            try (var holder = TestDb.connect(); var c = TestDb.connect(TestDb.login(role))) {
                 holder.setAutoCommit(false); // a pg_dump by a backup role, under another application name
                 execute(holder, "set transaction isolation level repeatable read");
                 queryLong(holder, "select count(*) from " + names.base());
@@ -1695,7 +1692,7 @@ class XidPartitionsIT {
             var names = schema.names();
             var partitions = new XidPartitions(names, config.partitions());
 
-            try (var holder = TestDb.connect(login(role)); var c = TestDb.connect(login(role))) {
+            try (var holder = TestDb.connect(TestDb.login(role)); var c = TestDb.connect(TestDb.login(role))) {
                 assertThat(queryString(c, "show statement_timeout")).isEqualTo("1s");
                 execute(c, "set lock_timeout = '7s'"); // a session value, which the DDL must give back
                 long lower = tail(c, names);
@@ -1960,13 +1957,6 @@ class XidPartitionsIT {
         }
     }
 
-    private static Properties login(String role) {
-        var login = new Properties();
-        login.setProperty("user", role);
-        login.setProperty("password", role);
-        return login;
-    }
-
     /** As a maintenance run: a failed step is logged, and the next run retries it. */
     private static void ensurePremadeAsMaintenance(XidPartitions partitions, Connection c) {
         try {
@@ -2042,11 +2032,8 @@ class XidPartitionsIT {
 
     /** Takes {@code LOCK_SWAP} shared in {@code step}'s transaction, as a relay step does. */
     private static void holdSwapShared(Connection step, TableNames names) throws SQLException {
-        try (var ps = step.prepareStatement("select pg_advisory_xact_lock_shared(?, ?)")) {
-            ps.setInt(1, names.internalNamespace());
-            ps.setInt(2, TableNames.LOCK_SWAP);
-            ps.execute();
-        }
+        execute(step, "select pg_advisory_xact_lock_shared(" + names.internalNamespace() + ", " + TableNames.LOCK_SWAP
+                + ")");
     }
 
     /** Sessions holding the swap's advisory lock: a session takes its own again at once, so only this shows a leak. */

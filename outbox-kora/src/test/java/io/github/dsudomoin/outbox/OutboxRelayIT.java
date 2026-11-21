@@ -6,6 +6,7 @@ import static io.github.dsudomoin.outbox.testing.TestDb.opening;
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
+import static io.github.dsudomoin.outbox.testing.TestSql.queryStrings;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -35,7 +36,6 @@ import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.api.trace.TracerProvider;
 import java.lang.management.ManagementFactory;
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -70,6 +70,8 @@ import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
@@ -188,11 +190,8 @@ class OutboxRelayIT {
             } else if (sql.contains("pg_try_advisory_xact_lock")) { // a shard step
                 lockingWorkers.add(Thread.currentThread().getName());
             }
-        }), new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {
-                delivered.incrementAndGet();
-            }
+        }), record -> {
+            delivered.incrementAndGet();
         });
         relay.start();
         var outbox = outbox(relay::wake);
@@ -601,14 +600,8 @@ class OutboxRelayIT {
         }
 
         try (var c = TestDb.connect()) {
-            var ids = new ArrayList<Long>();
-            try (var st = c.createStatement();
-                    var rs = st.executeQuery("select id from " + schema.names().tick() + " where id > " + before)) {
-                while (rs.next()) {
-                    ids.add(rs.getLong(1));
-                }
-            }
-            assertThat(ids).as("ticks above the start").isNotEmpty().allMatch(made::contains);
+            var ids = queryStrings(c, "select id from " + schema.names().tick() + " where id > " + before);
+            assertThat(ids).as("ticks above the start").isNotEmpty().allMatch(id -> made.contains(Long.parseLong(id)));
         }
         long runs = elapsed / TimeUnit.SECONDS.toNanos(1) + 1;
         assertThat(roundTrips).as("round trips of %d runs at most", runs).isLessThanOrEqualTo((int) (2 * runs));
@@ -689,7 +682,7 @@ class OutboxRelayIT {
                     throw new IllegalStateException(e);
                 }
             }
-            return records.stream().map(r -> (Outcome) Outcome.requeue()).toList();
+            return records.stream().map(r -> Outcome.requeue()).toList();
         }));
         send(outbox(relay::wake), IntStream.range(0, 30).mapToObj(i -> msg("t", "k", "k#" + i)).toArray(OutboxMessage[]::new));
         assertThat(relay.drain()).isZero();
@@ -721,7 +714,7 @@ class OutboxRelayIT {
                 throw new IllegalStateException(e);
             }
             records.forEach(r -> offers.merge(new String(r.payload(), UTF_8), 1, Integer::sum));
-            return records.stream().map(r -> (Outcome) Outcome.requeue()).toList();
+            return records.stream().map(r -> Outcome.requeue()).toList();
         }));
         send(outbox(relay::wake), IntStream.range(0, 5).mapToObj(i -> msg("t", "k", "k#" + i)).toArray(OutboxMessage[]::new));
 
@@ -746,7 +739,7 @@ class OutboxRelayIT {
         var parkedByOther = new AtomicLong(1_000_000);
         var relay = relay(answering(records -> {
             if (requeue.get()) {
-                return records.stream().map(r -> (Outcome) Outcome.requeue()).toList();
+                return records.stream().map(r -> Outcome.requeue()).toList();
             }
             try (var c = TestDb.connect(); var st = c.createStatement()) {
                 for (int i = 0; i < 2; i++) {
@@ -759,7 +752,7 @@ class OutboxRelayIT {
             } catch (SQLException e) {
                 throw new IllegalStateException(e);
             }
-            return records.stream().map(r -> (Outcome) Outcome.delivered()).toList();
+            return records.stream().map(r -> Outcome.delivered()).toList();
         }));
         send(outbox(relay::wake), IntStream.range(0, 6).mapToObj(i -> msg("t", "k", "k#" + i)).toArray(OutboxMessage[]::new));
         assertThat(relay.drain()).isZero();
@@ -787,7 +780,7 @@ class OutboxRelayIT {
         var parkedByOther = new AtomicLong(1_000_000);
         var relay = relay(answering(records -> {
             if (requeue.get()) {
-                return records.stream().map(r -> (Outcome) Outcome.requeue()).toList();
+                return records.stream().map(r -> Outcome.requeue()).toList();
             }
             if (feeds.getAndDecrement() > 0) {
                 try (var c = TestDb.connect(); var st = c.createStatement()) {
@@ -801,7 +794,7 @@ class OutboxRelayIT {
                     throw new IllegalStateException(e);
                 }
             }
-            return records.stream().map(r -> (Outcome) Outcome.delivered()).toList();
+            return records.stream().map(r -> Outcome.delivered()).toList();
         }));
         send(outbox(relay::wake), IntStream.range(0, 6).mapToObj(i -> msg("t", "k", "k#" + i)).toArray(OutboxMessage[]::new));
         assertThat(relay.drain()).isZero();
@@ -884,7 +877,7 @@ class OutboxRelayIT {
                     throw new IllegalStateException(e);
                 }
             }
-            return records.stream().map(r -> (Outcome) Outcome.delivered()).toList();
+            return records.stream().map(r -> Outcome.delivered()).toList();
         }));
         drainer.start();
         send(outbox(() -> {}), msg("t", early, "e"));
@@ -906,7 +899,7 @@ class OutboxRelayIT {
                         throw new IllegalStateException(e);
                     }
                 }
-                return records.stream().map(r -> (Outcome) Outcome.delivered()).toList();
+                return records.stream().map(r -> Outcome.delivered()).toList();
             }));
             await(Duration.ofSeconds(10), () -> checkpointTick() >= d);
             send(outbox(other::wake), IntStream.range(0, 6).mapToObj(i -> msg("t", late, "l" + i))
@@ -1194,18 +1187,10 @@ class OutboxRelayIT {
     void drainHandsDueParkedRowsAndDoesNotWaitForTheRest() throws Exception {
         config.relayEnabled(false).requeueDelay(Duration.ofSeconds(1));
         bootstrap();
-        var relay = relay(new OutboxHandler() { // k: requeued for an hour every time; j: requeued once
-            @Override
-            public void handle(OutboxRecord record) {
-            }
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                return records.stream().map(r -> "k".equals(key(r))
-                        ? Outcome.requeue(Instant.now().plus(Duration.ofHours(1)))
-                        : r.requeues() == 0 ? Outcome.requeue() : Outcome.delivered()).toList();
-            }
-        });
+        // k: requeued for an hour every time; j: requeued once
+        var relay = relay(eachRecord(r -> "k".equals(key(r))
+                ? Outcome.requeue(Instant.now().plus(Duration.ofHours(1)))
+                : r.requeues() == 0 ? Outcome.requeue() : Outcome.delivered()));
         send(outbox(relay::wake), msg("t", "k", "k#1"), msg("t", "j", "j#1"));
 
         long started = System.nanoTime();
@@ -1296,7 +1281,7 @@ class OutboxRelayIT {
         OutboxHandler handler = answering(records -> {
             if (!slow.get()) { // the setup: k and j fail beside a delivered row, so both are diverted
                 return records.stream().map(r -> "w".equals(key(r)) ? Outcome.delivered()
-                        : (Outcome) Outcome.retry(new RuntimeException("target down"))).toList();
+                        : Outcome.retry(new RuntimeException("target down"))).toList();
             }
             // a call blocked where the wind-down at 80 % does not reach it, as a slow target's I/O
             if (records.size() > 1) { // the retry pass's call of both heads: cut at batchTimeout
@@ -1305,7 +1290,7 @@ class OutboxRelayIT {
             } else if (singles.incrementAndGet() <= 2) { // a head's single call, then the main call of m
                 sleepThrough(batchTimeout.minusSeconds(1));
             }
-            return records.stream().map(r -> (Outcome) Outcome.delivered()).toList();
+            return records.stream().map(r -> Outcome.delivered()).toList();
         });
         var drainer = relay(handler);
         var outbox = outbox(() -> {});
@@ -1354,7 +1339,7 @@ class OutboxRelayIT {
         OutboxHandler handler = answering(records -> {
             if (!slow.get()) { // the setup: the heads fail beside a delivered row of their shard, so are diverted
                 return records.stream().map(r -> key(r).startsWith("w") ? Outcome.delivered()
-                        : (Outcome) Outcome.retry(new RuntimeException("target down"))).toList();
+                        : Outcome.retry(new RuntimeException("target down"))).toList();
             }
             // calls blocked where the wind-down at 80 % does not reach them, as a slow target's I/O; the shards
             // are stepped in either order, so the calls are told apart by their turn, not by their keys
@@ -1372,7 +1357,7 @@ class OutboxRelayIT {
             } else if (ofM && main.compareAndSet(false, true)) {
                 sleepThrough(almost); // the main pass's shared call
             }
-            return records.stream().map(r -> (Outcome) Outcome.delivered()).toList();
+            return records.stream().map(r -> Outcome.delivered()).toList();
         });
         var drainer = relay(handler);
         var outbox = outbox(() -> {});
@@ -1415,22 +1400,13 @@ class OutboxRelayIT {
     void aShardWhoseParkedRowIsDueIsSteppedWithoutNewRows() throws Exception {
         bootstrap();
         var delivered = new CopyOnWriteArrayList<OutboxRecord>();
-        var relay = start(new OutboxHandler() { // requeues each record once, then delivers it
-            @Override
-            public void handle(OutboxRecord record) {
+        var relay = start(eachRecord(r -> { // requeues each record once, then delivers it
+            if (r.requeues() == 0) {
+                return Outcome.requeue();
             }
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                return records.stream().map(r -> {
-                    if (r.requeues() == 0) {
-                        return Outcome.requeue();
-                    }
-                    delivered.add(r);
-                    return Outcome.delivered();
-                }).toList();
-            }
-        });
+            delivered.add(r);
+            return Outcome.delivered();
+        }));
         var outbox = outbox(relay::wake);
         awaitParked();
 
@@ -1604,14 +1580,11 @@ class OutboxRelayIT {
         bootstrap();
         var handler = new RecordingHandler();
         try (var err = new CapturedStderr()) {
-            var relay = start(new OutboxHandler() {
-                @Override
-                public void handle(OutboxRecord record) throws Exception {
-                    if ("deep".equals(new String(record.payload(), UTF_8))) {
-                        throw new StackOverflowError("deep payload (test)");
-                    }
-                    handler.handle(record);
+            var relay = start(record -> {
+                if ("deep".equals(new String(record.payload(), UTF_8))) {
+                    throw new StackOverflowError("deep payload (test)");
                 }
+                handler.handle(record);
             });
             var deep = keyOnShard(0, "deep");
             var messages = new ArrayList<OutboxMessage>();
@@ -1691,12 +1664,9 @@ class OutboxRelayIT {
         config.shards(1).batchSize(100).batchTimeout(Duration.ofSeconds(2)); // 400 ms past the soft deadline
         bootstrap();
         var handler = new RecordingHandler();
-        var relay = start(new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) throws Exception {
-                Thread.sleep(20); // a call of 100 records needs over 2 s, well past the soft deadline at 1.6 s
-                handler.handle(record);
-            }
+        var relay = start(record -> {
+            Thread.sleep(20); // a call of 100 records needs over 2 s, well past the soft deadline at 1.6 s
+            handler.handle(record);
         });
 
         var ids = send(outbox(relay::wake), IntStream.range(0, 1000)
@@ -1714,16 +1684,13 @@ class OutboxRelayIT {
         config.shards(1).batchSize(100).batchTimeout(Duration.ofSeconds(2));
         bootstrap();
         var handler = new RecordingHandler();
-        var relay = start(new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) throws Exception {
-                try {
-                    Thread.sleep(40); // a call of 100 records needs 4 s, twice batchTimeout
-                } catch (InterruptedException e) { // as Kora's blocking JDK @HttpClient does: flag cleared
-                    throw new IllegalStateException("wrapped", e);
-                }
-                handler.handle(record);
+        var relay = start(record -> {
+            try {
+                Thread.sleep(40); // a call of 100 records needs 4 s, twice batchTimeout
+            } catch (InterruptedException e) { // as Kora's blocking JDK @HttpClient does: flag cleared
+                throw new IllegalStateException("wrapped", e);
             }
+            handler.handle(record);
         });
 
         var ids = send(outbox(relay::wake), IntStream.range(0, 500)
@@ -1741,11 +1708,8 @@ class OutboxRelayIT {
         config.shards(1).batchTimeout(Duration.ofSeconds(2)); // 400 ms past the soft deadline
         bootstrap();
         var healthy = new RecordingHandler();
-        var hanging = new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) throws Exception {
-                Thread.sleep(60_000); // interrupted at the soft deadline
-            }
+        OutboxHandler hanging = record -> {
+            Thread.sleep(60_000); // interrupted at the soft deadline
         };
         var relay = start(OutboxHandler.byTopic(Map.of("slow", hanging), healthy));
         var messages = new ArrayList<OutboxMessage>();
@@ -1796,17 +1760,9 @@ class OutboxRelayIT {
         config.shards(1).retry(Duration.ofMillis(100), Duration.ofMillis(100), 0);
         bootstrap();
         var audit = new RecordingHandler();
-        OutboxHandler shortOfOutcomes = new OutboxHandler() { // one outcome whatever the call's size
-            @Override
-            public void handle(OutboxRecord record) {
-                throw new UnsupportedOperationException();
-            }
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                return records.size() == 1 ? audit.handleBatch(records) : List.of(Outcome.delivered());
-            }
-        };
+        OutboxHandler shortOfOutcomes = answering(records -> records.size() == 1 // one outcome whatever the call's size
+                ? audit.handleBatch(records)
+                : List.of(Outcome.delivered()));
         var fallback = new RecordingHandler();
         var relay = start(OutboxHandler.byTopic(Map.of("audit", shortOfOutcomes), fallback));
 
@@ -2034,12 +1990,9 @@ class OutboxRelayIT {
                 .idlePollInterval(Duration.ofMillis(200));
         bootstrap();
         var delivered = new AtomicInteger();
-        var relay = start(new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) throws Exception {
-                Thread.sleep(2); // 2000 records: about 4 s of one pass, its round never running out
-                delivered.incrementAndGet();
-            }
+        var relay = start(record -> {
+            Thread.sleep(2); // 2000 records: about 4 s of one pass, its round never running out
+            delivered.incrementAndGet();
         });
         var outbox = outbox(relay::wake);
         awaitParked();
@@ -2105,15 +2058,12 @@ class OutboxRelayIT {
         bootstrap();
         var handler = new RecordingHandler();
         var first = new CountDownLatch(1);
-        var relay = start(new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) throws Exception {
-                if (payload(record).equals("r#1")) {
-                    first.countDown();
-                    Thread.sleep(500); // its step in flight while the second row commits and is ticked
-                }
-                handler.handle(record);
+        var relay = start(record -> {
+            if (payload(record).equals("r#1")) {
+                first.countDown();
+                Thread.sleep(500); // its step in flight while the second row commits and is ticked
             }
+            handler.handle(record);
         });
         var outbox = outbox(relay::wake);
         awaitParked();
@@ -2158,18 +2108,15 @@ class OutboxRelayIT {
         var slow = keyOnShard(0, "slow");
         var slowDone = new AtomicInteger();
         var delays = new CopyOnWriteArrayList<Long>();
-        var relay = start(new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {
-                if (payload(record).equals("slow")) { // 300 ms, deaf to the wind-down's interrupt
-                    long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(300);
-                    while (System.nanoTime() < end) {
-                        Thread.onSpinWait();
-                    }
-                    slowDone.incrementAndGet();
-                } else {
-                    delays.add(Duration.between(record.createdAt(), Instant.now()).toMillis());
+        var relay = start(record -> {
+            if (payload(record).equals("slow")) { // 300 ms, deaf to the wind-down's interrupt
+                long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(300);
+                while (System.nanoTime() < end) {
+                    Thread.onSpinWait();
                 }
+                slowDone.incrementAndGet();
+            } else {
+                delays.add(Duration.between(record.createdAt(), Instant.now()).toMillis());
             }
         });
         var outbox = outbox(relay::wake);
@@ -2476,17 +2423,9 @@ class OutboxRelayIT {
         assertThat(maxCursorSeq()).isEqualTo(seq + 1);
     }
 
-    @Test
-    void aTickWithoutAShardSetStepsEachShardOnce() throws Exception {
-        aTickWithoutAShardSetStepsEachShardOnce(0);
-    }
-
-    @Test
-    void aTickWithoutAShardSetFarPastTheCheckpointStepsEachShardOnce() throws Exception {
-        aTickWithoutAShardSetStepsEachShardOnce(150); // 30 s of idle ticks, beyond maxTicksPerBatch (100)
-    }
-
-    private void aTickWithoutAShardSetStepsEachShardOnce(int idleTicksBefore) throws Exception {
+    @ParameterizedTest // 150 = 30 s of idle ticks, beyond maxTicksPerBatch (100)
+    @ValueSource(ints = {0, 150})
+    void aTickWithoutAShardSetStepsEachShardOnce(int idleTicksBefore) throws Exception {
         // no tick of the relay's own during the sweep: a cursor read racing a sibling's step of a shard (begun before
         // the read, committed after it) finds the shard behind, and a newer tick by then makes its second step a fresh
         // batch with a cursor row of its own. The wake-up below is throttled by the tick just inserted, so its attempt
@@ -2735,9 +2674,7 @@ class OutboxRelayIT {
     }
 
     private static List<Thread> deadLetterThreads() {
-        return Thread.getAllStackTraces().keySet().stream()
-                .filter(t -> t.getName().equals("outbox-dead-letters") && t.isAlive())
-                .toList();
+        return threads("outbox-dead-letters"::equals);
     }
 
     /** {@code delays} sorted: the 99th percentile. */
@@ -2803,7 +2740,7 @@ class OutboxRelayIT {
             var c = db.newConnection();
             return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
                     new Class<?>[] {Connection.class}, (proxy, method, args) -> {
-                        var result = invoke(method, c, args);
+                        var result = Intercepting.invoke(c, method, args);
                         if (method.getName().equals("prepareStatement")
                                 && ((String) args[0]).contains("pg_try_advisory_xact_lock")) {
                             var ps = (PreparedStatement) result;
@@ -2813,20 +2750,12 @@ class OutboxRelayIT {
                                             stepped.accept(Arrays.stream((Object[]) ((java.sql.Array) a[1])
                                                     .getArray()).map(shard -> (Integer) shard).toList());
                                         }
-                                        return invoke(m, ps, a);
+                                        return Intercepting.invoke(ps, m, a);
                                     });
                         }
                         return result;
                     });
         });
-    }
-
-    private static Object invoke(java.lang.reflect.Method method, Object target, Object[] args) throws Throwable {
-        try {
-            return method.invoke(target, args);
-        } catch (InvocationTargetException e) {
-            throw e.getCause();
-        }
     }
 
     private OutboxRelay start(OutboxHandler handler) {
@@ -3010,13 +2939,6 @@ class OutboxRelayIT {
         }
     }
 
-    /** {@code pg_current_xact_id()}: consumes one xid itself. */
-    private static long currentXid() throws Exception {
-        try (var c = TestDb.connect()) {
-            return queryLong(c, "select pg_current_xact_id()::text::bigint");
-        }
-    }
-
     /** Every worker parked: the relay is idle. */
     private void awaitParked() throws Exception {
         await(Duration.ofSeconds(5), () -> relayThreads().size() == config.workers()
@@ -3033,14 +2955,17 @@ class OutboxRelayIT {
     }
 
     private static List<Thread> tickerThreads() {
-        return Thread.getAllStackTraces().keySet().stream()
-                .filter(t -> t.getName().equals("outbox-ticker") && t.isAlive())
-                .toList();
+        return threads("outbox-ticker"::equals);
     }
 
     private static List<Thread> relayThreads() {
+        return threads(name -> name.startsWith("outbox-relay-"));
+    }
+
+    /** The live threads whose name matches. */
+    private static List<Thread> threads(Predicate<String> name) {
         return Thread.getAllStackTraces().keySet().stream()
-                .filter(t -> t.getName().startsWith("outbox-relay-") && t.isAlive())
+                .filter(t -> name.test(t.getName()) && t.isAlive())
                 .toList();
     }
 

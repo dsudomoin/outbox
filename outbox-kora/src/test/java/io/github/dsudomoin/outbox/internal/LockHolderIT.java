@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox.internal;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestPooler;
@@ -36,7 +37,7 @@ class LockHolderIT {
     @BeforeAll
     static void startPooler() throws SQLException {
         pooler = TestPooler.start(4, 0);
-        pooler.warm(TestDb.user(), TestDb.password());
+        pooler.warm();
     }
 
     @AfterAll
@@ -50,7 +51,7 @@ class LockHolderIT {
             closing.get(i).close();
         }
         db.release();
-        assertThat(pooler.leftovers(TestDb.user(), TestDb.password())).isEmpty();
+        assertThat(pooler.leftovers()).isEmpty();
     }
 
     @Test
@@ -157,16 +158,16 @@ class LockHolderIT {
 
     @Test
     void theLeftoverCheckSeesASessionSettingAndLock() throws Exception {
-        try (var c = pooler.connect(TestDb.user(), TestDb.password(), new Properties())) {
+        try (var c = pooler.connect(new Properties())) {
             TestSql.execute(c, "set lock_timeout = 1234");
             TestSql.execute(c, "select pg_advisory_lock(" + ns + ", 7)");
         }
         try {
-            assertThat(pooler.leftovers(TestDb.user(), TestDb.password()))
+            assertThat(pooler.leftovers())
                     .anyMatch(l -> l.contains("lock_timeout = 1234"))
                     .anyMatch(l -> l.contains("advisory lock (" + Integer.toUnsignedLong(ns) + ", 7, 2)"));
         } finally {
-            pooler.scrub(TestDb.user(), TestDb.password());
+            pooler.scrub();
         }
     }
 
@@ -198,6 +199,6 @@ class LockHolderIT {
     private static TestDatabase pooled() {
         var properties = new Properties();
         properties.setProperty("prepareThreshold", "0");
-        return TestDb.newDatabase(pooler.jdbcUrl(), TestDb.user(), TestDb.password(), 8, properties);
+        return TestDb.newDatabase(pooler.jdbcUrl(), TestDataSources.user(), TestDataSources.password(), 8, properties);
     }
 }

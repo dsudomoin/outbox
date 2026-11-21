@@ -19,6 +19,7 @@ import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.sql.Connection;
@@ -314,10 +315,7 @@ class TailSwapIT {
                     .contains("Send last in the transaction");
             stopLoad();
             assertThat(errors).as("writer failures").isEmpty();
-            relay.drain();
-            var missing = new HashSet<>(committed);
-            missing.removeAll(recording.delivered().stream().map(OutboxRecord::messageId).collect(Collectors.toSet()));
-            assertThat(missing).as("committed, never delivered").isEmpty();
+            assertEveryCommittedDelivered();
         } finally {
             stopLoad();
             longDb.release();
@@ -460,11 +458,16 @@ class TailSwapIT {
         assertThat(Duration.ofNanos(maxLatency.get())).as("the slowest writer transaction").isLessThan(WRITER_BOUND);
         assertThat(samples.get()).as("samples in %d ms, one per 10 ms", loadMillis).isGreaterThan(loadMillis / 40);
         assertThat(xidsLeft).as("outbox.partitions.xids_left at every sample: NaN, the tail attached").isEmpty();
+        assertEveryCommittedDelivered();
+        return swaps;
+    }
+
+    /** A drain, then every committed message was delivered. */
+    private void assertEveryCommittedDelivered() {
         relay.drain();
         var missing = new HashSet<>(committed);
         missing.removeAll(recording.delivered().stream().map(OutboxRecord::messageId).collect(Collectors.toSet()));
         assertThat(missing).as("committed, never delivered").isEmpty();
-        return swaps;
     }
 
     private void stopLoad() throws InterruptedException {
@@ -524,7 +527,7 @@ class TailSwapIT {
 
     private static long currentXid() throws SQLException {
         try (var c = TestDb.connect()) {
-            return queryLong(c, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint");
+            return TestSql.currentXid(c);
         }
     }
 

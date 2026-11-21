@@ -104,25 +104,22 @@ class OutboxRelaySoakIT {
         var duplicates = new AtomicInteger();
         var outOfOrder = new ConcurrentLinkedQueue<String>();
         var lastId = new ConcurrentHashMap<String, Long>();
-        var handler = new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {
-                if (payload(record).startsWith("slow")) { // 300 ms, deaf to the wind-down's interrupt
-                    long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(300);
-                    while (System.nanoTime() < end) {
-                        Thread.onSpinWait();
-                    }
+        OutboxHandler handler = record -> {
+            if (payload(record).startsWith("slow")) { // 300 ms, deaf to the wind-down's interrupt
+                long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(300);
+                while (System.nanoTime() < end) {
+                    Thread.onSpinWait();
                 }
-                if (!delivered.add(record.messageId())) {
-                    duplicates.incrementAndGet();
-                }
-                lastId.compute(key(record), (k, last) -> {
-                    if (last != null && last >= record.id()) {
-                        outOfOrder.add(k + ": " + record.id() + " after " + last);
-                    }
-                    return last == null ? record.id() : Math.max(last, record.id());
-                });
             }
+            if (!delivered.add(record.messageId())) {
+                duplicates.incrementAndGet();
+            }
+            lastId.compute(key(record), (k, last) -> {
+                if (last != null && last >= record.id()) {
+                    outOfOrder.add(k + ": " + record.id() + " after " + last);
+                }
+                return last == null ? record.id() : Math.max(last, record.id());
+            });
         };
         var started = List.of(start(handler), start(handler));
         var sent = ConcurrentHashMap.<UUID>newKeySet();

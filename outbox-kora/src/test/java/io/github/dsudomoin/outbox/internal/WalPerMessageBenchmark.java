@@ -2,7 +2,6 @@ package io.github.dsudomoin.outbox.internal;
 
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
-import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import io.github.dsudomoin.outbox.OutboxConfig;
@@ -11,7 +10,9 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
+import io.github.dsudomoin.outbox.testing.TestTracing;
 import java.sql.Connection;
 import java.util.ArrayList;
 import java.util.List;
@@ -58,7 +59,7 @@ class WalPerMessageBenchmark {
     @Test
     void oneMessagePerTransaction() throws Exception {
         var config = Bench.relay(SHARDS, 4, new OutboxConfig.RelayConfig() {}.batchSize(), MIN_TICK_MS);
-        var business = TestDb.uniqueTable();
+        var business = TestSql.uniqueTable();
         try (var c = TestDb.connect()) {
             execute(c, "create extension if not exists pg_walinspect");
             execute(c, "create table " + business + " (k int primary key, v bigint not null)");
@@ -71,7 +72,7 @@ class WalPerMessageBenchmark {
             var outbox = runtime.outbox();
             var payload = new byte[PAYLOAD];
             new Random(1).nextBytes(payload);
-            var traceparent = Bench.TRACEPARENT.getBytes(UTF_8);
+            var traceparent = TestTracing.TRACEPARENT.getBytes(UTF_8);
             var update = "update " + business + " set v = v + 1 where k = ?";
             var running = new AtomicBoolean(true);
             var committed = new AtomicLong();
@@ -109,14 +110,14 @@ class WalPerMessageBenchmark {
             try (var c = TestDb.connect()) {
                 var cursor = config.table() + "_cursor";
                 var tick = config.table() + "_tick";
-                String lsn0 = lsn(c);
+                String lsn0 = Bench.lsn(c);
                 long d0 = delivered.get();
                 long w0 = committed.get();
                 long cursors0 = inserted(c, cursor);
                 long ticks0 = inserted(c, tick);
                 long xid0 = queryLong(c, "select pg_current_xact_id()::text::bigint");
                 Thread.sleep(SECONDS * 1000L);
-                String lsn1 = lsn(c);
+                String lsn1 = Bench.lsn(c);
                 long d1 = delivered.get();
                 long w1 = committed.get();
                 long cursors1 = inserted(c, cursor);
@@ -139,10 +140,6 @@ class WalPerMessageBenchmark {
                 byRecord(c, lsn0, lsn1, messages);
             }
         }
-    }
-
-    private static String lsn(Connection c) throws Exception {
-        return queryString(c, "select pg_current_wal_insert_lsn()::text");
     }
 
     private static long inserted(Connection c, String table) throws Exception {

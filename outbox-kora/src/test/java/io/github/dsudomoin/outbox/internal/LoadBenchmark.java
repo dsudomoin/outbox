@@ -1,7 +1,6 @@
 package io.github.dsudomoin.outbox.internal;
 
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
-import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import io.github.dsudomoin.outbox.OutboxConfig;
@@ -9,10 +8,9 @@ import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
-import io.github.dsudomoin.outbox.testing.TestDb;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
-import java.sql.Connection;
-import java.sql.SQLException;
+import io.github.dsudomoin.outbox.testing.TestTracing;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -69,7 +67,7 @@ class LoadBenchmark {
     @Test
     void load() throws Exception {
         var config = Bench.relay(SHARDS, 4, BATCH, MIN_TICK_MS);
-        var business = TestDb.uniqueTable();
+        var business = TestSql.uniqueTable();
         try (var c = Bench.connect(); var st = c.createStatement()) {
             st.execute("create table " + business + " (k int primary key, v bigint not null)");
             st.execute("insert into " + business + " select g, 0 from generate_series(0, " + (KEYS - 1) + ") g");
@@ -94,7 +92,7 @@ class LoadBenchmark {
             var outbox = runtime.outbox();
             var payload = new byte[300];
             new Random(1).nextBytes(payload);
-            var traceparent = Bench.TRACEPARENT.getBytes(UTF_8);
+            var traceparent = TestTracing.TRACEPARENT.getBytes(UTF_8);
             var headers = List.of(new OutboxHeader("traceparent", traceparent));
             var update = "update " + business + " set v = v + 1 where k = ?";
             var running = new AtomicBoolean(true);
@@ -145,13 +143,13 @@ class LoadBenchmark {
             }
             Thread.sleep(WARMUP * 1000L);
             try (var c = Bench.connect()) {
-                String lsn0 = lsn(c);
+                String lsn0 = Bench.lsn(c);
                 long d0 = delivered.get();
                 long w0 = committed.get();
                 measuring.set(true);
                 Thread.sleep(SECONDS * 1000L);
                 measuring.set(false);
-                String lsn1 = lsn(c);
+                String lsn1 = Bench.lsn(c);
                 long d1 = delivered.get();
                 long w1 = committed.get();
                 running.set(false);
@@ -169,20 +167,10 @@ class LoadBenchmark {
                         (w1 - w0) * (double) PER_TX / SECONDS, (d1 - d0) / (double) SECONDS,
                         wal / (double) (d1 - d0));
                 System.out.printf(Locale.ROOT, "latency commit -> handler: p50 %.1f ms, p90 %.1f, p99 %.1f, max %.1f"
-                        + " (%d sampled)%n", ms(sorted, 0.5), ms(sorted, 0.9), ms(sorted, 0.99), ms(sorted, 1.0), n);
+                        + " (%d sampled)%n", Bench.ms(sorted, 0.5), Bench.ms(sorted, 0.9), Bench.ms(sorted, 0.99),
+                        Bench.ms(sorted, 1.0), n);
             }
         }
     }
 
-    private static double ms(long[] sorted, double q) {
-        if (sorted.length == 0) {
-            return Double.NaN;
-        }
-        int i = Math.min(sorted.length - 1, (int) Math.ceil(q * sorted.length) - 1);
-        return sorted[Math.max(0, i)] / 1e6;
-    }
-
-    private static String lsn(Connection c) throws SQLException {
-        return queryString(c, "select pg_current_wal_insert_lsn()::text");
-    }
 }

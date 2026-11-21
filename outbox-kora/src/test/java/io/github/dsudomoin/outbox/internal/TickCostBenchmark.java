@@ -5,11 +5,10 @@ import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.OutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
-import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -56,12 +55,6 @@ class TickCostBenchmark {
 
     @Test
     void tickDuration() throws Exception {
-        String url = System.getProperty("bench.jdbcUrl");
-        String user = url == null ? TestDb.user() : System.getProperty("bench.user");
-        String password = url == null ? TestDb.password() : System.getProperty("bench.password");
-        if (url == null) {
-            url = TestDb.jdbcUrl();
-        }
         int[] shardCounts = ints("bench.shards", "32,256,1024");
         int[] endedCounts = ints("bench.ended", "0,100,400");
         int rounds = Integer.getInteger("bench.rounds", 200);
@@ -70,21 +63,22 @@ class TickCostBenchmark {
             variants.add(new Variant("interleaved K " + k, false, k));
         }
 
-        var db = TestDb.newDatabase(url, user, password, 2);
+        var db = Bench.database(2);
         var open = new ArrayList<Connection>();
-        try (var tick = DriverManager.getConnection(url, user, password)) {
+        try (var tick = Bench.connect()) {
             long free = queryLong(tick, "select current_setting('max_connections')::int"
                     + " - current_setting('superuser_reserved_connections')::int"
                     + " - coalesce(current_setting('reserved_connections', true)::int, 0)"
                     + " - (select count(*) from pg_stat_activity where backend_type = 'client backend')");
             long wanted = Arrays.stream(endedCounts).max().orElse(0);
             for (long i = Math.min(wanted, free - 10); i > 0; i--) {
-                var c = DriverManager.getConnection(url, user, password);
+                var c = Bench.connect();
                 open.add(c);
                 c.setAutoCommit(false);
             }
             System.out.printf("TickCostBenchmark on %s: %d rounds per line, %d connections for the ended"
-                    + " transactions (%d free slots)%n", url, rounds, open.size(), free);
+                    + " transactions (%d free slots)%n", Bench.URL == null ? TestDataSources.jdbcUrl() : Bench.URL,
+                    rounds, open.size(), free);
             for (int shards : shardCounts) {
                 run(db, tick, open, shards, endedCounts, variants, rounds);
             }
@@ -160,8 +154,8 @@ class TickCostBenchmark {
                                     + " | probe p50 %8.3f ms, p99 %8.3f ms | make p50 %8.3f ms, p99 %8.3f ms"
                                     + " | every shard %d/%d%n",
                             shards, ended, held.size() < ended ? " (only " + held.size() + " opened)" : "",
-                            v.name(), ms(probe, 0.50), ms(probe, 0.99), ms(make, 0.50), ms(make, 0.99), everyShard,
-                            rounds);
+                            v.name(), Bench.ms(probe, 0.50), Bench.ms(probe, 0.99), Bench.ms(make, 0.50),
+                            Bench.ms(make, 0.99), everyShard, rounds);
                 }
             }
         } finally {
@@ -196,11 +190,6 @@ class TickCostBenchmark {
             c.rollback();
             c.setAutoCommit(true);
         }
-    }
-
-    /** Nearest-rank quantile of sorted nanoseconds, in ms. */
-    private static double ms(long[] sorted, double q) {
-        return sorted[Math.max(0, (int) Math.ceil(q * sorted.length) - 1)] / 1e6;
     }
 
     private static int[] ints(String property, String defaults) {

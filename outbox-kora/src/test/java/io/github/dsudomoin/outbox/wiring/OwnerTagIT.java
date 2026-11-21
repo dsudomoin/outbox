@@ -9,6 +9,7 @@ import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxSql;
 import io.github.dsudomoin.outbox.internal.Maintenance;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
@@ -69,16 +70,12 @@ class OwnerTagIT implements KoraAppTestConfigModifier {
                   relay { workers = 2, minTickInterval = 5ms }
                   partitions { xidsPerPartition = 1000, premake = 2 }
                 }
-                """.formatted(TestDb.jdbcUrl(), app, owner, schema));
+                """.formatted(TestDataSources.jdbcUrl(), app, owner, schema));
     }
 
     @Test
     void ddlRunsAsTheOwnerAndSendsAsTheApplication() throws Exception {
-        try (var c = TestDb.connect()) { // past the premade ranges: the next run makes new ones
-            TestSql.execute(c, "set synchronous_commit = off");
-            TestSql.execute(c, "do $$ begin for i in 1..3000 loop perform pg_current_xact_id(); commit; end loop;"
-                    + " end $$");
-        }
+        TestDb.burnXids(3000); // past the premade ranges: the next run makes new ones
         long until = System.nanoTime() + 10_000_000_000L;
         while (!maintenance.runOnce()) { // the run the relay started may hold the maintenance lock
             assertThat(System.nanoTime()).as("a maintenance run of this instance").isLessThan(until);
@@ -102,6 +99,6 @@ class OwnerTagIT implements KoraAppTestConfigModifier {
     }
 
     private static Connection as(String role) throws SQLException {
-        return DriverManager.getConnection(TestDb.jdbcUrl(), role, "pw");
+        return DriverManager.getConnection(TestDataSources.jdbcUrl(), role, "pw");
     }
 }

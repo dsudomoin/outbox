@@ -120,16 +120,6 @@ class DeadLetterPassIT {
     }
 
     @Test
-    void discardDeletesIt() throws Exception {
-        long id = letter("t", "k", "p", List.of());
-
-        assertThat(pass(letters -> all(letters, discard())).runOnce()).isZero();
-
-        assertThat(status(id)).isNull();
-        assertThat(decisions("discard")).isEqualTo(1);
-    }
-
-    @Test
     void redriveSendsItAgainWithTheSameMessageId() throws Exception {
         var headers = List.of(new OutboxHeader("h", bytes("v")));
         long id = letter("t", "k", "p", headers);

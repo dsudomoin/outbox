@@ -12,6 +12,7 @@ import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.OutboxSql;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -48,7 +49,7 @@ class TransactionPoolingIT {
     @BeforeAll
     static void startPooler() throws SQLException {
         pooler = TestPooler.start(4, 0);
-        pooler.warm(TestDb.user(), TestDb.password());
+        pooler.warm();
     }
 
     @AfterAll
@@ -63,7 +64,7 @@ class TransactionPoolingIT {
         }
         pools.forEach(TestDatabase::release);
         direct.release();
-        assertThat(pooler.leftovers(TestDb.user(), TestDb.password())).isEmpty();
+        assertThat(pooler.leftovers()).isEmpty();
     }
 
     @Test
@@ -82,9 +83,9 @@ class TransactionPoolingIT {
 
         await(() -> handler.delivered().size() >= sent.size(), "all 30 delivered");
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyInAnyOrderElementsOf(sent);
-        assertThat(handler.delivered()).filteredOn(r -> key(r).equals("k1")).extracting(r -> payload(r))
-                .as("in the order of their commits").containsExactly("m1", "m4", "m7", "m10", "m13", "m16", "m19",
-                        "m22", "m25", "m28");
+        assertThat(handler.delivered()).filteredOn(r -> new String(r.key(), UTF_8).equals("k1"))
+                .extracting(r -> new String(r.payload(), UTF_8)).as("in the order of their commits")
+                .containsExactly("m1", "m4", "m7", "m10", "m13", "m16", "m19", "m22", "m25", "m28");
     }
 
     @Test
@@ -168,7 +169,8 @@ class TransactionPoolingIT {
 
     @Test
     void startRefusesConnectionsThatLosePreparedStatementsAndSaysWhatToSet() throws Exception {
-        var db = TestDb.newDatabase(pooler.jdbcUrl(), TestDb.user(), TestDb.password(), 4); // prepareThreshold 5
+        // prepareThreshold 5
+        var db = TestDb.newDatabase(pooler.jdbcUrl(), TestDataSources.user(), TestDataSources.password(), 4);
         pools.add(db);
         var runtime = OutboxRuntime.builder(config, db, new RecordingHandler()).build();
         closing.add(runtime);
@@ -180,8 +182,9 @@ class TransactionPoolingIT {
     @Test
     void runsWithTheDriversPreparedStatementsBehindAPoolerThatKeepsThem() throws Exception {
         try (var keeping = TestPooler.start(4, 200)) {
-            keeping.warm(TestDb.user(), TestDb.password());
-            var db = TestDb.newDatabase(keeping.jdbcUrl(), TestDb.user(), TestDb.password(), 10); // threshold 5
+            keeping.warm();
+            // threshold 5
+            var db = TestDb.newDatabase(keeping.jdbcUrl(), TestDataSources.user(), TestDataSources.password(), 10);
             pools.add(db);
             var handler = new RecordingHandler();
             var runtime = OutboxRuntime.builder(config, db, handler).build();
@@ -196,14 +199,15 @@ class TransactionPoolingIT {
             assertThat(runtime.maintenance().runOnce()).isTrue();
 
             runtime.close();
-            assertThat(keeping.leftovers(TestDb.user(), TestDb.password())).isEmpty();
+            assertThat(keeping.leftovers()).isEmpty();
         }
     }
 
     private TestDatabase pooled(int size) {
         var properties = new Properties();
         properties.setProperty("prepareThreshold", "0"); // the pooler keeps no prepared statement
-        var db = TestDb.newDatabase(pooler.jdbcUrl(), TestDb.user(), TestDb.password(), size, properties);
+        var db = TestDb.newDatabase(pooler.jdbcUrl(), TestDataSources.user(), TestDataSources.password(), size,
+                properties);
         pools.add(db);
         return db;
     }
@@ -218,13 +222,5 @@ class TransactionPoolingIT {
 
     private static OutboxMessage msg(String topic, String key, String payload) {
         return OutboxMessage.of(topic, key, payload.getBytes(UTF_8));
-    }
-
-    private static String key(OutboxRecord r) {
-        return new String(r.key(), UTF_8);
-    }
-
-    private static String payload(OutboxRecord r) {
-        return new String(r.payload(), UTF_8);
     }
 }

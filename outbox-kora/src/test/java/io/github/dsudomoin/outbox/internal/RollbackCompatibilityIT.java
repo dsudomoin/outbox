@@ -165,7 +165,7 @@ class RollbackCompatibilityIT {
                     assertThat(n).isEqualTo(SHARDS);
                 }
             }
-            var undelivered = undelivered(c, delivered);
+            var undelivered = undelivered(delivered);
             assertThat(undelivered).as("left for the old reader").hasSizeGreaterThanOrEqualTo(5);
             for (int shard = 0; shard < SHARDS; shard++) {
                 var cursor = oldLatest(c, shard);
@@ -195,9 +195,7 @@ class RollbackCompatibilityIT {
         relay.drain();
         var all = new HashSet<UUID>(delivered);
         handler.delivered().stream().map(OutboxRecord::messageId).forEach(all::add);
-        try (var c = TestDb.connect()) {
-            assertThat(undelivered(c, all)).isEmpty();
-        }
+        assertThat(undelivered(all)).isEmpty();
     }
 
     /**
@@ -364,16 +362,9 @@ class RollbackCompatibilityIT {
     }
 
     /** The committed rows still in the outbox whose message is not in {@code delivered}. */
-    private Set<UUID> undelivered(Connection c, Set<UUID> delivered) throws SQLException {
-        var result = new HashSet<UUID>();
-        try (var st = c.createStatement(); var rs = st.executeQuery("select message_id from " + names.base())) {
-            while (rs.next()) {
-                var id = rs.getObject(1, UUID.class);
-                if (!delivered.contains(id)) {
-                    result.add(id);
-                }
-            }
-        }
+    private Set<UUID> undelivered(Set<UUID> delivered) throws SQLException {
+        var result = new HashSet<>(OutboxAdminIT.messageIds(names.base()));
+        result.removeAll(delivered);
         return result;
     }
 

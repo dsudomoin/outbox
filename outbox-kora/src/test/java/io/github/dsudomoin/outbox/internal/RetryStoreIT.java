@@ -89,7 +89,7 @@ class RetryStoreIT {
         assertThat(store.deadSize(c)).isEqualTo(1);
         assertThat(retryRow(follower.id())).isEqualTo("0|null|null");
         assertThat(retryRow(keyedHead.id())).isEqualTo("1|" + NOW.minusSeconds(1) + "|e1");
-        assertThat(deadRow(dead.id())).isEqualTo("0|1|boom|k3");
+        assertThat(deadRow(c, names, dead.id())).isEqualTo("0|1|boom|k3");
     }
 
     @Test
@@ -186,20 +186,9 @@ class RetryStoreIT {
 
         assertThat(store.size(c)).isEqualTo(1);
         assertThat(store.deadSize(c)).isEqualTo(1);
-        assertThat(deadRow(head.id())).isEqualTo("1|3|gave up|k");
+        assertThat(deadRow(c, names, head.id())).isEqualTo("1|3|gave up|k");
         assertThat(dueHeads(1, NOW, 10)).extracting(OutboxRecord::id).containsExactly(follower.id());
-        try (var ps = c.prepareStatement(
-                "select message_id, topic, payload, headers, created_at from " + names.dead() + " where id = ?")) {
-            ps.setLong(1, head.id());
-            try (var rs = ps.executeQuery()) {
-                rs.next();
-                assertThat(rs.getObject(1, UUID.class)).isEqualTo(head.messageId());
-                assertThat(rs.getString(2)).isEqualTo("t");
-                assertThat(rs.getBytes(3)).isEqualTo(head.payload());
-                assertThat(HeaderCodec.decode(rs.getBytes(4))).isEqualTo(head.headers());
-                assertThat(rs.getObject(5, OffsetDateTime.class).toInstant()).isEqualTo(head.createdAt());
-            }
-        }
+        assertDeadRowKeeps(c, names, head);
     }
 
     @Test
@@ -227,7 +216,7 @@ class RetryStoreIT {
         store.deadFromRetry(c, other, 2, null);
 
         assertThat(retryRow(head.id())).isEqualTo("1|" + LATER + "|first");
-        assertThat(deadRow(other.id())).isEqualTo("0|2|other|j");
+        assertThat(deadRow(c, names, other.id())).isEqualTo("0|2|other|j");
     }
 
     @Test
@@ -320,7 +309,7 @@ class RetryStoreIT {
         assertThat(store.dueHeads(c, 0, NOW, 10)).extracting(head -> head.r().id(), DueHead::waitingSince)
                 .containsExactly(tuple(a1.id(), null), tuple(b1.id(), null));
         assertThat(store.size(c)).isEqualTo(2);
-        assertThat(deadRow(dead.id())).isEqualTo("0|0|w|b");
+        assertThat(deadRow(c, names, dead.id())).isEqualTo("0|0|w|b");
     }
 
     @Test
@@ -378,7 +367,7 @@ class RetryStoreIT {
         assertThat(due).extracting(d -> d.r().requeues()).containsExactly(2);
         assertThat(store.followers(c, due, 10).get(head.id())).extracting(OutboxRecord::requeues).containsExactly(3);
         store.deadFromRetry(c, due.get(0).r(), 2, null); // the dead table does not keep it
-        assertThat(deadRow(head.id())).isEqualTo("0|2|e|k");
+        assertThat(deadRow(c, names, head.id())).isEqualTo("0|2|e|k");
     }
 
     @Test
@@ -500,13 +489,29 @@ class RetryStoreIT {
     }
 
     /** {@code shard|attempts|error|key}. */
-    private String deadRow(long id) throws SQLException {
+    static String deadRow(Connection c, TableNames names, long id) throws SQLException {
         try (var ps = c.prepareStatement("select shard, attempts, error, key from " + names.dead() + " where id = ?")) {
             ps.setLong(1, id);
             try (var rs = ps.executeQuery()) {
                 assertThat(rs.next()).as("dead row %s", id).isTrue();
                 return rs.getShort(1) + "|" + rs.getInt(2) + "|" + rs.getString(3) + "|"
                         + new String(rs.getBytes(4), UTF_8);
+            }
+        }
+    }
+
+    /** The dead row of {@code r} keeps its message id, topic, payload, headers and creation time. */
+    static void assertDeadRowKeeps(Connection c, TableNames names, OutboxRecord r) throws SQLException {
+        try (var ps = c.prepareStatement(
+                "select message_id, topic, payload, headers, created_at from " + names.dead() + " where id = ?")) {
+            ps.setLong(1, r.id());
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                assertThat(rs.getObject(1, UUID.class)).isEqualTo(r.messageId());
+                assertThat(rs.getString(2)).isEqualTo(r.topic());
+                assertThat(rs.getBytes(3)).isEqualTo(r.payload());
+                assertThat(HeaderCodec.decode(rs.getBytes(4))).isEqualTo(r.headers());
+                assertThat(rs.getObject(5, OffsetDateTime.class).toInstant()).isEqualTo(r.createdAt());
             }
         }
     }

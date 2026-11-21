@@ -28,11 +28,9 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.junit.jupiter.params.ParameterizedTest;
 import ru.tinkoff.kora.application.graph.All;
 import ru.tinkoff.kora.application.graph.LifecycleWrapper;
-import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
 import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetryFactory;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
-import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 
 /**
  * {@link OutboxModule#outboxRuntime}'s heartbeat: on a pool of one connection derived from the app's by default, so
@@ -242,29 +240,10 @@ class HeartbeatPoolIT {
 
     /** {@code db}, counting the connections it gives. */
     private static JdbcConnectionFactory counting(JdbcDatabase db, AtomicInteger taken) {
-        return new JdbcConnectionFactory() {
-            @Override
-            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
-                return db.withConnection(callback);
-            }
-
-            @Nullable
-            @Override
-            public Connection currentConnection() {
-                return db.currentConnection();
-            }
-
-            @Override
-            public Connection newConnection() {
-                taken.incrementAndGet();
-                return db.newConnection();
-            }
-
-            @Override
-            public DataBaseTelemetry telemetry() {
-                return db.telemetry();
-            }
-        };
+        return TestDb.opening(db, () -> {
+            taken.incrementAndGet();
+            return db.newConnection();
+        });
     }
 
     /** Waits until {@code last_seen} moves past its value now. */

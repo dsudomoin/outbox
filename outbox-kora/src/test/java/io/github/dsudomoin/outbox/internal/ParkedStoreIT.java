@@ -15,12 +15,11 @@ import io.github.dsudomoin.outbox.internal.BatchClassifier.Keep;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Park;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Unpark;
 import io.github.dsudomoin.outbox.internal.RetryStore.DueHead;
+import io.github.dsudomoin.outbox.testing.Intercepting;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import jakarta.annotation.Nullable;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -114,7 +113,7 @@ class ParkedStoreIT {
                 .containsExactly(keyed.id() + ":0:0:2:" + NOW, followed.id() + ":0:0:1:" + NOW.plusSeconds(3));
         assertThat(retryRows()).containsExactly(
                 failing.id() + ":0:2:1:" + LATER + ":e", carried.id() + ":0:0:1:null:null");
-        assertThat(deadRow(poison.id())).isEqualTo("0|1|boom|p");
+        assertThat(RetryStoreIT.deadRow(c, names, poison.id())).isEqualTo("0|1|boom|p");
     }
 
     @Test
@@ -305,18 +304,8 @@ class ParkedStoreIT {
         store.toDead(c, parked, 4, "x\u0000y");
         store.fromRetry(c, head, 2, LATER);
 
-        assertThat(deadRow(parked.id())).isEqualTo("0|4|x?y|k");
-        try (var ps = c.prepareStatement(
-                "select message_id, payload, headers, created_at from " + names.dead() + " where id = ?")) {
-            ps.setLong(1, parked.id());
-            try (var rs = ps.executeQuery()) {
-                rs.next();
-                assertThat(rs.getObject(1, UUID.class)).isEqualTo(parked.messageId());
-                assertThat(rs.getBytes(2)).isEqualTo(parked.payload());
-                assertThat(HeaderCodec.decode(rs.getBytes(3))).isEqualTo(parked.headers());
-                assertThat(rs.getObject(4, OffsetDateTime.class).toInstant()).isEqualTo(parked.createdAt());
-            }
-        }
+        assertThat(RetryStoreIT.deadRow(c, names, parked.id())).isEqualTo("0|4|x?y|k");
+        RetryStoreIT.assertDeadRowKeeps(c, names, parked);
         assertThat(parkedRows()).as("attempts kept from the retry table").containsExactly(
                 newer.id() + ":0:0:1:" + NOW, head.id() + ":1:3:2:" + LATER);
         assertSameRecord(store.due(c, 1, LATER, 10).get(0), head, 3, 2);
@@ -482,7 +471,7 @@ class ParkedStoreIT {
     private static Connection counting(Connection c, AtomicInteger executions) {
         return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[] {Connection.class},
                 (proxy, method, args) -> {
-                    var result = invoke(c, method, args);
+                    var result = Intercepting.invoke(c, method, args);
                     if (!(result instanceof PreparedStatement ps)) {
                         return result;
                     }
@@ -491,17 +480,9 @@ class ParkedStoreIT {
                                 if (m.getName().startsWith("execute")) {
                                     executions.incrementAndGet();
                                 }
-                                return invoke(ps, m, a);
+                                return Intercepting.invoke(ps, m, a);
                             });
                 });
-    }
-
-    private static Object invoke(Object target, Method method, Object[] args) throws Throwable {
-        try {
-            return method.invoke(target, args);
-        } catch (InvocationTargetException e) {
-            throw e.getCause();
-        }
     }
 
     /** Rows 1..{@code rows} of key {@code k} of topic {@code t} on shard 0, requeued once and due now. */
@@ -570,18 +551,6 @@ class ParkedStoreIT {
     @Nullable
     private static Instant instant(@Nullable OffsetDateTime t) {
         return t == null ? null : t.toInstant();
-    }
-
-    /** {@code shard|attempts|error|key}. */
-    private String deadRow(long id) throws SQLException {
-        try (var ps = c.prepareStatement("select shard, attempts, error, key from " + names.dead() + " where id = ?")) {
-            ps.setLong(1, id);
-            try (var rs = ps.executeQuery()) {
-                assertThat(rs.next()).as("dead row %s", id).isTrue();
-                return rs.getShort(1) + "|" + rs.getInt(2) + "|" + rs.getString(3) + "|"
-                        + new String(rs.getBytes(4), UTF_8);
-            }
-        }
     }
 
     private OutboxRecord record(String topic, @Nullable String key) {

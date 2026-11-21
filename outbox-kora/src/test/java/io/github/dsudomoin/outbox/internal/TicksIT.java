@@ -2,12 +2,12 @@ package io.github.dsudomoin.outbox.internal;
 
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
+import static io.github.dsudomoin.outbox.testing.TestSql.queryLongs;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryStrings;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.assertj.core.api.Assertions.tuple;
 
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RoundTrips;
@@ -121,13 +121,7 @@ class TicksIT {
                     execute(c, "delete from " + names.tick() + " where id = " + id); // a gap in the ids
                 }
             }
-            var ids = new ArrayList<Long>();
-            try (var st = c.createStatement(); var rs = st.executeQuery("select id from " + names.tick()
-                    + " where id > " + first + " order by id")) {
-                while (rs.next()) {
-                    ids.add(rs.getLong(1));
-                }
-            }
+            var ids = queryLongs(c, "select id from " + names.tick() + " where id > " + first + " order by id");
             for (int round = 0; round < 40; round++) {
                 long latest = ids.get(ids.size() / 2 + random.nextInt(ids.size() - ids.size() / 2));
                 for (int shard = 0; shard < SHARDS; shard++) {
@@ -307,14 +301,8 @@ class TicksIT {
         }
 
         try (var c = TestDb.connect()) {
-            var xmaxes = new ArrayList<Long>();
-            try (var st = c.createStatement();
-                    var rs = st.executeQuery(
-                            "select pg_snapshot_xmax(snapshot)::text::bigint from " + names.tick() + " order by id")) {
-                while (rs.next()) {
-                    xmaxes.add(rs.getLong(1));
-                }
-            }
+            var xmaxes = queryLongs(c, "select pg_snapshot_xmax(snapshot)::text::bigint from " + names.tick()
+                    + " order by id");
             assertThat(xmaxes).hasSize(401).isSorted();
 
             // per consecutive tick pair (k, k+1): writer xids visible in k but not in k+1 (lost), and the reverse
@@ -467,20 +455,17 @@ class TicksIT {
             assertThat(last.snapshot().xmax()).isGreaterThanOrEqualTo(first.snapshot().xmax());
             assertThat(last.createdAt()).isAfterOrEqualTo(first.createdAt());
             assertThat(ticks.get(c, middle.id())).usingRecursiveComparison().isEqualTo(middle);
-            assertThat(ticks.between(c, first.id(), last.id())).extracting(Ticks.Tick::id)
-                    .containsExactly(middle.id(), last.id());
-            assertThat(ticks.between(c, last.id(), last.id() + 100)).isEmpty();
 
             assertThat(ticks.deleteBelow(c, middle.id())).isEqualTo(1);
 
             assertThatThrownBy(() -> ticks.get(c, first.id())).isInstanceOf(IllegalStateException.class);
-            assertThat(ticks.between(c, 0, last.id())).extracting(Ticks.Tick::id)
-                    .containsExactly(middle.id(), last.id());
+            assertThat(ticks.get(c, List.of(first.id(), middle.id(), last.id())))
+                    .containsOnlyKeys(middle.id(), last.id());
         }
     }
 
     @Test
-    void getManyAndBetweenWithoutSnapshots() throws Exception {
+    void getManyReadsSnapshots() throws Exception {
         try (var c = TestDb.connect()) {
             var first = ticks.latest(c);
             var running = TestDb.connect(); // in flight at the ticks below: a snapshot with an xip
@@ -501,12 +486,6 @@ class TicksIT {
             assertThat(many.get(middle.id())).as("as the single get reads it").usingRecursiveComparison()
                     .isEqualTo(ticks.get(c, middle.id()));
             assertThat(ticks.get(c, List.of())).isEmpty();
-
-            var between = ticks.between(c, first.id(), last.id());
-            assertThat(between).extracting(Ticks.Tick::id, Ticks.Tick::createdAt, Ticks.Tick::maxId)
-                    .containsExactly(tuple(middle.id(), middle.createdAt(), middle.maxId()),
-                            tuple(last.id(), last.createdAt(), last.maxId()));
-            assertThat(between).extracting(Ticks.Tick::snapshot).containsOnlyNulls();
         }
     }
 
@@ -921,10 +900,7 @@ class TicksIT {
             execute(c, "grant select on sequence "
                     + queryString(c, "select pg_get_serial_sequence('" + names.base() + "', 'id')") + " to " + role);
         }
-        var login = new Properties();
-        login.setProperty("user", role);
-        login.setProperty("password", role);
-        return login;
+        return TestDb.login(role);
     }
 
     private static long xid(Connection c) throws Exception {

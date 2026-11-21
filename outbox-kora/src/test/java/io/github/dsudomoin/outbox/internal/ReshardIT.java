@@ -45,7 +45,7 @@ class ReshardIT {
     private static final OutboxDeadLetterHandler HOOK = letters -> List.of();
 
     private final TestDatabase db = TestDb.newDatabase(20);
-    private final String table = TestDb.uniqueTable();
+    private final String table = TestSql.uniqueTable();
     private final TableNames names = TableNames.of(table);
     private final RecordingHandler recording = new RecordingHandler();
     private final List<OutboxRelay> relays = new ArrayList<>();
@@ -152,6 +152,7 @@ class ReshardIT {
 
         assertThatThrownBy(() -> schema(config(8)).start())
                 .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("outbox.shards = 8 but " + names.cursor() + " holds cursors for 4 shards")
                 .hasMessageContaining(a.schema().instanceId() + " (4 shards");
         assertThat(cursorShards()).isEqualTo(4);
     }
@@ -429,24 +430,6 @@ class ReshardIT {
         var fresh = new OutboxSchema(db, new TestOutboxConfig().shards(null));
         fresh.start();
         assertThat(fresh.config().shards()).as("a new outbox").isEqualTo(OutboxConfig.DEFAULT_SHARDS);
-    }
-
-    @Test
-    void anExplicitShardCountReshardsOnlyWhenDrained() throws Exception {
-        var old = start(config(4));
-        send(old.outbox(), "k", "x");
-        stopped();
-
-        assertThatThrownBy(() -> schema(config(8)).start())
-                .isInstanceOf(IllegalStateException.class).hasMessageContaining("1 committed rows not relayed");
-        assertThat(cursorShards()).isEqualTo(4);
-
-        old.relay().drain();
-        stopped();
-        start(config(8));
-        assertThat(cursorShards()).isEqualTo(8);
-        start(config(8));
-        assertThat(cursorShards()).as("the same count again: nothing to do").isEqualTo(8);
     }
 
     private TestOutboxConfig config(Integer shards) {

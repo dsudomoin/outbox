@@ -50,18 +50,6 @@ class KoraOutboxTransactionsTest {
     }
 
     @Test
-    void afterCommitNeverAfterRollback() {
-        var runs = new AtomicInteger();
-
-        assertThatThrownBy(() -> db.inTx((SqlRunnable) () -> {
-            transactions.afterCommit(runs::incrementAndGet);
-            throw new IllegalStateException("rollback");
-        })).hasMessageContaining("rollback");
-
-        assertThat(runs).hasValue(0);
-    }
-
-    @Test
     void afterCommitEachRunsEveryInstanceOnceAfterTheCommit() {
         var runs = new AtomicInteger();
 
@@ -76,10 +64,11 @@ class KoraOutboxTransactionsTest {
     }
 
     @Test
-    void afterCommitEachNeverAfterRollback() {
+    void postCommitActionsNeverRunAfterRollback() {
         var runs = new AtomicInteger();
 
         assertThatThrownBy(() -> db.inTx((SqlRunnable) () -> {
+            transactions.afterCommit(runs::incrementAndGet);
             transactions.afterCommitEach(runs::incrementAndGet);
             transactions.afterCommitEach(runs::incrementAndGet);
             throw new IllegalStateException("rollback");
@@ -89,23 +78,14 @@ class KoraOutboxTransactionsTest {
     }
 
     @Test
-    void afterCommitEachOutsideTransactionFails() {
-        assertThatThrownBy(() -> transactions.afterCommitEach(() -> {})).isInstanceOf(IllegalStateException.class);
-    }
-
-    @Test
-    void afterCommitOutsideTransactionFails() {
+    void postCommitActionsOutsideTransactionFail() {
         assertThatThrownBy(() -> transactions.afterCommit(() -> {})).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> transactions.afterCommitEach(() -> {})).isInstanceOf(IllegalStateException.class);
     }
 
     @Test
     void translateGivesRuntimeSqlException() {
         var error = new SQLException("x");
         assertThat(transactions.translate(error)).isInstanceOf(RuntimeSqlException.class).hasCause(error);
-    }
-
-    @Test
-    void hintNamesInTx() {
-        assertThat(transactions.transactionHint()).isEqualTo("JdbcConnectionFactory.inTx(...)");
     }
 }

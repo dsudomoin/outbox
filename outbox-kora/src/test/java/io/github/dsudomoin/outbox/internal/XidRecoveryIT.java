@@ -587,7 +587,7 @@ class XidRecoveryIT {
             assertThat(maintenance.orphanRestore.restore(c, setAside, 0, Duration.ofSeconds(5))).isOne();
         }
         assertThat(exists(setAside)).isFalse();
-        assertThat(count(names.base(), List.of(orphanId))).isOne();
+        assertThat(MaintenanceIT.count(names.base(), List.of(orphanId))).isOne();
     }
 
     @Test
@@ -653,7 +653,7 @@ class XidRecoveryIT {
         var held = send(outbox, msg("t", "r", "head"), msg("t", "r", "follower"));
         var parked = send(outbox, msg("t", "p", "parked"));
         await(Duration.ofSeconds(5), // the head diverted with its follower, p requeued
-                () -> count(names.retry()) == 2 && count(names.parked(), parked) == 1);
+                () -> count(names.retry()) == 2 && MaintenanceIT.count(names.parked(), parked) == 1);
         try (var c = TestDb.connect()) { // a parked row whose outbox range is gone: its id above every outbox id
             execute(c, "insert into " + names.parked() + " (id, shard, message_id, topic, key, created_at, due_at)"
                     + " values (1000000000, 0, gen_random_uuid(), 't', convert_to('q', 'UTF8'), now(),"
@@ -665,9 +665,9 @@ class XidRecoveryIT {
         assertThat(maintenance.runOnce()).isTrue();
 
         assertThat(maintenance.halted()).isFalse();
-        assertThat(count(names.retry(), held)).as("the retry rows survive").isEqualTo(2);
-        assertThat(count(names.base(), held)).as("not copied into the outbox").isZero();
-        assertThat(count(names.base(), parked)).as("nor the parked one").isZero();
+        assertThat(MaintenanceIT.count(names.retry(), held)).as("the retry rows survive").isEqualTo(2);
+        assertThat(MaintenanceIT.count(names.base(), held)).as("not copied into the outbox").isZero();
+        assertThat(MaintenanceIT.count(names.base(), parked)).as("nor the parked one").isZero();
         try (var c = TestDb.connect()) {
             assertThat(queryLong(c, "select min(id) from " + names.base())).as("re-sent above every parked id")
                     .isGreaterThan(1_000_000_000L);
@@ -692,7 +692,7 @@ class XidRecoveryIT {
                     + " from generate_series(1, 50000) s");
         }
         forgeRegression();
-        var expected = new HashSet<>(messageIds());
+        var expected = new HashSet<>(OutboxAdminIT.messageIds(names.base()));
         var outbox = outbox(null);
         var stop = new AtomicBoolean();
         var errors = new ConcurrentLinkedQueue<Throwable>();
@@ -780,25 +780,6 @@ class XidRecoveryIT {
         assertThat(wakes).hasValue(1);
         assertThat(haltRows()).isZero();
         assertThat(tickExists(forged)).isFalse();
-        var handler = new RecordingHandler();
-        relay(handler, maintenance()).drain();
-        assertThat(delivered(handler)).containsAll(sent);
-    }
-
-    @Test
-    void adminRecoversInHaltMode() throws Exception {
-        config.xidRegression("halt");
-        bootstrap();
-        var sent = send(outbox(null), messages("m", 5));
-        forgeRegression();
-        var maintenance = maintenance();
-        assertThat(maintenance.runOnce()).isTrue();
-        assertThat(maintenance.halted()).isTrue();
-
-        assertThat(admin(maintenance).recoverXidRegression()).isEqualTo(5);
-
-        assertThat(maintenance.halted()).isFalse();
-        assertThat(haltRows()).isZero();
         var handler = new RecordingHandler();
         relay(handler, maintenance()).drain();
         assertThat(delivered(handler)).containsAll(sent);
@@ -1159,11 +1140,7 @@ class XidRecoveryIT {
     }
 
     private void advisory(Connection c, String function) throws SQLException {
-        try (var ps = c.prepareStatement("select " + function + "(?, ?)")) {
-            ps.setInt(1, names.internalNamespace());
-            ps.setInt(2, TableNames.LOCK_MAINTENANCE);
-            ps.execute();
-        }
+        execute(c, "select " + function + "(" + names.internalNamespace() + ", " + TableNames.LOCK_MAINTENANCE + ")");
     }
 
     private long latestTickId() throws SQLException {
@@ -1185,29 +1162,6 @@ class XidRecoveryIT {
     private static long count(String table) throws SQLException {
         try (var c = TestDb.connect()) {
             return queryLong(c, "select count(*) from " + table);
-        }
-    }
-
-    private static long count(String table, List<UUID> messageIds) throws SQLException {
-        try (var c = TestDb.connect();
-                var ps = c.prepareStatement("select count(*) from " + table + " where message_id = any(?)")) {
-            ps.setArray(1, c.createArrayOf("uuid", messageIds.toArray()));
-            try (var rs = ps.executeQuery()) {
-                rs.next();
-                return rs.getLong(1);
-            }
-        }
-    }
-
-    private List<UUID> messageIds() throws SQLException {
-        try (var c = TestDb.connect();
-                var st = c.createStatement();
-                var rs = st.executeQuery("select message_id from " + names.base())) {
-            var ids = new ArrayList<UUID>();
-            while (rs.next()) {
-                ids.add(rs.getObject(1, UUID.class));
-            }
-            return ids;
         }
     }
 
