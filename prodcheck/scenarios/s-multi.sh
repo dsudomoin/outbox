@@ -29,8 +29,8 @@ s_two_apps_one_db() { # two different apps with their own tables on one database
   pc_target
   pc_shop 1001
   pc_shop 1002
-  pc_courier 1003 -Doutbox.table=courier_main -Doutbox.inbox.table=courier_inbox
-  pc_courier 1004 -Doutbox.table=courier_main -Doutbox.inbox.table=courier_inbox
+  pc_courier 1003 $COURIER_MAIN
+  pc_courier 1004 $COURIER_MAIN
   local i
   for i in 1001 1002; do pc_load "$i" "$MIX"; done
   for i in 1003 1004; do pc_load "$i" 'rate=100&writers=2&keys=20&topics=deliveries,receipts,routed'; done
@@ -39,7 +39,7 @@ s_two_apps_one_db() { # two different apps with their own tables on one database
   pc_kill 1003
   sleep 5
   pc_shop 1001
-  pc_courier 1003 -Doutbox.table=courier_main -Doutbox.inbox.table=courier_inbox
+  pc_courier 1003 $COURIER_MAIN
   sleep 10
   pc_finish
 }
@@ -83,7 +83,7 @@ s_everything() { # all at once: writers with rollbacks, two apps, poison, requeu
   pc_target
   local i
   for i in 1001 1002; do pc_shop "$i"; pc_load "$i" 'rate=100&writers=4&keys=30&topics=payments,ledger,projection&rollbackPercent=5&tags=poison:60'; done
-  for i in 1003 1004; do pc_courier "$i" -Doutbox.table=courier_main -Doutbox.inbox.table=courier_inbox; pc_load "$i" 'rate=100&writers=4&keys=30&topics=deliveries,receipts,routed&rollbackPercent=5&tags=requeue:40,retry3:50'; done
+  for i in 1003 1004; do pc_courier "$i" $COURIER_MAIN; pc_load "$i" 'rate=100&writers=4&keys=30&topics=deliveries,receipts,routed&rollbackPercent=5&tags=requeue:40,retry3:50'; done
   tfault 'failPercent=10&dropPercent=5'
   tx_hold 45000
   local n
@@ -91,7 +91,7 @@ s_everything() { # all at once: writers with rollbacks, two apps, poison, requeu
     sleep 10
     case $((n % 4)) in
       0) pc_kill 1001; sleep 3; pc_shop 1001 ;;
-      1) pc_kill 1003; sleep 3; pc_courier 1003 -Doutbox.table=courier_main -Doutbox.inbox.table=courier_inbox ;;
+      1) pc_kill 1003; sleep 3; pc_courier 1003 $COURIER_MAIN ;;
       2) inst_kill9 "$T"; fault "kill -9 цели"; sleep 5; pc_target; tfault 'failPercent=10&dropPercent=5' ;;
       3) conn_kill ;;
     esac

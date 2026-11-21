@@ -188,8 +188,6 @@ s_soak() {
   soak_phase drain
   for i in 1001 1002 1003 1004 1005; do if up "$i"; then pc_unload "$i"; fi; done
   unblock_all 1004
-  sleep 3
-  unblock_all 1004
   local led rc=0
   led=$(python3 "$PC/scenarios/ledger.py" --source "$PG" --target "" --search-path accounts,public --base accounts.account_events \
     --dead-tags corrupt --exempt-tags wait,corrupt --order-within-tag wait --parked-file "$RESULT_DIR/soak.parked" --parked-limit "$SOAK_BATCH" --timeout 300) || rc=$?

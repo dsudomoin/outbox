@@ -199,8 +199,7 @@ s_stranded() { # the tick a shard with rows starts from is gone: one admin call 
   until [ "$n" -gt 20 ]; do
     body=$(admin 1002 POST recovery/stranded-shards)
     code=$(echo "$body" | sed -n 1p)
-    [ "$code" = 200 ] && total=$(echo "$body" | sed -n 2p | j 'd["count"]')
-    [ "$code" = 200 ] && break
+    if [ "$code" = 200 ]; then total=$(echo "$body" | sed -n 2p | j 'd["count"]'); break; fi
     n=$((n + 1))
     sleep 2
   done

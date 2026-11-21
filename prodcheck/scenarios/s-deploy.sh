@@ -1,7 +1,6 @@
 # Rolling deploys, contract versions, routes, rollback: «Откат релиза не теряет записей», «Rolling-деплои», «Версии
 # контрактов и откат».
 TYPED='rate=100&writers=3&keys=20&topics=orders,payments'
-waits() { [ "$(st 1001 'd["waitingSize"]')" -gt 0 ]; }
 
 roll() { # roll BIN I...: replaces the instances one by one, each graceful, under their load
   local bin=$1 i
@@ -85,7 +84,7 @@ v2_backlog() { # N+1 writes v2 with the target down, a backlog of v2 stays behin
   sleep 8
   roll "$SHOP_N1" 1001 1002
   tfault 'mode=ok'
-  check "$(passes wait_for 40 waits)" "откат за переходный релиз: записи v2 ждут (waitingSize > 0)"
+  check "$(passes wait_for 40 waits_on 1001)" "откат за переходный релиз: записи v2 ждут (waitingSize > 0)"
   sleep 12
   local attempts
   attempts=$(psql_q "select coalesce(max(attempts), 0) from outbox_retry where waiting_since is not null")
@@ -169,7 +168,7 @@ s_route_rollback() { # records of a route survive a rollback to the release with
   LOADS[1002]='rate=100&writers=3&keys=20&topics=payments'
   roll "$SHOP_N1" 1001 1002
   tfault 'failKeys='
-  check "$(passes wait_for 40 waits)" "записи маршрута ждут релиз с маршрутом (no_route)"
+  check "$(passes wait_for 40 waits_on 1001)" "записи маршрута ждут релиз с маршрутом (no_route)"
   check "$(passes is "$(psql_q 'select count(*) from outbox_dead')" = 0)" "в dead letters ничего не ушло"
   check "$(passes effects_grow 5 payments)" "другой топик идёт дальше"
   roll "$SHOP" 1001 1002

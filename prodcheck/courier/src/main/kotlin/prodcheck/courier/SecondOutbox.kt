@@ -18,7 +18,6 @@ import ru.tinkoff.kora.common.annotation.Root
 class SecondOutbox(
     main: OutboxConfig,
     transactions: OutboxTransactions,
-    prodcheck: ProdcheckConfig,
     target: TargetHttp,
     control: HandlerControl,
 ) : Lifecycle {
@@ -27,12 +26,12 @@ class SecondOutbox(
         const val ROUTE = "second"
     }
 
-    val table: String = prodcheck.second().table()
+    val table = "courier_audit" // the scenarios name it too (s-multi.sh BASES)
 
     val runtime: OutboxRuntime
 
     init {
-        require(table != main.table()) { "prodcheck.second.table must differ from outbox.table, both are $table" }
+        require(table != main.table()) { "outbox.table must not be the second outbox's $table" }
         // spelled out: Kotlin's `by` does not delegate Java default methods
         val config = object : OutboxConfig {
             override fun table() = this@SecondOutbox.table
@@ -44,11 +43,8 @@ class SecondOutbox(
             override fun recovery() = main.recovery()
             override fun schema() = main.schema()
         }
-        val handler = OutboxHandler { record ->
-            control.apply(ROUTE, record.keyAsString())
-            postOne(target, ROUTE, record)
-        }
-        runtime = OutboxRuntime.builder(config, transactions, handler).build()
+        runtime = OutboxRuntime.builder(config, transactions, OutboxHandler { postOne(target, control, ROUTE, it) })
+            .build()
     }
 
     override fun init() = runtime.start()

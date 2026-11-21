@@ -14,7 +14,6 @@ import ru.tinkoff.kora.application.graph.KoraApplication
 import ru.tinkoff.kora.common.KoraApp
 import ru.tinkoff.kora.config.common.Config
 import ru.tinkoff.kora.config.common.annotation.ConfigSource
-import ru.tinkoff.kora.config.common.annotation.ConfigValueExtractor
 import ru.tinkoff.kora.config.hocon.HoconConfigModule
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory
 import ru.tinkoff.kora.database.jdbc.JdbcDatabaseModule
@@ -70,12 +69,6 @@ interface CourierApp :
 @ConfigSource("prodcheck")
 interface ProdcheckConfig {
     fun instance(): String
-    fun second(): Second
-
-    @ConfigValueExtractor
-    interface Second {
-        fun table(): String
-    }
 }
 
 @ConfigSource("httpClient.target")

@@ -1,13 +1,15 @@
 # A long tail of one key: «Обработка сбоев», «Отложить запись». Real rows through the real paths: a failing key's followers
 # in the retry table, a key parked for as long as its block lasts. The numbers are the result; EXPLAIN goes to build/results.
-retry_size() { psql_q 'select count(*) from outbox_retry'; }
-parked_size() { psql_q 'select count(*) from outbox_parked'; }
+
+batch_seconds() { # batch_seconds I: outbox.batch.duration's sum on instance I, in s (metric would round it)
+  curl -s "localhost:$((8084 + $1))/metrics" | awk '$1 ~ /^outbox_batch_duration_seconds_sum/ {s += $2} END {printf "%.3f", s}'
+}
 
 tail_batch_stats() { # the mean of outbox.batch.duration over the last N seconds, in ms, instance I
   local i=$1 n=$2 c0 s0 c1 s1
-  c0=$(on "$i" metric outbox_batch_duration_seconds_count); s0=$(curl -s "localhost:$((8084 + i))/metrics" | awk '$1 ~ /^outbox_batch_duration_seconds_sum/ {s += $2} END {printf "%.3f", s}')
+  c0=$(on "$i" metric outbox_batch_duration_seconds_count); s0=$(batch_seconds "$i")
   sleep "$n"
-  c1=$(on "$i" metric outbox_batch_duration_seconds_count); s1=$(curl -s "localhost:$((8084 + i))/metrics" | awk '$1 ~ /^outbox_batch_duration_seconds_sum/ {s += $2} END {printf "%.3f", s}')
+  c1=$(on "$i" metric outbox_batch_duration_seconds_count); s1=$(batch_seconds "$i")
   python3 -c "print(f'{($s1 - $s0) * 1000 / max($c1 - $c0, 1):.1f} ms per step, {($c1 - $c0) / $n:.1f} steps/s')"
 }
 
@@ -23,9 +25,11 @@ tail_disk() { # tail_disk LABEL: the size and the update counters of both tables
       round(pg_relation_size(relid) / 1048576.0, 1), round(pg_total_relation_size(relid) / 1048576.0, 1),
       n_tup_upd, n_tup_hot_upd, n_dead_tup, autovacuum_count), '; ' order by relname)
     from pg_stat_user_tables where relname in ('outbox_parked', 'outbox_retry')")
-  log "disk $1: live retry $(retry_size), parked $(parked_size); $line"
-  echo "$(date -u +%T) $1: live retry $(retry_size), parked $(parked_size); $line" >> "$RESULT_DIR/retry-long-tail.disk"
-  check 0 "диск, $1 (retry $(retry_size), parked $(parked_size)): $line"
+  local r p
+  r=$(retry_size) p=$(parked_size)
+  log "disk $1: live retry $r, parked $p; $line"
+  echo "$(date -u +%T) $1: live retry $r, parked $p; $line" >> "$RESULT_DIR/retry-long-tail.disk"
+  check 0 "диск, $1 (retry $r, parked $p): $line"
 }
 
 auto_explain_on() { # the plans and the row counts of the library's own statements, with their real parameters, in the server log
@@ -69,17 +73,19 @@ open(os.environ["PLANS"], "w").write("\n\n".join(f"== {k}\n{v}" for k, v in slow
 ' 
 }
 
+requeued() { echo $(($(on 1001 metric outbox_messages_requeued_total) + $(on 1002 metric outbox_messages_requeued_total))); }
+
 tail_wave() { # tail_wave SECONDS: updates of the parked table and requeue answers per second, over time: the wave of d × N / B
   local out=$RESULT_DIR/retry-long-tail.wave end=$(($(now) + $1)) t u r u0 r0 t0
   : > "$out"
   u0=$(psql_q "select n_tup_upd from pg_stat_user_tables where relname = 'outbox_parked'")
-  r0=$(($(on 1001 metric outbox_messages_requeued_total) + $(on 1002 metric outbox_messages_requeued_total)))
+  r0=$(requeued)
   t0=$(now)
   while [ "$(now)" -lt "$end" ]; do
     sleep 2
     t=$(now)
     u=$(psql_q "select n_tup_upd from pg_stat_user_tables where relname = 'outbox_parked'")
-    r=$(($(on 1001 metric outbox_messages_requeued_total) + $(on 1002 metric outbox_messages_requeued_total)))
+    r=$(requeued)
     if [ "$t" -gt "$t0" ]; then echo "$(date -u -r "$t" +%T) updates/s $(((u - u0) / (t - t0))) requeues/s $(((r - r0) / (t - t0)))" >> "$out"; fi
     u0=$u r0=$r t0=$t
   done

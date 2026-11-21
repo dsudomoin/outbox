@@ -31,7 +31,7 @@ s_drain() { # relay off and on, parked and waiting records, the hook's run at th
   pc_begin drain
   BASES=(outbox courier_main)
   pc_target
-  local off='-Doutbox.relay.enabled=false -Doutbox.table=courier_main -Doutbox.inbox.table=courier_inbox' out
+  local off="-Doutbox.relay.enabled=false $COURIER_MAIN" out
   pc_courier 1001 $off
   hctl 1001 'waiting=true'
   pc_load 1001 'rate=200&writers=2&keys=20&topics=deliveries,receipts&tags=requeue:25,wait:40,poison:47'
@@ -70,7 +70,7 @@ s_drain() { # relay off and on, parked and waiting records, the hook's run at th
   check "$(passes is "$(psql_q "select (select count(*) from courier_main_parked) + (select count(*) from courier_main_retry)")" = 0)" "повторные drain разобрали отложенные и ждущие записи: вызовов $n"
   # relay on: drain contends with the workers and still returns
   inst_stop 1001
-  pc_courier 1001 -Doutbox.table=courier_main -Doutbox.inbox.table=courier_inbox
+  pc_courier 1001 $COURIER_MAIN
   pc_load 1001 'rate=200&writers=2&keys=20&topics=deliveries,receipts'
   sleep 3
   out=$(drain_call 1001 60)

@@ -1,9 +1,8 @@
 # Handlers: «Обработка сбоев», «Изоляция», «Дедлайны», «Отложить запись», «Ждать», «Независимые цели».
 PAY='rate=100&writers=4&keys=30&topics=payments'
-free_threads() { on "$1" metric outbox_handler_threads_free; }
-no_free_threads() { [ "$(free_threads "$1")" = 0 ]; }
-retry_rows() { [ "$(psql_q 'select count(*) from outbox_retry')" -gt 0 ]; }
-parked_rows() { [ "$(psql_q 'select count(*) from outbox_parked')" -gt 0 ]; }
+no_free_threads() { [ "$(on "$1" metric outbox_handler_threads_free)" = 0 ]; }
+retry_rows() { gt "$(retry_size)" 0; }
+parked_rows() { gt "$(parked_size)" 0; }
 waits_on() { [ "$(st "$1" 'd["waitingSize"]')" -gt 0 ]; }
 
 courier_pair() { # courier_pair LOAD [-Dkey=value...]: the target and two couriers
@@ -74,7 +73,7 @@ s_max_attempts() { # retries run out: dead with the attempts counted, the key go
   dead=$(psql_q "select count(*) from outbox_dead where convert_from(key, 'UTF8') = 'k5'")
   attempts=$(psql_q "select coalesce(min(attempts), 0) || '/' || coalesce(max(attempts), 0) from outbox_dead")
   check "$(passes gt "$dead" 0)" "$dead записей ключа в dead-таблице, попыток $attempts"
-  no_retry() { [ "$(psql_q 'select count(*) from outbox_retry')" = 0 ]; }
+  no_retry() { is "$(retry_size)" = 0; }
   wait_for 30 no_retry || true # the letters still coming, then the call that sends them all back
   redrive_until_empty 1001 '{"filter":{"topic":"payments"}}' 'topic=payments'
   REPAIRED="POST dead-letters/redrive по фильтру после починки цели"

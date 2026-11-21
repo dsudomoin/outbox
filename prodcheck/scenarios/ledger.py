@@ -85,8 +85,8 @@ while time.time() < deadline:
 result["drain_seconds"] = round(time.time() - started, 1)
 result["left_at_end"] = prev if drained else cur
 
-sent = {r[0]: {"outbox": r[1], "topic": r[2], "key": r[3], "seq": int(r[4]), "tag": r[5], "contract": int(r[6]), "at": float(r[7])}
-        for r in rows(args.source, "select message_id, outbox, topic, key, seq, tag, contract, extract(epoch from at) from pc_sent")}
+sent = {r[0]: {"topic": r[1], "key": r[2], "seq": int(r[3]), "tag": r[4], "at": float(r[5])}
+        for r in rows(args.source, "select message_id, topic, key, seq, tag, extract(epoch from at) from pc_sent")}
 rolled = {r[0] for r in rows(args.source, "select message_id from pc_rolled_back")}
 arrivals, effects = [], []
 for db, c in (("source", args.source), ("target", args.target)):
@@ -96,10 +96,7 @@ for db, c in (("source", args.source), ("target", args.target)):
         c, "select no, sink, message_id, extract(epoch from at), xmin from pc_arrival order by no")]
     effects += [{"db": db, "no": int(r[0]), "sink": r[1], "id": r[2], "at": float(r[3]), "xmin": r[4]} for r in rows(
         c, "select no, sink, message_id, extract(epoch from at), xmin from pc_effect order by no")]
-dead = {}
-for b in args.base:
-    for r in rows(args.source, f"select message_id, status, attempts, error, redrives from {b}_dead"):
-        dead[r[0]] = {"base": b, "status": r[1], "attempts": int(r[2]), "error": r[3], "redrives": int(r[4])}
+dead = {r[0]: r[1] for b in args.base for r in rows(args.source, f"select message_id, status from {b}_dead")}  # message_id: status
 
 effect_ids = {e["id"] for e in effects}
 arrival_ids = {a["id"] for a in arrivals}
@@ -228,7 +225,7 @@ pct = lambda q: round(latency[min(int(len(latency) * q), len(latency) - 1)], 3) 
 
 result.update(
     sent=len(sent), rolled_back=len(rolled), arrivals=len(arrivals), effects=len(effect_ids),
-    dead=len(dead), dead_kept=sum(1 for d in dead.values() if d["status"] == "kept"), discarded=len(discarded_ids),
+    dead=len(dead), dead_kept=sum(1 for status in dead.values() if status == "kept"), discarded=len(discarded_ids),
     lost=len(lost), lost_sample=lost[:5], phantom_rolled_back=len(phantom), phantom_sample=phantom[:5],
     unknown_arrivals=len(unknown), unknown_sample=unknown[:5], unexpected_dead=len(bad_dead), unexpected_dead_sample=bad_dead[:5],
     dead_and_effect=len(dead_and_effect), double_effects=double_effects, order_violations=len(effect_order),

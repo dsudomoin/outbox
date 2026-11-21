@@ -27,6 +27,7 @@ SHOP_N1=$PC/shop/build/install/shop-n1/bin/shop
 SHOP_N2=$PC/shop/build/install/shop-n2/bin/shop
 STORE41=$PC/store/build/install/store-boot41/bin/store # the Spring Boot twin of shop-n, Boot 4.1
 COURIER=$PC/courier/build/install/courier/bin/courier
+COURIER_MAIN='-Doutbox.table=courier_main -Doutbox.inbox.table=courier_inbox' # the courier on tables of its own
 TARGET=$PC/target/build/install/target/bin/target
 ACCOUNTS=$PC/accounts/build/install/accounts/bin/accounts
 ACCOUNTS_FULL=$PC/accounts/build/install/accounts-full/bin/accounts
@@ -141,6 +142,8 @@ passes() { if "$@" > /dev/null 2>&1; then echo 0; else echo 1; fi; }
 logs_have() { grep -qE "$1" "$LOGS/pc-$SCN-"*.log; }
 logs_count() { cat "$LOGS/pc-$SCN-"*.log | grep -cE "$1" || true; }
 is() { [ "$@" ]; }
+retry_size() { psql_q 'select count(*) from outbox_retry'; }
+parked_size() { psql_q 'select count(*) from outbox_parked'; }
 gt() { [ "$1" -gt "$2" ]; }
 effects() { # effects [SINK]: effects done so far, both databases
   local w=${1:+"where sink = '$1'"}

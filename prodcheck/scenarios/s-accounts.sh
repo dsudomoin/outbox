@@ -47,11 +47,13 @@ acc_full() { # the build with metrics and the admin API: /status stands for the 
   NO_ADMIN=""
 }
 
-blocked_accounts() { acc_q "select account from blocker"; }
-
-unblock_all() { # one unblock per blocked account: what ends the business wait in the service
-  local i=$1 a
-  for a in $(blocked_accounts); do tx_send "$i" "topic=$ACC&key=$a&tag=unblock" > /dev/null; done
+unblock_all() { # one unblock per blocked account, what ends the business wait in the service; twice, 3 s apart: a block
+  # can land after the first round
+  local i=$1 a round
+  for round in 1 2; do
+    [ "$round" = 1 ] || sleep 3
+    for a in $(acc_q "select account from blocker"); do tx_send "$i" "topic=$ACC&key=$a&tag=unblock" > /dev/null; done
+  done
 }
 
 acc_checks() { # what the library must keep true whatever happened
@@ -69,8 +71,6 @@ acc_checks() { # what the library must keep true whatever happened
 acc_end() { # stop the writers, clear the blocks, then the usual reconciliation
   local i
   for i in "${!APP_PIDS[@]}"; do if [ "$i" -lt "$T" ] && up "$i"; then pc_unload "$i"; alive_i=$i; fi; done
-  unblock_all "$alive_i"
-  sleep 3
   unblock_all "$alive_i"
   AFTER_LEDGER=acc_checks # a record's last redelivery may come in the drain
   pc_finish "${ACC_FINISH[@]}" "$@"
