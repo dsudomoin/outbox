@@ -96,7 +96,12 @@ public final class BatchReader {
 
     private static String manySql(TableNames names, String blocked) {
         return "select u.i, o.id, o.message_id, o.topic, o.key, o.payload, o.headers, o.created_at, o.shard, " + blocked
-                + " from unnest(?::int[], ?::text[]::xid8[],"
+                + manyFrom(names);
+    }
+
+    /** What {@link #manySql} and {@link #budgetedManySql} read: the shards' parameters as rows, each shard's rows. */
+    private static String manyFrom(TableNames names) {
+        return " from unnest(?::int[], ?::text[]::xid8[],"
                 + " ?::text[]::xid8[], ?::text[]::xid8[], ?::text[]::xid8[], ?::text[], ?::text[]::pg_snapshot[],"
                 + " ?::int8[], ?::int[], ?::bool[]) with ordinality u(shard, pmax, tmax, lo, hi, xip, snap, last_id, lim,"
                 + " chk, i)"
@@ -112,7 +117,15 @@ public final class BatchReader {
 
     private static String sql(TableNames names, String blocked) {
         return "select o.id, o.message_id, o.topic, o.key, o.payload, o.headers, o.created_at, o.shard, " + blocked
-                + " as blocked from ("
+                + " as blocked" + oneFrom(names);
+    }
+
+    /**
+     * What {@link #sql(TableNames, String)} and {@link #budgetedSql(TableNames, String)} read: the shard's rows in its
+     * snapshot after its last id.
+     */
+    private static String oneFrom(TableNames names) {
+        return " from ("
                 + " select * from " + names.base() + " where shard = ? and xid >= ?::xid8 and xid < ?::xid8"
                 + " union all"
                 + " select * from " + names.base() + " where shard = ? and xid = any(?::xid8[])"
@@ -127,18 +140,8 @@ public final class BatchReader {
                 + ", o.fit from (select w.*, w.run <= ? or w.n = 1 and ? as fit from (select l.*,"
                 + " sum(l.b) over r as run, row_number() over r as n from (select u.i, u.chk, o.id, o.message_id,"
                 + " o.topic, o.key, o.payload, o.headers, o.created_at, o.shard, " + RowBytes.sql("o") + " as b"
-                + " from unnest(?::int[], ?::text[]::xid8[],"
-                + " ?::text[]::xid8[], ?::text[]::xid8[], ?::text[]::xid8[], ?::text[], ?::text[]::pg_snapshot[],"
-                + " ?::int8[], ?::int[], ?::bool[]) with ordinality u(shard, pmax, tmax, lo, hi, xip, snap, last_id, lim,"
-                + " chk, i)"
-                + " cross join lateral (select o.* from ("
-                + " select * from " + names.base() + " where shard = u.shard and xid >= u.pmax and xid < u.tmax"
-                + " and xid >= ?::xid8 and xid < ?::xid8"
-                + " union all"
-                + " select * from " + names.base() + " where shard = u.shard and xid >= u.lo and xid <= u.hi"
-                + " and xid = any(u.xip::xid8[]) and xid >= ?::xid8 and xid < ?::xid8"
-                + ") o where pg_visible_in_snapshot(o.xid, u.snap) and o.id > u.last_id order by o.id limit u.lim) o"
-                + " limit ?) l window r as (rows between unbounded preceding and current row)) w) o" + BUDGET_CUT;
+                + manyFrom(names) + ") l window r as (rows between unbounded preceding and current row)) w) o"
+                + BUDGET_CUT;
     }
 
     /** {@link #sql(TableNames, String)} within a byte budget: the parameters are its, after two and before one. */
@@ -147,11 +150,7 @@ public final class BatchReader {
                 + " case when o.fit then " + blocked + " else false end as blocked, o.fit"
                 + " from (select w.*, w.run <= ? or w.n = 1 and ? as fit from (select l.*, sum(l.b) over r as run,"
                 + " row_number() over r as n from (select o.id, o.message_id, o.topic, o.key, o.payload, o.headers,"
-                + " o.created_at, o.shard, " + RowBytes.sql("o") + " as b from ("
-                + " select * from " + names.base() + " where shard = ? and xid >= ?::xid8 and xid < ?::xid8"
-                + " union all"
-                + " select * from " + names.base() + " where shard = ? and xid = any(?::xid8[])"
-                + ") o where pg_visible_in_snapshot(o.xid, ?::pg_snapshot) and o.id > ? order by o.id limit ?"
+                + " o.created_at, o.shard, " + RowBytes.sql("o") + " as b" + oneFrom(names)
                 + ") l window r as (order by l.id rows between unbounded preceding and current row)) w) o" + BUDGET_CUT
                 + " order by o.id";
     }

@@ -375,6 +375,24 @@ class StrandedShardsIT {
         assertThatThrownBy(() -> admin().recoverStrandedShards()).hasMessageStartingWith("no stranded shards");
     }
 
+    /**
+     * {@code shard}'s cursor on a tick X with a row behind it, a tick after it and a maintenance run: the checkpoint
+     * marks the shard busy. Returns X.
+     */
+    private long strandedOnATick(int shard, Cursors cursors, Ticks ticks, Maintenance maintenance) throws Exception {
+        long gone;
+        try (var c = direct.getConnection()) {
+            sendMany(shard, 1);
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            gone = ticks.latest(c).id();
+            cursors.append(c, new Cursor(shard, gone, null, 0, null, 0, null, null));
+            sendMany(shard, 1);
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+        }
+        assertThat(maintenance.runOnce()).isTrue();
+        return gone;
+    }
+
     @Test
     void aHealthyShardIdleBehindAGoneTickKeepsFlowing() throws Exception {
         // the stranded shard on tick X, with a row behind it, so busy at a checkpoint at K; the healthy one idle, its
@@ -384,16 +402,7 @@ class StrandedShardsIT {
         var cursors = new Cursors(names, SHARDS);
         var ticks = new Ticks(names, SHARDS);
         var maintenance = writer.maintenance();
-        long gone;
-        try (var c = direct.getConnection()) {
-            sendMany(stranded, 1);
-            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
-            gone = ticks.latest(c).id();
-            cursors.append(c, new Cursor(stranded, gone, null, 0, null, 0, null, null));
-            sendMany(stranded, 1);
-            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
-        }
-        assertThat(maintenance.runOnce()).isTrue();
+        long gone = strandedOnATick(stranded, cursors, ticks, maintenance);
         try (var c = direct.getConnection()) {
             execute(c, "delete from " + names.tick() + " where id = " + gone);
         }
@@ -620,16 +629,7 @@ class StrandedShardsIT {
         var cursors = new Cursors(names, SHARDS);
         var ticks = new Ticks(names, SHARDS);
         var maintenance = writer.maintenance();
-        long gone;
-        try (var c = direct.getConnection()) {
-            sendMany(stranded, 1);
-            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
-            gone = ticks.latest(c).id();
-            cursors.append(c, new Cursor(stranded, gone, null, 0, null, 0, null, null));
-            sendMany(stranded, 1);
-            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
-        }
-        assertThat(maintenance.runOnce()).isTrue();
+        long gone = strandedOnATick(stranded, cursors, ticks, maintenance);
         var checkpoint = "select tick_id from " + names.checkpoint();
         long before;
         long target;

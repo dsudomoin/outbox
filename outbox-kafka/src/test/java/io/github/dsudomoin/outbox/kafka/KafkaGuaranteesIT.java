@@ -225,29 +225,8 @@ class KafkaGuaranteesIT {
      */
     @Test
     void aPoisonSmallerThanTheProducerBatchStillGoesToTheDeadLetterTopic() throws Exception {
-        var within = DELIVERY_TIMEOUT.multipliedBy(2).plusSeconds(30);
-        var topic = TestKafka.createTopic("t-" + UUID.randomUUID(), 1, Map.of("max.message.bytes", "1024"));
-        var dlq = TestKafka.createTopic(topic + ".dlq", 1, Map.of());
-        var sender = sender();
-        // one shard: the four records share one call, so they share one producer batch
-        var runtime = start(OutboxRuntime.builder(config().shards(1), transactions, new Handler(sender))
-                .deadLetterHandler(new KafkaDeadLetterHandler(sender, "{topic}.dlq")));
-        long started = System.nanoTime();
-
-        var ids = sendAll(runtime, List.of(
-                OutboxMessage.of(topic, "k", bytes("before")),
-                OutboxMessage.of(topic, "k", new byte[10 * 1024]),
-                OutboxMessage.of(topic, "k", bytes("after")),
-                OutboxMessage.of(topic, "other", bytes("other"))));
-        var poison = ids.get(1);
-        committed.get("k").remove(poison); // its place is the dead-letter topic
-
-        var dead = TestKafka.consumeUntil(dlq, within, r -> !r.isEmpty());
-        assertThat(dead).extracting(KafkaOutboxHeaders::messageId).containsOnly(poison);
-        var main = consumeCommitted(topic, r -> true);
-        assertThat(main).extracting(KafkaOutboxHeaders::messageId).doesNotContain(poison);
-        await(Duration.ofSeconds(10), () -> runtime.admin().countDeadLetters(DeadLetterFilter.any()) == 0);
-        assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThanOrEqualTo(within);
+        poisonSharingABatchIsDeadLettered(DELIVERY_TIMEOUT.multipliedBy(2).plusSeconds(30), sender(),
+                config().shards(1));
     }
 
     /**
@@ -258,12 +237,20 @@ class KafkaGuaranteesIT {
      */
     @Test
     void aPoisonSmallerThanTheProducerBatchGoesToTheDeadLetterTopicWhenTheRelayCutsItsCall() throws Exception {
-        var within = Duration.ofSeconds(30);
-        var topic = TestKafka.createTopic("t-" + UUID.randomUUID(), 1, Map.of("max.message.bytes", "1024"));
-        var dlq = TestKafka.createTopic(topic + ".dlq", 1, Map.of());
         var sender = sender(Map.of(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, "1000",
                 ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, "20000"));
-        var config = config().shards(1).batchTimeout(Duration.ofSeconds(10));
+        poisonSharingABatchIsDeadLettered(Duration.ofSeconds(30), sender,
+                config().shards(1).batchTimeout(Duration.ofSeconds(10)));
+    }
+
+    /**
+     * A poison between records of its key and before one of another key, all four in one call on one shard, so in
+     * one producer batch: it reaches its dead-letter topic, the others the topic, all {@code within}.
+     */
+    private void poisonSharingABatchIsDeadLettered(Duration within, KafkaOutboxSender sender, TestOutboxConfig config)
+            throws Exception {
+        var topic = TestKafka.createTopic("t-" + UUID.randomUUID(), 1, Map.of("max.message.bytes", "1024"));
+        var dlq = TestKafka.createTopic(topic + ".dlq", 1, Map.of());
         var runtime = start(OutboxRuntime.builder(config, transactions, new Handler(sender))
                 .deadLetterHandler(new KafkaDeadLetterHandler(sender, "{topic}.dlq")));
         long started = System.nanoTime();
