@@ -1,8 +1,8 @@
 package io.github.dsudomoin.outbox.admin.spring;
 
-import static io.github.dsudomoin.outbox.admin.spring.AdminServer.API;
 import static io.github.dsudomoin.outbox.admin.spring.AdminServer.assertError;
 import static io.github.dsudomoin.outbox.admin.spring.AdminServer.awaitAudit;
+import static io.github.dsudomoin.outbox.testing.AdminRows.API;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.admin.spring.AdminServer.Keys;
@@ -10,12 +10,10 @@ import io.github.dsudomoin.outbox.admin.spring.AdminServer.WithKeys;
 import io.github.dsudomoin.outbox.testing.AdminRows;
 import io.github.dsudomoin.outbox.testing.AdminRows.Route;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
-import io.github.dsudomoin.outbox.testing.TestSql;
 import jakarta.servlet.Filter;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.net.http.HttpResponse;
-import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -148,7 +146,7 @@ class AdminCoexistenceIT {
         return AdminRows.ROUTES.stream();
     }
 
-    /** The list here is what {@link #seed} covers; the guard test goes through the app's mappings themselves. */
+    /** {@link AdminRows#ROUTES}, made by {@link AdminRows#seedEveryRoute}, against the app's own mappings. */
     @Test
     void theRoutesHereAreAllOfTheControllers() {
         try (var server = app()) {

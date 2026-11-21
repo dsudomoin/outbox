@@ -1,9 +1,9 @@
 package io.github.dsudomoin.outbox.admin.spring;
 
-import static io.github.dsudomoin.outbox.admin.spring.AdminServer.API;
 import static io.github.dsudomoin.outbox.admin.spring.AdminServer.assertError;
 import static io.github.dsudomoin.outbox.admin.spring.AdminServer.audit;
 import static io.github.dsudomoin.outbox.admin.spring.AdminServer.awaitAudit;
+import static io.github.dsudomoin.outbox.testing.AdminRows.API;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 

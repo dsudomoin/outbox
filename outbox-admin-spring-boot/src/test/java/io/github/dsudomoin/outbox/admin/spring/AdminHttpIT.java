@@ -3,17 +3,15 @@ package io.github.dsudomoin.outbox.admin.spring;
 import static io.github.dsudomoin.outbox.DeadLetter.Status.KEPT;
 import static io.github.dsudomoin.outbox.DeadLetter.Status.PENDING;
 import static io.github.dsudomoin.outbox.DeadLetter.Status.SCHEDULED;
+import static io.github.dsudomoin.outbox.testing.AdminRows.API;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import com.jayway.jsonpath.JsonPath;
-import io.github.dsudomoin.outbox.DeadLetter;
 import io.github.dsudomoin.outbox.Outbox;
 import io.github.dsudomoin.outbox.OutboxConfig;
-import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
-import io.github.dsudomoin.outbox.internal.HeaderCodec;
 import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.testing.AdminRows;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
@@ -32,7 +30,6 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.regex.Pattern;
@@ -80,7 +77,6 @@ import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandl
  */
 class AdminHttpIT {
 
-    private static final String API = "/kora-outbox/admin/v1";
     private static final Instant T0 = Instant.parse("2026-01-15T10:00:00Z");
 
     private WebApplicationContext context;

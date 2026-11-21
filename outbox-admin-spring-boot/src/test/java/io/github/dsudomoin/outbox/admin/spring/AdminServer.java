@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.admin.spring;
 
+import static io.github.dsudomoin.outbox.testing.AdminRows.API;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.OutboxConfig;
@@ -30,7 +31,6 @@ import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandl
 /** A whole app on a real Tomcat at a free port, its own outbox table, no relay, called over HTTP. */
 final class AdminServer implements AutoCloseable {
 
-    static final String API = "/kora-outbox/admin/v1";
     private static final String AUDIT = " INFO " + OutboxAdminGuard.class.getName() + " - ";
 
     @Configuration(proxyBeanMethods = false)

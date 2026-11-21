@@ -269,7 +269,7 @@ final class KafkaCluster implements AutoCloseable {
         awaitAllBrokers();
     }
 
-    /** Waits until the cluster lists {@code nodes} among its live brokers. */
+    /** Waits up to {@link #UP} until the cluster lists all three brokers as live. */
     private void awaitAllBrokers() {
         await(UP, () -> {
             try (var admin = admin()) {

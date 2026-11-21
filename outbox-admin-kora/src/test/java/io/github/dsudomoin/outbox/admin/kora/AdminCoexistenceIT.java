@@ -1,6 +1,6 @@
 package io.github.dsudomoin.outbox.admin.kora;
 
-import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
+import static io.github.dsudomoin.outbox.testing.AdminRows.API;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -9,7 +9,6 @@ import io.github.dsudomoin.outbox.testing.AdminRows;
 import io.github.dsudomoin.outbox.testing.AdminRows.Route;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDb;
-import io.github.dsudomoin.outbox.testing.TestSql;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.ServerSocket;
@@ -19,7 +18,6 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpRequest.BodyPublishers;
 import java.net.http.HttpResponse;
 import java.net.http.HttpResponse.BodyHandlers;
-import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -43,7 +41,6 @@ import ru.tinkoff.kora.test.extension.junit5.TestComponent;
 @KoraAppTest(value = AdminTestApp.class, components = UndertowHttpServer.class)
 class AdminCoexistenceIT implements KoraAppTestConfigModifier {
 
-    private static final String API = "/kora-outbox/admin/v1";
     private static final String STATUS = API + "/status";
     private static final String AUDIT = "INFO " + OutboxAdminInterceptor.class.getName() + " - ";
 

@@ -258,7 +258,7 @@ class KafkaEndToEndIT {
         Context.clear();
 
         var record = TestKafka.byMessageId(TestKafka.consumeUntil(topic, CONSUME_TIMEOUT, r -> !r.isEmpty())).get(id);
-        var traceparent = new String(record.headers().lastHeader("traceparent").value(), UTF_8).split("-");
+        var traceparent = TestKafka.traceparent(record).split("-");
         assertThat(traceparent[1]).isEqualTo(TestTracing.TRACE_ID);
         if (relayTraces) {
             assertThat(traceparent[2]).isNotEqualTo(TestTracing.SPAN_ID);

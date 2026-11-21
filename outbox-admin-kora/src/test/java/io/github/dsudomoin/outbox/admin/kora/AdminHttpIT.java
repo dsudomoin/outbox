@@ -3,15 +3,13 @@ package io.github.dsudomoin.outbox.admin.kora;
 import static io.github.dsudomoin.outbox.DeadLetter.Status.KEPT;
 import static io.github.dsudomoin.outbox.DeadLetter.Status.PENDING;
 import static io.github.dsudomoin.outbox.DeadLetter.Status.SCHEDULED;
+import static io.github.dsudomoin.outbox.testing.AdminRows.API;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
-import io.github.dsudomoin.outbox.DeadLetter;
-import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
-import io.github.dsudomoin.outbox.internal.HeaderCodec;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.TableNames;
@@ -19,7 +17,6 @@ import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.testing.AdminRows;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDb;
-import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -31,14 +28,12 @@ import java.net.http.HttpRequest.BodyPublishers;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse.BodyHandlers;
 import java.net.http.HttpResponse;
-import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
-import java.util.Locale;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -59,7 +54,6 @@ import ru.tinkoff.kora.test.extension.junit5.TestComponent;
 @KoraAppTest(value = AdminTestApp.class, components = UndertowHttpServer.class)
 class AdminHttpIT implements KoraAppTestConfigModifier {
 
-    private static final String API = "/kora-outbox/admin/v1";
     private static final Pattern LETTER_ID = Pattern.compile("\\{\"id\":(\\d+),\"messageId\"");
     private static final Instant T0 = Instant.parse("2026-01-15T10:00:00Z");
 

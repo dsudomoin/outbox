@@ -8,8 +8,8 @@ import org.junit.jupiter.api.Test;
 import org.postgresql.ds.PGSimpleDataSource;
 import org.springframework.jdbc.datasource.LazyConnectionDataSourceProxy;
 
-/** The heartbeat pool's config, copied from plain Hikari configs: no pool, no database. */
-class HeartbeatPoolConfigTest {
+/** What {@link HeartbeatPool#derive} cannot copy a pool from: no pool, no database. */
+class HeartbeatPoolTest {
 
     @Test
     void deriveSkipsWhatItCannotCopy() throws Exception {
