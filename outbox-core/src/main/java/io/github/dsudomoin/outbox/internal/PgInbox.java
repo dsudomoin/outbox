@@ -555,10 +555,4 @@ public final class PgInbox implements Inbox, AutoCloseable {
             return PgInbox.this.scope(other);
         }
     }
-
-    private static void execute(Connection c, String sql) throws SQLException {
-        try (var st = c.createStatement()) {
-            st.execute(sql);
-        }
-    }
 }

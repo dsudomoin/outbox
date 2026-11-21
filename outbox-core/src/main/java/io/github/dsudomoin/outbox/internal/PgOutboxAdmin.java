@@ -1,5 +1,7 @@
 package io.github.dsudomoin.outbox.internal;
 
+import static io.github.dsudomoin.outbox.internal.Sql.execute;
+
 import io.github.dsudomoin.outbox.DeadLetter;
 import io.github.dsudomoin.outbox.DeadLetterFilter;
 import io.github.dsudomoin.outbox.DeadLetterPage;
@@ -1182,12 +1184,6 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             }
         });
         return out.toString();
-    }
-
-    private static void execute(Connection c, String sql) throws SQLException {
-        try (var st = c.createStatement()) {
-            st.execute(sql);
-        }
     }
 
     private List<DeadLetterCount> deadLetterCounts(Connection c) throws SQLException {

@@ -1,5 +1,7 @@
 package io.github.dsudomoin.outbox.internal;
 
+import static io.github.dsudomoin.outbox.internal.Sql.execute;
+
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Attachment;
 import jakarta.annotation.Nullable;
@@ -1196,12 +1198,6 @@ public final class XidPartitions {
         }
         orphans.sort(Comparator.comparingLong(o -> xidOf(names.unqualified(o.table()).substring(prefix))));
         return orphans;
-    }
-
-    private static void execute(Connection c, String sql) throws SQLException {
-        try (var st = c.createStatement()) {
-            st.execute(sql);
-        }
     }
 
     private static void marker(Connection c, String sql, String range) throws SQLException {

@@ -1,5 +1,7 @@
 package io.github.dsudomoin.outbox.internal;
 
+import static io.github.dsudomoin.outbox.internal.Sql.execute;
+
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.OutboxTelemetry.ShardQueue;
 import io.github.dsudomoin.outbox.internal.Sql.SqlConsumer;
@@ -229,11 +231,5 @@ class QueueState {
     @Nullable
     private static Tick tick(long id, Tick latest, Map<Long, Tick> ticks) {
         return id == latest.id() ? latest : ticks.get(id);
-    }
-
-    private static void execute(Connection c, String sql) throws SQLException {
-        try (var st = c.createStatement()) {
-            st.execute(sql);
-        }
     }
 }

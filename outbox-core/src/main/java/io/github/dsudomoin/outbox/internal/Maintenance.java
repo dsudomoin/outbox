@@ -1,5 +1,7 @@
 package io.github.dsudomoin.outbox.internal;
 
+import static io.github.dsudomoin.outbox.internal.Sql.execute;
+
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxGauge;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
@@ -1157,12 +1159,6 @@ public final class Maintenance {
     private void logHalt(XidRecovery.Check check, String why) {
         if (due(haltLogged)) {
             log.error(recovery.halted(check, why));
-        }
-    }
-
-    private static void execute(Connection c, String sql) throws SQLException {
-        try (var st = c.createStatement()) {
-            st.execute(sql);
         }
     }
 }
