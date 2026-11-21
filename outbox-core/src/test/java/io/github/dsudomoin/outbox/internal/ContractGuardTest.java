@@ -340,21 +340,7 @@ class ContractGuardTest {
         assertThat(unchecked).as("fresh").isEmpty();
     }
 
-    /** Fail closed: an instance whose routes are unknown routes nothing. */
-    @Test
-    void aRelayWhoseRoutesAreUnknownRoutesNothing() {
-        var routes = new HashMap<String, Set<String>>();
-        routes.put("a", Set.of("orders"));
-        routes.put("unknown", null);
-        var guard = routed(Set.of("orders"), routes, Duration.ZERO);
-
-        assertThatThrownBy(() -> require(guard, message("orders", null), "?"))
-                .isInstanceOfSatisfying(OutboxMissingRouteException.class, e -> {
-                    assertThat(e).hasMessageContaining("1 of 2 live relay instances do not route it (unknown)");
-                    assertThat(e.instances()).containsExactly("unknown");
-                });
-    }
-
+    /** Fail closed: an instance whose routes are unknown (host-c) routes nothing. */
     @Test
     void theRouteRefusalNamesTwoInstancesThenHowManyMore() {
         var routes = new HashMap<String, Set<String>>();

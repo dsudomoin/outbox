@@ -98,54 +98,37 @@ class GuardedTelemetryTest {
     }
 
     @Test
-    void waitedIsForwarded() {
-        var waits = new ArrayList<String>();
-        var t = GuardedTelemetry.of(new OutboxTelemetry() {
-            @Override
-            public void waited(String topic, Outcome.Waiting.Kind kind) {
-                waits.add(topic + " " + kind);
-            }
-        });
-
-        t.waited("orders", Outcome.Waiting.Kind.NO_ROUTE);
-
-        assertThat(waits).containsExactly("orders NO_ROUTE");
-    }
-
-    @Test
-    void contractRejectedIsForwarded() {
-        var rejected = new ArrayList<String>();
-        var t = GuardedTelemetry.of(new OutboxTelemetry() {
-            @Override
-            public void contractRejected(String topic, String type, int version) {
-                rejected.add(topic + " " + type + " " + version);
-            }
-        });
-
-        t.contractRejected("orders", "Created", 2);
-
-        assertThat(rejected).containsExactly("orders Created 2");
-    }
-
-    @Test
-    void routeRejectedAndRouteUncheckedAreForwarded() {
+    void eventsAreForwarded() {
         var events = new ArrayList<String>();
         var t = GuardedTelemetry.of(new OutboxTelemetry() {
             @Override
+            public void waited(String topic, Outcome.Waiting.Kind kind) {
+                events.add("waited " + topic + " " + kind);
+            }
+
+            @Override
+            public void contractRejected(String topic, String type, int version) {
+                events.add("rejected " + topic + " " + type + " " + version);
+            }
+
+            @Override
             public void routeRejected(String topic) {
-                events.add("rejected " + topic);
+                events.add("routeRejected " + topic);
             }
 
             @Override
             public void routeUnchecked(String topic) {
-                events.add("unchecked " + topic);
+                events.add("routeUnchecked " + topic);
             }
         });
 
+        t.waited("orders", Outcome.Waiting.Kind.NO_ROUTE);
+        t.contractRejected("orders", "Created", 2);
         t.routeRejected("orders");
         t.routeUnchecked("audit");
 
-        assertThat(events).containsExactly("rejected orders", "unchecked audit");
+        assertThat(events).containsExactly("waited orders NO_ROUTE", "rejected orders Created 2",
+                "routeRejected orders", "routeUnchecked audit");
     }
 
     @Test
@@ -326,12 +309,14 @@ class GuardedTelemetryTest {
     }
 
     @Test
-    void callRunsOnceWhenScopeThrowsAfterIt() throws Exception {
-        var calls = new AtomicInteger();
-        var delivery = GuardedTelemetry.of(new ScopeThrowing(true))
-                .deliveryStarted(OutboxTelemetry.RelayStep.NONE, RECORDS, Instant.EPOCH);
-        assertThat(delivery.inRecordScope(RECORD, calls::incrementAndGet)).isEqualTo(1);
-        assertThat(calls).hasValue(1);
+    void callRunsOnceWhenScopeThrowsAfterOrBeforeIt() throws Exception {
+        for (boolean after : new boolean[] {true, false}) {
+            var calls = new AtomicInteger();
+            var delivery = GuardedTelemetry.of(new ScopeThrowing(after))
+                    .deliveryStarted(OutboxTelemetry.RelayStep.NONE, RECORDS, Instant.EPOCH);
+            assertThat(delivery.inRecordScope(RECORD, calls::incrementAndGet)).as("after " + after).isEqualTo(1);
+            assertThat(calls).as("after " + after).hasValue(1);
+        }
     }
 
     @Test
@@ -356,15 +341,6 @@ class GuardedTelemetryTest {
             assertThat(err.text()).contains("Delivery.inRecordScope");
         }
         assertThat(calls).as("a second run would hand the record to its target twice").hasValue(1);
-    }
-
-    @Test
-    void callRunsOnceWhenScopeThrowsBeforeIt() throws Exception {
-        var calls = new AtomicInteger();
-        var delivery = GuardedTelemetry.of(new ScopeThrowing(false))
-                .deliveryStarted(OutboxTelemetry.RelayStep.NONE, RECORDS, Instant.EPOCH);
-        assertThat(delivery.inRecordScope(RECORD, calls::incrementAndGet)).isEqualTo(1);
-        assertThat(calls).hasValue(1);
     }
 
     @Test
@@ -430,21 +406,14 @@ class GuardedTelemetryTest {
     }
 
     @Test
-    void insertRunsOnceWhenMessageScopeThrowsAfterIt() throws Exception {
-        var calls = new AtomicInteger();
-        var message = GuardedTelemetry.of(new MessageScope(Scope.THROW_AFTER)).enqueueStarted()
-                .message(MESSAGE, MESSAGE_ID, 3);
-        assertThat(message.inScope(calls::incrementAndGet)).isEqualTo(1);
-        assertThat(calls).hasValue(1);
-    }
-
-    @Test
-    void insertRunsOnceWhenMessageScopeSkipsIt() throws Exception {
-        var calls = new AtomicInteger();
-        var message = GuardedTelemetry.of(new MessageScope(Scope.SKIP)).enqueueStarted()
-                .message(MESSAGE, MESSAGE_ID, 3);
-        assertThat(message.inScope(calls::incrementAndGet)).isEqualTo(1);
-        assertThat(calls).hasValue(1);
+    void insertRunsOnceWhenMessageScopeThrowsAfterItOrSkipsIt() throws Exception {
+        for (var scope : List.of(Scope.THROW_AFTER, Scope.SKIP)) {
+            var calls = new AtomicInteger();
+            var message = GuardedTelemetry.of(new MessageScope(scope)).enqueueStarted()
+                    .message(MESSAGE, MESSAGE_ID, 3);
+            assertThat(message.inScope(calls::incrementAndGet)).as(scope.toString()).isEqualTo(1);
+            assertThat(calls).as(scope.toString()).hasValue(1);
+        }
     }
 
     @Test

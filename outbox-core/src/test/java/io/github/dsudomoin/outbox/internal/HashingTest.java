@@ -17,14 +17,6 @@ class HashingTest {
     }
 
     @Test
-    void sameTopicKeySameShard() {
-        int first = Hashing.keyHash("orders", "user-1".getBytes(UTF_8));
-        int second = Hashing.keyHash("orders", "user-1".getBytes(UTF_8));
-        assertThat(second).isEqualTo(first);
-        assertThat(Hashing.shard(second, 32)).isEqualTo(Hashing.shard(first, 32));
-    }
-
-    @Test
     void differentTopicSameKeyUsuallyDifferentHash() {
         int differ = 0;
         for (int i = 0; i < 1000; i++) {

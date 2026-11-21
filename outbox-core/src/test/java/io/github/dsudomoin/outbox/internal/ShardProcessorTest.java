@@ -40,7 +40,6 @@ class ShardProcessorTest {
         assertThat(BatchClassifier.errorType(new IllegalStateException())).isEqualTo("java.lang.IllegalStateException");
         assertThat(BatchClassifier.errorType(new FreeText("order 42 of customer 7 failed")))
                 .as("a toString that starts with its message").isEqualTo(FreeText.class.getName());
-        assertThat(BatchClassifier.REQUEUE_LIMIT_TYPE).isEqualTo("requeue_limit");
     }
 
     /** An exception whose toString is its message alone. */

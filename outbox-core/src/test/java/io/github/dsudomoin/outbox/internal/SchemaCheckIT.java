@@ -46,56 +46,20 @@ class SchemaCheckIT {
 
     @Test
     void missingWaitingSinceFails() throws Exception {
-        var schema = "s" + TestSql.uniqueTable();
-        var config = new TestOutboxConfig().table(schema + ".outbox");
-        var names = TableNames.of(config.table());
-
-        try (var c = TestDataSources.newDataSource().getConnection()) {
-            TestSql.execute(c, "create schema " + schema);
-            TestSql.execute(c, OutboxSql.outbox(config, null));
-            TestSql.execute(c, "alter table " + names.retry() + " drop column waiting_since");
-
-            assertThatThrownBy(() -> SchemaCheck.run(c, c, SchemaObjects.outbox(names), config.table(),
-                    "OutboxSql.outbox"))
-                    .hasMessageContaining("column " + names.retry() + ".waiting_since is missing (schema version 1:"
-                            + " apply OutboxSql.outbox)");
-        }
+        assertSchemaProblem((c, n) -> TestSql.execute(c, "alter table " + n.retry() + " drop column waiting_since"),
+                n -> "column " + n.retry() + ".waiting_since is missing (schema version 1: apply OutboxSql.outbox)");
     }
 
     @Test
     void missingRoutesFails() throws Exception {
-        var schema = "s" + TestSql.uniqueTable();
-        var config = new TestOutboxConfig().table(schema + ".outbox");
-        var names = TableNames.of(config.table());
-
-        try (var c = TestDataSources.newDataSource().getConnection()) {
-            TestSql.execute(c, "create schema " + schema);
-            TestSql.execute(c, OutboxSql.outbox(config, null));
-            TestSql.execute(c, "alter table " + names.instance() + " drop column routes");
-
-            assertThatThrownBy(() -> SchemaCheck.run(c, c, SchemaObjects.outbox(names), config.table(),
-                    "OutboxSql.outbox"))
-                    .hasMessageContaining("column " + names.instance() + ".routes is missing (schema version 1:"
-                            + " apply OutboxSql.outbox)");
-        }
+        assertSchemaProblem((c, n) -> TestSql.execute(c, "alter table " + n.instance() + " drop column routes"),
+                n -> "column " + n.instance() + ".routes is missing (schema version 1: apply OutboxSql.outbox)");
     }
 
     @Test
     void missingWaitingIndexFails() throws Exception {
-        var schema = "s" + TestSql.uniqueTable();
-        var config = new TestOutboxConfig().table(schema + ".outbox");
-        var names = TableNames.of(config.table());
-
-        try (var c = TestDataSources.newDataSource().getConnection()) {
-            TestSql.execute(c, "create schema " + schema);
-            TestSql.execute(c, OutboxSql.outbox(config, null));
-            TestSql.execute(c, "drop index " + names.retry() + "_waiting");
-
-            assertThatThrownBy(() -> SchemaCheck.run(c, c, SchemaObjects.outbox(names), config.table(),
-                    "OutboxSql.outbox"))
-                    .hasMessageContaining("index " + names.retry() + "_waiting is missing (schema version 1: apply"
-                            + " OutboxSql.outbox)");
-        }
+        assertSchemaProblem((c, n) -> TestSql.execute(c, "drop index " + n.retry() + "_waiting"),
+                n -> "index " + n.retry() + "_waiting is missing (schema version 1: apply OutboxSql.outbox)");
     }
 
     @Test
