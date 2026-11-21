@@ -2,6 +2,7 @@ package io.github.dsudomoin.outbox;
 
 import static io.github.dsudomoin.outbox.testing.Handlers.answering;
 import static io.github.dsudomoin.outbox.testing.Handlers.eachRecord;
+import static io.github.dsudomoin.outbox.testing.TestDb.opening;
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
@@ -64,7 +65,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
-import java.util.function.Supplier;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Tag;
@@ -2833,31 +2833,6 @@ class OutboxRelayIT {
                         return result;
                     });
         });
-    }
-
-    /** {@code base} with {@code newConnection} for its new connections; the rest forwards to {@code base}. */
-    private static JdbcConnectionFactory opening(JdbcConnectionFactory base, Supplier<Connection> newConnection) {
-        return new JdbcConnectionFactory() {
-            @Override
-            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
-                return base.withConnection(callback);
-            }
-
-            @Override
-            public Connection currentConnection() {
-                return base.currentConnection();
-            }
-
-            @Override
-            public Connection newConnection() {
-                return newConnection.get();
-            }
-
-            @Override
-            public DataBaseTelemetry telemetry() {
-                return base.telemetry();
-            }
-        };
     }
 
     private static Object invoke(java.lang.reflect.Method method, Object target, Object[] args) throws Throwable {

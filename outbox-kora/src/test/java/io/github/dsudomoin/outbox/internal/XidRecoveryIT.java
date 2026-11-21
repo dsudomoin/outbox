@@ -21,6 +21,7 @@ import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.lang.reflect.InvocationTargetException;
@@ -44,9 +45,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
-import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
-import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
@@ -136,11 +134,7 @@ class XidRecoveryIT {
         relay.close();
         // logical replication or DMS: the rows are copied, the sequences stay at their start, and the target's xid
         // counter is not behind, so no regression shows
-        try (var c = TestDb.connect()) {
-            execute(c, "alter table " + names.tick() + " alter column id restart with 1");
-            execute(c, "alter table " + names.cursor() + " alter column seq restart with 1");
-            execute(c, "alter table " + names.base() + " alter column id restart with 1");
-        }
+        rewindSequences();
 
         try (var err = new CapturedStderr()) {
             bootstrap(); // the restart onto the new cluster
@@ -165,11 +159,7 @@ class XidRecoveryIT {
         relay.close();
         // the source's last rows: written after its newest tick, so above every max_id and last_id
         var copied = send(outbox(null), messages("copied", 10));
-        try (var c = TestDb.connect()) { // the cutover: rows copied, sequences at their start
-            execute(c, "alter table " + names.tick() + " alter column id restart with 1");
-            execute(c, "alter table " + names.cursor() + " alter column seq restart with 1");
-            execute(c, "alter table " + names.base() + " alter column id restart with 1");
-        }
+        rewindSequences(); // the cutover: rows copied, sequences at their start
 
         bootstrap();
         var relayAfter = relay(handler, maintenance());
@@ -484,38 +474,20 @@ class XidRecoveryIT {
         bootstrap();
         forgeRegression();
         var failing = new AtomicBoolean(true);
-        var factory = new JdbcConnectionFactory() {
-            @Override
-            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
-                return db.withConnection(callback);
-            }
-
-            @Override
-            public Connection currentConnection() {
-                return db.currentConnection();
-            }
-
-            @Override
-            public Connection newConnection() {
-                var c = db.newConnection();
-                return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
-                        new Class<?>[] {Connection.class}, (proxy, method, args) -> {
-                            if (method.getName().equals("commit") && failing.compareAndSet(true, false)) {
-                                throw new IllegalStateException("injected commit failure");
-                            }
-                            try {
-                                return method.invoke(c, args);
-                            } catch (InvocationTargetException e) {
-                                throw e.getCause();
-                            }
-                        });
-            }
-
-            @Override
-            public DataBaseTelemetry telemetry() {
-                return db.telemetry();
-            }
-        };
+        var factory = TestDb.opening(db, () -> {
+            var c = db.newConnection();
+            return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
+                    new Class<?>[] {Connection.class}, (proxy, method, args) -> {
+                        if (method.getName().equals("commit") && failing.compareAndSet(true, false)) {
+                            throw new IllegalStateException("injected commit failure");
+                        }
+                        try {
+                            return method.invoke(c, args);
+                        } catch (InvocationTargetException e) {
+                            throw e.getCause();
+                        }
+                    });
+        });
         var maintenance = new Maintenance(new KoraOutboxTransactions(factory), names, config, new OutboxMetrics(null));
 
         assertThatThrownBy(maintenance::checkHalt).isInstanceOf(IllegalStateException.class)
@@ -967,7 +939,8 @@ class XidRecoveryIT {
                 .max(Comparator.comparingLong(b -> Long.parseLong(b.from())))
                 .orElseThrow();
         var recovery = new XidRecovery(names, config);
-        recovery.beforeTransaction = rc -> detachPending(range.name()); // after the finish before the transaction
+        // after the finish before the transaction
+        recovery.beforeTransaction = rc -> XidPartitionsIT.makeDetachPending(names, range.name());
 
         try (var c = TestDb.connect()) {
             var probe = names.base() + "_recovery"; // the copy's table: a copy before the check would fail on it
@@ -975,7 +948,7 @@ class XidRecoveryIT {
             assertThatThrownBy(() -> recovery.recover(c)).isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("became pending");
             assertThat(tickExists(forged)).as("rolled back").isTrue();
-            assertThat(isDetachPending(c, range.name())).isEqualTo("true");
+            assertThat(XidPartitionsIT.detachPending(c, range.name())).isEqualTo("true");
             execute(c, "drop table " + probe);
 
             recovery.beforeTransaction = null;
@@ -1116,20 +1089,13 @@ class XidRecoveryIT {
         assertThat(wakes).hasValue(0);
     }
 
-    /** Leaves {@code range} detach-pending: its DETACH CONCURRENTLY times out waiting for an older snapshot. */
-    private void detachPending(String range) throws SQLException {
-        try (var holder = TestDb.connect(); var c = TestDb.connect()) {
-            holder.setAutoCommit(false);
-            queryLong(holder, "select count(*) from " + names.base());
-            execute(c, "set lock_timeout = '300ms'");
-            assertThatThrownBy(() -> execute(c, "alter table " + names.base() + " detach partition " + range
-                    + " concurrently")).isInstanceOf(SQLException.class);
-            holder.commit();
+    /** The sequences back at their start, as a logical cutover leaves them on the target. */
+    private void rewindSequences() throws SQLException {
+        try (var c = TestDb.connect()) {
+            execute(c, "alter table " + names.tick() + " alter column id restart with 1");
+            execute(c, "alter table " + names.cursor() + " alter column seq restart with 1");
+            execute(c, "alter table " + names.base() + " alter column id restart with 1");
         }
-    }
-
-    private static String isDetachPending(Connection c, String table) throws SQLException {
-        return queryString(c, "select inhdetachpending::text from pg_inherits where inhrelid = to_regclass(?)", table);
     }
 
     private PgOutboxAdmin admin(Maintenance maintenance) {
@@ -1269,7 +1235,7 @@ class XidRecoveryIT {
 
     private static long currentXid() throws SQLException {
         try (var c = TestDb.connect()) {
-            return queryLong(c, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint");
+            return TestSql.currentXid(c);
         }
     }
 

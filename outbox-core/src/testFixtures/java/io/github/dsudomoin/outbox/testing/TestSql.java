@@ -30,6 +30,11 @@ public final class TestSql {
         }
     }
 
+    /** The xmax of the current snapshot: the next transaction id to be assigned. */
+    public static long currentXid(Connection c) throws SQLException {
+        return queryLong(c, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint");
+    }
+
     /** The first column of every row of {@code sql}, in order. */
     public static List<String> queryStrings(Connection c, String sql, String... args) throws SQLException {
         try (var ps = c.prepareStatement(sql)) {

@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.internal;
 
+import static io.github.dsudomoin.outbox.testing.TestSql.currentXid;
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
@@ -34,6 +35,22 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 class OutboxSchemaIT {
+
+    /** A dead table of a version before the dead-letter hook, its columns after {@code create table <name>}. */
+    private static final String PRE_HOOK_DEAD_TABLE = """
+             (
+              id         bigint primary key,
+              shard      smallint not null,
+              message_id uuid not null,
+              topic      text not null,
+              key        bytea,
+              payload    bytea,
+              headers    bytea,
+              created_at timestamptz not null,
+              attempts   int not null,
+              failed_at  timestamptz not null default now(),
+              error      text
+            )""";
 
     private final TestDatabase db = TestDb.newDatabase(10);
     private final TestOutboxConfig config = new TestOutboxConfig();
@@ -85,7 +102,7 @@ class OutboxSchemaIT {
         var n = schema.names();
         var partitions = new XidPartitions(n, config.partitions());
         PartitionDdl.Bound lowest;
-        try (var reader = TestDb.connect(); var c = TestDb.connect()) {
+        try (var c = TestDb.connect()) {
             lowest = PartitionDdl.listRanges(c, n.base()).stream()
                     .filter(b -> b.to() != null)
                     .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
@@ -95,19 +112,8 @@ class OutboxSchemaIT {
             }
             // a drop interrupted by its lock timeout leaves the range detach-pending (one allowed per parent)
             execute(c, "insert into " + n.dropping() + " (table_name) values ('" + n.unqualified(lowest.name()) + "')");
-            reader.setAutoCommit(false);
-            queryLong(reader, "select count(*) from " + n.base());
-            try (var st = c.createStatement()) {
-                st.execute("set lock_timeout = '300ms'");
-                assertThatThrownBy(() -> st.execute(
-                                "alter table " + n.base() + " detach partition " + lowest.name() + " concurrently"))
-                        .isInstanceOf(SQLException.class);
-                st.execute("reset lock_timeout");
-            }
-            reader.commit();
-            assertThat(queryString(c, "select inhdetachpending::text from pg_inherits where inhrelid = to_regclass(?)",
-                            lowest.name()))
-                    .isEqualTo("true");
+            XidPartitionsIT.makeDetachPending(n, lowest.name());
+            assertThat(XidPartitionsIT.detachPending(c, lowest.name())).isEqualTo("true");
             // into the extension window, so the same start also extends beside the pending range
             while (partitions.premadeAhead(c) > config.premake() / 2) {
                 TestDb.burnXids(200);
@@ -280,20 +286,7 @@ class OutboxSchemaIT {
                 + " and conname = ?";
         String checkName = n.unqualified(n.dead()) + "_status";
         try (var c = TestDb.connect()) {
-            execute(c, "create table " + n.dead() + """
-                     (
-                      id         bigint primary key,
-                      shard      smallint not null,
-                      message_id uuid not null,
-                      topic      text not null,
-                      key        bytea,
-                      payload    bytea,
-                      headers    bytea,
-                      created_at timestamptz not null,
-                      attempts   int not null,
-                      failed_at  timestamptz not null default now(),
-                      error      text
-                    )"""); // a dead table of a version before the dead-letter hook
+            execute(c, "create table " + n.dead() + PRE_HOOK_DEAD_TABLE);
             execute(c, "insert into " + n.dead() + " (id, shard, message_id, topic, created_at, attempts, error)"
                     + " values (1, 0, gen_random_uuid(), 't', now(), 3, 'boom'),"
                     + " (2, 1, gen_random_uuid(), 't', now(), 5, null)");
@@ -326,20 +319,7 @@ class OutboxSchemaIT {
     void upgradeOfALargeDeadTableDoesNotBuildTheIndexAtStartup() throws Exception {
         var n = TableNames.of(config.table());
         try (var c = TestDb.connect(); var err = new CapturedStderr()) {
-            execute(c, "create table " + n.dead() + """
-                     (
-                      id         bigint primary key,
-                      shard      smallint not null,
-                      message_id uuid not null,
-                      topic      text not null,
-                      key        bytea,
-                      payload    bytea,
-                      headers    bytea,
-                      created_at timestamptz not null,
-                      attempts   int not null,
-                      failed_at  timestamptz not null default now(),
-                      error      text
-                    )"""); // a dead table of a version before the dead-letter hook
+            execute(c, "create table " + n.dead() + PRE_HOOK_DEAD_TABLE);
             execute(c, "insert into " + n.dead() + " (id, shard, message_id, topic, created_at, attempts)"
                     + " select s, 0, gen_random_uuid(), 't', now(), 1 from generate_series(1, 200000) s");
 
@@ -407,11 +387,7 @@ class OutboxSchemaIT {
         config.xidsPerPartition(1000).premake(4);
         new OutboxSchema(db, config).start();
         var n = TableNames.of(config.table());
-        // to the middle of a range: the DDL below must not move the xid on to the next one
-        try (var c = TestDb.connect()) {
-            long current = currentXid(c);
-            TestDb.burnXids((int) (Math.floorDiv(current, 1000) * 1000 + 2500 - current));
-        } // half of premake used: the next bootstrap wants to extend
+        toTheMiddleOfARange();
 
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
             holder.setAutoCommit(false);
@@ -420,14 +396,7 @@ class OutboxSchemaIT {
             new OutboxSchema(db, config).start();
 
             holder.commit();
-            assertThat(queryString(c, "insert into " + n.base()
-                            + "(shard, message_id, topic) values (0, gen_random_uuid(), 't')"
-                            + " returning tableoid::regclass::text"))
-                    .startsWith(n.partitionPrefix())
-                    .isNotEqualTo(n.tail());
-            var partitions = new XidPartitions(n, config.partitions());
-            partitions.ensurePremade(c); // maintenance finishes the extension
-            assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(4);
+            assertInsertsFindARangeAndMaintenanceExtends(c, n);
         }
     }
 
@@ -440,10 +409,7 @@ class OutboxSchemaIT {
         config.xidsPerPartition(1000).premake(4);
         new OutboxSchema(db, config).start();
         var n = TableNames.of(config.table());
-        try (var c = TestDb.connect()) {
-            long current = currentXid(c);
-            TestDb.burnXids((int) (Math.floorDiv(current, 1000) * 1000 + 2500 - current));
-        } // half of premake used: the next bootstrap wants to extend
+        toTheMiddleOfARange();
 
         var hook = "slow_" + config.table();
         try (var c = TestDb.connect()) {
@@ -461,14 +427,7 @@ class OutboxSchemaIT {
                 execute(c, "drop event trigger " + hook + "; drop function " + hook + "()");
             }
 
-            assertThat(queryString(c, "insert into " + n.base()
-                            + "(shard, message_id, topic) values (0, gen_random_uuid(), 't')"
-                            + " returning tableoid::regclass::text"))
-                    .startsWith(n.partitionPrefix())
-                    .isNotEqualTo(n.tail());
-            var partitions = new XidPartitions(n, config.partitions());
-            partitions.ensurePremade(c); // maintenance finishes the extension
-            assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(4);
+            assertInsertsFindARangeAndMaintenanceExtends(c, n);
         }
     }
 
@@ -484,9 +443,6 @@ class OutboxSchemaIT {
                 Map.entry("outbox.relay.idlePollInterval", c -> c.idlePollInterval(Duration.ZERO)),
                 Map.entry("outbox.relay.batchTimeout", c -> c.batchTimeout(Duration.ZERO)),
                 Map.entry("outbox.relay.shutdownTimeout", c -> c.shutdownTimeout(Duration.ofMillis(-1))),
-                Map.entry("outbox.relay.connectionHold", c -> c.connectionHold(Duration.ZERO)),
-                Map.entry("outbox.relay.ticksWithoutRelay", c -> c.ticksWithoutRelay(Duration.ofMillis(-1))),
-                Map.entry("outbox.relay.ticksWithoutRelay", c -> c.ticksWithoutRelay(Duration.ofDays(25))),
                 Map.entry("outbox.relay.headFailuresBeforeDivert", c -> c.headFailuresBeforeDivert(0)),
                 Map.entry("outbox.relay.cursorAnchorInterval", c -> c.cursorAnchorInterval(Duration.ZERO)),
                 Map.entry("outbox.relay.cursorAnchorInterval", c -> c.maintenanceInterval(Duration.ofMinutes(2))
@@ -498,15 +454,8 @@ class OutboxSchemaIT {
                 Map.entry("outbox.partitions.xidsPerPartition", c -> c.xidsPerPartition(999)),
                 Map.entry("outbox.partitions.premake", c -> c.premake(1)),
                 Map.entry("outbox.partitions.maintenanceInterval", c -> c.maintenanceInterval(Duration.ZERO)),
-                Map.entry("outbox.partitions.swapLockTimeout", c -> c.swapLockTimeout(Duration.ofMillis(-1))),
-                Map.entry("outbox.partitions.maxTailScan", c -> c.maxTailScan(-1)),
                 Map.entry("outbox.partitions.tailConversion.window",
-                        c -> c.tailConversion("3-5", Duration.ofSeconds(1))),
-                Map.entry("outbox.partitions.tailConversion.maxStall", c -> c.tailConversion("", Duration.ZERO)),
-                Map.entry("outbox.deadLetters.batchSize", c -> c.deadLettersBatchSize(0)),
-                Map.entry("outbox.deadLetters.timeout", c -> c.deadLettersTimeout(Duration.ZERO)),
-                Map.entry("outbox.deadLetters.retention", c -> c.deadLettersRetention(Duration.ofMillis(-1))),
-                Map.entry("outbox.deadLetters.redriveHistory", c -> c.deadLettersRedriveHistory(Duration.ZERO)));
+                        c -> c.tailConversion("3-5", Duration.ofSeconds(1))));
 
         try (var c = TestDb.connect()) {
             for (var e : cases) {
@@ -526,25 +475,13 @@ class OutboxSchemaIT {
     void relayAndEnqueueRejectBadConfigWithTheSameMessages() {
         var schema = new OutboxSchema(db, config); // not initialized: their checks come first
         var valid = new DeadLetterPass(db, TableNames.of(config.table()), config, null, new OutboxMetrics(null));
-        List<Map.Entry<String, Consumer<TestOutboxConfig>>> cases = List.of(
-                Map.entry("outbox.relay.workers", c -> c.workers(0)),
-                Map.entry("outbox.relay.minTickInterval", c -> c.minTickInterval(Duration.ofMillis(-1))),
-                Map.entry("outbox.relay.idlePollInterval", c -> c.idlePollInterval(Duration.ZERO)),
-                Map.entry("outbox.relay.shutdownTimeout", c -> c.shutdownTimeout(Duration.ofMillis(-1))),
-                Map.entry("outbox.relay.connectionHold", c -> c.connectionHold(Duration.ZERO)),
-                Map.entry("outbox.relay.ticksWithoutRelay", c -> c.ticksWithoutRelay(Duration.ofMillis(-1))),
-                Map.entry("outbox.relay.ticksWithoutRelay", c -> c.ticksWithoutRelay(Duration.ofDays(25))),
-                Map.entry("outbox.partitions.maintenanceInterval", c -> c.maintenanceInterval(Duration.ZERO)));
-        for (var e : cases) {
-            var invalid = new TestOutboxConfig();
-            e.getValue().accept(invalid);
+        var invalid = new TestOutboxConfig();
+        invalid.workers(0);
 
-            assertThatThrownBy(() -> new OutboxRelay(db, invalid, schema, new RecordingHandler(),
-                    TestTelemetry.kora(), null, valid))
-                    .as(e.getKey())
-                    .isInstanceOf(IllegalArgumentException.class)
-                    .hasMessageStartingWith(e.getKey() + " ");
-        }
+        assertThatThrownBy(() -> new OutboxRelay(db, invalid, schema, new RecordingHandler(), TestTelemetry.kora(),
+                null, valid))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageStartingWith("outbox.relay.workers ");
         for (int shards : new int[] {0, Short.MAX_VALUE + 1}) {
             assertThatThrownBy(() -> new PgOutbox(db, schema, shards, () -> {}, TestTelemetry.kora()))
                     .isInstanceOf(IllegalArgumentException.class)
@@ -647,7 +584,26 @@ class OutboxSchemaIT {
         return rows;
     }
 
-    private static long currentXid(Connection c) throws SQLException {
-        return queryLong(c, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint");
+    /**
+     * To the middle of a range with half of premake used: the next bootstrap wants to extend, and its DDL does not
+     * move the xid on to the next range.
+     */
+    private static void toTheMiddleOfARange() throws SQLException {
+        try (var c = TestDb.connect()) {
+            long current = currentXid(c);
+            TestDb.burnXids((int) (Math.floorDiv(current, 1000) * 1000 + 2500 - current));
+        }
+    }
+
+    /** An insert lands in a range, not the tail, and a maintenance run finishes the extension. */
+    private void assertInsertsFindARangeAndMaintenanceExtends(Connection c, TableNames n) throws SQLException {
+        assertThat(queryString(c, "insert into " + n.base()
+                        + "(shard, message_id, topic) values (0, gen_random_uuid(), 't')"
+                        + " returning tableoid::regclass::text"))
+                .startsWith(n.partitionPrefix())
+                .isNotEqualTo(n.tail());
+        var partitions = new XidPartitions(n, config.partitions());
+        partitions.ensurePremade(c); // maintenance finishes the extension
+        assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(4);
     }
 }

@@ -1,7 +1,9 @@
 package io.github.dsudomoin.outbox.internal;
 
+import static io.github.dsudomoin.outbox.testing.TestSql.currentXid;
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
+import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -18,10 +20,7 @@ import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Types;
-import java.time.Clock;
 import java.time.Duration;
-import java.time.LocalDate;
-import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -217,10 +216,10 @@ class RollbackCompatibilityIT {
             schema.start();
             names = schema.names();
             var partitions = new XidPartitions(names, cfg.partitions());
-            partitions.clock = clockAt(12, 0); // outside the window
+            partitions.clock = XidPartitionsIT.at(12, 0); // outside the window
             try (var holder = TestDb.connect(); var c = TestDb.connect()) {
                 if (!state.equals("empty")) { // rows in the tail, then a swap that fails on a young lock holder
-                    TestDb.burnXids((int) (tailLower(c) - currentXid(c)) + 10);
+                    TestDb.burnXids((int) (XidPartitionsIT.tail(c, names) - currentXid(c)) + 10);
                     insert(c);
                     holder.setAutoCommit(false);
                     execute(holder, "lock table only " + names.base() + " in access share mode");
@@ -236,7 +235,7 @@ class RollbackCompatibilityIT {
                                 .as("the failed swap's ranges made ahead").isNotEmpty();
                     }
                 }
-                long tail = tailLower(c);
+                long tail = XidPartitionsIT.tail(c, names);
 
                 var failed = new ArrayList<SQLException>();
                 for (int i = 0; i < 30; i++) { // the previous release, 30 ranges on
@@ -258,10 +257,10 @@ class RollbackCompatibilityIT {
                         + " (select inhrelid from pg_inherits where inhparent = '" + names.base() + "'::regclass)"))
                         .as("%s: checks", state).isZero();
                 if (!state.equals("empty")) {
-                    assertThat(tailLower(c)).as("%s: the previous release leaves a hot tail be", state)
-                            .isEqualTo(tail);
+                    assertThat(XidPartitionsIT.tail(c, names))
+                            .as("%s: the previous release leaves a hot tail be", state).isEqualTo(tail);
                 }
-                partitions.clock = clockAt(4, 0); // upgraded again; an oversized tail waits for the window
+                partitions.clock = XidPartitionsIT.at(4, 0); // upgraded again; an oversized tail waits for the window
                 for (int run = 0; run < 5; run++) { // maintenance runs: four ranges a swap until premake are ahead
                     partitions.ensurePremade(c);
                 }
@@ -290,7 +289,8 @@ class RollbackCompatibilityIT {
                 upper = upper == null ? Long.parseLong(b.to()) : Math.max(upper, Long.parseLong(b.to()));
             }
         }
-        if (ahead > premake / 2 || PartitionDdl.hasRows(c, names.tail()) || current + size > tailLower(c)) {
+        if (ahead > premake / 2 || PartitionDdl.hasRows(c, names.tail())
+                || current + size > XidPartitionsIT.tail(c, names)) {
             return;
         }
         PartitionDdl.detach(c, names.base(), names.tail(), PartitionDdl.DETACH_LOCK_TIMEOUT);
@@ -343,20 +343,6 @@ class RollbackCompatibilityIT {
         execute(c, "insert into " + names.base() + " (shard, message_id, topic) values (0, gen_random_uuid(), 't')");
     }
 
-    private long tailLower(Connection c) throws SQLException {
-        return PartitionDdl.listRanges(c, names.base()).stream().filter(b -> b.to() == null)
-                .mapToLong(b -> Long.parseLong(b.from())).findFirst().orElseThrow();
-    }
-
-    private static long currentXid(Connection c) throws SQLException {
-        return queryLong(c, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint");
-    }
-
-    private static Clock clockAt(int hour, int minute) {
-        var zone = ZoneId.systemDefault();
-        return Clock.fixed(LocalDate.now(zone).atTime(hour, minute).atZone(zone).toInstant(), zone);
-    }
-
     private Cursor oldLatest(Connection c, int shard) throws SQLException {
         try (var ps = c.prepareStatement(oldLatest())) {
             ps.setInt(1, shard);
@@ -407,10 +393,6 @@ class RollbackCompatibilityIT {
             assertThat(ticks.make(c, Duration.ZERO)).isTrue();
             return ticks.latest(c).id();
         }
-    }
-
-    private static String queryString(Connection c, String sql) throws SQLException {
-        return io.github.dsudomoin.outbox.testing.TestSql.queryString(c, sql);
     }
 
     private OutboxRelay relay(RecordingHandler handler, Maintenance maintenance) {

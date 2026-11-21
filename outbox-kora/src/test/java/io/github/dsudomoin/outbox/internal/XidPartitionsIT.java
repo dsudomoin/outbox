@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.internal;
 
+import static io.github.dsudomoin.outbox.testing.TestSql.currentXid;
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
@@ -28,6 +29,7 @@ import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
+import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
@@ -57,10 +59,7 @@ class XidPartitionsIT {
 
         try (var c = TestDb.connect()) {
             assertThat(partitions.premadeAhead(c)).isLessThanOrEqualTo(2);
-            long offset = currentXid(c) % 1000;
-            if (offset > 900) { // ensurePremade's own DDL xids must not carry the counter into the next range
-                TestDb.burnXids((int) (1000 - offset) + 10);
-            }
+            roomInTheRange(c, 900);
 
             partitions.ensurePremade(c);
 
@@ -164,23 +163,8 @@ class XidPartitionsIT {
         var partitions = new XidPartitions(names, config.partitions());
         var done = new AtomicBoolean();
         var errors = new ConcurrentLinkedQueue<Throwable>();
-        var writers = new ArrayList<Thread>();
-        for (int i = 0; i < 4; i++) { // each commits every few ms: between pg_locks and pg_stat_activity it may be idle
-            var writer = new Thread(() -> {
-                try (var c = TestDb.connect()) {
-                    c.setAutoCommit(false);
-                    while (!done.get()) {
-                        execute(c, "insert into " + names.base()
-                                + " (shard, message_id, topic) values (0, gen_random_uuid(), 't')");
-                        c.commit();
-                    }
-                } catch (Throwable e) {
-                    errors.add(e);
-                }
-            });
-            writer.start();
-            writers.add(writer);
-        }
+        // each commits every few ms: between pg_locks and pg_stat_activity it may be idle
+        var writers = committingWriters(names, done, errors);
 
         var blockers = new ArrayList<String>();
         try (var c = TestDb.connect()) {
@@ -208,23 +192,8 @@ class XidPartitionsIT {
         var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1)); // 20 s in production
         var done = new AtomicBoolean();
         var errors = new ConcurrentLinkedQueue<Throwable>();
-        var writers = new ArrayList<Thread>();
-        for (int i = 0; i < 4; i++) { // the app's own writers under another login role: their age is hidden
-            var writer = new Thread(() -> {
-                try (var c = TestDb.connect()) {
-                    c.setAutoCommit(false);
-                    while (!done.get()) {
-                        execute(c, "insert into " + names.base()
-                                + " (shard, message_id, topic) values (0, gen_random_uuid(), 't')");
-                        c.commit();
-                    }
-                } catch (Throwable e) {
-                    errors.add(e);
-                }
-            });
-            writer.start();
-            writers.add(writer);
-        }
+        // the app's own writers under another login role: their age is hidden
+        var writers = committingWriters(names, done, errors);
 
         var blockers = new ArrayList<String>();
         try (var c = TestDb.connect(login(TestDb.newLoginRole()))) {
@@ -309,15 +278,7 @@ class XidPartitionsIT {
             execute(writer, "insert into " + orphan + " (id, shard, xid, message_id, topic)"
                     + " values (1, 0, '1', gen_random_uuid(), 't')");
             var errors = new ConcurrentLinkedQueue<Throwable>();
-            var commitLater = new Thread(() -> {
-                try {
-                    Thread.sleep(1000);
-                    writer.commit();
-                } catch (Throwable e) {
-                    errors.add(e);
-                }
-            });
-            commitLater.start();
+            var commitLater = commitAfter(writer, 1000, errors);
 
             boolean dropped = PartitionDdl.dropUnlessFound(
                     c, orphan, "select 1 from {table} limit 1", null, Duration.ofSeconds(10));
@@ -806,10 +767,7 @@ class XidPartitionsIT {
         TestDb.burnXids(2500);
 
         try (var c = TestDb.connect()) {
-            long offset = currentXid(c) % 1000;
-            if (offset > 900) { // ensurePremade's own DDL xids must not carry the counter into the next range
-                TestDb.burnXids((int) (1000 - offset) + 10);
-            }
+            roomInTheRange(c, 900);
             // a failed swap's, then a library version with one more outbox column
             PartitionDdl.create(c, names.base(), names.tailNext(), PartitionDdl.CREATE_LOCK_TIMEOUT);
             execute(c, "alter table " + names.base() + " add column added_later int");
@@ -838,21 +796,14 @@ class XidPartitionsIT {
                 st.execute("reset lock_timeout");
             }
             holder.commit();
-            assertThat(queryString(c, "select inhdetachpending::text from pg_inherits where inhrelid = to_regclass(?)",
-                            names.tail()))
-                    .isEqualTo("true");
+            assertThat(detachPending(c, names.tail())).isEqualTo("true");
             TestDb.burnXids(2500);
-            long offset = queryLong(c, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint % 1000");
-            if (offset > 900) { // ensurePremade's own DDL xids must not carry the counter into the next range
-                TestDb.burnXids((int) (1000 - offset) + 10);
-            }
+            roomInTheRange(c, 900);
 
             partitions.ensurePremade(c);
 
             assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(4);
-            assertThat(queryString(c, "select inhdetachpending::text from pg_inherits where inhrelid = to_regclass(?)",
-                            names.tail()))
-                    .isEqualTo("false");
+            assertThat(detachPending(c, names.tail())).isEqualTo("false");
             assertTailAboveLastRange(c, names);
         }
     }
@@ -870,10 +821,7 @@ class XidPartitionsIT {
             Thread.sleep(1100); // older than the threshold
             long lower = tail(c, names);
             TestDb.burnXids(2500);
-            long offset = currentXid(c) % 1000;
-            if (offset > 900) { // ensurePremade's own DDL xids must not carry the counter into the next range
-                TestDb.burnXids((int) (1000 - offset) + 10);
-            }
+            roomInTheRange(c, 900);
             assertThat(queryString(c, "select (backend_xmin is not null)::text from pg_stat_activity"
                             + " where pid = ?::int", Long.toString(queryLong(holder, "select pg_backend_pid()"))))
                     .as("the holder keeps its snapshot")
@@ -959,11 +907,7 @@ class XidPartitionsIT {
             queryLong(step, "select count(*) from " + names.base());
             Thread.sleep(1100);
             assertThat(partitions.swapBlocker(c)).as("without the swap lock, an old holder").isNotNull();
-            try (var ps = step.prepareStatement("select pg_advisory_xact_lock_shared(?, ?)")) {
-                ps.setInt(1, names.internalNamespace());
-                ps.setInt(2, TableNames.LOCK_SWAP);
-                ps.execute();
-            }
+            holdSwapShared(step, names);
 
             assertThat(partitions.swapBlocker(c)).as("the quiesce waits for it instead").isNull();
             step.commit();
@@ -979,23 +923,12 @@ class XidPartitionsIT {
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
             long lower = tail(c, names);
             TestDb.burnXids(2500);
-            long offset = currentXid(c) % 1000;
-            if (offset > 900) { // ensurePremade's own DDL xids must not carry the counter into the next range
-                TestDb.burnXids((int) (1000 - offset) + 10);
-            }
+            roomInTheRange(c, 900);
             execute(c, "set lock_timeout = '7s'"); // a session value, which the swap must give back
             holder.setAutoCommit(false); // a young reader, so no blocker: the swap waits for it and gives up
             queryLong(holder, "select count(*) from " + names.base());
             var errors = new ConcurrentLinkedQueue<Throwable>();
-            var release = new Thread(() -> {
-                try {
-                    Thread.sleep(2000);
-                    holder.commit();
-                } catch (Throwable e) {
-                    errors.add(e);
-                }
-            });
-            release.start();
+            var release = commitAfter(holder, 2000, errors);
 
             long start = System.nanoTime();
             assertThatThrownBy(() -> partitions.ensurePremade(c))
@@ -1028,26 +961,12 @@ class XidPartitionsIT {
         var done = new AtomicBoolean();
         var slowest = new AtomicLong();
         var errors = new ConcurrentLinkedQueue<Throwable>();
-        var writer = new Thread(() -> {
-            try (var w = TestDb.connect()) {
-                while (!done.get()) {
-                    long start = System.nanoTime();
-                    send(w, names, 1);
-                    slowest.accumulateAndGet(System.nanoTime() - start, Math::max);
-                    Thread.sleep(2);
-                }
-            } catch (Throwable e) {
-                errors.add(e);
-            }
-        });
+        var writer = timedWriter(names, done, slowest, errors);
 
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
             long lower = tail(c, names);
             TestDb.burnXids(2500);
-            long offset = currentXid(c) % 1000;
-            if (offset > 900) { // ensurePremade's own DDL xids must not carry the counter into the next range
-                TestDb.burnXids((int) (1000 - offset) + 10);
-            }
+            roomInTheRange(c, 900);
             String range = names.partitionPrefix() + lower;
             PartitionDdl.create(c, names.base(), range, PartitionDdl.CREATE_LOCK_TIMEOUT);
             holder.setAutoCommit(false); // a stray reader of the range, as pg_dump or a query by hand
@@ -1088,27 +1007,13 @@ class XidPartitionsIT {
         var done = new AtomicBoolean();
         var slowest = new AtomicLong();
         var errors = new ConcurrentLinkedQueue<Throwable>();
-        var writer = new Thread(() -> {
-            try (var w = TestDb.connect()) {
-                while (!done.get()) {
-                    long start = System.nanoTime();
-                    send(w, names, 1);
-                    slowest.accumulateAndGet(System.nanoTime() - start, Math::max);
-                    Thread.sleep(2);
-                }
-            } catch (Throwable e) {
-                errors.add(e);
-            }
-        });
+        var writer = timedWriter(names, done, slowest, errors);
 
         try (var c = TestDb.connect()) {
             long lower = tail(c, names);
             TestDb.burnXids(2500);
-            long offset = currentXid(c) % 1000;
-            if (offset > 900) { // ensurePremade's own DDL xids must not carry the counter into the next range
-                TestDb.burnXids((int) (1000 - offset) + 10);
-            }
-            stallInsideTheHold(partitions);
+            roomInTheRange(c, 900);
+            partitions.inHold = "perform pg_sleep(3);"; // a stall where the swap could once wait on its own client
             writer.start();
             Thread.sleep(100);
 
@@ -1126,7 +1031,7 @@ class XidPartitionsIT {
             assertThat(tail(c, names)).isEqualTo(lower);
             assertThat(detachPending(c, names.tail())).as("still attached").isEqualTo("false");
             assertThat(swapLocks(c, names)).as("the quiesce lock released").isZero();
-            noStallInsideTheHold(partitions);
+            partitions.inHold = null;
             partitions.ensurePremade(c);
 
             assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(4);
@@ -1148,10 +1053,7 @@ class XidPartitionsIT {
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
             long lower = tail(c, names);
             TestDb.burnXids(9000);
-            long offset = currentXid(c) % 1000;
-            if (offset > 900) {
-                TestDb.burnXids((int) (1000 - offset) + 10);
-            }
+            roomInTheRange(c, 900);
             holder.setAutoCommit(false); // old: the first run makes the ranges ahead, then defers
             queryLong(holder, "select count(*) from " + names.base());
             Thread.sleep(1100);
@@ -1491,10 +1393,7 @@ class XidPartitionsIT {
 
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
             TestDb.burnXids(2500);
-            long offset = currentXid(c) % 1000;
-            if (offset > 600) {
-                TestDb.burnXids((int) (1000 - offset) + 10);
-            }
+            roomInTheRange(c, 600);
             holder.setAutoCommit(false); // old: the run makes the ranges ahead, then defers
             queryLong(holder, "select count(*) from " + names.base());
             Thread.sleep(1100);
@@ -1552,16 +1451,9 @@ class XidPartitionsIT {
 
         try (var step = TestDb.connect(); var c = TestDb.connect()) {
             long lower = tail(c, names);
-            long offset = currentXid(c) % 1000;
-            if (offset > 900) { // ensurePremade's own DDL xids must not carry the counter into the next range
-                TestDb.burnXids((int) (1000 - offset) + 10);
-            }
+            roomInTheRange(c, 900);
             step.setAutoCommit(false); // a relay step in flight, past the quiesce timeout
-            try (var ps = step.prepareStatement("select pg_advisory_xact_lock_shared(?, ?)")) {
-                ps.setInt(1, names.internalNamespace());
-                ps.setInt(2, TableNames.LOCK_SWAP);
-                ps.execute();
-            }
+            holdSwapShared(step, names);
 
             long start = System.nanoTime();
             assertThatThrownBy(() -> partitions.ensurePremade(c, Duration.ofMillis(300), Duration.ofMillis(300)))
@@ -1595,10 +1487,7 @@ class XidPartitionsIT {
 
         try (var watch = TestDb.connect(); var c = TestDb.connect()) {
             long lower = tail(c, names);
-            long offset = currentXid(c) % 1000;
-            if (offset > 900) { // ensurePremade's own DDL xids must not carry the counter into the next range
-                TestDb.burnXids((int) (1000 - offset) + 10);
-            }
+            roomInTheRange(c, 900);
             execute(c, "set idle_session_timeout = '60s'"); // as maintenance sets it for its run
             long pid = queryLong(c, "select pg_backend_pid()");
             var stepSkipped = new AtomicBoolean();
@@ -1659,11 +1548,7 @@ class XidPartitionsIT {
             execute(step, "set application_name = 'slow-relay-step'");
             long stepPid = queryLong(step, "select pg_backend_pid()");
             step.setAutoCommit(false); // a relay step in flight, past the quiesce timeout
-            try (var ps = step.prepareStatement("select pg_advisory_xact_lock_shared(?, ?)")) {
-                ps.setInt(1, names.internalNamespace());
-                ps.setInt(2, TableNames.LOCK_SWAP);
-                ps.execute();
-            }
+            holdSwapShared(step, names);
 
             String log;
             try (var err = new CapturedStderr()) {
@@ -1690,10 +1575,7 @@ class XidPartitionsIT {
         TestDb.burnXids(2500);
 
         try (var c = TestDb.connect()) {
-            long offset = currentXid(c) % 1000;
-            if (offset > 900) { // ensurePremade's own DDL xids must not carry the counter into the next range
-                TestDb.burnXids((int) (1000 - offset) + 10);
-            }
+            roomInTheRange(c, 900);
             var before = PartitionDdl.listRanges(c, names.base());
             partitions.inHold = "raise exception 'mid-swap';"; // any failure inside the swap's statement
 
@@ -1727,15 +1609,7 @@ class XidPartitionsIT {
             writer.setAutoCommit(false); // a writer routed to the tail (its xid given here) that commits meanwhile
             var id = insertIntoTail(writer, names, lower + 5);
             var errors = new ConcurrentLinkedQueue<Throwable>();
-            var commitLater = new Thread(() -> {
-                try {
-                    Thread.sleep(1000);
-                    writer.commit();
-                } catch (Throwable e) {
-                    errors.add(e);
-                }
-            });
-            commitLater.start();
+            var commitLater = commitAfter(writer, 1000, errors);
 
             partitions.ensurePremade(c);
 
@@ -1763,11 +1637,8 @@ class XidPartitionsIT {
                 log = err.text();
             }
             var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1));
-            var login = new Properties();
-            login.setProperty("user", role);
-            login.setProperty("password", role);
 
-            try (var holder = TestDb.connect(); var c = TestDb.connect(login)) {
+            try (var holder = TestDb.connect(); var c = TestDb.connect(login(role))) {
                 holder.setAutoCommit(false); // a pg_dump by a backup role, under another application name
                 execute(holder, "set transaction isolation level repeatable read");
                 queryLong(holder, "select count(*) from " + names.base());
@@ -1823,31 +1694,18 @@ class XidPartitionsIT {
             schema.start();
             var names = schema.names();
             var partitions = new XidPartitions(names, config.partitions());
-            var login = new Properties();
-            login.setProperty("user", role);
-            login.setProperty("password", role);
 
-            try (var holder = TestDb.connect(login); var c = TestDb.connect(login)) {
+            try (var holder = TestDb.connect(login(role)); var c = TestDb.connect(login(role))) {
                 assertThat(queryString(c, "show statement_timeout")).isEqualTo("1s");
                 execute(c, "set lock_timeout = '7s'"); // a session value, which the DDL must give back
                 long lower = tail(c, names);
                 TestDb.burnXids(2500);
-                long offset = currentXid(c) % 1000;
-                if (offset > 400) { // its DDL and tries (two xids each) must not carry the counter into the next range
-                    TestDb.burnXids((int) (1000 - offset) + 10);
-                }
+                // its DDL and tries (two xids each) must not carry the counter into the next range
+                roomInTheRange(c, 400);
                 holder.setAutoCommit(false); // a young reader the swap waits over 1 s for
                 queryLong(holder, "select count(*) from " + names.base());
                 var errors = new ConcurrentLinkedQueue<Throwable>();
-                var release = new Thread(() -> {
-                    try {
-                        Thread.sleep(1500);
-                        holder.commit();
-                    } catch (Throwable e) {
-                        errors.add(e);
-                    }
-                });
-                release.start();
+                var release = commitAfter(holder, 1500, errors);
 
                 partitions.ensurePremade(c);
 
@@ -1933,9 +1791,7 @@ class XidPartitionsIT {
 
             assertThat(partitions.overflow()).isTrue();
             assertThat(countThroughParent(c, names, id)).isEqualTo(1);
-            assertThat(queryString(c, "select inhdetachpending::text from pg_inherits where inhrelid = to_regclass(?)",
-                            names.tail()))
-                    .isEqualTo("false");
+            assertThat(detachPending(c, names.tail())).isEqualTo("false");
             assertThat(tail(c, names)).isEqualTo(lower);
         }
     }
@@ -2062,9 +1918,7 @@ class XidPartitionsIT {
         var partitions = new XidPartitions(names, config.partitions());
 
         try (var c = TestDb.connect()) {
-            if (currentXid(c) % 1000 > 500) { // room for the xids the DDL below takes, within the one range
-                TestDb.burnXids((int) (1000 - currentXid(c) % 1000) + 10);
-            }
+            roomInTheRange(c, 500); // room for the xids the DDL below takes, within the one range
             long floor = Math.floorDiv(currentXid(c), 1000) * 1000;
             var current = names.partitionPrefix() + floor;
             execute(c, "alter table " + names.base() + " detach partition " + current);
@@ -2122,6 +1976,79 @@ class XidPartitionsIT {
         }
     }
 
+    /**
+     * Burns xids into the next 1000-xid range when the current xid is past {@code maxOffset} in its own:
+     * ensurePremade's own DDL xids must not carry the counter into the next range.
+     */
+    private static void roomInTheRange(Connection c, int maxOffset) throws SQLException {
+        long offset = currentXid(c) % 1000;
+        if (offset > maxOffset) {
+            TestDb.burnXids((int) (1000 - offset) + 10);
+        }
+    }
+
+    /** Four started writers, each committing an insert at a time until {@code done}. */
+    private static List<Thread> committingWriters(TableNames names, AtomicBoolean done, Queue<Throwable> errors) {
+        var writers = new ArrayList<Thread>();
+        for (int i = 0; i < 4; i++) {
+            var writer = new Thread(() -> {
+                try (var c = TestDb.connect()) {
+                    c.setAutoCommit(false);
+                    while (!done.get()) {
+                        execute(c, "insert into " + names.base()
+                                + " (shard, message_id, topic) values (0, gen_random_uuid(), 't')");
+                        c.commit();
+                    }
+                } catch (Throwable e) {
+                    errors.add(e);
+                }
+            });
+            writer.start();
+            writers.add(writer);
+        }
+        return writers;
+    }
+
+    /** A writer, not started, sending a message every 2 ms until {@code done}, the slowest send in {@code slowest}. */
+    private static Thread timedWriter(TableNames names, AtomicBoolean done, AtomicLong slowest,
+            Queue<Throwable> errors) {
+        return new Thread(() -> {
+            try (var w = TestDb.connect()) {
+                while (!done.get()) {
+                    long start = System.nanoTime();
+                    send(w, names, 1);
+                    slowest.accumulateAndGet(System.nanoTime() - start, Math::max);
+                    Thread.sleep(2);
+                }
+            } catch (Throwable e) {
+                errors.add(e);
+            }
+        });
+    }
+
+    /** A started thread that commits {@code c} after {@code millis}. */
+    private static Thread commitAfter(Connection c, long millis, Queue<Throwable> errors) {
+        var thread = new Thread(() -> {
+            try {
+                Thread.sleep(millis);
+                c.commit();
+            } catch (Throwable e) {
+                errors.add(e);
+            }
+        });
+        thread.start();
+        return thread;
+    }
+
+    /** Takes {@code LOCK_SWAP} shared in {@code step}'s transaction, as a relay step does. */
+    private static void holdSwapShared(Connection step, TableNames names) throws SQLException {
+        try (var ps = step.prepareStatement("select pg_advisory_xact_lock_shared(?, ?)")) {
+            ps.setInt(1, names.internalNamespace());
+            ps.setInt(2, TableNames.LOCK_SWAP);
+            ps.execute();
+        }
+    }
+
     /** Sessions holding the swap's advisory lock: a session takes its own again at once, so only this shows a leak. */
     private static long swapLocks(Connection c, TableNames names) throws SQLException {
         return queryLong(c, "select count(*) from pg_locks where locktype = 'advisory' and objsubid = 2 and objid = "
@@ -2149,17 +2076,8 @@ class XidPartitionsIT {
                 .orElseThrow(() -> new AssertionError("no range " + names.partitionPrefix() + lower));
     }
 
-    /** Makes the hold stall for 3 s where the swap could once wait on its own client. */
-    private static void stallInsideTheHold(XidPartitions partitions) {
-        partitions.inHold = "perform pg_sleep(3);";
-    }
-
-    private static void noStallInsideTheHold(XidPartitions partitions) {
-        partitions.inHold = null;
-    }
-
     /** A clock at {@code hour:minute} today in the JVM's zone. */
-    private static Clock at(int hour, int minute) {
+    static Clock at(int hour, int minute) {
         var zone = ZoneId.systemDefault();
         return Clock.fixed(LocalDate.now(zone).atTime(hour, minute).atZone(zone).toInstant(), zone);
     }
@@ -2194,12 +2112,21 @@ class XidPartitionsIT {
         return ids;
     }
 
-    private static String detachPending(Connection c, String table) throws SQLException {
+    /** {@code pg_inherits.inhdetachpending} of {@code table}, as text: null when it is no partition. */
+    static String detachPending(Connection c, String table) throws SQLException {
         return queryString(c, "select inhdetachpending::text from pg_inherits where inhrelid = to_regclass(?)", table);
     }
 
-    private static long currentXid(Connection c) throws SQLException {
-        return queryLong(c, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint");
+    /** Leaves {@code partition} detach-pending: its DETACH CONCURRENTLY times out waiting for an older snapshot. */
+    static void makeDetachPending(TableNames names, String partition) throws SQLException {
+        try (var holder = TestDb.connect(); var c = TestDb.connect()) {
+            holder.setAutoCommit(false);
+            queryLong(holder, "select count(*) from " + names.base());
+            execute(c, "set lock_timeout = '300ms'");
+            assertThatThrownBy(() -> execute(c, "alter table " + names.base() + " detach partition " + partition
+                    + " concurrently")).isInstanceOf(SQLException.class);
+            holder.commit();
+        }
     }
 
     private static UUID insertIntoTail(Connection c, TableNames names) throws SQLException {
@@ -2253,7 +2180,8 @@ class XidPartitionsIT {
         return schema.names();
     }
 
-    private static long tail(Connection c, TableNames names) throws SQLException {
+    /** The tail's lower bound. */
+    static long tail(Connection c, TableNames names) throws SQLException {
         return PartitionDdl.listRanges(c, names.base()).stream()
                 .filter(b -> b.to() == null)
                 .mapToLong(b -> Long.parseLong(b.from()))

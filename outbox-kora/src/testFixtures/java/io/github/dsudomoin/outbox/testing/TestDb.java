@@ -11,6 +11,7 @@ import java.util.Properties;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
 import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetryFactory;
 import ru.tinkoff.kora.database.jdbc.ConnectionContext;
@@ -241,6 +242,31 @@ public final class TestDb {
             @Override
             public DataBaseTelemetry telemetry() {
                 return db.telemetry();
+            }
+        };
+    }
+
+    /** {@code base} with {@code newConnection} for its new connections; the rest forwards to {@code base}. */
+    public static JdbcConnectionFactory opening(JdbcConnectionFactory base, Supplier<Connection> newConnection) {
+        return new JdbcConnectionFactory() {
+            @Override
+            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
+                return base.withConnection(callback);
+            }
+
+            @Override
+            public Connection currentConnection() {
+                return base.currentConnection();
+            }
+
+            @Override
+            public Connection newConnection() {
+                return newConnection.get();
+            }
+
+            @Override
+            public DataBaseTelemetry telemetry() {
+                return base.telemetry();
             }
         };
     }

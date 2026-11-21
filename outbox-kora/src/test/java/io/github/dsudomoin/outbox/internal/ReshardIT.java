@@ -19,7 +19,6 @@ import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
-import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -33,9 +32,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
-import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
-import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 
 /**
@@ -335,30 +331,12 @@ class ReshardIT {
         var node = start(config(4).maintenanceInterval(Duration.ofMillis(50)));
         execute("delete from " + names.instance());
         var failed = new AtomicBoolean();
-        JdbcConnectionFactory failingOnce = new JdbcConnectionFactory() {
-            @Override
-            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
-                return db.withConnection(callback);
+        var failingOnce = TestDb.opening(db, () -> {
+            if (failed.compareAndSet(false, true)) {
+                throw new AssertionError("not an Exception: would cancel a schedule that catches only those");
             }
-
-            @Override
-            public Connection currentConnection() {
-                return db.currentConnection();
-            }
-
-            @Override
-            public Connection newConnection() {
-                if (failed.compareAndSet(false, true)) {
-                    throw new AssertionError("not an Exception: would cancel a schedule that catches only those");
-                }
-                return db.newConnection();
-            }
-
-            @Override
-            public DataBaseTelemetry telemetry() {
-                return db.telemetry();
-            }
-        };
+            return db.newConnection();
+        });
         var heartbeat = new Heartbeat(
                 new KoraOutboxTransactions(failingOnce), node.schema(), node.schema().config(), false);
         try {
