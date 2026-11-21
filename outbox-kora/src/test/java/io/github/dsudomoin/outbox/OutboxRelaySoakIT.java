@@ -6,13 +6,13 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.internal.DeadLetterPass;
-import io.github.dsudomoin.outbox.internal.Hashing;
 import io.github.dsudomoin.outbox.internal.Maintenance;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.ShardKeys;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -211,12 +211,7 @@ class OutboxRelaySoakIT {
     }
 
     private String keyOnShard(int shard, String prefix) {
-        for (int i = 0; ; i++) {
-            var key = prefix + i;
-            if (Hashing.shard(Hashing.keyHash("t", key.getBytes(UTF_8)), config.shards()) == shard) {
-                return key;
-            }
-        }
+        return ShardKeys.first("t", prefix, shard, config.shards());
     }
 
     /** The highest cursor {@code seq}: grows with every cursor row written, whatever maintenance deletes. */

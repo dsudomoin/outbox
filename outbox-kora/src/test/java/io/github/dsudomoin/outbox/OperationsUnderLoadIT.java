@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox;
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
+import static io.github.dsudomoin.outbox.testing.TestSql.queryStrings;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -624,17 +625,8 @@ class OperationsUnderLoadIT {
      */
     private Orphan fill(Connection c, Bound range, long from) throws SQLException {
         // DETACH CONCURRENTLY keeps the bounds as a CHECK; the plain DETACH of MaintenanceIT's orphans leaves none
-        var checks = new ArrayList<String>();
-        try (var ps = c.prepareStatement("select conname from pg_constraint where conrelid = to_regclass(?)"
-                + " and contype = 'c'")) {
-            ps.setString(1, range.name());
-            try (var rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    checks.add(rs.getString(1));
-                }
-            }
-        }
-        for (var check : checks) {
+        for (var check : queryStrings(c, "select conname from pg_constraint where conrelid = to_regclass(?)"
+                + " and contype = 'c'", range.name())) {
             execute(c, "alter table " + range.name() + " drop constraint " + check);
         }
         execute(c, "insert into " + range.name() + " (id, shard, xid, message_id, topic) values (" + ORPHAN_IDS + ", 0,"

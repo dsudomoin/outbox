@@ -8,7 +8,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import io.github.dsudomoin.outbox.internal.BatchClassifier;
 import io.github.dsudomoin.outbox.internal.Cursors;
 import io.github.dsudomoin.outbox.internal.DeadLetterPass;
-import io.github.dsudomoin.outbox.internal.Hashing;
 import io.github.dsudomoin.outbox.internal.Maintenance;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
@@ -17,6 +16,7 @@ import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.internal.Ticks;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.testing.ShardKeys;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -47,6 +47,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -463,17 +464,8 @@ class TortureIT {
 
     /** The first key {@code <topic>-<i>} of each shard. */
     private List<String> keyPerShard(String topic) {
-        var keys = new String[config.shards()];
-        int found = 0;
-        for (int i = 0; found < keys.length; i++) {
-            var key = topic + "-" + i;
-            int shard = Hashing.shard(Hashing.keyHash(topic, key.getBytes(UTF_8)), config.shards());
-            if (keys[shard] == null) {
-                keys[shard] = key;
-                found++;
-            }
-        }
-        return List.of(keys);
+        return IntStream.range(0, config.shards())
+                .mapToObj(s -> ShardKeys.first(topic, topic + "-", s, config.shards())).toList();
     }
 
     /**

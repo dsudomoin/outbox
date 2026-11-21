@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox;
 
+import static io.github.dsudomoin.outbox.testing.Handlers.answering;
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -381,21 +382,13 @@ class TailSwapIT {
     private void start() throws SQLException {
         xidAtStart = currentXid();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
-        relay = new OutboxRelay(db, config, schema, new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) throws Exception {
-                recording.handle(record);
+        relay = new OutboxRelay(db, config, schema, answering(records -> {
+            var before = beforeNextCall.getAndSet(null);
+            if (before != null) {
+                before.run();
             }
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                var before = beforeNextCall.getAndSet(null);
-                if (before != null) {
-                    before.run();
-                }
-                return recording.handleBatch(records);
-            }
-        }, TestTelemetry.kora(), maintenance, new DeadLetterPass(db, names, config, null,
+            return recording.handleBatch(records);
+        }), TestTelemetry.kora(), maintenance, new DeadLetterPass(db, names, config, null,
                 new OutboxMetrics(null)));
         var outbox = new PgOutbox(db, schema, config.shards(), relay::wake, TestTelemetry.kora());
         for (int i = 0; i < WRITERS; i++) {
