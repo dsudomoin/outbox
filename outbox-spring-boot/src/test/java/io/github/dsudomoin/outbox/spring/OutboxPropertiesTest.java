@@ -8,6 +8,7 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -72,10 +73,10 @@ class OutboxPropertiesTest {
         bind(p -> assertThat(p.partitions().tailConversion().window()).isEmpty(),
             "outbox.partitions.tail-conversion.window=");
         bind(p -> assertThat(p.shards()).isEqualTo(16), "outbox.shards=16");
-        bind(p -> assertThat(p.networkTimeout()).isEqualTo(java.time.Duration.ofSeconds(7)),
+        bind(p -> assertThat(p.networkTimeout()).isEqualTo(Duration.ofSeconds(7)),
             "outbox.network-timeout=7s");
         bind(p -> assertThat(p.relay().retry().holdPermanent()).isTrue(), "outbox.relay.retry.hold-permanent=true");
-        bind(p -> assertThat(p.relay().ticksWithoutRelay()).isEqualTo(java.time.Duration.ofMillis(250)),
+        bind(p -> assertThat(p.relay().ticksWithoutRelay()).isEqualTo(Duration.ofMillis(250)),
             "outbox.relay.ticks-without-relay=250ms");
     }
 
@@ -142,14 +143,8 @@ class OutboxPropertiesTest {
     void malformedDurationNamesTheKey() {
         new ApplicationContextRunner().withUserConfiguration(PropertiesConfig.class)
             .withPropertyValues("outbox.relay.batch-timeout=30 seconds")
-            .run(context -> {
-                assertThat(context).hasFailed();
-                List<String> messages = new ArrayList<>();
-                for (Throwable t = context.getStartupFailure(); t != null; t = t.getCause()) {
-                    messages.add(String.valueOf(t.getMessage()));
-                }
-                assertThat(String.join("\n", messages)).contains("outbox.relay.batch-timeout");
-            });
+            .run(context -> assertThat(context).hasFailed().getFailure()
+                .hasStackTraceContaining("outbox.relay.batch-timeout"));
     }
 
     private static List<Method> settingAccessors(Class<?> type) {

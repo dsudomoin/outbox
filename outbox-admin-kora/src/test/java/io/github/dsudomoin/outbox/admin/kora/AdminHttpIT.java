@@ -16,7 +16,9 @@ import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.testing.AdminRows;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
+import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestDb;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -82,8 +84,8 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
                 }
                 httpServer { publicApiHttpPort = %d, privateApiHttpPort = %d }
                 openapi.management.file = ["openapi/kora-outbox-admin.yaml"]
-                """.formatted(TestDb.jdbcUrl(), TestDb.user(), TestDb.password(), TestDb.uniqueTable(), port,
-                freePort()));
+                """.formatted(TestDataSources.jdbcUrl(), TestDataSources.user(), TestDataSources.password(),
+                TestSql.uniqueTable(), port, freePort()));
     }
 
     @Test
@@ -362,7 +364,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
 
     @Test
     void tableNameIsNeverInterpolated() throws Exception {
-        var victim = TestDb.uniqueTable();
+        var victim = TestSql.uniqueTable();
         rows().execute("create table " + victim + " (id bigint)");
         var orphan = rows().foreignOrphan();
         rows().orphanRow(orphan, 1, 10);
@@ -388,10 +390,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         assertJson(none, 409);
         assertThat(none.body()).startsWith("{\"message\":\"no xid regression to recover");
 
-        var outbox = new PgOutbox(new KoraOutboxTransactions(db), schema, 2, () -> {}, TestTelemetry.kora());
-        var sent = db.inTx((SqlFunction0<List<UUID>>) () -> outbox.sendAll(List.of(
-                OutboxMessage.of("t", "a", bytes("1")), OutboxMessage.of("t", "b", bytes("2")),
-                OutboxMessage.of("t", "c", bytes("3")))));
+        var sent = sendThree();
         rows().forgeRegression();
 
         var recovered = call("POST", "/recovery/xid-regression", null);
@@ -409,10 +408,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         assertJson(none, 409);
         assertThat(none.body()).startsWith("{\"message\":\"no stranded shards");
 
-        var outbox = new PgOutbox(new KoraOutboxTransactions(db), schema, 2, () -> {}, TestTelemetry.kora());
-        var sent = db.inTx((SqlFunction0<List<UUID>>) () -> outbox.sendAll(List.of(
-                OutboxMessage.of("t", "a", bytes("1")), OutboxMessage.of("t", "b", bytes("2")),
-                OutboxMessage.of("t", "c", bytes("3")))));
+        var sent = sendThree();
         rows().execute("insert into " + names().tick() + " (snapshot) values (pg_current_snapshot())");
         rows().execute("delete from " + names().tick() + " where id = (select min(tick_id) from "
                 + names().cursor() + ")");
@@ -532,9 +528,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         }
 
         assertJson(response, 200);
-        var audit = log.lines().filter(l -> l.contains("INFO " + OutboxAdminInterceptor.class.getName() + " - "))
-                .toList();
-        assertThat(audit).singleElement().asString().endsWith("outbox admin POST \"" + API + "/waiting/abandon\""
+        assertThat(AdminCoexistenceIT.audit(log)).singleElement().asString().endsWith("outbox admin POST \"" + API + "/waiting/abandon\""
                 + " by \"tester\" with topic \"t\", key \"ключ\", reason \"v2 rolled back\\\", dryRun"
                 + " \\\"true\\r\\nINFO forged\", dryRun \"false\": 200");
         assertThat(log).doesNotContain("\nINFO forged");
@@ -560,9 +554,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
             log = stderr.text();
         }
 
-        var audit = log.lines().filter(l -> l.contains("INFO " + OutboxAdminInterceptor.class.getName() + " - "))
-                .map(l -> l.substring(l.indexOf("outbox admin "))).toList();
-        assertThat(audit).containsExactly(
+        assertThat(AdminCoexistenceIT.audit(log)).containsExactly(
                 "outbox admin POST \"" + API + "/dead-letters/discard\" by \"tester\" with topic \"orders\", key"
                         + " \"k\", error \"boom\", failedFrom \"2026-01-15T10:00:00Z\", failedTo"
                         + " \"2026-01-16T10:00:00Z\", status \"kept\": 200",
@@ -698,6 +690,13 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
 
     // ---------------------------------------------------------------------------------------------------- fixtures
 
+    private List<UUID> sendThree() {
+        var outbox = new PgOutbox(new KoraOutboxTransactions(db), schema, 2, () -> {}, TestTelemetry.kora());
+        return db.inTx((SqlFunction0<List<UUID>>) () -> outbox.sendAll(List.of(
+                OutboxMessage.of("t", "a", bytes("1")), OutboxMessage.of("t", "b", bytes("2")),
+                OutboxMessage.of("t", "c", bytes("3")))));
+    }
+
     private AdminRows rows() {
         return new AdminRows(TestDb::connect, names());
     }
@@ -720,17 +719,16 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
 
     private HttpResponse<String> call(String method, String path, String body) throws Exception {
         var request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + API + path))
-                .timeout(Duration.ofSeconds(60)) // another process can take this port on 127.0.0.1 and never answer
-                .header("X-Api-Key", "secret")
                 .method(method, body == null ? BodyPublishers.noBody() : BodyPublishers.ofString(body));
         if (body != null) {
             request.header("Content-Type", "application/json");
         }
-        return client.send(request.build(), BodyHandlers.ofString());
+        return send(request);
     }
 
     /** {@code request} with the test's key, sent as it is otherwise. */
     private HttpResponse<String> send(HttpRequest.Builder request) throws Exception {
+        // the timeout: another process can take this port on 127.0.0.1 and never answer
         return client.send(request.timeout(Duration.ofSeconds(60)).header("X-Api-Key", "secret").build(),
                 BodyHandlers.ofString());
     }

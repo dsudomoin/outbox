@@ -7,7 +7,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
 import io.github.dsudomoin.outbox.OutboxSql;
-import io.github.dsudomoin.outbox.spring.OutboxAutoConfigurationIT.WithInboxUser;
+import io.github.dsudomoin.outbox.spring.OutboxAutoConfigurationIT.InboxUser;
 import io.github.dsudomoin.outbox.spring.OutboxAutoConfigurationIT.WithOwner;
 import io.github.dsudomoin.outbox.spring.TestApps.OrdersRoute;
 import io.github.dsudomoin.outbox.spring.TestApps.WithRoute;
@@ -145,7 +145,7 @@ class MigrationsIT {
     @Test
     void migrationRunsBeforeInboxCheck() throws IOException {
         Files.writeString(migrations.resolve("V2__inbox.sql"), OutboxSql.inbox(config, app));
-        var flyway = flyway().withClassLoader(NO_JPA).withUserConfiguration(WithInboxUser.class);
+        var flyway = flyway().withClassLoader(NO_JPA).withBean(InboxUser.class);
 
         flyway.withPropertyValues("spring.flyway.enabled=false").run(context -> assertThat(context).hasFailed()
             .getFailure().rootCause().hasMessageContaining("schema check of " + config.inbox().table() + " failed"));

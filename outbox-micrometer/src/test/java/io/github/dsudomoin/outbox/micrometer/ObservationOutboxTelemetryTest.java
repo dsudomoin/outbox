@@ -323,8 +323,7 @@ class ObservationOutboxTelemetryTest {
 
     @Test
     void storedBaggageSurvivesHanding() {
-        var withBaggage = new OtelPropagator(ContextPropagators.create(TextMapPropagator.composite(
-                W3CTraceContextPropagator.getInstance(), W3CBaggagePropagator.getInstance())), otel);
+        var withBaggage = withBaggage();
         var registry = ObservationRegistry.create();
         registry.observationConfig().observationHandler(new ObservationHandler.FirstMatchingCompositeObservationHandler(
                 new PropagatingReceiverTracingObservationHandler<>(tracer, withBaggage),

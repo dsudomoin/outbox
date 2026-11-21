@@ -85,7 +85,8 @@ class AdminCoexistenceIT {
     @Configuration(proxyBeanMethods = false)
     static class App implements WebMvcConfigurer {
 
-        private final List<String> intercepted = new CopyOnWriteArrayList<>();
+        /** The paths its interceptor saw, for the test. */
+        final List<String> intercepted = new CopyOnWriteArrayList<>();
 
         @Bean
         AppController appController() {
@@ -103,12 +104,6 @@ class AdminCoexistenceIT {
                 ((HttpServletResponse) response).setHeader("X-Test-Global", "1");
                 chain.doFilter(request, response);
             };
-        }
-
-        /** The paths its interceptor saw, for the test. */
-        @Bean
-        List<String> intercepted() {
-            return intercepted;
         }
 
         @Override
@@ -131,11 +126,6 @@ class AdminCoexistenceIT {
                 }
             }).addPathPatterns("/status", "/dead-letters");
         }
-    }
-
-    @SuppressWarnings("unchecked")
-    private static List<String> intercepted(AdminServer server) {
-        return server.context.getBean("intercepted", List.class);
     }
 
     private static AdminServer app() {
@@ -257,7 +247,7 @@ class AdminCoexistenceIT {
                 lines += 3;
                 awaitAudit(stderr, lines);
             }
-            assertThat(intercepted(server)).as("only the allowed calls got past the guard")
+            assertThat(server.bean(App.class).intercepted).as("only the allowed calls got past the guard")
                 .containsExactlyElementsOf(AdminRows.ROUTES.stream().map(r -> path(server, r)).toList());
 
             var expected = new ArrayList<String>();

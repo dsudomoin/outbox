@@ -11,6 +11,8 @@ import java.time.LocalDate;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import tools.jackson.databind.exc.InvalidFormatException;
@@ -123,22 +125,14 @@ class JacksonCompatibilityIT {
         assertThat(jackson3.readValue(json, Primitive.class)).isEqualTo(new Primitive(1, "n"));
     }
 
-    /** Difference: Jackson 2 reads 0, Jackson 3 refuses (FAIL_ON_NULL_FOR_PRIMITIVES is on by default). */
-    @Test
-    void missingPrimitiveFieldIsZeroOnJackson2AndFailsOnJackson3() throws Exception {
-        var json = "{\"note\":\"n\"}";
-
+    /**
+     * Difference: a missing or null primitive reads as 0 on Jackson 2, Jackson 3 refuses it
+     * (FAIL_ON_NULL_FOR_PRIMITIVES is on by default).
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"{\"note\":\"n\"}", "{\"id\":null,\"note\":\"n\"}"})
+    void missingOrNullPrimitiveFieldIsZeroOnJackson2AndFailsOnJackson3(String json) throws Exception {
         assertThat(jackson2.readValue(json, Primitive.class)).isEqualTo(new Primitive(0, "n"));
-        assertThatThrownBy(() -> jackson3.readValue(json, Primitive.class))
-            .isInstanceOf(MismatchedInputException.class).hasMessageContaining("Cannot map `null` into type `long`");
-    }
-
-    /** Difference: as a missing one. */
-    @Test
-    void nullPrimitiveFieldIsZeroOnJackson2AndFailsOnJackson3() throws Exception {
-        var json = "{\"id\":null}";
-
-        assertThat(jackson2.readValue(json, Primitive.class)).isEqualTo(new Primitive(0, null));
         assertThatThrownBy(() -> jackson3.readValue(json, Primitive.class))
             .isInstanceOf(MismatchedInputException.class).hasMessageContaining("Cannot map `null` into type `long`");
     }

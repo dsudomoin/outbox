@@ -146,19 +146,10 @@ class HeartbeatIT {
         }
     }
 
-    @Configuration(proxyBeanMethods = false)
-    static class WithBrokenHikari {
-
-        @Bean
-        BrokenHikariWrapper dataSource() {
-            return new BrokenHikariWrapper();
-        }
-    }
-
     @Test
     void aFailedDerivationSharesTheAppConnections() {
         try (var log = new CapturedStderr()) {
-            runner().withUserConfiguration(WithBrokenHikari.class).run(context -> {
+            runner().withBean(BrokenHikariWrapper.class).run(context -> {
                 assertThat(context).hasNotFailed();
                 assertBeatsTakeConnections(context, context.getBean(BrokenHikariWrapper.class),
                     "app connections across two beats");

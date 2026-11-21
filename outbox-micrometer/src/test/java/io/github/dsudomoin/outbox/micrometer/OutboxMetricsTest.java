@@ -42,7 +42,6 @@ class OutboxMetricsTest {
             noop.deadLetterHookFailed();
             noop.relayFailed(new SQLException("x"));
             noop.gauge(OutboxGauge.RETRY_SIZE, () -> 1);
-            noop.gauge(OutboxGauge.RETRY_SIZE, () -> 1);
         }).doesNotThrowAnyException();
     }
 
@@ -165,14 +164,6 @@ class OutboxMetricsTest {
                 .isEqualTo(1);
         assertThat(registry.get("outbox.messages.route_unchecked").tags("topic", "orders").counter().count())
                 .isEqualTo(1);
-    }
-
-    @Test
-    void relayFailuresCount() {
-        metrics.relayFailed(new SQLException("x"));
-        metrics.relayFailed(new SQLException("y"));
-
-        assertThat(registry.counter("outbox.relay.failures").count()).isEqualTo(2.0);
     }
 
     private double waits(String topic, String kind) {

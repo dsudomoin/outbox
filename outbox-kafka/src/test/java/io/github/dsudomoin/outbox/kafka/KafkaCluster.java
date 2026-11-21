@@ -115,7 +115,7 @@ final class KafkaCluster implements AutoCloseable {
         awaitAllBrokers();
     }
 
-    String bootstrapServers() {
+    private String bootstrapServers() {
         return proxies.stream().map(p -> "localhost:" + p.port()).collect(Collectors.joining(","));
     }
 
@@ -183,7 +183,7 @@ final class KafkaCluster implements AutoCloseable {
         }
     }
 
-    TopicDescription describe(String topic) {
+    private TopicDescription describe(String topic) {
         try (var admin = admin()) {
             return admin.describeTopics(List.of(topic)).allTopicNames().get(30, TimeUnit.SECONDS).get(topic);
         } catch (Exception e) {
@@ -312,7 +312,7 @@ final class KafkaCluster implements AutoCloseable {
         }
     }
 
-    static void await(Duration timeout, BooleanSupplier condition) {
+    private static void await(Duration timeout, BooleanSupplier condition) {
         long deadline = System.nanoTime() + timeout.toNanos();
         while (!condition.getAsBoolean()) {
             if (System.nanoTime() > deadline) {

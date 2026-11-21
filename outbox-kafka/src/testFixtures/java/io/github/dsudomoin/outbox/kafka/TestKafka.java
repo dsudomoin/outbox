@@ -16,6 +16,8 @@ import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.header.Headers;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.testcontainers.kafka.KafkaContainer;
 
@@ -127,5 +129,14 @@ public final class TestKafka {
     public static String traceparent(ConsumerRecord<byte[], byte[]> record) {
         var header = record.headers().lastHeader("traceparent");
         return header == null ? null : new String(header.value(), UTF_8);
+    }
+
+    /** Each header as key and UTF-8 value, in order; a null value reads {@code <null>}. */
+    public static List<Map.Entry<String, String>> headers(Headers headers) {
+        var result = new ArrayList<Map.Entry<String, String>>();
+        for (Header h : headers) {
+            result.add(Map.entry(h.key(), h.value() == null ? "<null>" : new String(h.value(), UTF_8)));
+        }
+        return result;
     }
 }

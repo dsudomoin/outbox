@@ -9,7 +9,9 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.kafka.KafkaOutboxHeaders;
 import io.github.dsudomoin.outbox.kafka.TestKafka;
+import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestDb;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Duration;
 import java.util.LinkedHashSet;
@@ -26,7 +28,7 @@ import ru.tinkoff.kora.test.extension.junit5.TestComponent;
 class KafkaOutboxModuleIT implements KoraAppTestConfigModifier {
 
     private final String topic = TestKafka.createTopic(1);
-    private final String table = TestDb.uniqueTable();
+    private final String table = TestSql.uniqueTable();
 
     @TestComponent
     private JdbcDatabase db;
@@ -41,7 +43,7 @@ class KafkaOutboxModuleIT implements KoraAppTestConfigModifier {
 
     /** Test DB and broker, a fresh outbox table. */
     static KoraConfigModification config(String poolName) {
-        return config(poolName, TestDb.uniqueTable(), "");
+        return config(poolName, TestSql.uniqueTable(), "");
     }
 
     /** Test DB and broker, outbox table {@code table}; {@code kafka} adds keys to {@code outbox.kafka}. */
@@ -63,8 +65,8 @@ class KafkaOutboxModuleIT implements KoraAppTestConfigModifier {
                     %s
                   }
                 }
-                """.formatted(TestDb.jdbcUrl(), TestDb.user(), TestDb.password(), poolName, table,
-                TestKafka.bootstrapServers(), kafka));
+                """.formatted(TestDataSources.jdbcUrl(), TestDataSources.user(), TestDataSources.password(),
+                poolName, table, TestKafka.bootstrapServers(), kafka));
     }
 
     @Test

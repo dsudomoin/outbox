@@ -10,7 +10,7 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
-import io.github.dsudomoin.outbox.testing.TestDb;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
@@ -34,7 +34,7 @@ class KafkaReplaceIT implements KoraAppTestConfigModifier {
 
     @Override
     public KoraConfigModification config() { // the module's dead-letter topic is on: the app's hook still replaces it
-        return KafkaOutboxModuleIT.config("kafka-replace", TestDb.uniqueTable(), "deadLetterTopic = \"{topic}.dlq\"");
+        return KafkaOutboxModuleIT.config("kafka-replace", TestSql.uniqueTable(), "deadLetterTopic = \"{topic}.dlq\"");
     }
 
     @Test

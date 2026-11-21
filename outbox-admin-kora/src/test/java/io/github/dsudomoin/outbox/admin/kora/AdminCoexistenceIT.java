@@ -8,7 +8,9 @@ import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.testing.AdminRows;
 import io.github.dsudomoin.outbox.testing.AdminRows.Route;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
+import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestDb;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.ServerSocket;
@@ -50,7 +52,7 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
     private AdminTestApp.DelegateCalls delegate;
 
     private final HttpClient client = HttpClient.newHttpClient();
-    private final String table = TestDb.uniqueTable();
+    private final String table = TestSql.uniqueTable();
     /** Another process can take the test's port on 127.0.0.1 and never answer. */
     private static final Duration ANSWER = Duration.ofSeconds(60);
 
@@ -77,7 +79,8 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
                   file = ["openapi/test-app.yaml", "openapi/kora-outbox-admin.yaml"]
                   swaggerui.enabled = true
                 }
-                """.formatted(TestDb.jdbcUrl(), TestDb.user(), TestDb.password(), table, port, freePort()));
+                """.formatted(TestDataSources.jdbcUrl(), TestDataSources.user(), TestDataSources.password(),
+                table, port, freePort()));
     }
 
     static Stream<Route> routes() {
@@ -242,7 +245,7 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
     // ------------------------------------------------------------------------------------------------------- HTTP
 
     /** The interceptor's INFO lines, from {@code outbox admin}. */
-    private static List<String> audit(String log) {
+    static List<String> audit(String log) {
         return log.lines().filter(l -> l.contains(AUDIT)).map(l -> l.substring(l.indexOf(AUDIT) + AUDIT.length()))
                 .toList();
     }

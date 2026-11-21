@@ -39,9 +39,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
-import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.ProducerConfig;
-import org.apache.kafka.common.header.Header;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -91,7 +89,7 @@ class KafkaEndToEndIT {
         var record = received.get(keyed);
         assertThat(record.key()).isEqualTo(bytes("k1"));
         assertThat(record.value()).isEqualTo(bytes("v1"));
-        assertThat(headers(record)).containsExactly(
+        assertThat(TestKafka.headers(record.headers())).containsExactly(
                 Map.entry("h", "a"), Map.entry("no-value", "<null>"), Map.entry("h", "b"),
                 Map.entry(KafkaOutboxHeaders.MESSAGE_ID, keyed.toString()));
         assertThat(received.get(tombstone).key()).isNull();
@@ -289,14 +287,6 @@ class KafkaEndToEndIT {
         var sender = new KafkaOutboxSender(() -> properties);
         senders.add(sender);
         return sender;
-    }
-
-    private static List<Map.Entry<String, String>> headers(ConsumerRecord<byte[], byte[]> record) {
-        var result = new ArrayList<Map.Entry<String, String>>();
-        for (Header h : record.headers()) {
-            result.add(Map.entry(h.key(), h.value() == null ? "<null>" : new String(h.value(), UTF_8)));
-        }
-        return result;
     }
 
     private static byte[] bytes(String s) {

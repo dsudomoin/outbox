@@ -70,43 +70,18 @@ class OutboxAutoConfigurationIT {
             .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("outbox-kafka-spring-boot"));
     }
 
-    @Configuration(proxyBeanMethods = false)
-    static class AppConfig {
-
-        @Bean
-        TestOutboxConfig appOutboxConfig() {
-            return new TestOutboxConfig();
-        }
-    }
-
     @Test
     void appOutboxConfigBeanReplacesProperties() {
-        runner().withUserConfiguration(WithRoute.class, AppConfig.class).run(context -> {
-            assertThat(context).hasNotFailed().hasSingleBean(OutboxConfig.class)
-                .doesNotHaveBean(OutboxProperties.class);
-            var table = context.getBean(TestOutboxConfig.class).table();
+        runner().withUserConfiguration(WithRoute.class)
+            .withBean(TestOutboxConfig.class, TestOutboxConfig::new).run(context -> {
+                assertThat(context).hasNotFailed().hasSingleBean(OutboxConfig.class)
+                    .doesNotHaveBean(OutboxProperties.class);
+                var table = table(context);
 
-            var id = send(context, "orders");
+                var id = send(context, "orders");
 
-            assertThat(queryLong("select count(*) from " + table + " where message_id = '" + id + "'")).isOne();
-        });
-    }
-
-    @Test
-    void enabledFalseKeepsInbox() {
-        runner("outbox.enabled=false").run(context -> {
-            assertThat(context).hasNotFailed().doesNotHaveBean(Outbox.class).doesNotHaveBean(OutboxLifecycle.class)
-                .doesNotHaveBean(OutboxAdmin.class);
-            var inbox = context.getBean(Inbox.class);
-            var tx = new TransactionTemplate(context.getBean(PlatformTransactionManager.class));
-            var id = UuidV7.next();
-
-            Boolean first = tx.execute(status -> inbox.tryAccept(id));
-            Boolean again = tx.execute(status -> inbox.tryAccept(id));
-
-            assertThat(first).isTrue();
-            assertThat(again).isFalse();
-        });
+                assertThat(queryLong("select count(*) from " + table + " where message_id = '" + id + "'")).isOne();
+            });
     }
 
     /** The switch decides as the binder binds it, whatever the spelling. */
@@ -117,6 +92,15 @@ class OutboxAutoConfigurationIT {
             assertThat(context).hasNotFailed().doesNotHaveBean(Outbox.class).doesNotHaveBean(OutboxLifecycle.class)
                 .doesNotHaveBean(OutboxAdmin.class).hasSingleBean(Inbox.class);
             assertThat(context.getBean(OutboxProperties.class).enabled()).isFalse();
+            var inbox = context.getBean(Inbox.class);
+            var tx = new TransactionTemplate(context.getBean(PlatformTransactionManager.class));
+            var id = UuidV7.next();
+
+            Boolean first = tx.execute(status -> inbox.tryAccept(id));
+            Boolean again = tx.execute(status -> inbox.tryAccept(id));
+
+            assertThat(first).isTrue();
+            assertThat(again).isFalse();
         });
     }
 
@@ -136,22 +120,13 @@ class OutboxAutoConfigurationIT {
     /** A bean that uses the inbox. */
     record InboxUser(Inbox inbox) {}
 
-    @Configuration(proxyBeanMethods = false)
-    static class WithInboxUser {
-
-        @Bean
-        InboxUser inboxUser(Inbox inbox) {
-            return new InboxUser(inbox);
-        }
-    }
-
     @Test
     void inboxTableOnlyWhenInjected() {
         runner().withUserConfiguration(WithRoute.class).run(context -> {
             assertThat(context).hasNotFailed();
             assertThat(regclass(context.getBean(OutboxConfig.class).inbox().table())).isZero();
         });
-        runner().withUserConfiguration(WithRoute.class, WithInboxUser.class).run(context -> {
+        runner().withUserConfiguration(WithRoute.class).withBean(InboxUser.class).run(context -> {
             assertThat(context).hasNotFailed();
             assertThat(regclass(context.getBean(OutboxConfig.class).inbox().table())).isOne();
         });
@@ -170,15 +145,11 @@ class OutboxAutoConfigurationIT {
         @Bean(defaultCandidate = false)
         @OutboxOwner
         DataSource ownerDataSource() {
-            return as(owner);
+            var ds = (PGSimpleDataSource) TestDataSources.newDataSource();
+            ds.setUser(owner);
+            ds.setPassword("pw");
+            return ds;
         }
-    }
-
-    private static PGSimpleDataSource as(String role) {
-        var ds = (PGSimpleDataSource) TestDataSources.newDataSource();
-        ds.setUser(role);
-        ds.setPassword("pw");
-        return ds;
     }
 
     @Configuration(proxyBeanMethods = false)

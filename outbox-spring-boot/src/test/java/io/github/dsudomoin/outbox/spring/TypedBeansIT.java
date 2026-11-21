@@ -723,21 +723,18 @@ class TypedBeansIT {
             .isInstanceOf(NoSuchBeanDefinitionException.class);
     }
 
-    /** A scan of all beans is not about this adapter: with no injection point the generic beans are just absent. */
+    /**
+     * A scan of all beans is not about this adapter: with or without an injection point the generic beans are just
+     * absent.
+     */
     @Test
-    void scansSucceedWithoutTypedBeans() {
-        app().run(context -> {
-            assertScansSucceed(context);
-            assertThat(context.getBeansOfType(OutboxSerializer.class)).isEmpty();
-        });
-    }
-
-    @Test
-    void scansSucceedWithTypedBeans() {
-        app().withUserConfiguration(OrdersApp.class).run(context -> {
-            assertScansSucceed(context);
-            assertThat(context.getBeansOfType(OutboxSerializer.class)).isEmpty();
-        });
+    void scansSucceedWithoutExplicitBeans() {
+        for (var run : List.of(app(), app().withUserConfiguration(OrdersApp.class))) {
+            run.run(context -> {
+                assertScansSucceed(context);
+                assertThat(context.getBeansOfType(OutboxSerializer.class)).isEmpty();
+            });
+        }
     }
 
     @Test

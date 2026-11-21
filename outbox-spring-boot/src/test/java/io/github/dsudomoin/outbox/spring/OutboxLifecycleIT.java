@@ -316,18 +316,9 @@ class OutboxLifecycleIT {
         });
     }
 
-    @Configuration(proxyBeanMethods = false)
-    static class WithFallback {
-
-        @Bean
-        RecordingHandler fallback() {
-            return new RecordingHandler();
-        }
-    }
-
     @Test
     void sendAfterStopIsDurable() {
-        runner().withUserConfiguration(WithFallback.class).run(context -> {
+        runner().withBean(RecordingHandler.class).run(context -> {
             var handler = context.getBean(RecordingHandler.class);
             context.stop();
 

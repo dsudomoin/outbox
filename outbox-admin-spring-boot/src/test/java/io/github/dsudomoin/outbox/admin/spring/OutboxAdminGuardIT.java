@@ -190,16 +190,12 @@ class OutboxAdminGuardIT {
         try (var server = AdminServer.start(List.of("spring.aop.proxy-target-class=false"), WithKeys.class,
             WithSpy.class)) {
             assertThat(Proxy.isProxyClass(server.bean(OutboxAdminApi.class).getClass())).isTrue();
-            server.execute("insert into " + server.names.dead()
-                + " (id, shard, message_id, topic, created_at, attempts)"
-                + " values (1, 0, gen_random_uuid(), 't', now(), 3)");
+            letter(server);
 
             assertThat(server.post(DISCARD, "{\"ids\":[1]}").statusCode()).isEqualTo(500);
             assertThat(server.post(DISCARD, "{\"ids\":[1]}", KEY, "secret").statusCode()).isEqualTo(500);
 
-            try (var c = server.bean(DataSource.class).getConnection()) {
-                assertThat(TestSql.queryLong(c, "select count(*) from " + server.names.dead())).isEqualTo(1);
-            }
+            assertThat(letters(server)).isEqualTo(1);
         }
     }
 
@@ -252,9 +248,7 @@ class OutboxAdminGuardIT {
     void aDeniedPostDoesNotReadItsBodyAndChangesNothing() throws Exception {
         try (var server = AdminServer.start(WithKeys.class, WithSpy.class, WithBodyProbe.class)) {
             var probe = server.bean(BodyProbe.class);
-            server.execute("insert into " + server.names.dead()
-                + " (id, shard, message_id, topic, created_at, attempts)"
-                + " values (1, 0, gen_random_uuid(), 't', now(), 3)");
+            letter(server);
 
             assertError(server.post(DISCARD, "{\"ids\":[1]}"), 401, "X-Api-Key required");
             assertError(server.post(DISCARD, "not json", KEY, "wrong"), 403, "unknown key");
@@ -886,22 +880,13 @@ class OutboxAdminGuardIT {
             .withUserConfiguration(configurations).withPropertyValues(AdminHttpIT.properties());
     }
 
-    @Test
-    void noAuthorizerFailsTheStartNamingIt() {
-        runner().run(context -> {
-            assertThat(context).hasFailed();
-            assertThat(context.getStartupFailure()).isExactlyInstanceOf(IllegalStateException.class).hasNoCause()
-                .hasMessageStartingWith("no OutboxAdminAuthorizer bean: the admin API has no other protection, so it"
-                    + " does not start without one; define a bean");
-        });
-    }
-
     /** What the operator reads: Boot's failure analyzer would put its own text in place of this one, given a cause. */
     @Test
     void aRealStartWithoutAnAuthorizerReportsTheAdvice() {
         try (var stderr = new CapturedStderr()) {
             assertThatThrownBy(AdminServer::start).isExactlyInstanceOf(IllegalStateException.class).hasNoCause()
-                .hasMessageContaining("no OutboxAdminAuthorizer bean");
+                .hasMessageStartingWith("no OutboxAdminAuthorizer bean: the admin API has no other protection, so it"
+                    + " does not start without one; define a bean");
 
             assertThat(stderr.text()).contains("no OutboxAdminAuthorizer bean")
                 .doesNotContain("Consider defining a bean");

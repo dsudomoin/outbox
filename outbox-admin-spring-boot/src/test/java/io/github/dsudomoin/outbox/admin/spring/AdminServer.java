@@ -17,7 +17,6 @@ import java.net.http.HttpResponse;
 import java.net.http.HttpResponse.BodyHandlers;
 import java.sql.SQLException;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import javax.sql.DataSource;
@@ -93,13 +92,9 @@ final class AdminServer implements AutoCloseable {
     }
 
     static AdminServer start(List<String> properties, Class<?>... configurations) {
-        var all = new HashMap<String, Object>();
-        for (var property : AdminHttpIT.properties(properties.toArray(String[]::new))) {
-            all.put(property.substring(0, property.indexOf('=')), property.substring(property.indexOf('=') + 1));
-        }
-        all.put("server.port", "0");
-        all.put("spring.main.banner-mode", "off");
-        var builder = new SpringApplicationBuilder(Base.class).sources(configurations).properties(all);
+        var builder = new SpringApplicationBuilder(Base.class).sources(configurations)
+            .properties(AdminHttpIT.properties(properties.toArray(String[]::new)))
+            .properties("server.port=0", "spring.main.banner-mode=off");
         return new AdminServer(builder.run());
     }
 

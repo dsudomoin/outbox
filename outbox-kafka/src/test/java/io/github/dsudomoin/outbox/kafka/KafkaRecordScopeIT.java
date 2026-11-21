@@ -146,8 +146,7 @@ class KafkaRecordScopeIT {
         var sender = new KafkaOutboxSender(() -> properties, props -> new KafkaProducer<byte[], byte[]>(props) {
             @Override
             public Future<RecordMetadata> send(ProducerRecord<byte[], byte[]> record, Callback callback) {
-                var id = UUID.fromString(new String(record.headers().lastHeader(KafkaOutboxHeaders.MESSAGE_ID).value(),
-                        UTF_8));
+                var id = KafkaOutboxHeaders.messageId(record.headers());
                 sends.add(new Send(id, telemetry.scope.get()));
                 return super.send(record, callback);
             }

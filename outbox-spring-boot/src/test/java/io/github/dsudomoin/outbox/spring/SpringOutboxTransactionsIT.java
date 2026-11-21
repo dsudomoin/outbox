@@ -109,11 +109,8 @@ class SpringOutboxTransactionsIT {
 
     private static ApplicationContextRunner runner(String... properties) {
         return new ApplicationContextRunner().withUserConfiguration(App.class)
-            .withPropertyValues("spring.datasource.url=" + TestDataSources.jdbcUrl(),
-                "spring.datasource.username=" + TestDataSources.user(),
-                "spring.datasource.password=" + TestDataSources.password(),
-                "spring.flyway.enabled=false", "spring.liquibase.enabled=false",
-                "spring.autoconfigure.exclude=io.github.dsudomoin.outbox.spring.OutboxAutoConfiguration")
+            .withPropertyValues(TestApps.properties(
+                "spring.autoconfigure.exclude=io.github.dsudomoin.outbox.spring.OutboxAutoConfiguration"))
             .withPropertyValues(properties);
     }
 

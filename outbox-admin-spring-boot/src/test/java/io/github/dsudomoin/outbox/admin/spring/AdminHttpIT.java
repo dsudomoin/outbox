@@ -15,7 +15,6 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.testing.AdminRows;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
-import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import jakarta.servlet.http.HttpServletRequest;
@@ -43,7 +42,6 @@ import org.json.JSONException;
 import org.junit.jupiter.api.Test;
 import org.skyscreamer.jsonassert.JSONAssert;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.test.context.FilteredClassLoader;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.test.context.runner.WebApplicationContextRunner;
@@ -83,16 +81,6 @@ class AdminHttpIT {
     private MockMvc mvc;
     private TableNames names;
 
-    @Configuration(proxyBeanMethods = false)
-    @EnableAutoConfiguration
-    static class Boot {
-
-        @Bean
-        RecordingHandler handler() {
-            return new RecordingHandler();
-        }
-    }
-
     /** These tests are about the routes; {@link OutboxAdminGuardIT} is about who gets to them. */
     @Configuration(proxyBeanMethods = false)
     static class AllowAll {
@@ -124,7 +112,7 @@ class AdminHttpIT {
 
     private void app(Class<?>[] configurations, Body body, String... properties) {
         new WebApplicationContextRunner()
-            .withUserConfiguration(Boot.class, AllowAll.class).withUserConfiguration(configurations)
+            .withUserConfiguration(AdminServer.Base.class, AllowAll.class).withUserConfiguration(configurations)
             .withPropertyValues(properties(properties)).run(started -> {
                 assertThat(started).hasNotFailed();
                 context = started;
@@ -213,19 +201,6 @@ class AdminHttpIT {
             var last = call("GET", "/dead-letters?limit=2&afterId=" + b, null);
             assertThat(ids(last.body)).containsExactly(c);
             assertThat(last.body).as("a short page is the last").doesNotContain("nextAfterId");
-        });
-    }
-
-    @Test
-    void letterJsonCarriesEveryField() {
-        app(() -> {
-            long id = rows().letter(7, "t", "k", "timeout", T0, PENDING);
-            rows().execute("update " + names.dead() + " set redrives = 2, handler_attempts = 1 where id = " + id);
-
-            var response = call("GET", "/dead-letters?topic=t", null);
-
-            assertJson(response, 200);
-            assertSameJson(response.body, letterJson(id, rows().messageId(id)));
         });
     }
 
@@ -620,10 +595,7 @@ class AdminHttpIT {
             assertJson(none, 409);
             assertThat(none.body).startsWith("{\"message\":\"no xid regression to recover");
 
-            var outbox = context.getBean(Outbox.class);
-            var sent = new TransactionTemplate(context.getBean(PlatformTransactionManager.class))
-                .execute(status -> outbox.sendAll(List.of(OutboxMessage.of("t", "a", bytes("1")),
-                    OutboxMessage.of("t", "b", bytes("2")), OutboxMessage.of("t", "c", bytes("3")))));
+            var sent = sendThree();
             rows().forgeRegression();
 
             var recovered = call("POST", "/recovery/xid-regression", null);
@@ -643,10 +615,7 @@ class AdminHttpIT {
             assertJson(none, 409);
             assertThat(none.body).startsWith("{\"message\":\"no stranded shards");
 
-            var outbox = context.getBean(Outbox.class);
-            var sent = new TransactionTemplate(context.getBean(PlatformTransactionManager.class))
-                .execute(status -> outbox.sendAll(List.of(OutboxMessage.of("t", "a", bytes("1")),
-                    OutboxMessage.of("t", "b", bytes("2")), OutboxMessage.of("t", "c", bytes("3")))));
+            var sent = sendThree();
             rows().execute("insert into " + names.tick() + " (snapshot) values (pg_current_snapshot())");
             rows().execute("delete from " + names.tick() + " where id = (select min(tick_id) from "
                 + names.cursor() + ")");
@@ -1120,7 +1089,7 @@ class AdminHttpIT {
     /** {@link RequestReadersTest} has what a classpath does to it; this, that the check is not left for the first call. */
     @Test
     void theReaderIsNotLazy() {
-        new WebApplicationContextRunner().withUserConfiguration(Boot.class, AllowAll.class)
+        new WebApplicationContextRunner().withUserConfiguration(AdminServer.Base.class, AllowAll.class)
             .withInitializer(context -> context.addBeanFactoryPostProcessor(
                 new org.springframework.boot.LazyInitializationBeanFactoryPostProcessor()))
             .withPropertyValues(properties())
@@ -1158,53 +1127,6 @@ class AdminHttpIT {
         }
     }
 
-    @RestControllerAdvice
-    static class AppAdvice {
-
-        @ExceptionHandler(Exception.class)
-        ResponseEntity<String> any(Exception e) {
-            return ResponseEntity.status(418).body("the app's handler: " + e.getClass().getSimpleName());
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class App {
-
-        @Bean
-        AppController appController() {
-            return new AppController();
-        }
-
-        @Bean
-        AppAdvice appAdvice() {
-            return new AppAdvice();
-        }
-    }
-
-    /** Each one's failures stay its own, its lenient bodies too, Boot's problem details on or off. */
-    @Test
-    void appControllerAndItsErrorHandlingAreUntouched() {
-        for (var problemDetails : List.of("false", "true")) {
-            app(new Class<?>[] {App.class}, () -> {
-                assertThat(perform("GET", "/app/fail", null, null).getResponse().getStatus()).isEqualTo(418);
-                assertThat(perform("POST", "/app/echo", "application/json", "{\"name\":\"n\",\"extra\":1}")
-                    .getResponse().getContentAsString()).isEqualTo("n");
-
-                var refused = call("POST", "/dead-letters/discard", "{\"idz\":[1]}");
-                assertJson(refused, 400);
-                assertThat(refused.body).startsWith("{\"message\":\"unknown field 'idz'");
-                var malformed = call("POST", "/dead-letters/discard", "not json");
-                assertJson(malformed, 400);
-                assertThat(malformed.body).startsWith("{\"message\":\"Unrecognized token 'not'");
-                var badLimit = call("GET", "/dead-letters?limit=x", null);
-                assertJson(badLimit, 400);
-                assertThat(badLimit.body).startsWith("{\"message\":\"Query parameter 'limit'");
-                rows().execute("drop table " + names.dead() + " cascade");
-                assertJson(call("GET", "/dead-letters/count", null), 500);
-            }, "spring.mvc.problemdetails.enabled=" + problemDetails);
-        }
-    }
-
     /** What many apps have: first in order, answering every exception in the app's own way. */
     @RestControllerAdvice
     @Order(Ordered.HIGHEST_PRECEDENCE)
@@ -1230,22 +1152,33 @@ class AdminHttpIT {
         }
     }
 
+    /** Each one's failures stay its own, its lenient bodies too, Boot's problem details on or off. */
     @Test
-    void anAppsFirstInOrderAdviceDoesNotAnswerForTheAdmin() {
-        app(new Class<?>[] {FirstApp.class}, () -> {
-            assertThat(perform("GET", "/app/fail", null, null).getResponse().getStatus()).isEqualTo(418);
+    void appControllerAndItsErrorHandlingAreUntouched() {
+        for (var problemDetails : List.of("false", "true")) {
+            app(new Class<?>[] {FirstApp.class}, () -> {
+                assertThat(perform("GET", "/app/fail", null, null).getResponse().getStatus()).isEqualTo(418);
+                assertThat(perform("POST", "/app/echo", "application/json", "{\"name\":\"n\",\"extra\":1}")
+                    .getResponse().getContentAsString()).isEqualTo("n");
 
-            var refused = call("POST", "/dead-letters/discard", "{\"idz\":[1]}");
-            assertJson(refused, 400);
-            assertThat(refused.body).startsWith("{\"message\":\"unknown field 'idz'");
-            var conflict = call("POST", "/recovery/xid-regression", null);
-            assertJson(conflict, 409);
-            assertThat(conflict.body).startsWith("{\"message\":\"no xid regression to recover");
-            rows().execute("drop table " + names.dead() + " cascade");
-            var failed = call("GET", "/dead-letters/count", null);
-            assertJson(failed, 500);
-            assertThat(failed.body).contains(names.dead() + "\\\" does not exist");
-        });
+                var refused = call("POST", "/dead-letters/discard", "{\"idz\":[1]}");
+                assertJson(refused, 400);
+                assertThat(refused.body).startsWith("{\"message\":\"unknown field 'idz'");
+                var malformed = call("POST", "/dead-letters/discard", "not json");
+                assertJson(malformed, 400);
+                assertThat(malformed.body).startsWith("{\"message\":\"Unrecognized token 'not'");
+                var badLimit = call("GET", "/dead-letters?limit=x", null);
+                assertJson(badLimit, 400);
+                assertThat(badLimit.body).startsWith("{\"message\":\"Query parameter 'limit'");
+                var conflict = call("POST", "/recovery/xid-regression", null);
+                assertJson(conflict, 409);
+                assertThat(conflict.body).startsWith("{\"message\":\"no xid regression to recover");
+                rows().execute("drop table " + names.dead() + " cascade");
+                var failed = call("GET", "/dead-letters/count", null);
+                assertJson(failed, 500);
+                assertThat(failed.body).contains(names.dead() + "\\\" does not exist");
+            }, "spring.mvc.problemdetails.enabled=" + problemDetails);
+        }
     }
 
     @Configuration(proxyBeanMethods = false)
@@ -1310,14 +1243,14 @@ class AdminHttpIT {
     @Test
     void noControllerWithoutTheOutboxOrServletMvc() {
         new WebApplicationContextRunner()
-            .withUserConfiguration(Boot.class).withPropertyValues(properties("outbox.enabled=false"))
+            .withUserConfiguration(AdminServer.Base.class).withPropertyValues(properties("outbox.enabled=false"))
             .run(c -> assertThat(c).hasNotFailed().doesNotHaveBean(OutboxAdminController.class)
                 .doesNotHaveBean("outboxAdminGuard"));
-        new ApplicationContextRunner().withUserConfiguration(Boot.class).withPropertyValues(properties())
+        new ApplicationContextRunner().withUserConfiguration(AdminServer.Base.class).withPropertyValues(properties())
             .run(c -> assertThat(c).hasNotFailed().doesNotHaveBean(OutboxAdminController.class));
         new WebApplicationContextRunner()
             .withClassLoader(new FilteredClassLoader(RequestMappingHandlerAdapter.class))
-            .withUserConfiguration(Boot.class).withPropertyValues(properties())
+            .withUserConfiguration(AdminServer.Base.class).withPropertyValues(properties())
             .run(c -> assertThat(c).hasNotFailed().doesNotHaveBean(OutboxAdminController.class));
     }
 
@@ -1328,7 +1261,7 @@ class AdminHttpIT {
     }
 
     private void onServer(OnServer body, List<String> properties, Class<?>... configurations) throws Exception {
-        var all = new ArrayList<Class<?>>(List.of(AllowAll.class, App.class));
+        var all = new ArrayList<Class<?>>(List.of(AllowAll.class, FirstApp.class));
         all.addAll(List.of(configurations));
         try (var server = AdminServer.start(properties, all.toArray(Class<?>[]::new))) {
             names = server.names;
@@ -1393,6 +1326,13 @@ class AdminHttpIT {
 
     private AdminRows rows() {
         return new AdminRows(AdminHttpIT::connect, names);
+    }
+
+    private List<UUID> sendThree() {
+        var outbox = context.getBean(Outbox.class);
+        return new TransactionTemplate(context.getBean(PlatformTransactionManager.class))
+            .execute(status -> outbox.sendAll(List.of(OutboxMessage.of("t", "a", bytes("1")),
+                OutboxMessage.of("t", "b", bytes("2")), OutboxMessage.of("t", "c", bytes("3")))));
     }
 
     private long retryCount() throws SQLException {

@@ -10,7 +10,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.kafka.wiring.RoutedAuditHandler.AuditEvent;
 import io.github.dsudomoin.outbox.kafka.wiring.RoutedNoKafkaTestApp.AppCode;
+import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestDb;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import java.sql.SQLException;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
@@ -24,7 +26,7 @@ import ru.tinkoff.kora.test.extension.junit5.TestComponent;
 @KoraAppTest(RoutedNoKafkaTestApp.class)
 class RoutedNoKafkaIT implements KoraAppTestConfigModifier {
 
-    private final String table = TestDb.uniqueTable();
+    private final String table = TestSql.uniqueTable();
 
     @TestComponent
     private JdbcDatabase db;
@@ -50,7 +52,7 @@ class RoutedNoKafkaIT implements KoraAppTestConfigModifier {
                   relay { workers = 2, minTickInterval = 5ms, idlePollInterval = 100ms, headFailuresBeforeDivert = 1 }
                   partitions { xidsPerPartition = 1000000, premake = 4 }
                 }
-                """.formatted(TestDb.jdbcUrl(), TestDb.user(), TestDb.password(), table));
+                """.formatted(TestDataSources.jdbcUrl(), TestDataSources.user(), TestDataSources.password(), table));
     }
 
     @Test

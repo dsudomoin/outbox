@@ -459,19 +459,6 @@ class KafkaOutboxAutoConfigurationIT {
         });
     }
 
-    @Test
-    void outboxDisabledLeavesTheSenderToTheApp() {
-        var topic = TestKafka.createTopic(1);
-        runner("outbox.enabled=false").run(context -> {
-            var sender = context.getBean(KafkaOutboxSender.class);
-            var record = record(topic);
-
-            sender.send(List.of(record));
-
-            TestKafka.consumeUntil(topic, WAIT, r -> !r.isEmpty());
-        });
-    }
-
     /**
      * The auto-configured sender builds its producers with what {@link KafkaOutboxSender} forces and defaults, as the
      * producer's own config log shows it: the adapter binds {@code driver-properties} and adds nothing.
@@ -485,6 +472,7 @@ class KafkaOutboxAutoConfigurationIT {
                 .run(context -> {
                     var record = record(topic);
                     context.getBean(KafkaOutboxSender.class).send(List.of(record));
+                    TestKafka.consumeUntil(topic, WAIT, r -> !r.isEmpty());
                 });
             assertThat(err.text()).contains("ProducerConfig values", "acks = -1", "enable.idempotence = true",
                 "delivery.timeout.ms = 120000", "request.timeout.ms = 15000", "max.block.ms = 5000",

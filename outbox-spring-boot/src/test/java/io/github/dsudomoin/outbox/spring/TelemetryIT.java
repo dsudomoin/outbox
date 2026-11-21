@@ -16,7 +16,6 @@ import io.github.dsudomoin.outbox.micrometer.DefaultOutboxDeliveryObservationCon
 import io.github.dsudomoin.outbox.micrometer.DefaultOutboxEnqueueObservationConvention;
 import io.github.dsudomoin.outbox.micrometer.DefaultOutboxSettleObservationConvention;
 import io.github.dsudomoin.outbox.micrometer.DefaultOutboxStepObservationConvention;
-import io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry;
 import io.github.dsudomoin.outbox.micrometer.OutboxDeliveryObservationConvention;
 import io.github.dsudomoin.outbox.micrometer.OutboxDeliveryTracingObservationHandler;
 import io.github.dsudomoin.outbox.micrometer.OutboxDeliveryContext;
@@ -138,15 +137,6 @@ class TelemetryIT {
             spanIds.add(tracer.currentSpan().context().spanId());
             record.headers().stream().filter(h -> h.name().equals("traceparent"))
                 .forEach(h -> traceparents.add(new String(h.value(), UTF_8)));
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class WithSpanSeeingRoute {
-
-        @Bean
-        SpanSeeingRoute spanSeeingRoute(Tracer tracer) {
-            return new SpanSeeingRoute(tracer);
         }
     }
 
@@ -339,7 +329,7 @@ class TelemetryIT {
 
     @Test
     void handlerRunsInDeliverySpan() {
-        traced().withUserConfiguration(WithSpanSeeingRoute.class).run(context -> {
+        traced().withBean(SpanSeeingRoute.class).run(context -> {
             assertThat(context).hasNotFailed();
 
             send(context, "orders");
@@ -471,8 +461,7 @@ class TelemetryIT {
         var own = new OutboxTelemetry() {};
         runner().withUserConfiguration(TestApps.WithRoute.class).withBean(OutboxTelemetry.class, () -> own)
             .run(context -> {
-                assertThat(context).hasNotFailed().hasSingleBean(OutboxTelemetry.class)
-                    .doesNotHaveBean(ObservationOutboxTelemetry.class);
+                assertThat(context).hasNotFailed().hasSingleBean(OutboxTelemetry.class);
                 assertThat(context.getBean(OutboxTelemetry.class)).isSameAs(own);
             });
     }

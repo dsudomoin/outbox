@@ -17,7 +17,6 @@ import jakarta.annotation.Nullable;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -25,6 +24,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Function;
+import java.util.function.Supplier;
+import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.errors.NotEnoughReplicasException;
 import org.apache.kafka.common.errors.RecordTooLargeException;
@@ -85,7 +86,7 @@ class KafkaDeadLetterHandlerTest {
         assertThat(sent.get(0).topic()).isEqualTo(DLQ);
         assertThat(sent.get(0).key()).isEqualTo(bytes("k"));
         assertThat(sent.get(0).value()).isEqualTo(bytes("v"));
-        assertThat(headers(sent.get(0))).containsExactly(
+        assertThat(TestKafka.headers(sent.get(0).headers())).containsExactly(
                 Map.entry("h", "a"), Map.entry("no-value", "<null>"), Map.entry("h", "b"),
                 Map.entry(KafkaDeadLetterHandler.DEAD_TOPIC, TOPIC),
                 Map.entry(KafkaDeadLetterHandler.DEAD_ERROR, "java.lang.IllegalStateException: boom"),
@@ -94,7 +95,7 @@ class KafkaDeadLetterHandlerTest {
                 Map.entry(KafkaOutboxHeaders.MESSAGE_ID, keyed.messageId().toString()));
         assertThat(sent.get(1).key()).isNull();
         assertThat(sent.get(1).value()).isNull();
-        assertThat(headers(sent.get(1))).containsExactly(
+        assertThat(TestKafka.headers(sent.get(1).headers())).containsExactly(
                 Map.entry(KafkaDeadLetterHandler.DEAD_TOPIC, TOPIC),
                 Map.entry(KafkaDeadLetterHandler.DEAD_ERROR, "<null>"),
                 Map.entry(KafkaDeadLetterHandler.DEAD_ATTEMPTS, "7"),
@@ -110,7 +111,7 @@ class KafkaDeadLetterHandlerTest {
                 new OutboxHeader("outbox-local", null));
 
         assertThat(handler.handle(List.of(letter))).containsExactly(DeadLetterDecision.discard());
-        assertThat(headers(producers.get(0).history().get(0))).containsExactly(
+        assertThat(TestKafka.headers(producers.get(0).history().get(0).headers())).containsExactly(
                 Map.entry("h", "a"),
                 Map.entry(KafkaDeadLetterHandler.DEAD_TOPIC, TOPIC),
                 Map.entry(KafkaDeadLetterHandler.DEAD_ERROR, "<null>"),
@@ -315,11 +316,13 @@ class KafkaDeadLetterHandlerTest {
     /** {@code autoComplete} false: the test completes or fails each send, as Kafka's I/O thread would. */
     private KafkaDeadLetterHandler handler(@Nullable String template, boolean autoComplete,
             Function<ProducerRecord<byte[], byte[]>, RuntimeException> failure) {
-        var sender = new KafkaOutboxSender(() -> {
+        Supplier<Producer<byte[], byte[]>> make = () -> {
             var producer = new TestProducer(autoComplete, failure);
             producers.add(producer);
             return producer;
-        }, Duration.ofSeconds(20), Clock.systemUTC(), System::nanoTime);
+        };
+        var sender = new KafkaOutboxSender(make, make, Duration.ofSeconds(20), Duration.ZERO, Clock.systemUTC(),
+                System::nanoTime);
         return new KafkaDeadLetterHandler(sender, template);
     }
 
@@ -331,13 +334,6 @@ class KafkaDeadLetterHandlerTest {
             OutboxHeader... headers) {
         return new DeadLetter(id, UUID.randomUUID(), TOPIC, bytes(key), bytes(payload),
                 List.of(headers), Instant.now(), 3, FAILED_AT, error, DeadLetter.Status.PENDING, 0, 0, Instant.now());
-    }
-
-    private static List<Map.Entry<String, String>> headers(ProducerRecord<byte[], byte[]> record) {
-        var result = new ArrayList<Map.Entry<String, String>>();
-        record.headers().forEach(h -> result.add(Map.entry(h.key(), h.value() == null ? "<null>"
-                : new String(h.value(), UTF_8))));
-        return result;
     }
 
     private static byte[] bytes(String s) {

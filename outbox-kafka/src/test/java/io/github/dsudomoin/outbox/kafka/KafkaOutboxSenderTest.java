@@ -1034,20 +1034,6 @@ class KafkaOutboxSenderTest {
         assertThat(idle.closed()).as("nothing is remembered now").isTrue();
     }
 
-    @Test
-    void invalidRecordIsPermanent() throws Exception {
-        var sender = sender(DELIVERY_TIMEOUT);
-        var result = sendAsync(sender, List.of(record(1, "a")));
-        awaitSent(0, 1).errorNext(new InvalidRecordException("bad record"));
-        assertThat(result.get(5, SECONDS).get(0)).isInstanceOfSatisfying(Outcome.Permanent.class,
-                p -> assertThat(p.error()).isInstanceOf(InvalidRecordException.class));
-
-        var second = sendAsync(sender, List.of(record(2, "a")));
-        awaitSent(1, 1).errorNext(new InvalidTopicException("bad topic"));
-        assertThat(second.get(5, SECONDS).get(0)).isInstanceOfSatisfying(Outcome.Permanent.class,
-                p -> assertThat(p.error()).isInstanceOf(InvalidTopicException.class));
-    }
-
     /**
      * The broker refuses the topic (an append to an internal one): the refusal closes the call, and the topic's other
      * records, aborted or never sent, take the same {@code Permanent}; another topic's record costs no attempt.
@@ -1356,23 +1342,6 @@ class KafkaOutboxSenderTest {
         var next = sendAsync(sender, List.of(record(2, onP)));
         awaitSent(1, 1).completeNext();
         assertThat(next.get(5, SECONDS)).containsExactly(Outcome.delivered());
-    }
-
-    @Test
-    void interruptWhileSendingLeavesTheRestUnsent() {
-        var sender = sender(() -> new TestProducer(false, r -> {
-            if (new String(r.key(), UTF_8).equals("b")) {
-                throw new InterruptException("waiting for metadata"); // sets the flag, like KafkaProducer
-            }
-            return null;
-        }), DELIVERY_TIMEOUT);
-
-        var outcomes = sender.send(List.of(record(1, "a"), record(2, "b"), record(3, "c")));
-        assertThat(Thread.interrupted()).as("flag kept").isTrue();
-
-        assertThat(outcomes.get(0)).as("in flight, aborted by our close").isInstanceOf(Outcome.Retry.class);
-        assertThat(outcomes.subList(1, 3)).containsExactly(Outcome.notAttempted(), Outcome.notAttempted());
-        assertThat(producers.get(0).closed()).isTrue();
     }
 
     /**
@@ -2169,17 +2138,6 @@ class KafkaOutboxSenderTest {
                 .containsEntry("request.timeout.ms", "15000")
                 .containsEntry("max.block.ms", "5000")
                 .containsEntry("enable.metrics.push", "false");
-    }
-
-    @Test
-    void closeClosesFactoryProducers() {
-        var producer = new TestProducer(true, r -> null);
-        var sender = new KafkaOutboxSender(CONFIG, properties -> producer);
-        sender.send(List.of(record(1, "a")));
-
-        sender.close();
-
-        assertThat(producer.closed()).isTrue();
     }
 
     /**

@@ -118,8 +118,9 @@ class KafkaOutboxSenderInRelayIT {
 
     private OutboxRuntime start(Function<Map<String, Object>, Producer<byte[], byte[]>> producers) {
         // the timeouts the duplicate was found with, the defaults then: the relay's soft deadline cut such calls
-        var sender = new KafkaOutboxSender(() -> TestKafka.shortTimeouts(
-                props(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092")), producers);
+        var properties = new Properties();
+        properties.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        var sender = new KafkaOutboxSender(() -> TestKafka.shortTimeouts(properties), producers);
         closing.add(sender);
         var config = new TestOutboxConfig().shards(1).batchTimeout(BATCH_TIMEOUT);
         var runtime = OutboxRuntime.builder(config, transactions, sender.handler()).build();
@@ -174,8 +175,7 @@ class KafkaOutboxSenderInRelayIT {
 
         @Override
         public synchronized Future<RecordMetadata> send(ProducerRecord<byte[], byte[]> record, Callback callback) {
-            var id = UUID.fromString(new String(record.headers().lastHeader(KafkaOutboxHeaders.MESSAGE_ID).value(),
-                    UTF_8));
+            var id = KafkaOutboxHeaders.messageId(record.headers());
             handed.computeIfAbsent(id, k -> new AtomicInteger()).incrementAndGet();
             var sent = super.send(record, (metadata, e) -> {
                 if (e == null) {
@@ -190,11 +190,5 @@ class KafkaOutboxSenderInRelayIT {
 
     private static byte[] bytes(String s) {
         return s.getBytes(UTF_8);
-    }
-
-    private static Properties props(String key, String value) {
-        var p = new Properties();
-        p.put(key, value);
-        return p;
     }
 }

@@ -186,17 +186,10 @@ class OutboxAdminInterceptorTest {
     @ParameterizedTest
     @ValueSource(strings = {"cross-site", "same-site"})
     void aPostAnotherSiteSentIsRefusedBeforeTheAuthorizer(String site) {
-        var interceptor = interceptor(request -> {
-            throw new AssertionError("the authorizer must not run");
-        }, new AtomicReference<>());
-
         try (var stderr = new CapturedStderr()) {
-            var response = interceptor.intercept(Context.current(), request("POST",
-                    "/kora-outbox/admin/v1/dead-letters/discard", HttpHeaders.of("sec-fetch-site", site)),
-                    NO_ROUTE).toCompletableFuture();
+            var answered = refusedUpfront(request("POST", "/kora-outbox/admin/v1/dead-letters/discard",
+                    HttpHeaders.of("sec-fetch-site", site)), true);
 
-            assertThat(response).as("answered without the authorizer").isDone();
-            var answered = response.join();
             assertThat(answered.code()).isEqualTo(403);
             assertThat(body(answered)).isEqualTo("{\"message\":\"cross-site request refused\"}");
             assertThat(stderr.text())
@@ -212,17 +205,10 @@ class OutboxAdminInterceptorTest {
     @CsvSource({"http://evil.example,app:8080", "null,app:8080", "http://app:8081,app:8080", "http://app,app:8080",
             "http://app:8080,app", "http://app:8080,"})
     void aPostWhoseOriginIsAnotherHostIsRefusedBeforeTheAuthorizer(String origin, String host) {
-        var interceptor = interceptor(request -> {
-            throw new AssertionError("the authorizer must not run");
-        }, new AtomicReference<>());
+        var answered = refusedUpfront(request("POST", "/kora-outbox/admin/v1/recovery/xid-regression",
+                host == null ? HttpHeaders.of("origin", origin) : HttpHeaders.of("origin", origin, "host", host)),
+                true);
 
-        var response = interceptor.intercept(Context.current(), request("POST",
-                "/kora-outbox/admin/v1/recovery/xid-regression", host == null ? HttpHeaders.of("origin", origin)
-                        : HttpHeaders.of("origin", origin, "host", host)),
-                NO_ROUTE).toCompletableFuture();
-
-        assertThat(response).as("answered without the authorizer").isDone();
-        var answered = response.join();
         assertThat(answered.code()).isEqualTo(403);
         assertThat(body(answered)).isEqualTo("{\"message\":\"cross-site request refused\"}");
     }
@@ -233,15 +219,8 @@ class OutboxAdminInterceptorTest {
             "https://app,app:443", "https://app:8443,app:8443", "http://[::1]:8080,[::1]:8080",
             "http://admin.internal,admin.internal"})
     void aPostFromTheServersOwnOriginReachesTheAuthorizer(String origin, String host) {
-        var authorization = new AtomicReference<Runnable>();
-        var interceptor = interceptor(request -> OutboxAdminAuthorizer.allow("ops"), authorization);
-
-        var response = interceptor.intercept(Context.current(), request("POST",
-                "/kora-outbox/admin/v1/recovery/xid-regression", HttpHeaders.of("origin", origin, "host", host)),
-                (context, request) -> CompletableFuture.completedFuture(HttpServerResponse.of(200)));
-        authorization.get().run();
-
-        assertThat(response.toCompletableFuture().join().code()).isEqualTo(200);
+        assertThat(allowedCode(request("POST", "/kora-outbox/admin/v1/recovery/xid-regression",
+                HttpHeaders.of("origin", origin, "host", host)), true)).isEqualTo(200);
     }
 
     /**
@@ -250,22 +229,12 @@ class OutboxAdminInterceptorTest {
      */
     @Test
     void checkOriginOffLetsAnotherOriginReachTheAuthorizerButNotAnotherSite() {
-        var authorization = new AtomicReference<Runnable>();
-        var interceptor = interceptor(request -> OutboxAdminAuthorizer.allow("ops"), authorization, false);
+        assertThat(allowedCode(request("POST", "/kora-outbox/admin/v1/recovery/xid-regression",
+                HttpHeaders.of("origin", "http://ops.internal", "host", "app:8080")), false)).isEqualTo(200);
 
-        var response = interceptor.intercept(Context.current(), request("POST",
-                "/kora-outbox/admin/v1/recovery/xid-regression",
-                HttpHeaders.of("origin", "http://ops.internal", "host", "app:8080")),
-                (context, request) -> CompletableFuture.completedFuture(HttpServerResponse.of(200)));
-        authorization.get().run();
-        assertThat(response.toCompletableFuture().join().code()).isEqualTo(200);
-
-        var crossSite = interceptor.intercept(Context.current(), request("POST",
-                "/kora-outbox/admin/v1/recovery/xid-regression",
+        assertThat(refusedUpfront(request("POST", "/kora-outbox/admin/v1/recovery/xid-regression",
                 HttpHeaders.of("origin", "http://ops.internal", "host", "app:8080", "sec-fetch-site", "cross-site")),
-                NO_ROUTE).toCompletableFuture();
-        assertThat(crossSite).as("answered without the authorizer").isDone();
-        assertThat(crossSite.join().code()).isEqualTo(403);
+                false).code()).isEqualTo(403);
     }
 
     @Test
@@ -285,18 +254,11 @@ class OutboxAdminInterceptorTest {
     @ParameterizedTest
     @CsvSource({"POST,same-origin", "GET,"})
     void anOriginIsNotLookedAtWithSecFetchSiteOrOnAGet(String method, String site) {
-        var authorization = new AtomicReference<Runnable>();
-        var interceptor = interceptor(request -> OutboxAdminAuthorizer.allow("ops"), authorization);
-
         var headers = HttpHeaders.of("origin", "http://proxy.example", "host", "app:8080");
         if (site != null) {
             headers.set("sec-fetch-site", site);
         }
-        var response = interceptor.intercept(Context.current(), request(method, "/kora-outbox/admin/v1/status",
-                headers), (context, request) -> CompletableFuture.completedFuture(HttpServerResponse.of(200)));
-        authorization.get().run();
-
-        assertThat(response.toCompletableFuture().join().code()).isEqualTo(200);
+        assertThat(allowedCode(request(method, "/kora-outbox/admin/v1/status", headers), true)).isEqualTo(200);
     }
 
     /**
@@ -335,30 +297,35 @@ class OutboxAdminInterceptorTest {
     @ParameterizedTest
     @ValueSource(strings = {"application/json", "application/json; charset=utf-8", "Application/JSON;charset=UTF-8"})
     void aBodyRouteTakesJson(String type) {
-        var authorization = new AtomicReference<Runnable>();
-        var interceptor = interceptor(request -> OutboxAdminAuthorizer.allow("ops"), authorization);
-
-        var response = interceptor.intercept(Context.current(), request("POST",
-                "/kora-outbox/admin/v1/dead-letters/discard", HttpHeaders.of("content-type", type)),
-                (context, request) -> CompletableFuture.completedFuture(HttpServerResponse.of(200)));
-        authorization.get().run();
-
-        assertThat(response.toCompletableFuture().join().code()).isEqualTo(200);
+        assertThat(allowedCode(request("POST", "/kora-outbox/admin/v1/dead-letters/discard",
+                HttpHeaders.of("content-type", type)), true)).isEqualTo(200);
     }
 
     /** Clients other than browsers send no such header; a GET changes nothing, so a link from another site works. */
     @ParameterizedTest
     @CsvSource({"POST,", "POST,same-origin", "POST,none", "GET,cross-site"})
     void aCallOfTheSameSiteOrNoBrowserReachesTheAuthorizer(String method, String site) {
+        assertThat(allowedCode(request(method, "/kora-outbox/admin/v1/status",
+                site == null ? HttpHeaders.of() : HttpHeaders.of("sec-fetch-site", site)), true)).isEqualTo(200);
+    }
+
+    /** The code of a call the {@code ops} authorizer allows to a route answering 200, once the authorization ran. */
+    private static int allowedCode(HttpServerRequest request, boolean checkOrigin) {
         var authorization = new AtomicReference<Runnable>();
-        var interceptor = interceptor(request -> OutboxAdminAuthorizer.allow("ops"), authorization);
-
-        var response = interceptor.intercept(Context.current(), request(method, "/kora-outbox/admin/v1/status",
-                site == null ? HttpHeaders.of() : HttpHeaders.of("sec-fetch-site", site)),
-                (context, request) -> CompletableFuture.completedFuture(HttpServerResponse.of(200)));
+        var response = interceptor(r -> OutboxAdminAuthorizer.allow("ops"), authorization, checkOrigin)
+                .intercept(Context.current(), request,
+                        (context, r) -> CompletableFuture.completedFuture(HttpServerResponse.of(200)));
         authorization.get().run();
+        return response.toCompletableFuture().join().code();
+    }
 
-        assertThat(response.toCompletableFuture().join().code()).isEqualTo(200);
+    /** The response to a call refused before an authorizer that fails the test if it runs, and before the route. */
+    private static HttpServerResponse refusedUpfront(HttpServerRequest request, boolean checkOrigin) {
+        var response = interceptor(r -> {
+            throw new AssertionError("the authorizer must not run");
+        }, new AtomicReference<>(), checkOrigin).intercept(Context.current(), request, NO_ROUTE).toCompletableFuture();
+        assertThat(response).as("answered without the authorizer").isDone();
+        return response.join();
     }
 
     private static String body(HttpServerResponse response) {
