@@ -181,6 +181,7 @@ row_lock_run() { # row_lock_run NAME [-Dkey=value...]: k3's row held for 70 s un
   sleep 75
   local to=$(now)
   sleep 5
+  log "see latency of the other accounts in the result"
   acc_end --slow-keys k3 --slow-from "$from" --slow-to "$to"
 }
 

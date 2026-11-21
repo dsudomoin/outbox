@@ -135,9 +135,9 @@ public final class LoadGenerator {
                 }
                 if (!stop) {
                     if (s.bulk()) {
-                        bulkTx(s, sender, counts);
+                        bulkTx(s, counts);
                     } else {
-                        tx(s, sender, counts);
+                        tx(s, counts);
                     }
                 }
             } catch (Throwable t) {
@@ -160,12 +160,12 @@ public final class LoadGenerator {
         return next;
     }
 
-    private void tx(Settings s, Sender sender, Counts counts) {
+    private void tx(Settings s, Counts counts) {
         var random = ThreadLocalRandom.current();
         var drafts = new ArrayList<Draft>(s.txMessages());
         for (var i = 0; i < s.txMessages(); i++) {
             var tag = tag(s, counts);
-            drafts.add(new Draft(topic(s, sender, counts, tag), "k" + random.nextInt(s.keys()), tag));
+            drafts.add(new Draft(topic(s, counts, tag), "k" + random.nextInt(s.keys()), tag));
         }
         drafts.sort(LOCK_ORDER);
         var rollback = random.nextDouble() * 100 < s.rollbackPercent();
@@ -175,7 +175,7 @@ public final class LoadGenerator {
                 for (var d : drafts) {
                     var seq = Ledger.nextSeq(c, d.topic(), d.key());
                     var id = sender.send(d.topic(), d.key(), seq, d.tag());
-                    rows.add(row(sender, id, d, seq));
+                    rows.add(row(id, d, seq));
                 }
                 Ledger.sent(c, rows);
                 finish(s, rollback);
@@ -186,12 +186,12 @@ public final class LoadGenerator {
         }
     }
 
-    private void bulkTx(Settings s, Sender sender, Counts counts) {
+    private void bulkTx(Settings s, Counts counts) {
         var drafts = new ArrayList<Draft>(s.txMessages());
         for (var i = 0; i < s.txMessages(); i++) {
             var tag = tag(s, counts);
             var key = s.bulkKey() != null ? s.bulkKey() : UUID.randomUUID().toString();
-            drafts.add(new Draft(topic(s, sender, counts, tag), key, tag));
+            drafts.add(new Draft(topic(s, counts, tag), key, tag));
         }
         var rollback = ThreadLocalRandom.current().nextDouble() * 100 < s.rollbackPercent();
         var rows = new ArrayList<Ledger.Sent>(drafts.size());
@@ -212,7 +212,7 @@ public final class LoadGenerator {
                 }
                 var ids = sender.outbox().sendAll(messages);
                 for (var i = 0; i < ids.size(); i++) {
-                    rows.add(row(sender, ids.get(i), drafts.get(i), seqs[i]));
+                    rows.add(row(ids.get(i), drafts.get(i), seqs[i]));
                 }
                 Ledger.sent(c, rows);
                 finish(s, rollback);
@@ -223,7 +223,7 @@ public final class LoadGenerator {
         }
     }
 
-    private Ledger.Sent row(Sender sender, UUID id, Draft d, long seq) {
+    private Ledger.Sent row(UUID id, Draft d, long seq) {
         return new Ledger.Sent(id, app, instance, sender.table(), d.topic(), d.key(), seq, d.tag(),
                 sender.contract(d.topic()));
     }
@@ -246,7 +246,7 @@ public final class LoadGenerator {
         rolledBack.add(rows.size());
     }
 
-    private static String topic(Settings s, Sender sender, Counts counts, String tag) {
+    private String topic(Settings s, Counts counts, String tag) {
         var topics = s.topics() != null ? s.topics() : sender.topics();
         var turn = counts.topicByTag.merge(tag, 1, (n, one) -> (n + one) % topics.size());
         return topics.get(turn % topics.size());

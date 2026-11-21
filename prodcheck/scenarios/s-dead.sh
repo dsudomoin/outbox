@@ -108,7 +108,7 @@ s_hook_mixed_fleet() { # a fleet with and without the hook: letters wait for the
   sleep 5
   check "$(passes pending_now)" "инстанс без хука не забирает их у него"
   pc_kill 1001
-  none_pending() { ! pending_now; }
+  none_pending() { [ "$(psql_q "select count(*) from outbox_dead where status = 'pending'")" = 0 ]; }
   check "$(passes wait_for 40 none_pending)" "инстанс с хуком умер, heartbeat истёк: письма стали kept"
   pc_finish --dead-tags hook-keep --exempt-tags hook-keep --allow-left dead-pending
 }
