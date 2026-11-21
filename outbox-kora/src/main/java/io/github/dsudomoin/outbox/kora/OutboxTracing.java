@@ -99,25 +99,22 @@ public final class OutboxTracing {
 
     /** Runs {@code call} in a forked Kora context carrying {@code otel}; the caller's context is restored after. */
     public static <T> T withKoraContext(io.opentelemetry.context.Context otel, Callable<T> call) throws Exception {
-        var previous = Context.current();
-        var forked = previous.fork();
-        forked.inject(); // before set(): it writes trace ids into the MDC of the current context
+        var scope = open(otel);
         try {
-            OpentelemetryContext.set(forked, new OpentelemetryContext(otel));
             return call.call();
         } finally {
-            previous.inject();
+            scope.close();
         }
     }
 
     /**
-     * Makes a forked Kora context carrying {@code otel} current on this thread, as {@link #withKoraContext} does, until
-     * the returned scope closes; the context current before is restored then, exactly.
+     * Makes a forked Kora context carrying {@code otel} current on this thread until the returned scope closes; the
+     * context current before is restored then, exactly.
      */
     static KoraScope open(io.opentelemetry.context.Context otel) {
         var previous = Context.current();
         var forked = previous.fork();
-        forked.inject();
+        forked.inject(); // before set(): it writes trace ids into the MDC of the current context
         try {
             OpentelemetryContext.set(forked, new OpentelemetryContext(otel));
         } catch (Throwable e) {
@@ -131,18 +128,14 @@ public final class OutboxTracing {
     static final class KoraScope {
 
         private final Context previous;
-        private boolean closed;
 
         private KoraScope(Context previous) {
             this.previous = previous;
         }
 
-        /** Restores the thread's previous context; a second close does nothing. */
+        /** Restores the thread's previous context; its owner closes it once. */
         void close() {
-            if (!closed) {
-                closed = true;
-                previous.inject();
-            }
+            previous.inject();
         }
     }
 

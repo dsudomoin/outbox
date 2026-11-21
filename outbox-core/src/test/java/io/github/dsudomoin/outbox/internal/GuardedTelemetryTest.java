@@ -45,12 +45,14 @@ class GuardedTelemetryTest {
 
     @Test
     void throwingDeliveryHandsRecordsUnchanged() {
-        var delivery = GuardedTelemetry.of(new Throwing()).deliveryStarted(RECORDS, Instant.EPOCH);
+        var delivery = GuardedTelemetry.of(new Throwing())
+                .deliveryStarted(OutboxTelemetry.RelayStep.NONE, RECORDS, Instant.EPOCH);
         assertThat(delivery.handed(RECORDS)).isSameAs(RECORDS);
         assertThatCode(() -> delivery.finished(List.of(Outcome.delivered()))).doesNotThrowAnyException();
         assertThatCode(() -> delivery.failed(new IOException("x"))).doesNotThrowAnyException();
 
-        var failingStart = GuardedTelemetry.of(new ThrowingStart()).deliveryStarted(RECORDS, Instant.EPOCH);
+        var failingStart = GuardedTelemetry.of(new ThrowingStart())
+                .deliveryStarted(OutboxTelemetry.RelayStep.NONE, RECORDS, Instant.EPOCH);
         assertThat(failingStart.handed(RECORDS)).isSameAs(RECORDS);
     }
 
@@ -67,7 +69,8 @@ class GuardedTelemetryTest {
                 };
             }
         };
-        var delivery = GuardedTelemetry.of(shrinking).deliveryStarted(RECORDS, Instant.EPOCH);
+        var delivery = GuardedTelemetry.of(shrinking)
+                .deliveryStarted(OutboxTelemetry.RelayStep.NONE, RECORDS, Instant.EPOCH);
         assertThat(delivery.handed(RECORDS)).isSameAs(RECORDS);
     }
 
@@ -78,7 +81,6 @@ class GuardedTelemetryTest {
             t.enqueued("orders");
             t.delivered("orders", Duration.ofMillis(1));
             t.retried("orders");
-            t.deadLettered("orders");
             t.requeued("orders");
             t.waited("orders", Outcome.Waiting.Kind.CONTRACT);
             t.contractRejected("orders", "Created", 2);
@@ -284,7 +286,8 @@ class GuardedTelemetryTest {
                 return new Delivery() {};
             }
         };
-        var delivery = GuardedTelemetry.of(plain).deliveryStarted(RECORDS, Instant.EPOCH);
+        var delivery = GuardedTelemetry.of(plain)
+                .deliveryStarted(OutboxTelemetry.RelayStep.NONE, RECORDS, Instant.EPOCH);
         var failure = new IllegalStateException("handler");
         try (var err = new CapturedStderr()) {
             assertThatThrownBy(() -> delivery.inRecordScope(RECORD, () -> {
@@ -311,7 +314,8 @@ class GuardedTelemetryTest {
                 };
             }
         };
-        var delivery = GuardedTelemetry.of(swallowing).deliveryStarted(RECORDS, Instant.EPOCH);
+        var delivery = GuardedTelemetry.of(swallowing)
+                .deliveryStarted(OutboxTelemetry.RelayStep.NONE, RECORDS, Instant.EPOCH);
         var failure = new IOException("handler");
         try (var err = new CapturedStderr()) {
             assertThatThrownBy(() -> delivery.inRecordScope(RECORD, () -> {
@@ -324,7 +328,8 @@ class GuardedTelemetryTest {
     @Test
     void callRunsOnceWhenScopeThrowsAfterIt() throws Exception {
         var calls = new AtomicInteger();
-        var delivery = GuardedTelemetry.of(new ScopeThrowing(true)).deliveryStarted(RECORDS, Instant.EPOCH);
+        var delivery = GuardedTelemetry.of(new ScopeThrowing(true))
+                .deliveryStarted(OutboxTelemetry.RelayStep.NONE, RECORDS, Instant.EPOCH);
         assertThat(delivery.inRecordScope(RECORD, calls::incrementAndGet)).isEqualTo(1);
         assertThat(calls).hasValue(1);
     }
@@ -344,7 +349,8 @@ class GuardedTelemetryTest {
                 };
             }
         };
-        var delivery = GuardedTelemetry.of(twice).deliveryStarted(RECORDS, Instant.EPOCH);
+        var delivery = GuardedTelemetry.of(twice)
+                .deliveryStarted(OutboxTelemetry.RelayStep.NONE, RECORDS, Instant.EPOCH);
         try (var err = new CapturedStderr()) {
             assertThat(delivery.inRecordScope(RECORD, calls::incrementAndGet)).isEqualTo(1);
             assertThat(err.text()).contains("Delivery.inRecordScope");
@@ -355,7 +361,8 @@ class GuardedTelemetryTest {
     @Test
     void callRunsOnceWhenScopeThrowsBeforeIt() throws Exception {
         var calls = new AtomicInteger();
-        var delivery = GuardedTelemetry.of(new ScopeThrowing(false)).deliveryStarted(RECORDS, Instant.EPOCH);
+        var delivery = GuardedTelemetry.of(new ScopeThrowing(false))
+                .deliveryStarted(OutboxTelemetry.RelayStep.NONE, RECORDS, Instant.EPOCH);
         assertThat(delivery.inRecordScope(RECORD, calls::incrementAndGet)).isEqualTo(1);
         assertThat(calls).hasValue(1);
     }

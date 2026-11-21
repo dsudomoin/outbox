@@ -63,18 +63,6 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         }
     }
 
-    @Override
-    public Delivery deliveryStarted(List<OutboxRecord> records, Instant now) {
-        Delivery delivery;
-        try {
-            delivery = delegate.deliveryStarted(records, now);
-        } catch (Throwable e) {
-            warn("deliveryStarted", e);
-            return Delivery.NONE;
-        }
-        return delivery == Delivery.NONE ? delivery : guarded(delivery);
-    }
-
     /** {@code step} as the delegate returned it: a guard of this telemetry is unwrapped first. */
     @Override
     public Delivery deliveryStarted(RelayStep step, List<OutboxRecord> records, Instant now) {
@@ -110,15 +98,6 @@ public final class GuardedTelemetry implements OutboxTelemetry {
             delegate.retried(topic);
         } catch (Throwable e) {
             warn("retried", e);
-        }
-    }
-
-    @Override
-    public void deadLettered(String topic) {
-        try {
-            delegate.deadLettered(topic);
-        } catch (Throwable e) {
-            warn("deadLettered", e);
         }
     }
 
@@ -357,10 +336,9 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         /** As {@link GuardedDelivery#inRecordScope}, which also refuses a second run: it would write twice. */
         @Override
         public <T> T inScope(Callable<T> insert) throws Exception {
-            var tracked = new TrackedCall<>(insert, true);
-            T result;
+            var tracked = new TrackedCall<>(insert);
             try {
-                result = delegate.inScope(tracked);
+                delegate.inScope(tracked);
             } catch (Throwable e) {
                 if (tracked.state == TrackedCall.THREW) {
                     if (e != tracked.error) {
@@ -510,7 +488,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         /** A second run of the call refused: it would hand the record to its target twice. */
         @Override
         public <T> T inRecordScope(OutboxRecord record, Callable<T> call) throws Exception {
-            var tracked = new TrackedCall<>(call, true);
+            var tracked = new TrackedCall<>(call);
             T result;
             try {
                 result = delegate.inRecordScope(record, tracked);
@@ -572,7 +550,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     }
 
     /**
-     * A scope's call that remembers whether it ran and how it ended; {@code once}: a second run throws
+     * A scope's call that remembers whether it ran and how it ended; a second run throws
      * {@link IllegalStateException} instead of running it again.
      */
     private static final class TrackedCall<T> implements Callable<T> {
@@ -582,19 +560,17 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         static final int THREW = 2;
 
         private final Callable<T> call;
-        private final boolean once;
         int state = NOT_RUN;
         T result;
         Throwable error;
 
-        TrackedCall(Callable<T> call, boolean once) {
+        TrackedCall(Callable<T> call) {
             this.call = call;
-            this.once = once;
         }
 
         @Override
         public T call() throws Exception {
-            if (once && state != NOT_RUN) {
+            if (state != NOT_RUN) {
                 throw new IllegalStateException("the scope ran its call twice");
             }
             try {

@@ -39,14 +39,8 @@ public final class OutboxDeliveryContext extends ReceiverContext<OutboxRecord> {
 
     OutboxDeliveryContext(OutboxRecord record, Instant now, @Nullable Observation step) {
         super((carrier, key) -> {
-            var headers = carrier.headers();
-            for (int i = headers.size() - 1; i >= 0; i--) {
-                var h = headers.get(i);
-                if (h.name().equals(key)) {
-                    return h.value() == null ? null : new String(h.value(), UTF_8);
-                }
-            }
-            return null;
+            var value = TraceHeaders.last(carrier.headers(), key);
+            return value == null ? null : new String(value, UTF_8);
         }, Kind.CONSUMER);
         this.record = record;
         this.now = now;

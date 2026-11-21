@@ -233,6 +233,16 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
         }
     }
 
+    /** {@code call} with {@code observation}'s scope open; the thread's previous scope is restored however it ends. */
+    private <T> T scoped(Observation observation, Callable<T> call) throws Exception {
+        var previous = observations.getCurrentObservationScope();
+        try (var scope = observation.openScope()) {
+            return call.call();
+        } finally {
+            restoreScope(observations, previous);
+        }
+    }
+
     /**
      * Makes {@code previous} the thread's scope again. A scope that a handler left current, by throwing while it opened
      * or closed, is reset first: the tracing handler then closes the tracer's scope as well, which would otherwise keep
@@ -399,12 +409,7 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
         /** The thread's previous scope is restored however it ends: see {@link #stepStarted}. */
         @Override
         public <T> T inScope(Callable<T> insert) throws Exception {
-            var previous = observations.getCurrentObservationScope();
-            try (var scope = observation.openScope()) {
-                return insert.call();
-            } finally {
-                restoreScope(observations, previous);
-            }
+            return scoped(observation, insert);
         }
 
         @Override
@@ -547,12 +552,7 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
             if (i == null) {
                 return call.call();
             }
-            var previous = observations.getCurrentObservationScope(); // restored however it ends: see stepStarted
-            try (var scope = started[i].openScope()) {
-                return call.call();
-            } finally {
-                restoreScope(observations, previous);
-            }
+            return scoped(started[i], call);
         }
 
         /** Ends the record's observation unless it has ended; a record not of this call, or not observed, is ignored. */

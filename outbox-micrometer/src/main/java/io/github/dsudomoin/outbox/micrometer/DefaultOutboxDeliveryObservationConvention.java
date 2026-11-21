@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.micrometer;
 
+import io.github.dsudomoin.outbox.InternalApi;
 import io.github.dsudomoin.outbox.Outcome;
 import io.micrometer.common.KeyValues;
 import java.time.Duration;
@@ -36,7 +37,7 @@ public class DefaultOutboxDeliveryObservationConvention implements OutboxDeliver
         var topic = topic(context);
         var outcome = context.outcome();
         if (outcome != null) {
-            return topic.withOutcome(name(outcome));
+            return topic.withOutcome(outcomeName(outcome));
         }
         return context.failed() ? topic.withOutcome("failed") : topic.values();
     }
@@ -66,7 +67,9 @@ public class DefaultOutboxDeliveryObservationConvention implements OutboxDeliver
         return topics.computeIfAbsent(context.record().topic(), Topic::of);
     }
 
-    private static String name(Outcome outcome) {
+    /** {@code outbox.outcome} of {@code outcome}, as the Kora telemetry names it on its spans too. */
+    @InternalApi
+    public static String outcomeName(Outcome outcome) {
         if (outcome instanceof Outcome.Retry) {
             return "retry";
         } else if (outcome instanceof Outcome.Permanent) {

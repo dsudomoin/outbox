@@ -7,6 +7,7 @@ import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.internal.RecordScope;
+import io.github.dsudomoin.outbox.micrometer.DefaultOutboxDeliveryObservationConvention;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.trace.Span;
@@ -406,7 +407,6 @@ public final class KoraOutboxTelemetry implements OutboxTelemetry {
         span.setStatus(StatusCode.ERROR);
     }
 
-
     /**
      * A delivery span per record, started before the call and ended once: by the handler's report of the record
      * ({@link #recordFinished}, on the handler thread) or by the call's end (on the relay thread), whichever comes
@@ -518,27 +518,11 @@ public final class KoraOutboxTelemetry implements OutboxTelemetry {
         }
 
         private static void end(Span span, Outcome outcome) {
-            Throwable error = null;
-            String name;
-            if (outcome instanceof Outcome.Retry r) {
-                name = "retry";
-                error = r.error();
-            } else if (outcome instanceof Outcome.Permanent p) {
-                name = "permanent";
-                error = p.error();
-            } else if (outcome instanceof Outcome.NotAttempted) {
-                name = "not_attempted";
-            } else if (outcome instanceof Outcome.Requeue) {
-                name = "requeued";
-            } else if (outcome instanceof Outcome.Waiting) {
-                name = "waiting";
-            } else {
-                name = "delivered";
-            }
-            span.setAttribute("outbox.outcome", name);
+            span.setAttribute("outbox.outcome", DefaultOutboxDeliveryObservationConvention.outcomeName(outcome));
+            var error = outcome instanceof Outcome.Retry r ? r.error()
+                    : outcome instanceof Outcome.Permanent p ? p.error() : null;
             if (error != null) {
-                span.recordException(error);
-                span.setStatus(StatusCode.ERROR);
+                fail(span, error);
             }
             span.end();
         }
