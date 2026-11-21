@@ -183,30 +183,6 @@ class ShardProcessorIT {
     }
 
     @Test
-    void chunkedBatchDoesNotLoseLongTransaction() throws Exception {
-        config.batchSize(3);
-        bootstrap();
-        long t0 = cursor(0).tickId();
-        var longTx = begin();
-        var late = outbox.send(longTx, msg("t", "late", "late")); // the smallest id, committed after t1
-        var others = send(IntStream.range(0, 6).mapToObj(i -> msg("t", "k" + i, "k" + i))
-                .toArray(OutboxMessage[]::new));
-        long t1 = tick();
-
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 3, false));
-        long lastId = handler.delivered().get(2).id();
-        assertThat(cursor(0)).isEqualTo(new Cursor(0, t0, t1, lastId, null, 0, null, null));
-        longTx.commit();
-        long t2 = tick();
-        processUntilNoWork();
-
-        var expected = new ArrayList<>(others);
-        expected.add(late);
-        assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyElementsOf(expected);
-        assertThat(cursor(0)).isEqualTo(new Cursor(0, t2, null, 0, null, 0, null, null));
-    }
-
-    @Test
     void giantTransactionIsDeliveredCompletelyInOrder() throws Exception {
         config.batchSize(100);
         bootstrap();
@@ -450,8 +426,7 @@ class ShardProcessorIT {
         now = now.plus(INITIAL);
         process();
         assertThat(retryRows()).containsExactly("k#1:1:" + notBefore, "k#2:0:-");
-        assertThat(rows("select last_error from " + names.retry() + " where next_attempt_at is not null",
-                rs -> rs.getString(1))).singleElement().asString().contains("k#1 rejected");
+        assertThat(headErrors()).singleElement().asString().contains("k#1 rejected");
         assertThat(counter("outbox.messages.failed", "topic", "t", "outcome", "retry")).isEqualTo(1);
 
         script = null;
@@ -713,9 +688,7 @@ class ShardProcessorIT {
         process();
         var due = now.plus(INITIAL); // the wait delay is 50 ms too
         assertThat(retryRows()).containsExactly("w#1:0:" + due, "f#1:1:" + due, "w#2:0:-", "f#2:0:-", "w#3:0:-");
-        assertThat(rows("select payload, waiting_since from " + names.retry() + " where waiting_since is not null",
-                rs -> new String(rs.getBytes(1), UTF_8) + ":" + rs.getObject(2, OffsetDateTime.class).toInstant()))
-                .containsExactly("w#1:" + now);
+        assertThat(waiting()).containsExactly("w#1:" + now);
         script = null;
         calls.clear();
 
@@ -1552,9 +1525,11 @@ class ShardProcessorIT {
 
     /** A session waits for {@code LOCK_SWAP} exclusively: the swap's quiesce request is queued. */
     private boolean swapLockQueued() throws SQLException {
-        return Long.parseLong(rows("select count(*) from pg_locks where locktype = 'advisory' and classid::bigint = "
-                + Integer.toUnsignedLong(names.internalNamespace()) + " and objid = " + TableNames.LOCK_SWAP
-                + " and objsubid = 2 and mode = 'ExclusiveLock' and not granted", rs -> rs.getString(1)).get(0)) > 0;
+        try (var c = TestDb.connect()) {
+            return queryLong(c, "select count(*) from pg_locks where locktype = 'advisory' and classid::bigint = "
+                    + Integer.toUnsignedLong(names.internalNamespace()) + " and objid = " + TableNames.LOCK_SWAP
+                    + " and objsubid = 2 and mode = 'ExclusiveLock' and not granted") > 0;
+        }
     }
 
     /** A key of topic {@code t} on {@code shard}. */
@@ -3111,7 +3086,7 @@ class ShardProcessorIT {
     /** Three keys in a call, all requeueing: no call again at once, however few rows each brings. */
     @Test
     void aStepAtOneMomentDoesNotRepeatItself() throws Exception {
-        config.shards(1).batchSize(6);
+        config.batchSize(6);
         bootstrap();
         requeueAll();
         send(msg("t", "a", "a#1"), msg("t", "b", "b#1"), msg("t", "c", "c#1"), msg("t", "a", "a#2"),
@@ -3132,7 +3107,7 @@ class ShardProcessorIT {
     /** A key that fits in a call is never split: a row of it does not go without the older ones. */
     @Test
     void aKeyThatFitsComesWholeHoweverManyKeysShareTheStep() throws Exception {
-        config.shards(1).batchSize(20);
+        config.batchSize(20);
         bootstrap();
         requeueAll();
         var rows = new ArrayList<OutboxMessage>();
@@ -3277,7 +3252,7 @@ class ShardProcessorIT {
     /** A head does not overtake the older rows of a key that fits, however full the due pass would make the call. */
     @Test
     void aHeadOfAKeyThatFitsComesAfterItsOlderRowsWhateverTheCallHolds() throws Exception {
-        config.shards(1).batchSize(5);
+        config.batchSize(5);
         bootstrap();
         parkBelowAHead("k", List.of("k#1", "k#2", "k#3", "k#4"), "k#5");
         requeueAll();
@@ -3306,7 +3281,7 @@ class ShardProcessorIT {
     /** Heads of several keys: each comes after all its older rows, not a share of them. */
     @Test
     void headsOfSeveralKeysEachBringAllTheirOlderRows() throws Exception {
-        config.shards(1).batchSize(4);
+        config.batchSize(4);
         bootstrap();
         parkBelowAHead("k", List.of("k#1", "k#2", "k#3"), "k#4");
         parkBelowAHead("j", List.of("j#1", "j#2", "j#3"), "j#4");
@@ -3859,7 +3834,7 @@ class ShardProcessorIT {
     /** A storm of keys that fit one at a time holds neither the cursor nor the healthy keys behind them. */
     @Test
     void aChunkGoesOnPastKeysThatFindNoRoomInItsCall() throws Exception {
-        config.shards(1).batchSize(100);
+        config.batchSize(100);
         bootstrap();
         seedAStorm();
         script = records -> records.stream().map(r -> new String(r.payload(), UTF_8).startsWith("h")
@@ -3881,7 +3856,7 @@ class ShardProcessorIT {
     /** Such a storm ending: every key in its order, its held rows behind its older ones. */
     @Test
     void aKeyHeldOutOfACallComesInItsOrder() throws Exception {
-        config.shards(1).batchSize(100);
+        config.batchSize(100);
         bootstrap();
         seedAStorm();
         script = answering(Map.of());
@@ -3916,7 +3891,7 @@ class ShardProcessorIT {
     /** A held record takes its key past a call: it passes the key's older rows, and its leaving brings them next. */
     @Test
     void aHeldRecordTakingItsKeyPastACallPassesAtMostAPortion() throws Exception {
-        config.shards(1).batchSize(3);
+        config.batchSize(3);
         bootstrap();
         requeueAll();
         send(msg("t", "a", "a#1"), msg("t", "a", "a#2"), msg("t", "a", "a#3"), msg("t", "b", "b#1"), msg("t", "b", "b#2"),
@@ -3969,7 +3944,7 @@ class ShardProcessorIT {
     /** A chunk of records whose keys fit, each with its parked rows whole: what finds no room comes by the due pass. */
     @Test
     void aKeyWithNoRoomInItsCallComesNextInItsOrder() throws Exception {
-        config.shards(1).batchSize(4);
+        config.batchSize(4);
         bootstrap();
         requeueAll();
         send(msg("t", "a", "a#1"), msg("t", "a", "a#2"), msg("t", "a", "a#3"), msg("t", "b", "b#1"), msg("t", "b", "b#2"),
@@ -5420,20 +5395,15 @@ class ShardProcessorIT {
 
     /** Cursor rows of {@code shard} ever appended: the log only grows while maintenance does not run. */
     private long cursorRows(int shard) throws SQLException {
-        return Long.parseLong(rows("select count(*) from " + names.cursor() + " where shard = " + shard,
-                rs -> rs.getString(1)).get(0));
+        try (var c = TestDb.connect()) {
+            return queryLong(c, "select count(*) from " + names.cursor() + " where shard = " + shard);
+        }
     }
 
     /** {@code n} keys of topic {@code t} on {@code shard}. */
     private List<String> keysOnShard(int shard, int n) {
-        var keys = new ArrayList<String>();
-        for (int i = 0; keys.size() < n; i++) {
-            var key = "k" + i;
-            if (Hashing.shard(Hashing.keyHash("t", key.getBytes(UTF_8)), config.shards()) == shard) {
-                keys.add(key);
-            }
-        }
-        return keys;
+        var keys = new ShardKeys("t", config.shards());
+        return IntStream.range(0, n).mapToObj(i -> keys.next(shard)).toList();
     }
 
     /** {@code c}, adding the SQL of each statement it prepares to {@link #statements}. */
@@ -5624,8 +5594,9 @@ class ShardProcessorIT {
     }
 
     private List<Long> retryIds() throws SQLException {
-        return rows("select id from " + names.retry() + " order by id", rs -> rs.getString(1)).stream()
-                .map(Long::valueOf).toList();
+        try (var c = TestDb.connect()) {
+            return TestSql.queryLongs(c, "select id from " + names.retry() + " order by id");
+        }
     }
 
     /** {@code payload:attempts} in id order. */

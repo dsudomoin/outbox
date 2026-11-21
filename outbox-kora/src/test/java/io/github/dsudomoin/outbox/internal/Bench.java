@@ -40,6 +40,20 @@ final class Bench {
                 System.getProperty("bench.password"));
     }
 
+    /**
+     * A new business table of {@code keys} rows {@code (k, 0)}, {@code k} its primary key, whose rows the writers bump
+     * under their row lock; its name.
+     */
+    static String businessTable(int keys) throws SQLException {
+        var business = TestSql.uniqueTable();
+        try (var c = connect()) {
+            TestSql.execute(c, "create table " + business + " (k int primary key, v bigint not null)");
+            TestSql.execute(c, "insert into " + business + " select g, 0 from generate_series(0, " + (keys - 1)
+                    + ") g");
+        }
+        return business;
+    }
+
     /** The current WAL insert position. */
     static String lsn(Connection c) throws SQLException {
         return TestSql.queryString(c, "select pg_current_wal_insert_lsn()::text");

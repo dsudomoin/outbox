@@ -481,12 +481,12 @@ class OutboxAdminIT {
                     .isInstanceOf(IllegalArgumentException.class);
         }
 
-        assertThat(MaintenanceIT.exists(victim)).isTrue();
-        assertThat(MaintenanceIT.exists(unrelated)).isTrue();
+        assertThat(TestDb.exists(victim)).isTrue();
+        assertThat(TestDb.exists(unrelated)).isTrue();
         assertThat(count(precreated)).as("nothing moved").isOne();
         assertThat(ranges()).extracting(Bound::name).contains(attached);
-        assertThat(MaintenanceIT.exists(attached + "_id")).as("nothing run on the attached range").isFalse();
-        assertThat(MaintenanceIT.exists(precreated + "_id")).isFalse();
+        assertThat(TestDb.exists(attached + "_id")).as("nothing run on the attached range").isFalse();
+        assertThat(TestDb.exists(precreated + "_id")).isFalse();
         assertThat(outboxMessageIds()).isEmpty();
         assertThat(wakes).hasValue(0);
     }
@@ -501,7 +501,7 @@ class OutboxAdminIT {
 
         assertThat(admin.restoreOrphan(orphan, 20)).isEqualTo(2);
 
-        assertThat(MaintenanceIT.exists(orphan)).as("dropped").isFalse();
+        assertThat(TestDb.exists(orphan)).as("dropped").isFalse();
         assertThat(outboxMessageIds()).containsExactly(at, above);
         assertThat(admin.status().orphans()).isEmpty();
         assertThat(wakes).hasValue(1);
@@ -521,7 +521,7 @@ class OutboxAdminIT {
                     .isEqualTo(3000);
         }
 
-        assertThat(MaintenanceIT.exists(orphan)).as("dropped").isFalse();
+        assertThat(TestDb.exists(orphan)).as("dropped").isFalse();
         assertThat(outboxMessageIds()).hasSize(3000);
     }
 
@@ -537,7 +537,7 @@ class OutboxAdminIT {
                     .isEqualTo(3000);
         }
 
-        assertThat(MaintenanceIT.exists(orphan)).as("dropped").isFalse();
+        assertThat(TestDb.exists(orphan)).as("dropped").isFalse();
     }
 
     /** A scan cut all the same says so, with the table's size and what to run by hand, and keeps every row. */
@@ -596,7 +596,7 @@ class OutboxAdminIT {
         }
 
         assertThat(admin.orphanRestore.scanSlowdown).as("the first time again").isOne();
-        assertThat(MaintenanceIT.exists(orphan)).as("dropped").isFalse();
+        assertThat(TestDb.exists(orphan)).as("dropped").isFalse();
     }
 
     /**
@@ -700,7 +700,7 @@ class OutboxAdminIT {
                     .isInstanceOf(IllegalArgumentException.class);
         }
 
-        assertThat(MaintenanceIT.exists(orphan)).isTrue();
+        assertThat(TestDb.exists(orphan)).isTrue();
         assertThat(count(orphan)).isEqualTo(2);
         assertThat(admin.status().orphans()).containsExactly(new Orphan(orphan, OrphanKind.FOREIGN));
         assertThat(outboxMessageIds()).isEmpty();
@@ -876,7 +876,7 @@ class OutboxAdminIT {
         }
         assertThat(new Maintenance(db, names, config, new OutboxMetrics(null)).runOnce()).isTrue();
         for (var table : strangers) {
-            assertThat(MaintenanceIT.exists(table)).as("empty, yet not dropped as a foreign orphan would be").isTrue();
+            assertThat(TestDb.exists(table)).as("empty, yet not dropped as a foreign orphan would be").isTrue();
         }
     }
 
@@ -1163,18 +1163,12 @@ class OutboxAdminIT {
         var processor = collecting(handed);
         try {
             // below the outbox's ids; the lowest the head, due in an hour
-            execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, payload, created_at,"
-                    + " attempts, next_attempt_at) select -i, " + shard + ", gen_random_uuid(), 't', 'k', 'old', now(),"
-                    + " case when i = 1500 then 3 else 0 end, case when i = 1500 then now() + interval '1 hour' end"
-                    + " from generate_series(1, 1500) i");
-            execute("update " + names.cursor() + " set retry_due_at = now() + interval '1 hour' where shard = "
-                    + shard);
-            db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("t", "k", bytes("fresh"))));
+            oldKey(shard, 1500);
             var first = new AtomicBoolean(true);
             admin.afterChunk = c -> {
                 if (first.compareAndSet(true, false)) {
                     try {
-                        step(processor, ticks, shard, Instant.now());
+                        step(processor, shard, Instant.now());
                     } catch (Exception e) {
                         throw new IllegalStateException(e);
                     }
@@ -1186,7 +1180,7 @@ class OutboxAdminIT {
             assertThat(payloads(names.dead())).doesNotContain("fresh");
             assertThat(payloads(names.retry())).containsExactly("fresh");
             assertThat(count(names.retry() + " where next_attempt_at is not null")).as("its head").isOne();
-            step(processor, ticks, shard, Instant.now().plusSeconds(1));
+            step(processor, shard, Instant.now().plusSeconds(1));
             assertThat(handed).containsExactly("fresh");
             assertThat(count(names.retry())).isZero();
         } finally {
@@ -1206,18 +1200,12 @@ class OutboxAdminIT {
         var processor = collecting(handed);
         try {
             // two full chunks; the lowest the head, due in an hour
-            execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, payload, created_at,"
-                    + " attempts, next_attempt_at) select -i, " + shard + ", gen_random_uuid(), 't', 'k', 'old', now(),"
-                    + " case when i = 2000 then 3 else 0 end, case when i = 2000 then now() + interval '1 hour' end"
-                    + " from generate_series(1, 2000) i");
-            execute("update " + names.cursor() + " set retry_due_at = now() + interval '1 hour' where shard = "
-                    + shard);
-            db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("t", "k", bytes("fresh"))));
+            oldKey(shard, 2000);
             var chunks = new AtomicInteger();
             admin.afterChunk = c -> {
                 if (chunks.incrementAndGet() == 1) {
                     try {
-                        step(processor, ticks, shard, Instant.now());
+                        step(processor, shard, Instant.now());
                     } catch (Exception e) {
                         throw new IllegalStateException(e);
                     }
@@ -1232,7 +1220,7 @@ class OutboxAdminIT {
             assertThat(count(names.retry() + " where next_attempt_at is not null")).as("its head").isOne();
             assertThat(queryText("select (retry_due_at <= now())::text from " + names.cursor() + " where shard = "
                     + shard + " order by seq desc limit 1")).as("due now on the cursor").isEqualTo("true");
-            step(processor, ticks, shard, Instant.now().plusSeconds(1));
+            step(processor, shard, Instant.now().plusSeconds(1));
             assertThat(handed).containsExactly("fresh");
             assertThat(count(names.retry())).isZero();
         } finally {
@@ -1253,11 +1241,11 @@ class OutboxAdminIT {
             db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("t", "k", bytes("later"))));
             assertThat(admin.abandonKey("t", bytes("k"), "gone", false)).isEqualTo(new Abandoned(1, 1));
 
-            step(processor, ticks, shard, Instant.now());
+            step(processor, shard, Instant.now());
 
             assertThat(handed).as("sent later, delivered").containsExactly("later");
             assertThat(admin.redriveDeadLetters(List.of(1L))).isOne();
-            step(processor, ticks, shard, Instant.now().plusSeconds(1));
+            step(processor, shard, Instant.now().plusSeconds(1));
             assertThat(handed).containsExactly("later", "stuck");
             assertThat(count(names.dead())).isZero();
         } finally {
@@ -1281,7 +1269,7 @@ class OutboxAdminIT {
                     + " 3, now() + interval '1 hour')");
             var neighbour = ShardKeys.first("t", "other", shard, config.shards());
             db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("t", neighbour, bytes("o#1"))));
-            var step = pool.submit(() -> step(processor, ticks, shard, Instant.now()));
+            var step = pool.submit(() -> step(processor, shard, Instant.now()));
             assertThat(inHandler.await(10, SECONDS)).isTrue();
 
             admin.shardWait = Duration.ofMillis(200);
@@ -1323,11 +1311,11 @@ class OutboxAdminIT {
         try {
             var now = Instant.now();
             db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("t", "w", bytes("w#1"))));
-            step(processor, ticks, shard, now);
+            step(processor, shard, now);
             assertThat(payloads(names.retry())).as("waiting").containsExactly("w#1");
             db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("t", "w", bytes("w#2"))));
             block.set(true);
-            var step = pool.submit(() -> step(processor, ticks, shard, now.plusSeconds(1)));
+            var step = pool.submit(() -> step(processor, shard, now.plusSeconds(1)));
             assertThat(inHandler.await(10, SECONDS)).isTrue();
 
             admin.shardWait = Duration.ofMillis(200);
@@ -1378,8 +1366,21 @@ class OutboxAdminIT {
         }
     }
 
+    /**
+     * {@code rows} retry rows of key k below the outbox's ids, the lowest ({@code i = rows}) the head with 3 attempts,
+     * due in an hour as the cursor's retry pass is, then a send of {@code fresh} of the key.
+     */
+    private void oldKey(int shard, int rows) throws SQLException {
+        execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, payload, created_at,"
+                + " attempts, next_attempt_at) select -i, " + shard + ", gen_random_uuid(), 't', 'k', 'old', now(),"
+                + " case when i = " + rows + " then 3 else 0 end, case when i = " + rows + " then now() + interval"
+                + " '1 hour' end from generate_series(1, " + rows + ") i");
+        execute("update " + names.cursor() + " set retry_due_at = now() + interval '1 hour' where shard = " + shard);
+        db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("t", "k", bytes("fresh"))));
+    }
+
     /** One relay step of {@code shard} at {@code now} after a new tick, committed. */
-    private Void step(ShardProcessor processor, Ticks ticks, int shard, Instant now) throws Exception {
+    private Void step(ShardProcessor processor, int shard, Instant now) throws Exception {
         long latest;
         try (var c = TestDb.connect()) {
             assertThat(ticks.make(c, Duration.ZERO)).isTrue();
@@ -1427,7 +1428,9 @@ class OutboxAdminIT {
     }
 
     private List<Long> ids(String table) throws SQLException {
-        return longs("select id from " + table + " order by id");
+        try (var c = TestDb.connect()) {
+            return TestSql.queryLongs(c, "select id from " + table + " order by id");
+        }
     }
 
     static List<String> payloads(String table) throws SQLException {
@@ -1490,7 +1493,7 @@ class OutboxAdminIT {
         return orphan;
     }
 
-    private static void awaitLockWait(Connection observer, long pid) throws Exception {
+    static void awaitLockWait(Connection observer, long pid) throws Exception {
         long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
         while (queryLong(observer, "select count(*) from pg_locks where not granted and pid = " + pid) == 0) {
             assertThat(System.nanoTime()).as("pid %d waits for a lock", pid).isLessThan(deadline);
@@ -1538,7 +1541,7 @@ class OutboxAdminIT {
     }
 
     private List<Long> deadIds() throws SQLException {
-        return longs("select id from " + names.dead() + " order by id");
+        return ids(names.dead());
     }
 
     private List<UUID> outboxMessageIds() throws SQLException {
@@ -1557,12 +1560,6 @@ class OutboxAdminIT {
         try (var c = TestDb.connect()) {
             return TestSql.queryStrings(c, "select concat_ws(' ', message_id, topic, encode(key, 'hex'), md5(payload),"
                     + " md5(headers)) from " + table + " order by id");
-        }
-    }
-
-    private List<Long> longs(String sql) throws SQLException {
-        try (var c = TestDb.connect()) {
-            return TestSql.queryLongs(c, sql);
         }
     }
 

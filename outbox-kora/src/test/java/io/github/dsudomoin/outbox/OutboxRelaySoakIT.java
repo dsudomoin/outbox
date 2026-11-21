@@ -9,7 +9,6 @@ import io.github.dsudomoin.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.outbox.internal.Maintenance;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
-import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.ShardKeys;
@@ -176,10 +175,9 @@ class OutboxRelaySoakIT {
     }
 
     private OutboxRelay start(OutboxHandler handler) {
-        var transactions = new KoraOutboxTransactions(db);
-        var relay = new OutboxRelay(transactions, config, schema, handler, TestTelemetry.kora(),
-                new Maintenance(transactions, schema.names(), config, new OutboxMetrics(null)),
-                new DeadLetterPass(transactions, schema.names(), config, null, new OutboxMetrics(null)));
+        var relay = new OutboxRelay(db, config, schema, handler, TestTelemetry.kora(),
+                new Maintenance(db, schema.names(), config, new OutboxMetrics(null)),
+                new DeadLetterPass(db, schema.names(), config, null, new OutboxMetrics(null)));
         relays.add(relay);
         relay.start();
         assertThat(relay.running()).isTrue();

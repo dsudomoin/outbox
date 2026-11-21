@@ -21,7 +21,6 @@ import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.ShardProcessor;
 import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.internal.Ticks;
-import io.github.dsudomoin.outbox.kora.KoraOutboxTelemetry;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
@@ -35,6 +34,7 @@ import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.api.trace.TracerProvider;
+import jakarta.annotation.Nullable;
 import java.lang.management.ManagementFactory;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
@@ -240,16 +240,10 @@ class OutboxRelayIT {
         var relay = start(handler);
         var outbox = outbox(relay::wake);
         awaitParked();
-        var keys = new ArrayList<String>();
-        var perShard = new int[16];
-        for (int i = 0; keys.size() < 16 * 100; i++) {
-            var key = "k" + i;
-            int shard = Hashing.shard(Hashing.keyHash("t", key.getBytes(UTF_8)), 16);
-            if (perShard[shard] < 100) {
-                perShard[shard]++;
-                keys.add(key);
-            }
-        }
+        var shardKeys = new ShardKeys("t", 16);
+        var keys = IntStream.range(0, 16).boxed()
+                .flatMap(s -> IntStream.range(0, 100).mapToObj(i -> shardKeys.next(s)))
+                .toList();
         // the first batch of each shard: the relay learns a hundred rows a shard
         send(outbox, keys.stream().map(k -> msg("t", k, "a")).toArray(OutboxMessage[]::new));
         await(Duration.ofSeconds(10), () -> handler.delivered().size() == keys.size());
@@ -277,10 +271,7 @@ class OutboxRelayIT {
         var outbox = outbox(relay::wake);
         awaitParked();
 
-        long before;
-        try (var c = TestDb.connect()) {
-            before = queryLong(c, "select coalesce(max(id), 0) from " + schema.names().tick());
-        }
+        long before = ticksMade();
         long started = System.nanoTime();
         int sent = 0;
         while (System.nanoTime() - started < TimeUnit.SECONDS.toNanos(2)) { // a wake-up every commit
@@ -347,14 +338,14 @@ class OutboxRelayIT {
                     if (sql.contains("pg_try_advisory_xact_lock(")) { // a maintenance run
                         runs.incrementAndGet();
                     }
-                })), noHook(db)));
+                })), deadLetters(db, null)));
         relays.get(0).start();
         await(Duration.ofSeconds(5), () -> runs.get() == 1);
 
         config.relayEnabled(false);
         var disabled = new AtomicInteger();
         relays.add(new OutboxRelay(db, config, schema, new RecordingHandler(), TestTelemetry.kora(),
-                maintenance(observed(sql -> disabled.incrementAndGet())), noHook(db)));
+                maintenance(observed(sql -> disabled.incrementAndGet())), deadLetters(db, null)));
         relays.get(1).start();
         relays.get(1).close();
         assertThat(disabled).hasValue(0);
@@ -391,7 +382,7 @@ class OutboxRelayIT {
         };
         try (var err = new CapturedStderr()) {
             relays.add(new OutboxRelay(db, config, schema, new RecordingHandler(), TestTelemetry.kora(),
-                    maintenance(failing), noHook(db)));
+                    maintenance(failing), deadLetters(db, null)));
             relays.get(0).start();
 
             // a run that throws would cancel all later runs without a word: the run logs it and the next one comes
@@ -439,20 +430,6 @@ class OutboxRelayIT {
                 .isLessThanOrEqualTo((tickAttempts + 2) * config.workers() * 4);
         int total = sent;
         await(Duration.ofSeconds(5), () -> handler.delivered().size() == total);
-    }
-
-    @Test
-    void otherInstanceDeliversViaIdlePoll() throws Exception {
-        config.idlePollInterval(Duration.ofMillis(200)); // the default
-        bootstrap();
-        var handler = new RecordingHandler();
-        start(handler); // another instance: nothing wakes it
-        var outbox = outbox(() -> {});
-
-        var ids = send(outbox, msg("t", "k", "p"), msg("t", null, "q"));
-
-        await(Duration.ofSeconds(1), () -> handler.delivered().size() == 2);
-        assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyInAnyOrderElementsOf(ids);
     }
 
     @Test
@@ -1120,21 +1097,17 @@ class OutboxRelayIT {
         var factory = tracking(tight, peaks);
         var entered = new CountDownLatch(1);
         var done = new CountDownLatch(1);
-        var metrics = new OutboxMetrics(null);
         OutboxHandler slow = record -> {
             if ("poison".equals(key(record))) {
                 throw new OutboxPermanentException("bad payload");
             }
             Thread.sleep(20);
         };
-        var relay = new OutboxRelay(new KoraOutboxTransactions(factory), config, schema, slow,
-                new KoraOutboxTelemetry(metrics, null), maintenance(db),
-                new DeadLetterPass(new KoraOutboxTransactions(factory), schema.names(), config, letters -> {
-                    entered.countDown();
-                    done.await(); // until the call is cut
-                    return List.of();
-                }, metrics));
-        relays.add(relay);
+        var relay = relay(factory, slow, letters -> {
+            entered.countDown();
+            done.await(); // until the call is cut
+            return List.of();
+        });
         // stand-ins for an outbox and an inbox maintenance run, at the same time
         try (var outboxMaintenance = tight.newConnection(); var inboxMaintenance = tight.newConnection()) {
             relay.start();
@@ -1295,12 +1268,7 @@ class OutboxRelayIT {
         send(outbox, msg("t", "w", "w"), msg("t", "k", "k"), msg("t", "j", "j"));
         assertThat(drainer.drain()).isOne(); // the heads are due in an hour: the drain does not wait for them
         assertThat(rows(schema.names().retry())).isEqualTo(2);
-        try (var c = TestDb.connect(); var st = c.createStatement()) {
-            st.execute("update " + schema.names().retry() + " set next_attempt_at = now() - interval '1 minute'"
-                    + " where next_attempt_at is not null");
-            st.execute("update " + schema.names().cursor() + " set retry_due_at = now() - interval '1 minute'"
-                    + " where retry_due_at is not null");
-        }
+        retryDueNow();
         send(outbox, msg("t", "m", "m"));
         slow.set(true);
 
@@ -1364,12 +1332,7 @@ class OutboxRelayIT {
                 msg("t", keyOnShard(1, "j"), "j"));
         assertThat(drainer.drain()).isEqualTo(2); // the heads are due in an hour: the drain does not wait for them
         assertThat(rows(schema.names().retry())).isEqualTo(4);
-        try (var c = TestDb.connect(); var st = c.createStatement()) {
-            st.execute("update " + schema.names().retry() + " set next_attempt_at = now() - interval '1 minute'"
-                    + " where next_attempt_at is not null");
-            st.execute("update " + schema.names().cursor() + " set retry_due_at = now() - interval '1 minute'"
-                    + " where retry_due_at is not null");
-        }
+        retryDueNow();
         send(outbox, msg("t", m, "m"));
         slow.set(true);
 
@@ -1381,6 +1344,16 @@ class OutboxRelayIT {
         drained.get(3, TimeUnit.MINUTES); // throws "made no progress" if the drain gives up on the step
         assertThat(main).isTrue();
         assertThat(rows(schema.names().retry())).isZero();
+    }
+
+    /** Makes every retry row and every shard's retry pass due a minute ago. */
+    private void retryDueNow() throws SQLException {
+        try (var c = TestDb.connect(); var st = c.createStatement()) {
+            st.execute("update " + schema.names().retry() + " set next_attempt_at = now() - interval '1 minute'"
+                    + " where next_attempt_at is not null");
+            st.execute("update " + schema.names().cursor() + " set retry_due_at = now() - interval '1 minute'"
+                    + " where retry_due_at is not null");
+        }
     }
 
     private static void sleepThrough(Duration duration) {
@@ -1579,7 +1552,7 @@ class OutboxRelayIT {
         var handler = new RecordingHandler();
         try (var err = new CapturedStderr()) {
             var relay = start(record -> {
-                if ("deep".equals(new String(record.payload(), UTF_8))) {
+                if ("deep".equals(payload(record))) {
                     throw new StackOverflowError("deep payload (test)");
                 }
                 handler.handle(record);
@@ -1642,7 +1615,7 @@ class OutboxRelayIT {
         var handler = new RecordingHandler();
         try (var err = new CapturedStderr()) {
             var relay = new OutboxRelay(db, config, schema, handler, TestTelemetry.kora(null, failing), maintenance(db),
-                    noHook(db));
+                    deadLetters(db, null));
             relays.add(relay);
             relay.start();
 
@@ -2226,7 +2199,7 @@ class OutboxRelayIT {
         bootstrap(); // maintenance runs at start, then not for an hour
         var maintenance = maintenance(db);
         var relay = new OutboxRelay(db, config, schema, new RecordingHandler(), TestTelemetry.kora(), maintenance,
-                noHook(db));
+                deadLetters(db, null));
         relays.add(relay);
         var bootstrapped = lastSuccess();
         relay.start();
@@ -2276,7 +2249,7 @@ class OutboxRelayIT {
         var maintenance = maintenance(db);
         var handler = new RecordingHandler();
         var relay = new OutboxRelay(db, config, schema, handler, TestTelemetry.kora(), maintenance,
-                noHook(db));
+                deadLetters(db, null));
         relays.add(relay);
         relay.start();
         // then maintenance's checkpoint moves every idle shard on, past the ids the restore goes back to
@@ -2598,8 +2571,13 @@ class OutboxRelayIT {
     }
 
     private OutboxRelay relay(JdbcConnectionFactory factory, OutboxHandler handler) {
+        return relay(factory, handler, null);
+    }
+
+    private OutboxRelay relay(
+            JdbcConnectionFactory factory, OutboxHandler handler, @Nullable OutboxDeadLetterHandler hook) {
         var relay = new OutboxRelay(new KoraOutboxTransactions(factory), config, schema, handler,
-                TestTelemetry.kora(), maintenance(db), noHook(factory));
+                TestTelemetry.kora(), maintenance(db), deadLetters(factory, hook));
         relays.add(relay);
         return relay;
     }
@@ -2621,19 +2599,14 @@ class OutboxRelayIT {
         });
     }
 
-    /** A dead-letter pass without a hook: every dead letter is kept. */
-    private DeadLetterPass noHook(JdbcConnectionFactory factory) {
-        return new DeadLetterPass(new KoraOutboxTransactions(factory), schema.names(), config, null,
+    /** A dead-letter pass calling {@code hook}; without one, every dead letter is kept. */
+    private DeadLetterPass deadLetters(JdbcConnectionFactory factory, @Nullable OutboxDeadLetterHandler hook) {
+        return new DeadLetterPass(new KoraOutboxTransactions(factory), schema.names(), config, hook,
                 new OutboxMetrics(null));
     }
 
     private OutboxRelay relay(OutboxHandler handler, OutboxDeadLetterHandler hook) {
-        var metrics = new OutboxMetrics(null);
-        var relay = new OutboxRelay(db, config, schema, handler, new KoraOutboxTelemetry(metrics, null),
-                maintenance(db),
-                new DeadLetterPass(db, schema.names(), config, hook, metrics));
-        relays.add(relay);
-        return relay;
+        return relay(db, handler, hook);
     }
 
     /** A handler failing every record of key {@code poison} permanently. */

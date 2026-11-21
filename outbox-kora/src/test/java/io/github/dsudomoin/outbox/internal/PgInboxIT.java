@@ -24,6 +24,7 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.InstantSource;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -365,10 +366,7 @@ class PgInboxIT {
         try (var c = TestDb.connect()) {
             assertThat(queryString(c, "select consumer from " + table() + " where message_id = ?::uuid",
                     accepted.toString())).isEmpty();
-            try (var ps = c.prepareStatement("insert into " + table() + " (message_id, consumer) values (?, '')")) {
-                ps.setObject(1, recorded);
-                ps.executeUpdate();
-            }
+            execute(c, "insert into " + table() + " (message_id, consumer) values ('" + recorded + "', '')");
         }
 
         assertThat(accept(recorded)).isFalse();
@@ -411,18 +409,12 @@ class PgInboxIT {
         var app = TestDb.newDatabase(2, role);
         try (var holder = TestDb.connect()) { // a maintenance run elsewhere holds the lock for about 2 s
             int ns = TableNames.of("public." + table()).internalNamespace();
-            try (var ps = holder.prepareStatement("select pg_advisory_lock(?, ?)")) {
-                ps.setInt(1, ns);
-                ps.setInt(2, TableNames.LOCK_INBOX_MAINTENANCE);
-                ps.execute();
-            }
+            execute(holder, "select pg_advisory_lock(" + ns + ", " + TableNames.LOCK_INBOX_MAINTENANCE + ")");
             var errors = new ConcurrentLinkedQueue<Throwable>();
             var release = new Thread(() -> {
-                try (var ps = holder.prepareStatement("select pg_advisory_unlock(?, ?)")) {
+                try {
                     Thread.sleep(2000);
-                    ps.setInt(1, ns);
-                    ps.setInt(2, TableNames.LOCK_INBOX_MAINTENANCE);
-                    ps.execute();
+                    execute(holder, "select pg_advisory_unlock(" + ns + ", " + TableNames.LOCK_INBOX_MAINTENANCE + ")");
                 } catch (Throwable e) {
                     errors.add(e);
                 }
@@ -456,11 +448,8 @@ class PgInboxIT {
             execute(c, "alter table " + table() + " alter column received_at set default current_timestamp");
         }
         try (var holder = TestDb.connect()) { // a maintenance run elsewhere holds the lock past lock_timeout
-            try (var ps = holder.prepareStatement("select pg_advisory_lock(?, ?)")) {
-                ps.setInt(1, TableNames.of("public." + table()).internalNamespace());
-                ps.setInt(2, TableNames.LOCK_INBOX_MAINTENANCE);
-                ps.execute();
-            }
+            execute(holder, "select pg_advisory_lock(" + TableNames.of("public." + table()).internalNamespace() + ", "
+                    + TableNames.LOCK_INBOX_MAINTENANCE + ")");
             var other = new PgInbox(db, config, new OutboxMetrics(null));
 
             assertThatThrownBy(other::start)
@@ -491,10 +480,8 @@ class PgInboxIT {
         try (var c = TestDb.connect(); var reader = TestDb.connect()) {
             attach(c, expired.get(0), hour - 6 * HOUR);
             attach(c, expired.get(1), hour - 5 * HOUR);
-            try (var ps = c.prepareStatement("insert into " + table() + " (message_id) values (?)")) {
-                ps.setObject(1, UuidV7.next(hour - 5 * HOUR + 1)); // expired rows go with their partition
-                ps.executeUpdate();
-            }
+            // expired rows go with their partition
+            execute(c, "insert into " + table() + " (message_id) values ('" + UuidV7.next(hour - 5 * HOUR + 1) + "')");
             // an interrupted drop left the upper one detach-pending: the lower one's detach fails (55000) until
             // the pending one is finished
             reader.setAutoCommit(false);
@@ -595,18 +582,12 @@ class PgInboxIT {
         var recent = table() + "_t" + HOURS.format(Instant.ofEpochMilli(hour + 240 * HOUR));
         try (var c = TestDb.connect()) {
             attach(c, expired, hour - 5 * HOUR);
-            try (var ps = c.prepareStatement("insert into " + table() + " (message_id) values (?)")) {
-                ps.setObject(1, UuidV7.next(hour - 5 * HOUR + 1));
-                ps.executeUpdate();
-            }
+            execute(c, "insert into " + table() + " (message_id) values ('" + UuidV7.next(hour - 5 * HOUR + 1) + "')");
             // a run killed after its DETACH went through, before its DROP
             execute(c, "alter table " + table() + " detach partition " + expired + " concurrently");
             // and a detached table whose ids are still in the window: its dedup records sit outside the inbox
             standalone(c, recent);
-            try (var ps = c.prepareStatement("insert into " + recent + " (message_id) values (?)")) {
-                ps.setObject(1, UuidV7.next());
-                ps.executeUpdate();
-            }
+            execute(c, "insert into " + recent + " (message_id) values ('" + UuidV7.next() + "')");
         }
         var orphanRegistry = new SimpleMeterRegistry();
         var maintaining = new PgInbox(db, config, new OutboxMetrics(orphanRegistry));
@@ -960,7 +941,8 @@ class PgInboxIT {
     @Test
     void theWindowGaugeKeepsFallingOnceNoRangeIsLeft() throws Exception {
         var broken = new AtomicBoolean();
-        inbox = new PgInbox(db, new OwnerTransactions(db, brokenWhen(broken)), config, new OutboxMetrics(registry));
+        inbox = new PgInbox(db, new OwnerTransactions(db, brokenWhen(broken)), config, new OutboxMetrics(registry),
+                InstantSource.system());
         inbox.start();
         long top = highest() - HOUR;
         broken.set(true); // no instance makes ranges any more
@@ -983,7 +965,8 @@ class PgInboxIT {
      */
     private void refreshesWithTheOwnerBroken(AtomicBoolean broken, ConnectionSource owner) throws Exception {
         var staleRegistry = new SimpleMeterRegistry();
-        var stale = new PgInbox(db, new OwnerTransactions(db, owner), config, new OutboxMetrics(staleRegistry));
+        var stale = new PgInbox(db, new OwnerTransactions(db, owner), config, new OutboxMetrics(staleRegistry),
+                InstantSource.system());
         stale.start();
         try {
             long top = highest();

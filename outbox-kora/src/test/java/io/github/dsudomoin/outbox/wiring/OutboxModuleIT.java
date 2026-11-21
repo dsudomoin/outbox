@@ -1,7 +1,7 @@
 package io.github.dsudomoin.outbox.wiring;
 
+import static io.github.dsudomoin.outbox.testing.TestDb.exists;
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
-import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -142,12 +142,6 @@ class OutboxModuleIT implements KoraAppTestConfigModifier {
 
     private UUID send() throws SQLException {
         return db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("orders", "k", "p".getBytes(UTF_8))));
-    }
-
-    private static boolean exists(String table) throws SQLException {
-        try (var c = TestDb.connect()) {
-            return queryString(c, "select to_regclass(?)::text", table) != null;
-        }
     }
 
     private static void await(BooleanSupplier condition) throws InterruptedException {

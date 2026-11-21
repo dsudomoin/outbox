@@ -22,7 +22,6 @@ import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Properties;
 import java.util.UUID;
 import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.AfterAll;
@@ -204,10 +203,7 @@ class TransactionPoolingIT {
     }
 
     private TestDatabase pooled(int size) {
-        var properties = new Properties();
-        properties.setProperty("prepareThreshold", "0"); // the pooler keeps no prepared statement
-        var db = TestDb.newDatabase(pooler.jdbcUrl(), TestDataSources.user(), TestDataSources.password(), size,
-                properties);
+        var db = TestDb.newDatabase(pooler, size);
         pools.add(db);
         return db;
     }

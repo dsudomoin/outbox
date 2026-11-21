@@ -42,8 +42,6 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
 
 class XidPartitionsIT {
 
-    private static final Duration SWAP_LOCK_TIMEOUT = Duration.ZERO; // the default: no wait
-
     private final TestDatabase db = TestDb.newDatabase(4);
 
     @AfterEach
@@ -53,7 +51,7 @@ class XidPartitionsIT {
 
     @Test
     void extendsWhenHalfOfPremadeConsumed() throws Exception {
-        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
         var partitions = new XidPartitions(names, config.partitions());
         TestDb.burnXids(2500);
@@ -72,7 +70,7 @@ class XidPartitionsIT {
 
     @Test
     void extensionDoesNotBlockConcurrentInserts() throws Exception {
-        var config = new TestOutboxConfig().xidsPerPartition(10_000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var config = new TestOutboxConfig().xidsPerPartition(10_000).premake(4);
         var names = bootstrap(config);
         var partitions = new XidPartitions(names, config.partitions());
         var done = new AtomicBoolean();
@@ -147,9 +145,9 @@ class XidPartitionsIT {
 
             assertThat(errors).isEmpty();
             assertThat(sawPending).as("the tail or a range seen detach-pending").isFalse();
-            // an insert waits at most for the swap's lock wait plus the milliseconds it holds the lock; the second
-            // leaves room for a saturated machine
-            assertThat(Duration.ofNanos(maxLatency.get())).isLessThan(SWAP_LOCK_TIMEOUT.plusSeconds(1));
+            // an insert waits at most for the swap's lock wait, none at swapLockTimeout 0, the default, plus the
+            // milliseconds it holds the lock; the second leaves room for a saturated machine
+            assertThat(Duration.ofNanos(maxLatency.get())).isLessThan(Duration.ofSeconds(1));
             assertThat(tail(c, names)).isGreaterThan(initialTail);
             assertThat(queryLong(c, "select count(*) from " + names.tail())).isZero();
             assertThat(queryLong(c, "select count(*) from " + names.base())).isPositive();
@@ -467,6 +465,7 @@ class XidPartitionsIT {
             assertThat(log).contains("ERROR").contains(names.tail());
             assertThat(tail(c, names)).isEqualTo(lower);
             assertThat(partitions.overflow()).isTrue();
+            assertThat(partitions.tailStuck()).as("no window: stuck at once").isTrue();
             assertNoCheck(c, names);
             send(c, names, 10);
             assertThat(queryLong(c, "select count(*) from " + names.tail())).isEqualTo(10_011);
@@ -711,7 +710,7 @@ class XidPartitionsIT {
 
     @Test
     void tailThatOverflowedWhileItsSwapWasDeferredIsConverted() throws Exception {
-        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
         var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1));
 
@@ -737,7 +736,7 @@ class XidPartitionsIT {
 
     @Test
     void noSwapWhenNoRangeIsToBeAdded() throws Exception {
-        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
         // xidsPerPartition shrunk since: half of premake used up, yet the ranges reach past premake new ones
         var shrunk = new XidPartitions(names, new TestOutboxConfig().xidsPerPartition(100).premake(4).partitions());
@@ -762,7 +761,7 @@ class XidPartitionsIT {
 
     @Test
     void tailNextLeftBeforeAColumnWasAddedIsMadeAnew() throws Exception {
-        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
         var partitions = new XidPartitions(names, config.partitions());
         TestDb.burnXids(2500);
@@ -811,7 +810,7 @@ class XidPartitionsIT {
 
     @Test
     void snapshotsDoNotDeferTheSwap() throws Exception {
-        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
         var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1)); // 20 s in production
 
@@ -839,7 +838,7 @@ class XidPartitionsIT {
 
     @Test
     void oldLockOnTheParentDefersTheSwapUntilItEnds() throws Exception {
-        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
         var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1));
 
@@ -872,7 +871,7 @@ class XidPartitionsIT {
 
     @Test
     void pgDumpDefersTheSwapAtAnyAge() throws Exception {
-        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
         var partitions = new XidPartitions(names, config.partitions()); // the production 20 s
         var dump = new Properties();
@@ -917,7 +916,7 @@ class XidPartitionsIT {
 
     @Test
     void failedSwapLeavesTheTailAttached() throws Exception {
-        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
         var partitions = new XidPartitions(names, config.partitions());
 
@@ -934,7 +933,8 @@ class XidPartitionsIT {
             long start = System.nanoTime();
             assertThatThrownBy(() -> partitions.ensurePremade(c))
                     .isInstanceOfSatisfying(SQLException.class, e -> assertThat(e.getSQLState()).isEqualTo("55P03"));
-            assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(SWAP_LOCK_TIMEOUT.plusSeconds(1));
+            // no lock wait: swapLockTimeout 0, the default
+            assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(1));
             assertThat(detachPending(c, names.tail())).as("still attached").isEqualTo("false");
             assertThat(tail(c, names)).isEqualTo(lower);
             assertThat(swapLocks(c, names)).as("the quiesce lock released").isZero();
@@ -1247,22 +1247,6 @@ class XidPartitionsIT {
         }
     }
 
-    /** With no tailConversion window a tail over maxTailScan can never be converted: it is stuck at once. */
-    @Test
-    void anOversizedTailIsStuckAtOnceWithoutAWindow() throws Exception {
-        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(64 * 1024)
-                .tailConversion("", Duration.ofSeconds(1));
-        var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
-
-        try (var c = TestDb.connect()) {
-            overflowTail(c, names, 10_000);
-            ensurePremadeAsMaintenance(partitions, c);
-
-            assertThat(partitions.tailStuck()).isTrue();
-        }
-    }
-
     @Test
     void bootstrapSaysTheTailConversionWindowAndItsZone() throws Exception {
         var config = new TestOutboxConfig().tailConversion("02:00-04:30", Duration.ofMillis(800))
@@ -1292,9 +1276,7 @@ class XidPartitionsIT {
                 var partitions = new XidPartitions(names, config.partitions());
                 try (var c = DriverManager.getConnection(pg17.getJdbcUrl(), pg17.getUsername(), pg17.getPassword())) {
                     burn(c, 2500);
-                    if (currentXid(c) % 1000 > 600) { // its own xids must not carry the counter into the next range
-                        burn(c, 500);
-                    }
+                    roomInTheRange(c, 600); // its own xids must not carry the counter into the next range
                     long empty = tail(c, names);
                     partitions.ensurePremade(c);
                     assertThat(tail(c, names)).as("the empty tail swapped").isGreaterThan(empty);
@@ -1342,9 +1324,7 @@ class XidPartitionsIT {
                 var names = schema.names();
                 var partitions = new XidPartitions(names, config.partitions());
                 burn(c, 2500);
-                if (currentXid(c) % 1000 > 600) {
-                    burn(c, 500);
-                }
+                roomInTheRange(c, 600);
                 long lower = tail(c, names);
                 execute(w, "set synchronous_commit = local"); // the writer's own commits: not what this is about
                 partitions.beforeSwap = () -> {
@@ -1443,7 +1423,7 @@ class XidPartitionsIT {
 
     @Test
     void quiesceWaitsForARelayStepAndTimesOutWithoutALock() throws Exception {
-        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
         var partitions = new XidPartitions(names, config.partitions());
         TestDb.burnXids(2500);
@@ -1479,7 +1459,7 @@ class XidPartitionsIT {
      */
     @Test
     void aClientFrozenUnderTheQuiesceLosesItWithinSeconds() throws Exception {
-        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
         var partitions = new XidPartitions(names, config.partitions());
         TestDb.burnXids(2500);
@@ -1517,14 +1497,8 @@ class XidPartitionsIT {
 
     /** A relay step's try for {@code LOCK_SWAP} shared, in a transaction of its own. */
     private static boolean trySwapShared(Connection c, TableNames names) throws SQLException {
-        try (var ps = c.prepareStatement("select pg_try_advisory_xact_lock_shared(?, ?)")) {
-            ps.setInt(1, names.internalNamespace());
-            ps.setInt(2, TableNames.LOCK_SWAP);
-            try (var rs = ps.executeQuery()) {
-                rs.next();
-                return rs.getBoolean(1);
-            }
-        }
+        return queryString(c, "select pg_try_advisory_xact_lock_shared(" + names.internalNamespace() + ", "
+                + TableNames.LOCK_SWAP + ")::text").equals("true");
     }
 
     /**
@@ -1533,7 +1507,7 @@ class XidPartitionsIT {
      */
     @Test
     void aQuiesceTimeoutNamesTheRelayStepsInFlight() throws Exception {
-        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
         var partitions = new XidPartitions(names, config.partitions());
 
@@ -1566,7 +1540,7 @@ class XidPartitionsIT {
 
     @Test
     void errorMidSwapRollsBackAndReleasesTheSwapLock() throws Exception {
-        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
         var partitions = new XidPartitions(names, config.partitions());
         TestDb.burnXids(2500);
@@ -1612,7 +1586,7 @@ class XidPartitionsIT {
 
             commitLater.join();
             assertThat(errors).isEmpty();
-            assertThat(countThroughParent(c, names, id)).isEqualTo(1);
+            assertThat(MaintenanceIT.count(names.base(), List.of(id))).isEqualTo(1);
             assertThat(partitions.overflow()).isTrue();
             assertThat(tail(c, names)).isEqualTo(lower);
             assertThat(swapLocks(c, names)).as("the quiesce lock released").isZero();
@@ -1757,7 +1731,7 @@ class XidPartitionsIT {
             commitLater.join();
             assertThat(errors).isEmpty();
             assertThat(partitions.overflow()).isTrue();
-            assertThat(countThroughParent(c, names, id)).isEqualTo(1);
+            assertThat(MaintenanceIT.count(names.base(), List.of(id))).isEqualTo(1);
             assertThat(tail(c, names)).isEqualTo(lower);
         }
     }
@@ -1782,12 +1756,12 @@ class XidPartitionsIT {
                 st.execute("reset lock_timeout");
             }
             holder.commit();
-            assertThat(countThroughParent(c, names, id)).isZero(); // a pending tail hides its rows
+            assertThat(MaintenanceIT.count(names.base(), List.of(id))).isZero(); // a pending tail hides its rows
 
             partitions.ensurePremade(c);
 
             assertThat(partitions.overflow()).isTrue();
-            assertThat(countThroughParent(c, names, id)).isEqualTo(1);
+            assertThat(MaintenanceIT.count(names.base(), List.of(id))).isEqualTo(1);
             assertThat(detachPending(c, names.tail())).isEqualTo("false");
             assertThat(tail(c, names)).isEqualTo(lower);
         }
@@ -1808,7 +1782,7 @@ class XidPartitionsIT {
             partitions.ensurePremade(c);
 
             assertThat(partitions.overflow()).isTrue();
-            assertThat(countThroughParent(c, names, id)).isEqualTo(1);
+            assertThat(MaintenanceIT.count(names.base(), List.of(id))).isEqualTo(1);
             assertTailAboveLastRange(c, names);
             assertThat(tail(c, names)).isEqualTo(lower);
         }
@@ -1973,7 +1947,7 @@ class XidPartitionsIT {
     private static void roomInTheRange(Connection c, int maxOffset) throws SQLException {
         long offset = currentXid(c) % 1000;
         if (offset > maxOffset) {
-            TestDb.burnXids((int) (1000 - offset) + 10);
+            burn(c, (int) (1000 - offset) + 10);
         }
     }
 
@@ -2149,16 +2123,6 @@ class XidPartitionsIT {
         execute(c, "insert into " + names.base() + " (shard, xid, message_id, topic) select s % 4, '" + lower
                 + "'::xid8, gen_random_uuid(), 't' from generate_series(1, " + rows + ") s");
         assertThat(queryLong(c, "select count(*) from " + names.tail())).isEqualTo(rows);
-    }
-
-    private static long countThroughParent(Connection c, TableNames names, UUID id) throws SQLException {
-        try (var ps = c.prepareStatement("select count(*) from " + names.base() + " where message_id = ?")) {
-            ps.setObject(1, id);
-            try (var rs = ps.executeQuery()) {
-                rs.next();
-                return rs.getLong(1);
-            }
-        }
     }
 
     private TableNames bootstrap(TestOutboxConfig config) throws Exception {

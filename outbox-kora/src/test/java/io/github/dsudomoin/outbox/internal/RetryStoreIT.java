@@ -80,8 +80,8 @@ class RetryStoreIT {
         var due = dueHeads(0, NOW, 10);
 
         assertThat(due).extracting(OutboxRecord::id).containsExactly(unkeyedHead.id(), keyedHead.id());
-        assertSameRecord(due.get(0), unkeyedHead, 2);
-        assertSameRecord(due.get(1), keyedHead, 1);
+        ParkedStoreIT.assertSameRecord(due.get(0), unkeyedHead, 2, 0);
+        ParkedStoreIT.assertSameRecord(due.get(1), keyedHead, 1, 0);
         assertThat(dueHeads(0, NOW, 1)).extracting(OutboxRecord::id).containsExactly(unkeyedHead.id());
         assertThat(dueHeads(0, LATER, 10)).extracting(OutboxRecord::id)
                 .containsExactly(unkeyedHead.id(), keyedHead.id(), notDue.id());
@@ -129,13 +129,14 @@ class RetryStoreIT {
                 new Follower(a3)), NOW);
         store.apply(c, 1, List.of(new Follower(otherShard)), NOW);
 
-        var followers = store.followers(c, notWaiting(a, b, unkeyed), 2);
+        var followers = store.followers(c, notWaiting(a, b, unkeyed), 2, RowBytes.NO_LIMIT);
 
         assertThat(followers).containsOnlyKeys(a.id(), b.id());
         assertThat(followers.get(a.id())).extracting(OutboxRecord::id).containsExactly(a1.id(), a2.id());
         assertThat(followers.get(b.id())).extracting(OutboxRecord::id).containsExactly(b1.id());
-        assertSameRecord(followers.get(b.id()).get(0), b1, 0);
-        assertThat(store.followers(c, notWaiting(b1), 5)).as("only rows after the given one").isEmpty();
+        ParkedStoreIT.assertSameRecord(followers.get(b.id()).get(0), b1, 0, 0);
+        assertThat(store.followers(c, notWaiting(b1), 5, RowBytes.NO_LIMIT)).as("only rows after the given one")
+                .isEmpty();
     }
 
     @Test
@@ -237,7 +238,8 @@ class RetryStoreIT {
         assertThat(waitingSince(failed.id())).isNull();
         assertThat(waitingSince(skipped.id())).isNull();
         assertThat(retryRow(waiting.id())).isEqualTo("2|" + NOW + "|waiting (contract): v2");
-        assertThat(store.dueHeads(c, 0, NOW, 10)).as("those that do not wait first, each part in id order")
+        assertThat(store.dueHeads(c, 0, NOW, 10, RowBytes.NO_LIMIT, true))
+                .as("those that do not wait first, each part in id order")
                 .extracting(head -> head.r().id(), DueHead::waitingSince)
                 .containsExactly(tuple(failed.id(), null), tuple(skipped.id(), null), tuple(waiting.id(), since));
         assertThat(dueHeads(0, NOW, 2)).as("a limit leaves out the waiting ones first")
@@ -253,12 +255,13 @@ class RetryStoreIT {
         store.apply(c, 0, List.of(new Head(waiting, 0, NOW, "w", Kind.HANDLER), new Head(other, 1, NOW, "e"),
                 new Follower(w1), new Follower(o1)), NOW);
 
-        var due = store.dueHeads(c, 0, NOW, 10);
+        var due = store.dueHeads(c, 0, NOW, 10, RowBytes.NO_LIMIT, true);
 
         assertThat(due).extracting(head -> head.r().id(), DueHead::takesFollowers)
                 .containsExactly(tuple(other.id(), true), tuple(waiting.id(), false));
-        assertThat(store.followers(c, due, 10)).containsOnlyKeys(other.id());
-        assertThat(store.followers(c, due, 10).get(other.id())).extracting(OutboxRecord::id).containsExactly(o1.id());
+        assertThat(store.followers(c, due, 10, RowBytes.NO_LIMIT)).containsOnlyKeys(other.id());
+        assertThat(store.followers(c, due, 10, RowBytes.NO_LIMIT).get(other.id())).extracting(OutboxRecord::id)
+                .containsExactly(o1.id());
         assertThat(new DueHead(record("t", null), null).takesFollowers()).as("unkeyed").isFalse();
     }
 
@@ -306,7 +309,8 @@ class RetryStoreIT {
         assertThat(store.promote(c, 0, delivered, NOW)).isTrue();
         assertThat(store.promote(c, 0, dead, NOW)).isTrue();
 
-        assertThat(store.dueHeads(c, 0, NOW, 10)).extracting(head -> head.r().id(), DueHead::waitingSince)
+        assertThat(store.dueHeads(c, 0, NOW, 10, RowBytes.NO_LIMIT, true))
+                .extracting(head -> head.r().id(), DueHead::waitingSince)
                 .containsExactly(tuple(a1.id(), null), tuple(b1.id(), null));
         assertThat(store.size(c)).isEqualTo(2);
         assertThat(deadRow(c, names, dead.id())).isEqualTo("0|0|w|b");
@@ -362,10 +366,11 @@ class RetryStoreIT {
         var follower = requeued(record("t", "k"), 3);
         store.apply(c, 0, List.of(new Head(head, 1, NOW, "e"), new Follower(follower)), NOW);
 
-        var due = store.dueHeads(c, 0, NOW, 10);
+        var due = store.dueHeads(c, 0, NOW, 10, RowBytes.NO_LIMIT, true);
 
         assertThat(due).extracting(d -> d.r().requeues()).containsExactly(2);
-        assertThat(store.followers(c, due, 10).get(head.id())).extracting(OutboxRecord::requeues).containsExactly(3);
+        assertThat(store.followers(c, due, 10, RowBytes.NO_LIMIT).get(head.id())).extracting(OutboxRecord::requeues)
+                .containsExactly(3);
         store.deadFromRetry(c, due.get(0).r(), 2, null); // the dead table does not keep it
         assertThat(deadRow(c, names, head.id())).isEqualTo("0|2|e|k");
     }
@@ -442,7 +447,7 @@ class RetryStoreIT {
 
     /** {@link RetryStore#dueHeads}' records. */
     private List<OutboxRecord> dueHeads(int shard, Instant now, int limit) throws SQLException {
-        return store.dueHeads(c, shard, now, limit).stream().map(DueHead::r).toList();
+        return store.dueHeads(c, shard, now, limit, RowBytes.NO_LIMIT, true).stream().map(DueHead::r).toList();
     }
 
     private static List<DueHead> notWaiting(OutboxRecord... heads) {
@@ -463,16 +468,6 @@ class RetryStoreIT {
 
     private String lastError(long id) throws SQLException {
         return retryRow(id).split("\\|", 3)[2];
-    }
-
-    private void assertSameRecord(OutboxRecord actual, OutboxRecord expected, int attempts) {
-        assertThat(actual.messageId()).isEqualTo(expected.messageId());
-        assertThat(actual.topic()).isEqualTo(expected.topic());
-        assertThat(actual.key()).isEqualTo(expected.key());
-        assertThat(actual.payload()).isEqualTo(expected.payload());
-        assertThat(actual.headers()).isEqualTo(expected.headers());
-        assertThat(actual.createdAt()).isEqualTo(expected.createdAt());
-        assertThat(actual.attempts()).isEqualTo(attempts);
     }
 
     /** {@code attempts|next_attempt_at|last_error}. */

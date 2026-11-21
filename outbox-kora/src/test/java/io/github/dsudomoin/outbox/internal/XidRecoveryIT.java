@@ -187,7 +187,7 @@ class XidRecoveryIT {
         var relay = relay(handler, maintenance);
         relay.start();
         var outbox = outbox(relay);
-        send(outbox, msg("t", "x", "first"));
+        send(outbox, msg("x", "first"));
         await(Duration.ofSeconds(5), () -> OutboxAdminIT.count(names.dead()) == 1);
         // the run the relay started with holds the maintenance lock until it ends: a run of ours completes only after
         // it, and the run below then is the one that meets the rewound sequence
@@ -202,7 +202,7 @@ class XidRecoveryIT {
 
             assertThat(err.text()).contains("ERROR").contains(names.base());
         }
-        send(outbox, msg("t", "x", "second")); // without the raise, its id is the dead letter's: 23505 on every step
+        send(outbox, msg("x", "second")); // without the raise, its id is the dead letter's: 23505 on every step
         await(Duration.ofSeconds(10), () -> OutboxAdminIT.count(names.dead()) == 2);
     }
 
@@ -258,7 +258,7 @@ class XidRecoveryIT {
             tasks.add(pool.submit(() -> {
                 while (!stop.get()) {
                     try {
-                        send(outbox, msg("t", "w", "w"));
+                        send(outbox, msg("w", "w"));
                     } catch (Throwable t) {
                         errors.add(t);
                     }
@@ -571,8 +571,8 @@ class XidRecoveryIT {
 
         assertThat(maintenance.runOnce()).isTrue(); // the recovery
         var setAside = names.base() + "_o" + range.from();
-        assertThat(MaintenanceIT.exists(range.name())).isFalse();
-        assertThat(MaintenanceIT.exists(setAside)).isTrue();
+        assertThat(TestDb.exists(range.name())).isFalse();
+        assertThat(TestDb.exists(setAside)).isTrue();
         assertThat(OutboxAdminIT.count(setAside)).isOne();
         try (var err = new CapturedStderr()) {
             assertThat(maintenance.runOnce()).isTrue(); // the next run's orphan sweep keeps it
@@ -580,12 +580,12 @@ class XidRecoveryIT {
             assertThat(err.text()).contains("ERROR").contains(setAside)
                     .contains("OutboxAdmin.restoreOrphan(\"" + setAside + "\", fromXid)");
         }
-        assertThat(MaintenanceIT.exists(setAside)).isTrue();
+        assertThat(TestDb.exists(setAside)).isTrue();
         assertThat(registry.get("outbox.partitions.orphaned").gauge().value()).isEqualTo(1);
         try (var c = TestDb.connect()) {
             assertThat(maintenance.orphanRestore.restore(c, setAside, 0, Duration.ofSeconds(5))).isOne();
         }
-        assertThat(MaintenanceIT.exists(setAside)).isFalse();
+        assertThat(TestDb.exists(setAside)).isFalse();
         assertThat(MaintenanceIT.count(names.base(), List.of(orphanId))).isOne();
     }
 
@@ -619,7 +619,7 @@ class XidRecoveryIT {
         assertThat(maintenance.runOnce()).isTrue();
         assertThat(maintenance.halted()).isFalse();
         assertThat(haltRows()).isZero();
-        assertThat(MaintenanceIT.exists(standalone)).as("empty: dropped").isFalse();
+        assertThat(TestDb.exists(standalone)).as("empty: dropped").isFalse();
     }
 
     @Test
@@ -649,8 +649,8 @@ class XidRecoveryIT {
         var relay = relay(handler, maintenance);
         relay.start();
         var outbox = outbox(relay);
-        var held = send(outbox, msg("t", "r", "head"), msg("t", "r", "follower"));
-        var parked = send(outbox, msg("t", "p", "parked"));
+        var held = send(outbox, msg("r", "head"), msg("r", "follower"));
+        var parked = send(outbox, msg("p", "parked"));
         await(Duration.ofSeconds(5), // the head diverted with its follower, p requeued
                 () -> OutboxAdminIT.count(names.retry()) == 2 && MaintenanceIT.count(names.parked(), parked) == 1);
         try (var c = TestDb.connect()) { // a parked row whose outbox range is gone: its id above every outbox id
@@ -659,7 +659,7 @@ class XidRecoveryIT {
                     + " now() + interval '1 hour')");
         }
         forgeRegression();
-        var other = send(outbox, msg("t", "k", "other"));
+        var other = send(outbox, msg("k", "other"));
 
         assertThat(maintenance.runOnce()).isTrue();
 
@@ -704,7 +704,7 @@ class XidRecoveryIT {
                 tasks.add(pool.submit(() -> {
                     while (!stop.get()) {
                         try {
-                            written.addAll(send(outbox, msg("t", key, "w")));
+                            written.addAll(send(outbox, msg(key, "w")));
                         } catch (Throwable t) {
                             errors.add(t);
                         }
@@ -849,7 +849,7 @@ class XidRecoveryIT {
         config.clockMargin(Duration.ZERO).relayEnabled(false);
         bootstrap();
         var relay = relay(new RecordingHandler(), maintenance());
-        send(outbox(null), msg("t", "k", "relayed"));
+        send(outbox(null), msg("k", "relayed"));
         assertThat(relay.drain()).isOne();
         long drained = latestTickId();
         try (var c = TestDb.connect()) {
@@ -948,7 +948,7 @@ class XidRecoveryIT {
 
             assertThat(PartitionDdl.standalone(c, names.base(), "_o[0-9]+")).as("nothing set aside").isEmpty();
         }
-        assertThat(MaintenanceIT.exists(empty)).as("not dropped").isTrue();
+        assertThat(TestDb.exists(empty)).as("not dropped").isTrue();
         assertThat(OutboxAdminIT.count(withRow)).isOne();
     }
 
@@ -1123,11 +1123,11 @@ class XidRecoveryIT {
     }
 
     private static OutboxMessage[] messages(String prefix, int n) {
-        return IntStream.range(0, n).mapToObj(i -> msg("t", "k" + i % 5, prefix + i)).toArray(OutboxMessage[]::new);
+        return IntStream.range(0, n).mapToObj(i -> msg("k" + i % 5, prefix + i)).toArray(OutboxMessage[]::new);
     }
 
-    private static OutboxMessage msg(String topic, String key, String payload) {
-        return OutboxMessage.of(topic, key, payload.getBytes(UTF_8));
+    private static OutboxMessage msg(String key, String payload) {
+        return OutboxMessage.of("t", key, payload.getBytes(UTF_8));
     }
 
     private static String key(OutboxRecord r) {

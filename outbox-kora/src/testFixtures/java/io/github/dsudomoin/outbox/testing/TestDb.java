@@ -46,6 +46,14 @@ public final class TestDb {
         return newDatabase(TestDataSources.jdbcUrl(), role, role, maxPoolSize, new Properties());
     }
 
+    /** Kora pool through {@code pooler}, a transaction-mode pgbouncer; the caller closes it with {@code release()}. */
+    public static TestDatabase newDatabase(TestPooler pooler, int maxPoolSize) {
+        var properties = new Properties();
+        properties.setProperty("prepareThreshold", "0"); // the pooler keeps no prepared statement
+        return newDatabase(pooler.jdbcUrl(), TestDataSources.user(), TestDataSources.password(), maxPoolSize,
+                properties);
+    }
+
     /** Kora pool over any database, e.g. the bench stand's; the caller closes it with {@code release()}. */
     public static TestDatabase newDatabase(String jdbcUrl, String user, String password, int maxPoolSize) {
         return newDatabase(jdbcUrl, user, password, maxPoolSize, new Properties());
@@ -198,29 +206,15 @@ public final class TestDb {
                     if (!name.equals("commit") || committed.getAndSet(true)) {
                         return null;
                     }
-                    int pid;
-                    try (var st = c.createStatement(); var rs = st.executeQuery("select pg_backend_pid()")) {
-                        rs.next();
-                        pid = rs.getInt(1);
-                    }
+                    long pid = TestSql.queryLong(c, "select pg_backend_pid()");
                     if (commits) {
                         c.commit();
                     }
-                    try (var other = connect(); var st = other.createStatement()) {
-                        st.execute("select pg_terminate_backend(" + pid + ")");
-                        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
-                        while (true) {
-                            try (var rs = st.executeQuery("select count(*) from pg_stat_activity where pid = " + pid)) {
-                                rs.next();
-                                if (rs.getInt(1) == 0) {
-                                    break;
-                                }
-                            }
-                            if (System.nanoTime() - deadline > 0) {
-                                throw new IllegalStateException("backend " + pid + " still alive 10 s after"
-                                        + " pg_terminate_backend");
-                            }
-                            Thread.sleep(5);
+                    try (var other = connect()) {
+                        // Postgres 14+ waits for the backend to exit when given a timeout
+                        if (TestSql.queryLong(other, "select pg_terminate_backend(" + pid + ", 10000)::int") == 0) {
+                            throw new IllegalStateException("backend " + pid + " still alive 10 s after"
+                                    + " pg_terminate_backend");
                         }
                     }
                     if (!commits) {
@@ -282,6 +276,13 @@ public final class TestDb {
                 throw e.getCause();
             }
         }));
+    }
+
+    /** Whether {@code table}, a name {@code to_regclass} resolves, exists. */
+    public static boolean exists(String table) throws SQLException {
+        try (var c = connect()) {
+            return TestSql.queryString(c, "select (to_regclass(?) is not null)::text", table).equals("true");
+        }
     }
 
     /** Consumes {@code n} transaction ids with autocommit statements. */

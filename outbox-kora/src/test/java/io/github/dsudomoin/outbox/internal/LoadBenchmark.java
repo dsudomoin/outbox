@@ -8,7 +8,6 @@ import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
-import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.github.dsudomoin.outbox.testing.TestTracing;
 import java.util.ArrayList;
@@ -67,11 +66,7 @@ class LoadBenchmark {
     @Test
     void load() throws Exception {
         var config = Bench.relay(SHARDS, 4, BATCH, MIN_TICK_MS);
-        var business = TestSql.uniqueTable();
-        try (var c = Bench.connect(); var st = c.createStatement()) {
-            st.execute("create table " + business + " (k int primary key, v bigint not null)");
-            st.execute("insert into " + business + " select g, 0 from generate_series(0, " + (KEYS - 1) + ") g");
-        }
+        var business = Bench.businessTable(KEYS);
         // sampled message id -> commit time (nanoTime); the handler takes it out and records the latency
         var committedAt = new ConcurrentHashMap<UUID, Long>();
         var measuring = new AtomicBoolean(false);

@@ -9,8 +9,6 @@ import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
-import io.github.dsudomoin.outbox.testing.TestDb;
-import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.github.dsudomoin.outbox.testing.TestTracing;
 import java.sql.Connection;
@@ -49,7 +47,7 @@ class WalPerMessageBenchmark {
     private static final int SECONDS = Integer.getInteger("bench.seconds", 30);
     private static final int PAYLOAD = 300;
 
-    private final TestDatabase db = TestDb.newDatabase(WRITERS + 16);
+    private final TestDatabase db = Bench.database(WRITERS + 16);
 
     @AfterEach
     void release() {
@@ -59,12 +57,10 @@ class WalPerMessageBenchmark {
     @Test
     void oneMessagePerTransaction() throws Exception {
         var config = Bench.relay(SHARDS, 4, new OutboxConfig.RelayConfig() {}.batchSize(), MIN_TICK_MS);
-        var business = TestSql.uniqueTable();
-        try (var c = TestDb.connect()) {
+        try (var c = Bench.connect()) {
             execute(c, "create extension if not exists pg_walinspect");
-            execute(c, "create table " + business + " (k int primary key, v bigint not null)");
-            execute(c, "insert into " + business + " select g, 0 from generate_series(0, " + (KEYS - 1) + ") g");
         }
+        var business = Bench.businessTable(KEYS);
         var delivered = new AtomicLong();
         try (var runtime = OutboxRuntime.builder(config, db, record -> delivered.incrementAndGet())
                 .telemetry(TestTelemetry.kora()).build()) {
@@ -107,7 +103,7 @@ class WalPerMessageBenchmark {
                 threads.add(t);
             }
             Thread.sleep(WARMUP * 1000L);
-            try (var c = TestDb.connect()) {
+            try (var c = Bench.connect()) {
                 var cursor = config.table() + "_cursor";
                 var tick = config.table() + "_tick";
                 String lsn0 = Bench.lsn(c);

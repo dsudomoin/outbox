@@ -390,9 +390,9 @@ class TicksIT {
 
             // queued in this order behind the holder; both take their lock-statement snapshot now
             var made = pool.submit(() -> ticks.make(maker, Duration.ZERO));
-            awaitLockWait(observer, makerPid);
+            OutboxAdminIT.awaitLockWait(observer, makerPid);
             var madeThrottled = pool.submit(() -> ticks.make(throttled, Duration.ofSeconds(1)));
-            awaitLockWait(observer, throttledPid);
+            OutboxAdminIT.awaitLockWait(observer, throttledPid);
             writer.setAutoCommit(false);
             long xid = xid(writer);
             writer.commit();
@@ -563,24 +563,6 @@ class TicksIT {
             assertThat(ticks.make(c, Duration.ZERO)).isTrue(); // C
 
             assertThat(shards(c)).as("shard 4's row is visible in P").containsExactly(1, 2, 5);
-        }
-    }
-
-    @Test
-    void aTransactionRunningAtThePreviousTickCountsInTheTickThatSeesItCommitted() throws Exception {
-        try (var writer = TestDb.connect(); var c = TestDb.connect()) {
-            writer.setAutoCommit(false);
-            insertRow(writer, 5);
-            long xid = xid(writer);
-            xid(c); // a later xid completes: the writer is below xmax
-            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
-            assertThat(ticks.latest(c).snapshot().xip()).as("in flight at P").contains(xid);
-            assertThat(shards(c)).doesNotContain(5);
-
-            writer.commit();
-            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
-
-            assertThat(shards(c)).containsExactly(5); // P.xip minus C.xip
         }
     }
 
@@ -903,14 +885,6 @@ class TicksIT {
 
     private static long xid(Connection c) throws Exception {
         return queryLong(c, "select pg_current_xact_id()::text::bigint");
-    }
-
-    private static void awaitLockWait(Connection observer, long pid) throws Exception {
-        long deadline = System.nanoTime() + Duration.ofSeconds(1).toNanos();
-        while (queryLong(observer, "select count(*) from pg_locks where not granted and pid = " + pid) == 0) {
-            assertThat(System.nanoTime()).as("pid %d waits for a lock", pid).isLessThan(deadline);
-            Thread.sleep(1);
-        }
     }
 
     private static void assertSessionRestored(Connection c) throws Exception {

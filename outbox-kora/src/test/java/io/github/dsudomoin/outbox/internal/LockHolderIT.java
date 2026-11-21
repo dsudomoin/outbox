@@ -3,7 +3,6 @@ package io.github.dsudomoin.outbox.internal;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestPooler;
@@ -13,7 +12,6 @@ import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
@@ -31,7 +29,7 @@ class LockHolderIT {
     private static TestPooler pooler;
 
     private final int ns = ThreadLocalRandom.current().nextInt();
-    private final TestDatabase db = pooled();
+    private final TestDatabase db = TestDb.newDatabase(pooler, 8);
     private final List<AutoCloseable> closing = new ArrayList<>();
 
     @BeforeAll
@@ -194,11 +192,5 @@ class LockHolderIT {
                     + " locktype = 'advisory' and classid::bigint = " + Integer.toUnsignedLong(ns) + " and objid = "
                     + key + " and objsubid = 2 and granted")).isOne();
         }
-    }
-
-    private static TestDatabase pooled() {
-        var properties = new Properties();
-        properties.setProperty("prepareThreshold", "0");
-        return TestDb.newDatabase(pooler.jdbcUrl(), TestDataSources.user(), TestDataSources.password(), 8, properties);
     }
 }

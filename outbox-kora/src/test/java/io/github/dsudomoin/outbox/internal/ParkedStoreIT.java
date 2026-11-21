@@ -178,9 +178,9 @@ class ParkedStoreIT {
                 "14:0:1:0:" + NOW + ":ej",
                 "15:1:1:0:" + NOW + ":es");
         assertThat(parkedIds()).containsExactly(5L, 11L, 12L, 13L);
-        assertSameRecord(retries.dueHeads(c, 0, next, 1).get(0).r(), p7, 3, 3);
-        assertThat(retries.followers(c, List.of(new DueHead(p7, null)), 10).get(7L)).extracting(OutboxRecord::id)
-                .containsExactly(8L, 9L, 10L);
+        assertSameRecord(retries.dueHeads(c, 0, next, 1, RowBytes.NO_LIMIT, true).get(0).r(), p7, 3, 3);
+        assertThat(retries.followers(c, List.of(new DueHead(p7, null)), 10, RowBytes.NO_LIMIT).get(7L))
+                .extracting(OutboxRecord::id).containsExactly(8L, 9L, 10L);
     }
 
     @Test
@@ -338,7 +338,7 @@ class ParkedStoreIT {
 
     @Test
     void aDuePassBringsAKeyThatFitsWholeAndALargerKeyOnlyItsDueRows() throws SQLException {
-        var fits = new ParkedStore(names, retries, DELAY, 3);
+        var fits = new ParkedStore(names, retries, DELAY, 3, RowBytes.NO_LIMIT);
         var k1 = record("t", "k");
         var k2 = record("t", "k");
         var k3 = record("t", "k");
@@ -351,13 +351,14 @@ class ParkedStoreIT {
         }
         store.apply(c, 0, parks, Set.of(), NOW);
 
-        assertThat(fits.dueWithOlder(c, 0, NOW, 10, 20)).extracting(OutboxRecord::id).as("k3 is not due, and newer")
+        assertThat(fits.dueWithOlder(c, 0, NOW, 10, 20, RowBytes.NO_LIMIT, RowBytes.NO_LIMIT, true))
+                .extracting(OutboxRecord::id).as("k3 is not due, and newer")
                 .containsExactly(k1.id(), k2.id(), big.get(3).id());
     }
 
     @Test
     void aKeyThatDoesNotFitInTheCallStaysForTheNextStep() throws SQLException {
-        var fits = new ParkedStore(names, retries, DELAY, 3);
+        var fits = new ParkedStore(names, retries, DELAY, 3, RowBytes.NO_LIMIT);
         var a = List.of(record("t", "a"), record("t", "a"), record("t", "a"));
         var b = List.of(record("t", "b"), record("t", "b"), record("t", "b"));
         var parks = new ArrayList<BatchClassifier.Action>();
@@ -365,7 +366,8 @@ class ParkedStoreIT {
         b.forEach(row -> parks.add(new Park(row, 1, NOW)));
         fits.apply(c, 0, parks, Set.of(), NOW);
 
-        assertThat(fits.dueWithOlder(c, 0, NOW, 6, 4)).extracting(OutboxRecord::id).as("the first key always fits")
+        assertThat(fits.dueWithOlder(c, 0, NOW, 6, 4, RowBytes.NO_LIMIT, RowBytes.NO_LIMIT, true))
+                .extracting(OutboxRecord::id).as("the first key always fits")
                 .containsExactlyElementsOf(a.stream().map(OutboxRecord::id).toList());
     }
 
@@ -385,13 +387,14 @@ class ParkedStoreIT {
         assertThat(fits.dueWithOlder(c, 0, NOW, 10, 20, 5, 40, false)).as("a first row over the budget").isEmpty();
         assertThat(fits.dueWithOlder(c, 0, NOW, 10, 20, 5, 5, true)).extracting(OutboxRecord::id)
                 .as("unless one at least is asked for: then it goes alone").containsExactly(a.get(0).id());
-        assertThat(fits.dueWithOlder(c, 0, NOW, 10, 20)).extracting(OutboxRecord::id).as("no byte limit")
+        assertThat(fits.dueWithOlder(c, 0, NOW, 10, 20, RowBytes.NO_LIMIT, RowBytes.NO_LIMIT, true))
+                .extracting(OutboxRecord::id).as("no byte limit")
                 .containsExactly(a.get(0).id(), a.get(1).id(), a.get(2).id(), b.id());
     }
 
     @Test
     void aRowAnsweringRequeueInALongKeyComesRoundAfterItsBatches() throws SQLException {
-        var fits = new ParkedStore(names, retries, DELAY, 2);
+        var fits = new ParkedStore(names, retries, DELAY, 2, RowBytes.NO_LIMIT);
         var rows = new ArrayList<OutboxRecord>();
         var parks = new ArrayList<BatchClassifier.Action>();
         for (int i = 0; i < 7; i++) {
@@ -412,7 +415,7 @@ class ParkedStoreIT {
 
     @Test
     void pullNextBringsTheLowestRowsOfAKeyWhoseOfferedRowsAllLeft() throws SQLException {
-        var fits = new ParkedStore(names, retries, DELAY, 2);
+        var fits = new ParkedStore(names, retries, DELAY, 2, RowBytes.NO_LIMIT);
         var gone = record("t", "a");
         var next = List.of(record("t", "a"), record("t", "a"));
         var after = record("t", "a");
@@ -494,7 +497,7 @@ class ParkedStoreIT {
         }
     }
 
-    private void assertSameRecord(OutboxRecord actual, OutboxRecord expected, int attempts, int requeues) {
+    static void assertSameRecord(OutboxRecord actual, OutboxRecord expected, int attempts, int requeues) {
         assertThat(actual.id()).isEqualTo(expected.id());
         assertThat(actual.messageId()).isEqualTo(expected.messageId());
         assertThat(actual.topic()).isEqualTo(expected.topic());

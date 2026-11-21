@@ -1,9 +1,9 @@
 package io.github.dsudomoin.outbox;
 
+import static io.github.dsudomoin.outbox.testing.TestDb.exists;
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLongs;
-import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryStrings;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -750,12 +750,6 @@ class OperationsUnderLoadIT {
     private static UUID v7(Bound range) {
         long from = millis(range.from());
         return UuidV7.next(from + ThreadLocalRandom.current().nextLong(millis(range.to()) - from));
-    }
-
-    private static boolean exists(String table) throws SQLException {
-        try (var c = TestDb.connect()) {
-            return queryString(c, "select (to_regclass(?) is not null)::text", table).equals("true");
-        }
     }
 
     private double gauge(String name) {

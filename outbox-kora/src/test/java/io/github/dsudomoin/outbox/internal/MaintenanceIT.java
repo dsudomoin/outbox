@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.internal;
 
+import static io.github.dsudomoin.outbox.testing.TestDb.exists;
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
@@ -888,9 +889,7 @@ class MaintenanceIT {
             assertThat(XidPartitionsIT.detachPending(c, pending.name())).isEqualTo("true");
             execute(c, "create table " + unrelated + " (a int)");
             // a report on another table: read only, so it holds no xid back, but its snapshot is older than a FINALIZE
-            report.setAutoCommit(false);
-            execute(report, "set transaction isolation level repeatable read");
-            queryLong(report, "select count(*) from " + unrelated);
+            holdSnapshot(report, unrelated);
             TestDb.burnXids(3000);
             relay.drain();
             long horizon = horizonXmin();
@@ -958,10 +957,8 @@ class MaintenanceIT {
             failedDetach(c, range.name());
             reader.commit();
             execute(c, "create table " + unrelated + " (a int)");
-            report.setAutoCommit(false);
-            execute(report, "set transaction isolation level repeatable read");
+            holdSnapshot(report, unrelated);
             long pid = queryLong(report, "select pg_backend_pid()");
-            queryLong(report, "select count(*) from " + unrelated);
 
             try (var err = new CapturedStderr()) {
                 assertThat(maintenance.runOnce()).isTrue();
@@ -991,9 +988,7 @@ class MaintenanceIT {
         assertThat(gauge(registry, "outbox.partitions.xids_left")).as("tail attached").isNaN();
 
         try (var holder = TestDb.connect(); var c = TestDb.connect(); var err = new CapturedStderr()) {
-            holder.setAutoCommit(false); // a pg_dump
-            execute(holder, "set transaction isolation level repeatable read");
-            queryLong(holder, "select count(*) from " + names.base());
+            holdSnapshot(holder, names.base()); // a pg_dump
             // a tail detach that timed out waiting for it: the tail is pending, and FINALIZE waits for the snapshot
             failedDetach(c, names.tail());
             long top = ranges().stream().filter(b -> b.to() != null).mapToLong(b -> Long.parseLong(b.to())).max()
@@ -1026,13 +1021,11 @@ class MaintenanceIT {
         assertThat(maintenance.runOnce()).isTrue();
         assertThat(gauge(registry, "outbox.partitions.xids_left")).as("tail attached").isNaN();
 
-        String dead = names.dead().substring(names.dead().lastIndexOf('.') + 1);
+        String dead = names.unqualified(names.dead());
         try (var holder = TestDb.connect(); var c = TestDb.connect(); var err = new CapturedStderr()) {
             execute(c, "alter table " + names.dead() + " rename to " + dead + "_moved");
             execute(c, "update " + names.maintenance() + " set succeeded_at = now() - interval '1 day'");
-            holder.setAutoCommit(false); // a pg_dump
-            execute(holder, "set transaction isolation level repeatable read");
-            queryLong(holder, "select count(*) from " + names.base());
+            holdSnapshot(holder, names.base()); // a pg_dump
             failedDetach(c, names.tail()); // the tail is left detach-pending, as above
 
             assertThat(maintenance.runOnce()).isTrue();
@@ -1193,9 +1186,7 @@ class MaintenanceIT {
             while (currentXid() < Long.parseLong(range.to())) {
                 TestDb.burnXids(200);
             }
-            reader.setAutoCommit(false); // a report: a snapshot and a lock on the outbox, no xid
-            execute(reader, "set transaction isolation level repeatable read");
-            queryLong(reader, "select count(*) from " + names.base());
+            holdSnapshot(reader, names.base()); // a report: a snapshot and a lock on the outbox, no xid
             execute(operator, "set lock_timeout = '300ms'"); // an operator's detach, cancelled: the range stays pending
             assertThatThrownBy(() -> execute(operator, "alter table " + names.base() + " detach partition "
                             + range.name() + " concurrently"))
@@ -2247,16 +2238,10 @@ class MaintenanceIT {
     void aBuildWhoseStateIsHiddenFromMaintenanceGoesOn() throws Exception {
         bootstrap();
         deadTableWithoutIndex(1);
-        var role = "rotated_" + Long.toHexString(System.nanoTime());
-        try (var c = TestDb.connect()) {
-            execute(c, "create role " + role + " login password 'pw'");
-        }
-        var props = new java.util.Properties();
-        props.setProperty("user", role);
-        props.setProperty("password", "pw");
+        var role = TestDb.newLoginRole();
         var builder = new DeadIndexBuilder(db, names, Duration.ofMinutes(1), Duration.ofMinutes(1),
                 new SocketBound(Duration.ZERO));
-        try (var c = TestDb.connect(); var other = TestDb.connect(props); var holder = openDeadInsert(2);
+        try (var c = TestDb.connect(); var other = TestDb.connect(TestDb.login(role)); var holder = openDeadInsert(2);
                 var err = new CapturedStderr()) {
             builder.startIfDue(c);
             await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
@@ -2274,6 +2259,7 @@ class MaintenanceIT {
         } finally {
             builder.close(Duration.ofSeconds(10));
             try (var c = TestDb.connect()) {
+                execute(c, "drop owned by " + role);
                 execute(c, "drop role if exists " + role);
             }
         }
@@ -2596,12 +2582,6 @@ class MaintenanceIT {
                 .orElseThrow();
     }
 
-    static boolean exists(String table) throws SQLException {
-        try (var c = TestDb.connect()) {
-            return queryString(c, "select (to_regclass(?) is not null)::text", table).equals("true");
-        }
-    }
-
     /** An orphan {@link #oursOrphan} made: the slowest shard's horizon, and the message ids sent and kept apart. */
     private record Detached(String table, long horizon, List<UUID> sent, List<UUID> above) {}
 
@@ -2650,6 +2630,13 @@ class MaintenanceIT {
             }
         }
         return all;
+    }
+
+    /** Opens a repeatable-read transaction on {@code c} and takes its snapshot with a read of {@code table}. */
+    private static void holdSnapshot(Connection c, String table) throws SQLException {
+        c.setAutoCommit(false);
+        execute(c, "set transaction isolation level repeatable read");
+        queryLong(c, "select count(*) from " + table);
     }
 
     static long count(String table, List<UUID> messageIds) throws SQLException {

@@ -68,9 +68,7 @@ class DrainBenchmark {
                 .build()) {
             writer.start();
             var outbox = writer.outbox();
-            var schema = new OutboxSchema(db, writerConfig);
-            schema.start();
-            var ticks = new Ticks(schema.names(), SHARDS);
+            var ticks = new Ticks(writer.schema().names(), SHARDS);
             var filling = new AtomicBoolean(true);
             Thread ticker = null;
             if (TICK_EVERY_MS > 0) {

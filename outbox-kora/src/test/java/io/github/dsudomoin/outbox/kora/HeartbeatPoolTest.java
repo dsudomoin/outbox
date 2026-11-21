@@ -4,16 +4,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.typesafe.config.ConfigFactory;
 import io.github.dsudomoin.outbox.JdbcTransactions;
-import jakarta.annotation.Nullable;
-import java.sql.Connection;
+import io.github.dsudomoin.outbox.testing.TestDb;
 import java.time.Duration;
 import org.junit.jupiter.api.Test;
 import org.postgresql.ds.PGSimpleDataSource;
 import ru.tinkoff.kora.config.common.origin.SimpleConfigOrigin;
 import ru.tinkoff.kora.config.hocon.HoconConfigFactory;
-import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
-import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
-import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 
 /** What the Kora adapter adds to the heartbeat pool: when it derives one, and the HOCON flag; no database. */
 class HeartbeatPoolTest {
@@ -24,28 +20,8 @@ class HeartbeatPoolTest {
 
         assertThat(HeartbeatPool.derive(new JdbcTransactions(new PGSimpleDataSource()), interval))
                 .as("not KoraOutboxTransactions").isNull();
-        assertThat(HeartbeatPool.derive(new KoraOutboxTransactions(new JdbcConnectionFactory() {
-            @Override
-            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
-                throw new UnsupportedOperationException();
-            }
-
-            @Nullable
-            @Override
-            public Connection currentConnection() {
-                throw new UnsupportedOperationException();
-            }
-
-            @Override
-            public Connection newConnection() {
-                throw new UnsupportedOperationException();
-            }
-
-            @Override
-            public DataBaseTelemetry telemetry() {
-                throw new UnsupportedOperationException();
-            }
-        }), interval)).as("over a factory that is not a JdbcDatabase").isNull();
+        assertThat(HeartbeatPool.derive(new KoraOutboxTransactions(TestDb.opening(null, () -> null)), interval))
+                .as("over a factory that is not a JdbcDatabase").isNull();
     }
 
     @Test
