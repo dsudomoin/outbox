@@ -51,7 +51,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
             warn("enqueueStarted", e);
             return Enqueue.NONE;
         }
-        return enqueue == Enqueue.NONE ? enqueue : new GuardedEnqueue(enqueue);
+        return enqueue == null || enqueue == Enqueue.NONE ? Enqueue.NONE : new GuardedEnqueue(enqueue);
     }
 
     @Override
@@ -358,7 +358,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
                 warn("Message.inScope", new IllegalStateException("the message scope did not run its insert"));
                 return insert.call();
             }
-            return tracked.result;
+            return tracked.result; // the insert's own, whatever the scope returned
         }
 
         @Override
@@ -489,9 +489,8 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         @Override
         public <T> T inRecordScope(OutboxRecord record, Callable<T> call) throws Exception {
             var tracked = new TrackedCall<>(call);
-            T result;
             try {
-                result = delegate.inRecordScope(record, tracked);
+                delegate.inRecordScope(record, tracked);
             } catch (Throwable e) {
                 if (tracked.state == TrackedCall.THREW) {
                     if (e != tracked.error) {
@@ -511,7 +510,7 @@ public final class GuardedTelemetry implements OutboxTelemetry {
                 warn("Delivery.inRecordScope", new IllegalStateException("the record scope did not run its call"));
                 return call.call();
             }
-            return result;
+            return tracked.result; // the call's own, whatever the scope returned: a telemetry cannot change it
         }
 
         @Override

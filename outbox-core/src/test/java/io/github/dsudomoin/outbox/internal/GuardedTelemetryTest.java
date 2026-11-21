@@ -296,6 +296,25 @@ class GuardedTelemetryTest {
         }
     }
 
+    /** As the other factories read a null: no hook of a null enqueue runs, and none of them warns. */
+    @Test
+    void aNullEnqueueIsNone() {
+        var t = GuardedTelemetry.of(new OutboxTelemetry() {
+            @Override
+            public Enqueue enqueueStarted() {
+                return null;
+            }
+        });
+
+        try (var err = new CapturedStderr()) {
+            var enqueue = t.enqueueStarted();
+            enqueue.message(MESSAGE, MESSAGE_ID, 3);
+
+            assertThat(enqueue).isSameAs(OutboxTelemetry.Enqueue.NONE);
+            assertThat(err.text()).doesNotContain("WARN");
+        }
+    }
+
     @Test
     void messageNoneIsNotWrapped() {
         var plain = new OutboxTelemetry() {
@@ -370,6 +389,17 @@ class GuardedTelemetryTest {
             assertThat(err.text()).contains("Message.inScope");
         }
         assertThat(calls).as("a second insert would write the message twice").hasValue(1);
+    }
+
+    /** A scope that returns a value of its own does not change what the insert or the handler call returned. */
+    @Test
+    void aScopesOwnReturnValueIsNotTheResult() throws Exception {
+        var message = GuardedTelemetry.of(new MessageScope(Scope.REPLACE)).enqueueStarted()
+                .message(MESSAGE, MESSAGE_ID, 3);
+        var delivery = delivery(new DeliveryScope(Scope.REPLACE));
+
+        assertThat(message.inScope(() -> "inserted")).isEqualTo("inserted");
+        assertThat(delivery.inRecordScope(RECORD, () -> "sent")).isEqualTo("sent");
     }
 
     @Test
@@ -649,8 +679,8 @@ class GuardedTelemetryTest {
         }
     }
 
-    /** A scope's bug; {@code THROW_BEFORE} throws without running the call. */
-    private enum Scope { THROW_AFTER, THROW_BEFORE, SKIP, TWICE, SWALLOW }
+    /** A scope's bug; {@code THROW_BEFORE} throws without running the call, {@code REPLACE} returns null for it. */
+    private enum Scope { THROW_AFTER, THROW_BEFORE, SKIP, TWICE, REPLACE, SWALLOW }
 
     /** {@code call} run in a scope with the bug {@code bug}. */
     private static <T> T buggy(Scope bug, Callable<T> call) throws Exception {
@@ -666,6 +696,10 @@ class GuardedTelemetryTest {
             case TWICE -> {
                 call.call();
                 return call.call();
+            }
+            case REPLACE -> {
+                call.call();
+                return null;
             }
             default -> {
                 try {
