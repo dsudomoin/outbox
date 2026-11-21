@@ -102,15 +102,17 @@ public interface OutboxTelemetry {
      * further database work, handler calls ({@link #deliveryStarted(RelayStep, List, Instant)}), its
      * {@link RelayStep#settleStarted settle} and its transaction's commit, or the rollback of a failed COMMIT, run on
      * this thread (the handler itself on a handler thread) until {@link RelayStep#finished()} or
-     * {@link RelayStep#failed}. When the step's own work fails, the settle and the step end before the rollback.
+     * {@link RelayStep#failed}. When the step's own work fails, the settle and the step end before the rollback; a
+     * COMMIT the relay sends in one round trip with the step's cursor rows, as it does whenever the step writes any, is
+     * part of that work.
      */
     default RelayStep stepStarted(List<Integer> shards) {
         return RelayStep.NONE;
     }
 
     /**
-     * A relay step of one or more shards did its work, its writes included, and its transaction commits next:
-     * {@code duration} leaves the commit out.
+     * A relay step of one or more shards did its work, its writes included: {@code duration} ends with the insert of
+     * its cursor rows, and so includes the COMMIT the relay sends with them.
      */
     default void stepFinished(Duration duration) {}
 
@@ -225,7 +227,8 @@ public interface OutboxTelemetry {
 
     /**
      * One relay step, ended once on the thread that started it, with its transaction: {@link #finished()} once its
-     * COMMIT returned, {@link #failed} once a failed COMMIT rolled back, or as its own work fails, before the rollback.
+     * COMMIT returned; {@link #failed} as its own work fails, before the rollback (a COMMIT sent with the step's cursor
+     * rows included), or once a COMMIT sent on its own failed and rolled back.
      * Its hooks come in this order: {@link #fetched} per shard, then the settle ({@link #settleStarted}, ended before
      * the step), then the end.
      */
@@ -250,8 +253,8 @@ public interface OutboxTelemetry {
         /**
          * Once per step with work, after its last handler call, before it writes the main pass's outcomes and the
          * cursors (the retry pass writes each call's outcomes before the next call, earlier). Ended once, before this
-         * step is: after its COMMIT returned, or after the rollback of a failed COMMIT; when the step's own work
-         * fails, before the rollback.
+         * step is: after its COMMIT returned; when the step's own work fails (a COMMIT sent with its cursor rows
+         * included), before the rollback; after a COMMIT sent on its own failed, after the rollback.
          */
         default Settle settleStarted() {
             return Settle.NONE;
@@ -282,7 +285,8 @@ public interface OutboxTelemetry {
         default void committed(int records) {}
 
         /**
-         * The step failed with {@code error}, which rolls its transaction back (after a failed COMMIT: once it has),
+         * The step failed with {@code error}, which rolls its transaction back (after a failed COMMIT sent on its own:
+         * once it has),
          * before {@link RelayStep#failed}: none of the {@code records} it would have recorded is; a step whose writes
          * failed part way counts those it made.
          */
