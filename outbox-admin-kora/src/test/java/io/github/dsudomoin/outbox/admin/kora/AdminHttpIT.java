@@ -16,6 +16,7 @@ import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
+import io.github.dsudomoin.outbox.testing.AdminRows;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestSql;
@@ -93,15 +94,16 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
 
     @Test
     void statusMapsEveryField() throws Exception {
-        execute("insert into " + names().halt() + " (max_tick_xmax) values ('1')");
-        execute("insert into " + names().retry() + " (id, shard, message_id, topic, created_at, waiting_since) values"
+        rows().execute("insert into " + names().halt() + " (max_tick_xmax) values ('1')");
+        rows().execute("insert into " + names().retry()
+                + " (id, shard, message_id, topic, created_at, waiting_since) values"
                 + " (1, 0, gen_random_uuid(), 't', now(), now() - interval '1 hour'),"
                 + " (2, 0, gen_random_uuid(), 't', now(), null)");
-        letter(1, "a", "1", "boom", T0, KEPT);
-        letter(2, "a", "2", "boom", T0, KEPT);
-        letter(3, "a", "3", "boom", T0, PENDING);
-        letter(4, "b", "4", "boom", T0, SCHEDULED);
-        var orphan = foreignOrphan();
+        rows().letter(1, "a", "1", "boom", T0, KEPT);
+        rows().letter(2, "a", "2", "boom", T0, KEPT);
+        rows().letter(3, "a", "3", "boom", T0, PENDING);
+        rows().letter(4, "b", "4", "boom", T0, SCHEDULED);
+        var orphan = rows().foreignOrphan();
         // this app's own heartbeat, its first beat at start, the next one maintenanceInterval (30 s) later
         try (var c = TestDb.connect()) {
             long deadline = System.nanoTime() + 10_000_000_000L;
@@ -110,8 +112,8 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
                 Thread.sleep(20);
             }
         }
-        execute("delete from " + names().instance());
-        execute("insert into " + names().instance() + " (instance_id, shards, last_seen, hook_active, relay,"
+        rows().execute("delete from " + names().instance());
+        rows().execute("insert into " + names().instance() + " (instance_id, shards, last_seen, hook_active, relay,"
                 + " contracts, routes, expires_at) values ('host-b/7/0000beef', 2, '2026-01-15T10:00:00Z', true, true,"
                 + " '{\"t2\": 2, \"t1\": 1}', '{t2,t1}', now() + interval '1 hour'), ('host-c/8/0000cafe', 2,"
                 + " '2026-01-15T10:00:00Z', false, false, null, null, null), ('host-d/9/0000d00d', 2,"
@@ -142,9 +144,9 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
 
     @Test
     void findsByEachFilterFieldAndPages() throws Exception {
-        long a = letter(1, "t1", "k1", "disk full", T0.minusSeconds(7200), KEPT);
-        long b = letter(2, "t2", "ключ", "timeout", T0.minusSeconds(3600), PENDING);
-        long c = letter(3, "t1", "k3", "timeout", T0, SCHEDULED);
+        long a = rows().letter(1, "t1", "k1", "disk full", T0.minusSeconds(7200), KEPT);
+        long b = rows().letter(2, "t2", "ключ", "timeout", T0.minusSeconds(3600), PENDING);
+        long c = rows().letter(3, "t1", "k3", "timeout", T0, SCHEDULED);
 
         assertThat(find("topic=t1")).containsExactly(a, c);
         assertThat(find("key=" + encode("ключ"))).as("the key's UTF-8 bytes").containsExactly(b);
@@ -168,13 +170,13 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
 
     @Test
     void letterJsonCarriesEveryField() throws Exception {
-        long id = letter(7, "t", "k", "timeout", T0, PENDING);
-        execute("update " + names().dead() + " set redrives = 2, handler_attempts = 1 where id = " + id);
+        long id = rows().letter(7, "t", "k", "timeout", T0, PENDING);
+        rows().execute("update " + names().dead() + " set redrives = 2, handler_attempts = 1 where id = " + id);
 
         var response = call("GET", "/dead-letters?topic=t", null);
 
         assertJson(response, 200);
-        assertThat(response.body()).isEqualTo("{\"items\":[{\"id\":7,\"messageId\":\"" + messageId(id) + "\","
+        assertThat(response.body()).isEqualTo("{\"items\":[{\"id\":7,\"messageId\":\"" + rows().messageId(id) + "\","
                 + "\"topic\":\"t\",\"key\":\"" + base64("k") + "\",\"payload\":\"" + base64("p") + "\","
                 + "\"headers\":[{\"name\":\"h1\",\"value\":\"" + base64("v") + "\"},{\"name\":\"h2\"}],"
                 + "\"createdAt\":\"2026-01-15T09:00:00.000Z\",\"attempts\":3,"
@@ -184,9 +186,9 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
 
     @Test
     void countsByTheFilter() throws Exception {
-        letter(1, "t1", "a", "boom", T0, KEPT);
-        letter(2, "t1", "b", "boom", T0, PENDING);
-        letter(3, "t2", "c", "boom", T0, KEPT);
+        rows().letter(1, "t1", "a", "boom", T0, KEPT);
+        rows().letter(2, "t1", "b", "boom", T0, PENDING);
+        rows().letter(3, "t2", "c", "boom", T0, KEPT);
 
         assertThat(call("GET", "/dead-letters/count", null).body()).isEqualTo("{\"count\":3}");
         var t1 = call("GET", "/dead-letters/count?topic=t1", null);
@@ -197,38 +199,38 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
 
     @Test
     void redrivesByIdsIntoTheOutbox() throws Exception {
-        long a = letter(1, "t", "a", "boom", T0, KEPT);
-        long b = letter(2, "t", "b", "boom", T0, PENDING);
-        long other = letter(3, "t", "c", "boom", T0, KEPT);
-        var sent = List.of(messageId(a), messageId(b));
+        long a = rows().letter(1, "t", "a", "boom", T0, KEPT);
+        long b = rows().letter(2, "t", "b", "boom", T0, PENDING);
+        long other = rows().letter(3, "t", "c", "boom", T0, KEPT);
+        var sent = List.of(rows().messageId(a), rows().messageId(b));
 
         var response = call("POST", "/dead-letters/redrive", "{\"ids\":[" + a + "," + b + ",999999]}");
 
         assertJson(response, 200);
         assertThat(response.body()).isEqualTo("{\"count\":2}");
-        assertThat(deadIds()).containsExactly(other);
-        assertThat(outboxMessageIds()).containsExactlyElementsOf(sent);
+        assertThat(rows().deadIds()).containsExactly(other);
+        assertThat(rows().outboxMessageIds()).containsExactlyElementsOf(sent);
     }
 
     @Test
     void redrivesByFilter() throws Exception {
-        long a = letter(1, "t1", "a", "boom", T0, KEPT);
-        long other = letter(2, "t2", "b", "boom", T0, KEPT);
-        var sent = messageId(a);
+        long a = rows().letter(1, "t1", "a", "boom", T0, KEPT);
+        long other = rows().letter(2, "t2", "b", "boom", T0, KEPT);
+        var sent = rows().messageId(a);
 
         var response = call("POST", "/dead-letters/redrive", "{\"filter\":{\"topic\":\"t1\"}}");
 
         assertThat(response.body()).isEqualTo("{\"count\":1}");
-        assertThat(deadIds()).containsExactly(other);
-        assertThat(outboxMessageIds()).containsExactly(sent);
+        assertThat(rows().deadIds()).containsExactly(other);
+        assertThat(rows().outboxMessageIds()).containsExactly(sent);
     }
 
     @Test
     void discardsByFilterAndByIds() throws Exception {
-        long a = letter(1, "t1", "a", "disk full", T0, KEPT);
-        letter(2, "t1", "b", "timeout", T0, KEPT);
-        letter(3, "t2", "c", "timeout", T0, KEPT);
-        long kept = letter(4, "t2", "d", "disk full", T0, KEPT);
+        long a = rows().letter(1, "t1", "a", "disk full", T0, KEPT);
+        rows().letter(2, "t1", "b", "timeout", T0, KEPT);
+        rows().letter(3, "t2", "c", "timeout", T0, KEPT);
+        long kept = rows().letter(4, "t2", "d", "disk full", T0, KEPT);
 
         var byFilter = call("POST", "/dead-letters/discard", "{\"filter\":{\"error\":\"timeout\"}}");
         var byIds = call("POST", "/dead-letters/discard", "{\"ids\":[" + a + "]}");
@@ -236,13 +238,13 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         assertJson(byFilter, 200);
         assertThat(byFilter.body()).isEqualTo("{\"count\":2}");
         assertThat(byIds.body()).isEqualTo("{\"count\":1}");
-        assertThat(deadIds()).containsExactly(kept);
-        assertThat(outboxMessageIds()).isEmpty();
+        assertThat(rows().deadIds()).containsExactly(kept);
+        assertThat(rows().outboxMessageIds()).isEmpty();
     }
 
     @Test
     void selectionNeedsExactlyOneOfIdsAndFilter() throws Exception {
-        long id = letter(1, "t", "k", "boom", T0, KEPT);
+        long id = rows().letter(1, "t", "k", "boom", T0, KEPT);
 
         for (var operation : List.of("redrive", "discard")) {
             for (var body : List.of("{\"ids\":[" + id + "],\"filter\":{\"topic\":\"t\"}}", "{}", "{\"filter\":{}}",
@@ -253,15 +255,15 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
                 assertThat(response.body()).as(operation + " " + body).startsWith("{\"message\":\"");
             }
         }
-        assertThat(deadIds()).containsExactly(id);
-        assertThat(outboxMessageIds()).isEmpty();
+        assertThat(rows().deadIds()).containsExactly(id);
+        assertThat(rows().outboxMessageIds()).isEmpty();
     }
 
     /** A blank topic or error dropped would widen the call to every letter the rest of the filter matches. */
     @Test
     void blankFilterStringsAreRefusedByBulkCalls() throws Exception {
-        long id = letter(1, "t", "k", "boom", T0, KEPT);
-        long other = letter(2, "u", "k", "boom", T0, KEPT);
+        long id = rows().letter(1, "t", "k", "boom", T0, KEPT);
+        long other = rows().letter(2, "u", "k", "boom", T0, KEPT);
 
         for (var operation : List.of("redrive", "discard")) {
             for (var body : List.of("{\"filter\":{\"topic\":\"\",\"status\":\"kept\"}}",
@@ -273,15 +275,15 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
                 assertThat(response.body()).as(operation + " " + body).startsWith("{\"message\":\"a blank ");
             }
         }
-        assertThat(deadIds()).containsExactly(id, other);
-        assertThat(outboxMessageIds()).isEmpty();
+        assertThat(rows().deadIds()).containsExactly(id, other);
+        assertThat(rows().outboxMessageIds()).isEmpty();
         assertThat(find("topic=&status=kept")).as("reads still take a blank one as absent").containsExactly(id, other);
     }
 
     /** A typo must never widen a call: {@code eror} ignored would discard every letter of the topic. */
     @Test
     void unknownFieldsAreRefused() throws Exception {
-        long id = letter(1, "t", "k", "boom", T0, KEPT);
+        long id = rows().letter(1, "t", "k", "boom", T0, KEPT);
 
         for (var operation : List.of("redrive", "discard")) {
             for (var body : List.of("{\"filter\":{\"topic\":\"t\",\"eror\":\"x\"}}",
@@ -292,16 +294,16 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
                 assertThat(response.body()).as(operation + " " + body).startsWith("{\"message\":\"unknown field '");
             }
         }
-        assertThat(deadIds()).containsExactly(id);
-        assertThat(outboxMessageIds()).isEmpty();
+        assertThat(rows().deadIds()).containsExactly(id);
+        assertThat(rows().outboxMessageIds()).isEmpty();
     }
 
     /** A repeated field must never widen a call: the last {@code "error":null} kept would discard the whole topic. */
     @Test
     void duplicateFieldsAreRefused() throws Exception {
-        long x = letter(1, "t", "k", "x", T0, KEPT);
-        long y = letter(2, "t", "k", "y", T0, KEPT);
-        seedWaiting();
+        long x = rows().letter(1, "t", "k", "x", T0, KEPT);
+        long y = rows().letter(2, "t", "k", "y", T0, KEPT);
+        rows().seedWaiting();
 
         for (var operation : List.of("redrive", "discard")) {
             for (var body : List.of("{\"filter\":{\"topic\":\"t\",\"error\":\"x\",\"error\":null}}",
@@ -318,58 +320,58 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
             assertJson(response, 400);
             assertThat(response.body()).as(path).startsWith("{\"message\":\"duplicate field 'key' in Abandon");
         }
-        assertThat(deadIds()).containsExactly(x, y);
-        assertThat(outboxMessageIds()).isEmpty();
+        assertThat(rows().deadIds()).containsExactly(x, y);
+        assertThat(rows().outboxMessageIds()).isEmpty();
     }
 
     @Test
     void idsAreCappedAt1000() throws Exception {
-        long id = letter(1, "t", "k", "boom", T0, KEPT);
+        long id = rows().letter(1, "t", "k", "boom", T0, KEPT);
         var thousand = LongStream.rangeClosed(1, 1000).mapToObj(Long::toString).collect(Collectors.joining(","));
 
         var tooMany = call("POST", "/dead-letters/discard", "{\"ids\":[" + thousand + ",1001]}");
 
         assertJson(tooMany, 400);
         assertThat(tooMany.body()).startsWith("{\"message\":\"at most 1000 ids");
-        assertThat(deadIds()).containsExactly(id);
+        assertThat(rows().deadIds()).containsExactly(id);
         assertThat(call("POST", "/dead-letters/discard", "{\"ids\":[" + thousand + "]}").body())
                 .isEqualTo("{\"count\":1}");
     }
 
     @Test
     void restoresAStandaloneRangeFromTheCut() throws Exception {
-        var orphan = foreignOrphan();
-        orphanRow(orphan, 1, 10);
-        var at = orphanRow(orphan, 2, 20);
-        var above = orphanRow(orphan, 3, 30);
+        var orphan = rows().foreignOrphan();
+        rows().orphanRow(orphan, 1, 10);
+        var at = rows().orphanRow(orphan, 2, 20);
+        var above = rows().orphanRow(orphan, 3, 30);
 
         var response = call("POST", "/orphans/" + orphan + "/restore?fromXid=20", null);
 
         assertJson(response, 200);
         assertThat(response.body()).isEqualTo("{\"count\":2}");
-        assertThat(exists(orphan)).as("dropped").isFalse();
-        assertThat(outboxMessageIds()).containsExactly(at, above);
+        assertThat(rows().exists(orphan)).as("dropped").isFalse();
+        assertThat(rows().outboxMessageIds()).containsExactly(at, above);
     }
 
     @Test
     void aNegativeFromXidIs400AndKeepsTheOrphan() throws Exception {
-        var orphan = foreignOrphan();
-        orphanRow(orphan, 1, 10);
+        var orphan = rows().foreignOrphan();
+        rows().orphanRow(orphan, 1, 10);
 
         var response = call("POST", "/orphans/" + orphan + "/restore?fromXid=-1", null);
 
         assertJson(response, 400);
         assertThat(response.body()).startsWith("{\"message\":\"");
-        assertThat(exists(orphan)).isTrue();
-        assertThat(outboxMessageIds()).isEmpty();
+        assertThat(rows().exists(orphan)).isTrue();
+        assertThat(rows().outboxMessageIds()).isEmpty();
     }
 
     @Test
     void tableNameIsNeverInterpolated() throws Exception {
         var victim = TestDb.uniqueTable();
-        execute("create table " + victim + " (id bigint)");
-        var orphan = foreignOrphan();
-        orphanRow(orphan, 1, 10);
+        rows().execute("create table " + victim + " (id bigint)");
+        var orphan = rows().foreignOrphan();
+        rows().orphanRow(orphan, 1, 10);
 
         for (var table : List.of(orphan + ";drop table " + victim, names().base() + "_x1000' or '1'='1",
                 victim, names().base(), "otherschema." + orphan)) {
@@ -380,9 +382,9 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
             assertThat(response.body()).as("the decoded name reached the call")
                     .startsWith("{\"message\":\"" + table + " is not ");
         }
-        assertThat(exists(victim)).isTrue();
-        assertThat(exists(orphan)).isTrue();
-        assertThat(outboxMessageIds()).isEmpty();
+        assertThat(rows().exists(victim)).isTrue();
+        assertThat(rows().exists(orphan)).isTrue();
+        assertThat(rows().outboxMessageIds()).isEmpty();
     }
 
     @Test
@@ -396,13 +398,13 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         var sent = db.inTx((SqlFunction0<List<UUID>>) () -> outbox.sendAll(List.of(
                 OutboxMessage.of("t", "a", bytes("1")), OutboxMessage.of("t", "b", bytes("2")),
                 OutboxMessage.of("t", "c", bytes("3")))));
-        forgeRegression();
+        rows().forgeRegression();
 
         var recovered = call("POST", "/recovery/xid-regression", null);
 
         assertJson(recovered, 200);
         assertThat(recovered.body()).isEqualTo("{\"count\":3}");
-        assertThat(outboxMessageIds()).as("re-sent with the same message ids").containsAll(sent);
+        assertThat(rows().outboxMessageIds()).as("re-sent with the same message ids").containsAll(sent);
         assertThat(call("GET", "/status", null).body()).startsWith("{\"halted\":false,");
     }
 
@@ -417,38 +419,39 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         var sent = db.inTx((SqlFunction0<List<UUID>>) () -> outbox.sendAll(List.of(
                 OutboxMessage.of("t", "a", bytes("1")), OutboxMessage.of("t", "b", bytes("2")),
                 OutboxMessage.of("t", "c", bytes("3")))));
-        execute("insert into " + names().tick() + " (snapshot) values (pg_current_snapshot())");
-        execute("delete from " + names().tick() + " where id = (select min(tick_id) from " + names().cursor() + ")");
-        execute("delete from " + names().checkpoint());
+        rows().execute("insert into " + names().tick() + " (snapshot) values (pg_current_snapshot())");
+        rows().execute("delete from " + names().tick() + " where id = (select min(tick_id) from "
+                + names().cursor() + ")");
+        rows().execute("delete from " + names().checkpoint());
 
         var repaired = call("POST", "/recovery/stranded-shards", null);
 
         assertJson(repaired, 200);
         assertThat(repaired.body()).isEqualTo("{\"count\":3}");
-        assertThat(outboxMessageIds()).as("re-sent with the same message ids").containsAll(sent);
+        assertThat(rows().outboxMessageIds()).as("re-sent with the same message ids").containsAll(sent);
         assertJson(call("POST", "/recovery/stranded-shards", null), 409);
     }
 
     @Test
     void abandonsWaitingKeysWhole() throws Exception {
-        seedWaiting();
+        rows().seedWaiting();
 
         var dryRun = call("POST", "/waiting/abandon",
                 "{\"topic\":\"t\",\"reason\":\"rolled back\",\"dryRun\":true}");
         assertJson(dryRun, 200);
         assertThat(dryRun.body()).isEqualTo("{\"keys\":3,\"records\":5}");
-        assertThat(deadIds()).as("a dry run moves nothing").isEmpty();
+        assertThat(rows().deadIds()).as("a dry run moves nothing").isEmpty();
 
         var oneKey = call("POST", "/waiting/abandon",
                 "{\"topic\":\"t\",\"key\":\"ключ\",\"reason\":\"rolled back\"}");
         assertJson(oneKey, 200);
         assertThat(oneKey.body()).as("the key's UTF-8 bytes").isEqualTo("{\"keys\":1,\"records\":1}");
-        assertThat(deadIds()).containsExactly(30L);
+        assertThat(rows().deadIds()).containsExactly(30L);
 
         var rest = call("POST", "/waiting/abandon",
                 "{\"topic\":\"t\",\"reason\":\"rolled back\",\"dryRun\":false}");
         assertThat(rest.body()).isEqualTo("{\"keys\":2,\"records\":4}");
-        assertThat(deadIds()).containsExactly(5L, 10L, 11L, 20L, 30L);
+        assertThat(rows().deadIds()).containsExactly(5L, 10L, 11L, 20L, 30L);
         try (var c = TestDb.connect()) {
             assertThat(queryString(c, "select string_agg(distinct status || ' ' || error, ', ') from "
                     + names().dead())).isEqualTo("kept abandoned: rolled back");
@@ -458,17 +461,17 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
 
     @Test
     void abandonsAKeyOrAnUnkeyedRecord() throws Exception {
-        seedWaiting();
+        rows().seedWaiting();
 
         var dryRun = call("POST", "/keys/abandon", "{\"topic\":\"t\",\"key\":\"k\",\"reason\":\"stuck\",\"dryRun\":true}");
         assertJson(dryRun, 200);
         assertThat(dryRun.body()).isEqualTo("{\"keys\":1,\"records\":3}");
-        assertThat(deadIds()).isEmpty();
+        assertThat(rows().deadIds()).isEmpty();
 
         var key = call("POST", "/keys/abandon", "{\"topic\":\"t\",\"key\":\"k\",\"reason\":\"stuck\"}");
         assertJson(key, 200);
         assertThat(key.body()).as("head, follower and parked row").isEqualTo("{\"keys\":1,\"records\":3}");
-        assertThat(deadIds()).containsExactly(5L, 10L, 11L);
+        assertThat(rows().deadIds()).containsExactly(5L, 10L, 11L);
 
         String unkeyed;
         try (var c = TestDb.connect()) {
@@ -477,7 +480,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         var record = call("POST", "/keys/abandon",
                 "{\"topic\":\"t\",\"messageId\":\"" + unkeyed + "\",\"reason\":\"poison\"}");
         assertThat(record.body()).isEqualTo("{\"keys\":1,\"records\":1}");
-        assertThat(deadIds()).containsExactly(5L, 10L, 11L, 20L);
+        assertThat(rows().deadIds()).containsExactly(5L, 10L, 11L, 20L);
 
         assertThat(call("POST", "/keys/abandon", "{\"topic\":\"t\",\"key\":\"k\",\"reason\":\"stuck\"}").body())
                 .as("a second call").isEqualTo("{\"keys\":0,\"records\":0}");
@@ -485,7 +488,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
 
     @Test
     void abandonKeyRefusesBadInput() throws Exception {
-        seedWaiting();
+        rows().seedWaiting();
         for (var body : new String[] {
             "{\"topic\":\"t\",\"reason\":\"r\"}",
             "{\"topic\":\"t\",\"key\":\"k\",\"messageId\":\"" + UUID.randomUUID() + "\",\"reason\":\"r\"}",
@@ -498,12 +501,12 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         }) {
             assertJson(call("POST", "/keys/abandon", body), 400);
         }
-        assertThat(deadIds()).isEmpty();
+        assertThat(rows().deadIds()).isEmpty();
     }
 
     @Test
     void abandonKeyOnABusyShardIsAConflict() throws Exception {
-        seedWaiting();
+        rows().seedWaiting();
         try (var holder = TestDb.connect()) {
             holder.setAutoCommit(false);
             try (var ps = holder.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {
@@ -518,13 +521,13 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
             assertThat(busy.body()).contains("busy, retry");
             holder.rollback();
         }
-        assertThat(deadIds()).isEmpty();
+        assertThat(rows().deadIds()).isEmpty();
     }
 
     /** The one audit line names the caller and the reason, each value quoted and escaped, so none forges a part. */
     @Test
     void abandonAuditLineCarriesItsReason() throws Exception {
-        seedWaiting();
+        rows().seedWaiting();
 
         HttpResponse<String> response;
         String log;
@@ -546,8 +549,8 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
     /** A call that destroys or moves letters or rows names what it selected: the filter, the ids (the first ten). */
     @Test
     void destructiveAuditLinesNameTheirSelection() throws Exception {
-        var orphan = foreignOrphan();
-        orphanRow(orphan, 1, 10);
+        var orphan = rows().foreignOrphan();
+        rows().orphanRow(orphan, 1, 10);
         var ids = LongStream.rangeClosed(1, 12).boxed().toList();
 
         String log;
@@ -585,7 +588,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
     /** A typo must never widen the call: {@code kye} ignored would abandon every key of the topic. */
     @Test
     void abandonRefusesBadInput() throws Exception {
-        seedWaiting();
+        rows().seedWaiting();
 
         for (var body : List.of("{\"reason\":\"r\"}", "{\"topic\":\"t\"}", "{\"topic\":\"t\",\"reason\":\" \"}",
                 "{\"topic\":\"\",\"reason\":\"r\"}", "{\"topic\":\"t\",\"kye\":\"k\",\"reason\":\"r\"}",
@@ -598,13 +601,13 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         }
         assertThat(call("POST", "/waiting/abandon", "{\"topic\":\"t\",\"kye\":\"k\",\"reason\":\"r\"}").body())
                 .startsWith("{\"message\":\"unknown field 'kye'");
-        assertThat(deadIds()).isEmpty();
+        assertThat(rows().deadIds()).isEmpty();
     }
 
     /** What the generated server or the call refuses for its input answers 400 before anything runs. */
     @Test
     void badInputIs400() throws Exception {
-        long id = letter(1, "t", "k", "boom", T0, KEPT);
+        long id = rows().letter(1, "t", "k", "boom", T0, KEPT);
 
         for (var query : List.of("limit=0", "limit=1001")) {
             var response = call("GET", "/dead-letters?" + query, null);
@@ -633,7 +636,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
             assertJson(response, 400);
             assertThat(response.body()).as(response.uri().toString()).startsWith("{\"message\":\"");
         }
-        assertThat(deadIds()).containsExactly(id);
+        assertThat(rows().deadIds()).containsExactly(id);
     }
 
     /**
@@ -642,7 +645,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
      */
     @Test
     void anotherContentTypeIs415() throws Exception {
-        long id = letter(1, "t", "k", "boom", T0, KEPT);
+        long id = rows().letter(1, "t", "k", "boom", T0, KEPT);
 
         for (var type : List.of("text/plain", "application/x-www-form-urlencoded")) {
             var response = send(HttpRequest.newBuilder(URI.create("http://localhost:" + port + API
@@ -653,7 +656,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
             assertThat(response.body()).isEqualTo("{\"message\":\"Content-Type " + type
                     + " is not supported: application/json only\"}");
         }
-        assertThat(deadIds()).containsExactly(id);
+        assertThat(rows().deadIds()).containsExactly(id);
     }
 
     /**
@@ -680,7 +683,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
      */
     @Test
     void otherFailuresAreA500Error() throws Exception {
-        execute("drop table " + names().dead() + " cascade");
+        rows().execute("drop table " + names().dead() + " cascade");
 
         HttpResponse<String> response;
         String log;
@@ -701,119 +704,12 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
 
     // ---------------------------------------------------------------------------------------------------- fixtures
 
+    private AdminRows rows() {
+        return new AdminRows(TestDb::connect, names());
+    }
+
     private TableNames names() {
         return schema.names();
-    }
-
-    /**
-     * A dead letter as the relay writes one: payload p, headers h1=v and h2 without a value, created an hour before
-     * {@code failedAt}; a pending or scheduled one is due an hour after it.
-     */
-    private long letter(long id, String topic, String key, String error, Instant failedAt, DeadLetter.Status status)
-            throws SQLException {
-        var headers = HeaderCodec.encode(List.of(new OutboxHeader("h1", bytes("v")), new OutboxHeader("h2", null)));
-        try (var c = TestDb.connect(); var ps = c.prepareStatement("insert into " + names().dead()
-                + " (id, shard, message_id, topic, key, payload, headers, created_at, attempts, failed_at, error,"
-                + " status, due_at) values (?, 0, gen_random_uuid(), ?, ?, ?, ?, ?, 3, ?, ?, ?, ?)")) {
-            ps.setLong(1, id);
-            ps.setString(2, topic);
-            ps.setBytes(3, bytes(key));
-            ps.setBytes(4, bytes("p"));
-            ps.setBytes(5, headers);
-            ps.setObject(6, failedAt.minusSeconds(3600).atOffset(ZoneOffset.UTC));
-            ps.setObject(7, failedAt.atOffset(ZoneOffset.UTC));
-            ps.setString(8, error);
-            ps.setString(9, status.name().toLowerCase(Locale.ROOT));
-            ps.setObject(10, status == KEPT ? null : failedAt.plusSeconds(3600).atOffset(ZoneOffset.UTC));
-            ps.executeUpdate();
-        }
-        return id;
-    }
-
-    /**
-     * Topic t, shard 0: waiting head 10 of key k with follower 11 and parked row 5; unkeyed waiting head 20; waiting
-     * head 30 of key ключ.
-     */
-    private void seedWaiting() throws SQLException {
-        execute("insert into " + names().retry() + " (id, shard, message_id, topic, key, created_at, next_attempt_at,"
-                + " waiting_since) values (10, 0, gen_random_uuid(), 't', 'k', now(), now(), now()),"
-                + " (11, 0, gen_random_uuid(), 't', 'k', now(), null, null),"
-                + " (20, 0, gen_random_uuid(), 't', null, now(), now(), now()),"
-                + " (30, 0, gen_random_uuid(), 't', convert_to('ключ', 'UTF8'), now(), now(), now())");
-        execute("insert into " + names().parked() + " (id, shard, message_id, topic, key, created_at, due_at)"
-                + " values (5, 0, gen_random_uuid(), 't', 'k', now(), now())");
-    }
-
-    private UUID messageId(long letter) throws SQLException {
-        try (var c = TestDb.connect()) {
-            return UUID.fromString(queryString(c, "select message_id::text from " + names().dead() + " where id = "
-                    + letter));
-        }
-    }
-
-    /** A standalone {@code <base>_x1000}, below every range of the outbox, as someone else's detach leaves one. */
-    private String foreignOrphan() throws SQLException {
-        var orphan = names().partitionPrefix() + "1000";
-        execute("create table " + orphan + " (like " + names().base() + " including defaults)");
-        return orphan;
-    }
-
-    /** A row of a standalone range with that xid; returns its message id. */
-    private UUID orphanRow(String table, long id, long xid) throws SQLException {
-        var messageId = UUID.randomUUID();
-        try (var c = TestDb.connect(); var ps = c.prepareStatement("insert into " + table
-                + " (id, shard, xid, message_id, topic, key, payload) values (?, 0, ?::text::xid8, ?, 't', ?, ?)")) {
-            ps.setLong(1, id);
-            ps.setString(2, Long.toString(xid));
-            ps.setObject(3, messageId);
-            ps.setBytes(4, bytes("k" + id));
-            ps.setBytes(5, bytes("row"));
-            ps.executeUpdate();
-        }
-        return messageId;
-    }
-
-    /** As after a dump/restore: a tick whose snapshot xmax lies 10⁹ xids past the counter, made a minute ago. */
-    private void forgeRegression() throws SQLException {
-        try (var c = TestDb.connect()) {
-            long xmax = queryLong(c, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint") + 1_000_000_000L;
-            execute("insert into " + names().tick() + " (snapshot, created_at) values ('" + xmax + ":" + xmax
-                    + ":'::pg_snapshot, now() - interval '1 minute')");
-        }
-    }
-
-    private List<Long> deadIds() throws SQLException {
-        var all = new ArrayList<Long>();
-        try (var c = TestDb.connect(); var st = c.createStatement();
-                var rs = st.executeQuery("select id from " + names().dead() + " order by id")) {
-            while (rs.next()) {
-                all.add(rs.getLong(1));
-            }
-        }
-        return all;
-    }
-
-    private List<UUID> outboxMessageIds() throws SQLException {
-        var all = new ArrayList<UUID>();
-        try (var c = TestDb.connect(); var st = c.createStatement();
-                var rs = st.executeQuery("select message_id from " + names().base() + " order by id")) {
-            while (rs.next()) {
-                all.add(rs.getObject(1, UUID.class));
-            }
-        }
-        return all;
-    }
-
-    private static boolean exists(String table) throws SQLException {
-        try (var c = TestDb.connect()) {
-            return queryString(c, "select to_regclass(?)::text", table) != null;
-        }
-    }
-
-    private static void execute(String sql) throws SQLException {
-        try (var c = TestDb.connect()) {
-            TestSql.execute(c, sql);
-        }
     }
 
     // ------------------------------------------------------------------------------------------------------- HTTP

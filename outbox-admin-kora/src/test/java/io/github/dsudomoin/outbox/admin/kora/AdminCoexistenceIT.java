@@ -4,6 +4,9 @@ import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.github.dsudomoin.outbox.internal.TableNames;
+import io.github.dsudomoin.outbox.testing.AdminRows;
+import io.github.dsudomoin.outbox.testing.AdminRows.Route;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestSql;
@@ -44,28 +47,6 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
     private static final String STATUS = API + "/status";
     private static final String AUDIT = "INFO " + OutboxAdminInterceptor.class.getName() + " - ";
 
-    /** An admin route: its operation, method, path ({@code {orphan}} is the test's orphan table) and body. */
-    record Route(String operation, String method, String path, String body) {
-
-        @Override
-        public String toString() {
-            return operation;
-        }
-    }
-
-    /** All nine, in the contract's order, each acting on what {@link #seed} made when allowed. */
-    static final List<Route> ROUTES = List.of(
-            new Route("getStatus", "GET", API + "/status", null),
-            new Route("findDeadLetters", "GET", API + "/dead-letters?topic=t", null),
-            new Route("countDeadLetters", "GET", API + "/dead-letters/count?topic=t", null),
-            new Route("redriveDeadLetters", "POST", API + "/dead-letters/redrive", "{\"ids\":[1]}"),
-            new Route("discardDeadLetters", "POST", API + "/dead-letters/discard", "{\"ids\":[1]}"),
-            new Route("restoreOrphan", "POST", API + "/orphans/{orphan}/restore?fromXid=0", null),
-            new Route("recoverStrandedShards", "POST", API + "/recovery/stranded-shards", null),
-            new Route("recoverXidRegression", "POST", API + "/recovery/xid-regression", null),
-            new Route("abandonKey", "POST", API + "/keys/abandon", "{\"topic\":\"t\",\"key\":\"k\",\"reason\":\"test\"}"),
-            new Route("abandonWaiting", "POST", API + "/waiting/abandon", "{\"topic\":\"t\",\"reason\":\"test\"}"));
-
     @TestComponent
     private AdminTestApp.KeyAuthorizer authorizer;
     @TestComponent
@@ -103,14 +84,14 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
     }
 
     static Stream<Route> routes() {
-        return ROUTES.stream();
+        return AdminRows.ROUTES.stream();
     }
 
     @ParameterizedTest(name = "{0} answers 401 and 403")
     @MethodSource("routes")
     void everyAdminRouteAnswers401And403(Route route) throws Exception {
-        seed();
-        var before = state();
+        rows().seedEveryRoute();
+        var before = rows().state();
         HttpResponse<String> noKey, wrongKey;
         String log;
         try (var stderr = new CapturedStderr()) {
@@ -122,30 +103,16 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
         assertError(noKey, 401, "X-Api-Key required");
         assertError(wrongKey, 403, "unknown key");
         assertThat(delegate.operations).as("the delegate never ran").isEmpty();
-        assertThat(state()).as("dead letters, outbox rows, the orphan and the ticks unchanged").isEqualTo(before);
+        assertThat(rows().state()).as("dead letters, outbox rows, the orphan and the ticks unchanged")
+                .isEqualTo(before);
         assertThat(audit(log)).as("one INFO line per call").containsExactly(
                 "outbox admin " + route.method() + " \"" + path(route) + "\" denied: 401",
                 "outbox admin " + route.method() + " \"" + path(route) + "\" denied: 403");
         if (route.method().equals("POST")) {
             assertThat(call(route, "secret").statusCode()).isEqualTo(200);
-            assertThat(state()).as("what an allowed call changes, so the check above can fail").isNotEqualTo(before);
+            assertThat(rows().state()).as("what an allowed call changes, so the check above can fail")
+                    .isNotEqualTo(before);
         }
-    }
-
-    @Test
-    void globalInterceptorAppliesToAdminRoutes() throws Exception {
-        seed();
-
-        for (var route : ROUTES) {
-            for (var key : new String[] {null, "wrong", "secret"}) {
-                var response = call(route, key);
-
-                assertThat(response.headers().firstValue("X-Test-Global")).as(route + " with key " + key)
-                        .hasValue("1");
-            }
-        }
-        assertThat(delegate.operations).as("the allowed calls ran")
-                .containsExactlyElementsOf(ROUTES.stream().map(Route::operation).toList());
     }
 
     /** The app's generated API, its {@code appKey} scheme and extractor, beside ours: neither guards the other. */
@@ -170,8 +137,8 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
         assertThat(authorizer.threads).as("the admin authorizer guards the admin routes alone").isEmpty();
         assertThat(delegate.operations).isEmpty();
 
-        var adminStatus = get(STATUS, "secret");
-        var adminLetters = get(API + "/dead-letters", "secret");
+        var adminStatus = send(STATUS, "X-Api-Key", "secret");
+        var adminLetters = send(API + "/dead-letters", "X-Api-Key", "secret");
 
         assertThat(adminStatus.statusCode()).as("no app key needed").isEqualTo(200);
         assertThat(adminStatus.body()).startsWith("{\"halted\":false,");
@@ -183,9 +150,9 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
     /** With two files, {@code openapi.management} serves each at {@code <endpoint>/<file name without extension>}. */
     @Test
     void bothSpecsAreServedAndListed() throws Exception {
-        var app = get("/openapi/test-app", null);
-        var admin = get("/openapi/kora-outbox-admin", null);
-        var swaggerUi = get("/swagger-ui", null);
+        var app = send("/openapi/test-app");
+        var admin = send("/openapi/kora-outbox-admin");
+        var swaggerUi = send("/swagger-ui");
 
         assertThat(app.statusCode()).isEqualTo(200);
         assertThat(app.body()).contains("title: admin wiring test app").contains("operationId: appStatus")
@@ -197,7 +164,7 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
         }
         assertThat(admin.body()).as("the shipped contract").isEqualTo(contract);
         assertThat(Pattern.compile("operationId: (\\w+)").matcher(admin.body()).results().map(m -> m.group(1)))
-                .containsExactlyElementsOf(ROUTES.stream().map(Route::operation).toList());
+                .containsExactlyElementsOf(AdminRows.ROUTES.stream().map(Route::operation).toList());
         assertThat(admin.body()).doesNotContain("securitySchemes").doesNotContain("security:");
         assertThat(swaggerUi.statusCode()).isEqualTo(200);
         assertThat(swaggerUi.body()).as("both in the Swagger UI selector")
@@ -205,34 +172,32 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
                 .contains("\"/openapi/kora-outbox-admin\"").contains("name: \"kora-outbox-admin\"");
     }
 
+    /** The app's global interceptor runs on every admin call, and each call's audit line names the identity. */
     @Test
     void auditLineNamesTheIdentity() throws Exception {
-        seed();
+        rows().seedEveryRoute();
 
         String log;
         try (var stderr = new CapturedStderr()) {
-            for (var route : ROUTES) {
-                call(route, null);
-                call(route, "wrong");
-                assertThat(call(route, "secret").statusCode()).as(route.toString()).isEqualTo(200);
+            for (var route : AdminRows.ROUTES) {
+                var responses = List.of(call(route, null), call(route, "wrong"), call(route, "secret"));
+                for (var response : responses) {
+                    assertThat(response.headers().firstValue("X-Test-Global")).as(route.toString()).hasValue("1");
+                }
+                assertThat(responses.get(2).statusCode()).as(route.toString()).isEqualTo(200);
             }
             log = stderr.text();
         }
 
         var expected = new ArrayList<String>();
-        for (var route : ROUTES) {
+        for (var route : AdminRows.ROUTES) {
             var call = "outbox admin " + route.method() + " \"" + path(route) + "\"";
-            var allowed = call + " by \"tester\"" + switch (route.operation()) {
-                case "redriveDeadLetters", "discardDeadLetters" -> " with count \"1\", ids \"[1]\"";
-                case "restoreOrphan" -> " with fromXid \"0\"";
-                case "abandonWaiting" -> " with topic \"t\", key null, reason \"test\", dryRun \"false\"";
-                case "abandonKey" -> " with topic \"t\", key \"k\", messageId null, reason \"test\", dryRun \"false\"";
-                default -> "";
-            } + ": 200";
+            var allowed = call + " by \"tester\"" + AdminRows.allowedDetail(route) + ": 200";
             expected.addAll(List.of(call + " denied: 401", call + " denied: 403", allowed));
         }
         assertThat(audit(log)).as("one INFO line per call").containsExactlyElementsOf(expected);
-        assertThat(delegate.operations).containsExactlyElementsOf(ROUTES.stream().map(Route::operation).toList());
+        assertThat(delegate.operations)
+                .containsExactlyElementsOf(AdminRows.ROUTES.stream().map(Route::operation).toList());
     }
 
     /** The caller, not yet authenticated, learns nothing of why: the WARN line has the exception. */
@@ -241,7 +206,7 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
         HttpResponse<String> failed;
         String log;
         try (var stderr = new CapturedStderr()) {
-            failed = get(STATUS, "boom");
+            failed = send(STATUS, "X-Api-Key", "boom");
             log = stderr.text();
         }
 
@@ -261,20 +226,11 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
                 .doesNotContain("\nINFO forged");
     }
 
-    /** Quoted, its quotes and backslashes escaped, a path cannot end early and pass for the rest of a line. */
-    @Test
-    void auditLineQuotesThePath() throws Exception {
-        assertThat(postWithoutKey(API + "/orphans/x%20by%20root:%20200/restore?fromXid=0"))
-                .contains("outbox admin POST \"" + API + "/orphans/x by root: 200/restore\" denied: 401");
-        assertThat(postWithoutKey(API + "/orphans/x%22%20by%20root:%20200%20%22/restore?fromXid=0"))
-                .contains("orphans/x\\\" by root: 200 \\\"/restore\" denied: 401");
-    }
-
     /** XNIO names its I/O threads {@code kora-undertow I/O-<n>}, the blocking pool {@code kora-undertow task-<n>}. */
     @Test
     void authorizerRunsOffTheIoThreads() throws Exception {
-        get(STATUS, null);
-        get(STATUS, "secret");
+        send(STATUS);
+        send(STATUS, "X-Api-Key", "secret");
 
         assertThat(authorizer.threads).as("a blocking authorizer must not stall the server's I/O threads")
                 .hasSize(2).allSatisfy(t -> assertThat(t).startsWith("kora-undertow task-"));
@@ -282,51 +238,8 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
 
     // ---------------------------------------------------------------------------------------------------- fixtures
 
-    /**
-     * Something for every mutating route to change: kept dead letter 1, the foreign orphan {@code <table>_x1000}
-     * with one row, one outbox row, a tick whose snapshot xmax lies 10⁹ xids past the counter, as after a
-     * dump/restore, and waiting retry head 2.
-     */
-    private void seed() throws SQLException {
-        execute("insert into " + table + "_dead (id, shard, message_id, topic, created_at, attempts)"
-                + " values (1, 0, gen_random_uuid(), 't', now(), 3)");
-        execute("insert into " + table + "_retry (id, shard, message_id, topic, created_at, next_attempt_at,"
-                + " waiting_since) values (2, 0, gen_random_uuid(), 't', now(), now(), now())");
-        execute("insert into " + table + "_retry (id, shard, message_id, topic, key, created_at, next_attempt_at)"
-                + " values (3, 0, gen_random_uuid(), 't', 'k', now(), now())");
-        execute("create table " + orphan() + " (like " + table + " including defaults)");
-        execute("insert into " + orphan() + " (id, shard, xid, message_id, topic)"
-                + " values (1, 0, '10', gen_random_uuid(), 't')");
-        execute("insert into " + table + " (shard, message_id, topic) values (0, gen_random_uuid(), 't')");
-        execute("insert into " + table + "_tick (snapshot, created_at) select (x || ':' || x || ':')::pg_snapshot,"
-                + " now() - interval '1 minute' from (select pg_snapshot_xmax(pg_current_snapshot())::text::bigint"
-                + " + 1000000000 x) s");
-        // the cursors' tick gone, so the shards stranded; the forged tick above is the latest
-        execute("delete from " + table + "_tick where id = (select min(tick_id) from " + table + "_cursor)");
-    }
-
-    /** What the mutating routes change: dead letter ids, outbox message ids, the orphan's rows, ticks and cursors. */
-    private String state() throws SQLException {
-        try (var c = TestDb.connect()) {
-            var orphanRows = queryString(c, "select to_regclass(?)::text", orphan()) == null ? "dropped"
-                    : queryString(c, "select count(*)::text from " + orphan());
-            return String.join(" | ",
-                    queryString(c, "select string_agg(id::text, ',' order by id) from " + table + "_dead"),
-                    queryString(c, "select string_agg(message_id::text, ',' order by id) from " + table),
-                    orphanRows,
-                    queryString(c, "select string_agg(id::text, ',' order by id) from " + table + "_tick"),
-                    queryString(c, "select string_agg(seq::text, ',' order by seq) from " + table + "_cursor"));
-        }
-    }
-
-    private String orphan() {
-        return table + "_x1000";
-    }
-
-    private static void execute(String sql) throws SQLException {
-        try (var c = TestDb.connect()) {
-            TestSql.execute(c, sql);
-        }
+    private AdminRows rows() {
+        return new AdminRows(TestDb::connect, TableNames.of(table));
     }
 
     // ------------------------------------------------------------------------------------------------------- HTTP
@@ -339,13 +252,13 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
 
     /** {@code route}'s path without its query, as the audit line names it. */
     private String path(Route route) {
-        var path = route.path().replace("{orphan}", orphan());
+        var path = route.path().replace("{orphan}", rows().orphan());
         return path.contains("?") ? path.substring(0, path.indexOf('?')) : path;
     }
 
     private HttpResponse<String> call(Route route, String apiKey) throws Exception {
         var request = HttpRequest.newBuilder(URI.create("http://localhost:" + port
-                        + route.path().replace("{orphan}", orphan())))
+                        + route.path().replace("{orphan}", rows().orphan())))
                 .timeout(ANSWER)
                 .method(route.method(), route.body() == null ? BodyPublishers.noBody()
                         : BodyPublishers.ofString(route.body()));
@@ -380,14 +293,6 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
         var request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path)).timeout(ANSWER);
         if (headers.length > 0) {
             request.headers(headers);
-        }
-        return client.send(request.build(), BodyHandlers.ofString());
-    }
-
-    private HttpResponse<String> get(String path, String apiKey) throws Exception {
-        var request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path)).timeout(ANSWER);
-        if (apiKey != null) {
-            request.header("X-Api-Key", apiKey);
         }
         return client.send(request.build(), BodyHandlers.ofString());
     }

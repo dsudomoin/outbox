@@ -27,12 +27,17 @@ import ru.tinkoff.kora.config.hocon.HoconConfigFactory;
 import ru.tinkoff.kora.http.common.body.HttpBodyInput;
 import ru.tinkoff.kora.http.common.cookie.Cookie;
 import ru.tinkoff.kora.http.common.header.HttpHeaders;
+import ru.tinkoff.kora.http.server.common.HttpServerInterceptor;
 import ru.tinkoff.kora.http.server.common.HttpServerRequest;
 import ru.tinkoff.kora.http.server.common.HttpServerResponse;
 import ru.tinkoff.kora.http.server.common.HttpServerResponseException;
 import ru.tinkoff.kora.http.server.common.handler.BlockingRequestExecutor;
 
 class OutboxAdminInterceptorTest {
+
+    private static final HttpServerInterceptor.InterceptChain NO_ROUTE = (context, request) -> {
+        throw new AssertionError("the route must not run");
+    };
 
     /**
      * The authorizer's stage completes only after the caller has attached to the response stage, as on a real
@@ -42,16 +47,14 @@ class OutboxAdminInterceptorTest {
     @Test
     void authorizerFailureIsAuditedBeforeTheResponseCompletes() {
         var authorization = new AtomicReference<Runnable>();
-        var interceptor = new OutboxAdminInterceptor(request -> {
+        var interceptor = interceptor(request -> {
             throw new IllegalStateException("key store down");
-        }, deferred(authorization), new $ModelError_JsonWriter(), true);
+        }, authorization);
 
         try (var stderr = new CapturedStderr()) {
             var logAtResponse = new AtomicReference<String>();
             var response = interceptor.intercept(Context.current(), request("/kora-outbox/admin/v1/status"),
-                    (context, request) -> {
-                        throw new AssertionError("the route must not run");
-                    }).whenComplete((r, e) -> logAtResponse.set(stderr.text()));
+                    NO_ROUTE).whenComplete((r, e) -> logAtResponse.set(stderr.text()));
 
             authorization.get().run();
 
@@ -64,15 +67,12 @@ class OutboxAdminInterceptorTest {
     @Test
     void anAuthorizerThrowing401GetsTheFixed500() {
         var authorization = new AtomicReference<Runnable>();
-        var interceptor = new OutboxAdminInterceptor(request -> {
+        var interceptor = interceptor(request -> {
             throw HttpServerResponseException.of(401, "token expired");
-        }, deferred(authorization), new $ModelError_JsonWriter(), true);
+        }, authorization);
 
         try (var stderr = new CapturedStderr()) {
-            var response = interceptor.intercept(Context.current(), request("/kora-outbox/admin/v1/status"),
-                    (context, request) -> {
-                        throw new AssertionError("the route must not run");
-                    });
+            var response = interceptor.intercept(Context.current(), request("/kora-outbox/admin/v1/status"), NO_ROUTE);
             authorization.get().run();
 
             var answered = response.toCompletableFuture().join();
@@ -89,8 +89,7 @@ class OutboxAdminInterceptorTest {
     @Test
     void aRouteFailureIsA500Error() {
         var authorization = new AtomicReference<Runnable>();
-        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.allow("ops\n"),
-                deferred(authorization), new $ModelError_JsonWriter(), true);
+        var interceptor = interceptor(request -> OutboxAdminAuthorizer.allow("ops\n"), authorization);
 
         try (var stderr = new CapturedStderr()) {
             var response = interceptor.intercept(Context.current(), request("/kora-outbox/admin/v1/status"),
@@ -111,8 +110,7 @@ class OutboxAdminInterceptorTest {
     @Test
     void aServerResponseExceptionKeepsItsStatus() {
         var authorization = new AtomicReference<Runnable>();
-        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.allow("ops"),
-                deferred(authorization), new $ModelError_JsonWriter(), true);
+        var interceptor = interceptor(request -> OutboxAdminAuthorizer.allow("ops"), authorization);
 
         try (var stderr = new CapturedStderr()) {
             var response = interceptor.intercept(Context.current(), request("/kora-outbox/admin/v1/status"),
@@ -133,14 +131,10 @@ class OutboxAdminInterceptorTest {
     @Test
     void auditLinePathIsOneQuotedToken() {
         var authorization = new AtomicReference<Runnable>();
-        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.unauthorized("who?"),
-                deferred(authorization), new $ModelError_JsonWriter(), true);
+        var interceptor = interceptor(request -> OutboxAdminAuthorizer.unauthorized("who?"), authorization);
 
         try (var stderr = new CapturedStderr()) {
-            var response = interceptor.intercept(Context.current(), request("/a\\\" by root: 200 \""),
-                    (context, request) -> {
-                        throw new AssertionError("the route must not run");
-                    });
+            var response = interceptor.intercept(Context.current(), request("/a\\\" by root: 200 \""), NO_ROUTE);
             authorization.get().run();
 
             assertThat(response.toCompletableFuture().join().code()).isEqualTo(401);
@@ -152,15 +146,12 @@ class OutboxAdminInterceptorTest {
     @Test
     void auditLineEscapesFormatCharacters() {
         var authorization = new AtomicReference<Runnable>();
-        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.unauthorized("who?"),
-                deferred(authorization), new $ModelError_JsonWriter(), true);
+        var interceptor = interceptor(request -> OutboxAdminAuthorizer.unauthorized("who?"), authorization);
 
         try (var stderr = new CapturedStderr()) {
             var response = interceptor.intercept(Context.current(),
                     request("/kora-outbox/admin/v1/orphans/x\u202ey\u200bz\uDB40\uDC01/restore"),
-                    (context, request) -> {
-                        throw new AssertionError("the route must not run");
-                    });
+                    NO_ROUTE);
             authorization.get().run();
 
             assertThat(response.toCompletableFuture().join().code()).isEqualTo(401);
@@ -174,8 +165,7 @@ class OutboxAdminInterceptorTest {
     @Test
     void auditLineQuotesTheIdentity() {
         var authorization = new AtomicReference<Runnable>();
-        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.allow("x\": 200 \\"),
-                deferred(authorization), new $ModelError_JsonWriter(), true);
+        var interceptor = interceptor(request -> OutboxAdminAuthorizer.allow("x\": 200 \\"), authorization);
 
         try (var stderr = new CapturedStderr()) {
             var response = interceptor.intercept(Context.current(), request("/kora-outbox/admin/v1/status"),
@@ -196,16 +186,14 @@ class OutboxAdminInterceptorTest {
     @ParameterizedTest
     @ValueSource(strings = {"cross-site", "same-site"})
     void aPostAnotherSiteSentIsRefusedBeforeTheAuthorizer(String site) {
-        var interceptor = new OutboxAdminInterceptor(request -> {
+        var interceptor = interceptor(request -> {
             throw new AssertionError("the authorizer must not run");
-        }, deferred(new AtomicReference<>()), new $ModelError_JsonWriter(), true);
+        }, new AtomicReference<>());
 
         try (var stderr = new CapturedStderr()) {
             var response = interceptor.intercept(Context.current(), request("POST",
                     "/kora-outbox/admin/v1/dead-letters/discard", HttpHeaders.of("sec-fetch-site", site)),
-                    (context, request) -> {
-                        throw new AssertionError("the route must not run");
-                    }).toCompletableFuture();
+                    NO_ROUTE).toCompletableFuture();
 
             assertThat(response).as("answered without the authorizer").isDone();
             var answered = response.join();
@@ -224,16 +212,14 @@ class OutboxAdminInterceptorTest {
     @CsvSource({"http://evil.example,app:8080", "null,app:8080", "http://app:8081,app:8080", "http://app,app:8080",
             "http://app:8080,app", "http://app:8080,"})
     void aPostWhoseOriginIsAnotherHostIsRefusedBeforeTheAuthorizer(String origin, String host) {
-        var interceptor = new OutboxAdminInterceptor(request -> {
+        var interceptor = interceptor(request -> {
             throw new AssertionError("the authorizer must not run");
-        }, deferred(new AtomicReference<>()), new $ModelError_JsonWriter(), true);
+        }, new AtomicReference<>());
 
         var response = interceptor.intercept(Context.current(), request("POST",
                 "/kora-outbox/admin/v1/recovery/xid-regression", host == null ? HttpHeaders.of("origin", origin)
                         : HttpHeaders.of("origin", origin, "host", host)),
-                (context, request) -> {
-                    throw new AssertionError("the route must not run");
-                }).toCompletableFuture();
+                NO_ROUTE).toCompletableFuture();
 
         assertThat(response).as("answered without the authorizer").isDone();
         var answered = response.join();
@@ -248,8 +234,7 @@ class OutboxAdminInterceptorTest {
             "http://admin.internal,admin.internal"})
     void aPostFromTheServersOwnOriginReachesTheAuthorizer(String origin, String host) {
         var authorization = new AtomicReference<Runnable>();
-        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.allow("ops"),
-                deferred(authorization), new $ModelError_JsonWriter(), true);
+        var interceptor = interceptor(request -> OutboxAdminAuthorizer.allow("ops"), authorization);
 
         var response = interceptor.intercept(Context.current(), request("POST",
                 "/kora-outbox/admin/v1/recovery/xid-regression", HttpHeaders.of("origin", origin, "host", host)),
@@ -266,8 +251,7 @@ class OutboxAdminInterceptorTest {
     @Test
     void checkOriginOffLetsAnotherOriginReachTheAuthorizerButNotAnotherSite() {
         var authorization = new AtomicReference<Runnable>();
-        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.allow("ops"),
-                deferred(authorization), new $ModelError_JsonWriter(), false);
+        var interceptor = interceptor(request -> OutboxAdminAuthorizer.allow("ops"), authorization, false);
 
         var response = interceptor.intercept(Context.current(), request("POST",
                 "/kora-outbox/admin/v1/recovery/xid-regression",
@@ -279,9 +263,7 @@ class OutboxAdminInterceptorTest {
         var crossSite = interceptor.intercept(Context.current(), request("POST",
                 "/kora-outbox/admin/v1/recovery/xid-regression",
                 HttpHeaders.of("origin", "http://ops.internal", "host", "app:8080", "sec-fetch-site", "cross-site")),
-                (context, request) -> {
-                    throw new AssertionError("the route must not run");
-                }).toCompletableFuture();
+                NO_ROUTE).toCompletableFuture();
         assertThat(crossSite).as("answered without the authorizer").isDone();
         assertThat(crossSite.join().code()).isEqualTo(403);
     }
@@ -304,8 +286,7 @@ class OutboxAdminInterceptorTest {
     @CsvSource({"POST,same-origin", "GET,"})
     void anOriginIsNotLookedAtWithSecFetchSiteOrOnAGet(String method, String site) {
         var authorization = new AtomicReference<Runnable>();
-        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.allow("ops"),
-                deferred(authorization), new $ModelError_JsonWriter(), true);
+        var interceptor = interceptor(request -> OutboxAdminAuthorizer.allow("ops"), authorization);
 
         var headers = HttpHeaders.of("origin", "http://proxy.example", "host", "app:8080");
         if (site != null) {
@@ -328,8 +309,7 @@ class OutboxAdminInterceptorTest {
             "application/jsonx,415", ",400"})
     void aBodyRouteRefusesAnotherContentTypeBeforeTheRoute(String type, int status) {
         var authorization = new AtomicReference<Runnable>();
-        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.allow("ops"),
-                deferred(authorization), new $ModelError_JsonWriter(), true);
+        var interceptor = interceptor(request -> OutboxAdminAuthorizer.allow("ops"), authorization);
 
         try (var stderr = new CapturedStderr()) {
             for (var path : List.of("dead-letters/discard", "dead-letters/redrive", "keys/abandon",
@@ -337,9 +317,7 @@ class OutboxAdminInterceptorTest {
                     "waiting/abandon/")) {
                 var response = interceptor.intercept(Context.current(), request("POST",
                         "/kora-outbox/admin/v1/" + path, type == null ? HttpHeaders.of()
-                                : HttpHeaders.of("content-type", type)), (context, request) -> {
-                            throw new AssertionError("the route must not run");
-                        });
+                                : HttpHeaders.of("content-type", type)), NO_ROUTE);
                 authorization.get().run();
 
                 var answered = response.toCompletableFuture().join();
@@ -358,8 +336,7 @@ class OutboxAdminInterceptorTest {
     @ValueSource(strings = {"application/json", "application/json; charset=utf-8", "Application/JSON;charset=UTF-8"})
     void aBodyRouteTakesJson(String type) {
         var authorization = new AtomicReference<Runnable>();
-        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.allow("ops"),
-                deferred(authorization), new $ModelError_JsonWriter(), true);
+        var interceptor = interceptor(request -> OutboxAdminAuthorizer.allow("ops"), authorization);
 
         var response = interceptor.intercept(Context.current(), request("POST",
                 "/kora-outbox/admin/v1/dead-letters/discard", HttpHeaders.of("content-type", type)),
@@ -374,8 +351,7 @@ class OutboxAdminInterceptorTest {
     @CsvSource({"POST,", "POST,same-origin", "POST,none", "GET,cross-site"})
     void aCallOfTheSameSiteOrNoBrowserReachesTheAuthorizer(String method, String site) {
         var authorization = new AtomicReference<Runnable>();
-        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.allow("ops"),
-                deferred(authorization), new $ModelError_JsonWriter(), true);
+        var interceptor = interceptor(request -> OutboxAdminAuthorizer.allow("ops"), authorization);
 
         var response = interceptor.intercept(Context.current(), request(method, "/kora-outbox/admin/v1/status",
                 site == null ? HttpHeaders.of() : HttpHeaders.of("sec-fetch-site", site)),
@@ -393,6 +369,16 @@ class OutboxAdminInterceptorTest {
             throw new UncheckedIOException(e);
         }
         return out.toString(UTF_8);
+    }
+
+    /** An interceptor whose authorizer runs when the test runs what it leaves in {@code run}. */
+    private static OutboxAdminInterceptor interceptor(OutboxAdminAuthorizer authorizer, AtomicReference<Runnable> run) {
+        return interceptor(authorizer, run, true);
+    }
+
+    private static OutboxAdminInterceptor interceptor(OutboxAdminAuthorizer authorizer, AtomicReference<Runnable> run,
+            boolean checkOrigin) {
+        return new OutboxAdminInterceptor(authorizer, deferred(run), new $ModelError_JsonWriter(), checkOrigin);
     }
 
     /** Runs the handler only when the test runs what it leaves in {@code run}. */

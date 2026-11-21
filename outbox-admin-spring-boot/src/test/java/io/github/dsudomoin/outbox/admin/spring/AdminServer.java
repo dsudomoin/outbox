@@ -191,11 +191,10 @@ final class AdminServer implements AutoCloseable {
      * Waits for {@code lines} of them: MVC flushes an allowed call's response before the guard writes its line, so the
      * line can come just after the client has its response. Call it before the next call, or two lines may swap.
      */
-    static List<String> awaitAudit(CapturedStderr stderr, int lines) throws InterruptedException {
+    static void awaitAudit(CapturedStderr stderr, int lines) throws InterruptedException {
         long deadline = System.nanoTime() + 5_000_000_000L;
         while (audit(stderr).size() < lines && System.nanoTime() < deadline) {
             Thread.sleep(5);
         }
-        return audit(stderr);
     }
 }

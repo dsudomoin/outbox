@@ -15,6 +15,7 @@ import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.internal.HeaderCodec;
 import io.github.dsudomoin.outbox.internal.TableNames;
+import io.github.dsudomoin.outbox.testing.AdminRows;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
@@ -140,15 +141,16 @@ class AdminHttpIT {
     @Test
     void statusMapsEveryField() {
         app(() -> {
-            execute("insert into " + names.halt() + " (max_tick_xmax) values ('1')");
-            execute("insert into " + names.retry() + " (id, shard, message_id, topic, created_at, waiting_since) values"
+            rows().execute("insert into " + names.halt() + " (max_tick_xmax) values ('1')");
+            rows().execute("insert into " + names.retry()
+                + " (id, shard, message_id, topic, created_at, waiting_since) values"
                 + " (1, 0, gen_random_uuid(), 't', now(), now() - interval '1 hour'),"
                 + " (2, 0, gen_random_uuid(), 't', now(), null)");
-            letter(1, "a", "1", "boom", T0, KEPT);
-            letter(2, "a", "2", "boom", T0, KEPT);
-            letter(3, "a", "3", "boom", T0, PENDING);
-            letter(4, "b", "4", "boom", T0, SCHEDULED);
-            var orphan = foreignOrphan();
+            rows().letter(1, "a", "1", "boom", T0, KEPT);
+            rows().letter(2, "a", "2", "boom", T0, KEPT);
+            rows().letter(3, "a", "3", "boom", T0, PENDING);
+            rows().letter(4, "b", "4", "boom", T0, SCHEDULED);
+            var orphan = rows().foreignOrphan();
             // this app's own heartbeat, its first beat at start, the next one maintenanceInterval (30 s) later
             try (var c = connect()) {
                 long deadline = System.nanoTime() + 10_000_000_000L;
@@ -159,8 +161,8 @@ class AdminHttpIT {
             }
             assertThat((Boolean) JsonPath.read(call("GET", "/status", null).body, "$.instances[0].live"))
                 .as("this app's own row, just beaten").isTrue();
-            execute("delete from " + names.instance());
-            execute("insert into " + names.instance() + " (instance_id, shards, last_seen, hook_active, relay,"
+            rows().execute("delete from " + names.instance());
+            rows().execute("insert into " + names.instance() + " (instance_id, shards, last_seen, hook_active, relay,"
                 + " contracts, routes) values ('host-b/7/0000beef', 2, '2026-01-15T10:00:00Z', true, true,"
                 + " '{\"t2\": 2, \"t1\": 1}', '{t2,t1}'), ('host-c/8/0000cafe', 2, '2026-01-15T10:00:00Z', false,"
                 + " false, null, null), ('host-d/9/0000d00d', 2, '2026-01-15T10:00:00Z', true, true, '{}', '{}')");
@@ -193,9 +195,9 @@ class AdminHttpIT {
     @Test
     void findsByEachFilterFieldAndPages() {
         app(() -> {
-            long a = letter(1, "t1", "k1", "disk full", T0.minusSeconds(7200), KEPT);
-            long b = letter(2, "t2", "ключ", "timeout", T0.minusSeconds(3600), PENDING);
-            long c = letter(3, "t1", "k3", "timeout", T0, SCHEDULED);
+            long a = rows().letter(1, "t1", "k1", "disk full", T0.minusSeconds(7200), KEPT);
+            long b = rows().letter(2, "t2", "ключ", "timeout", T0.minusSeconds(3600), PENDING);
+            long c = rows().letter(3, "t1", "k3", "timeout", T0, SCHEDULED);
 
             assertThat(find("topic=t1")).containsExactly(a, c);
             assertThat(find("key=" + encode("ключ"))).as("the key's UTF-8 bytes").containsExactly(b);
@@ -221,13 +223,13 @@ class AdminHttpIT {
     @Test
     void letterJsonCarriesEveryField() {
         app(() -> {
-            long id = letter(7, "t", "k", "timeout", T0, PENDING);
-            execute("update " + names.dead() + " set redrives = 2, handler_attempts = 1 where id = " + id);
+            long id = rows().letter(7, "t", "k", "timeout", T0, PENDING);
+            rows().execute("update " + names.dead() + " set redrives = 2, handler_attempts = 1 where id = " + id);
 
             var response = call("GET", "/dead-letters?topic=t", null);
 
             assertJson(response, 200);
-            assertSameJson(response.body, letterJson(id, messageId(id)));
+            assertSameJson(response.body, letterJson(id, rows().messageId(id)));
         });
     }
 
@@ -244,8 +246,8 @@ class AdminHttpIT {
     @Test
     void datesAreWrittenToTheMillisecondInUtc() {
         app(() -> {
-            letter(1, "t", "k", "boom", T0.plusNanos(123_456_000), KEPT);
-            letter(2, "t", "k", "boom", T0.plusNanos(120_000_000), KEPT);
+            rows().letter(1, "t", "k", "boom", T0.plusNanos(123_456_000), KEPT);
+            rows().letter(2, "t", "k", "boom", T0.plusNanos(120_000_000), KEPT);
 
             var body = call("GET", "/dead-letters", null).body;
 
@@ -257,9 +259,9 @@ class AdminHttpIT {
     @Test
     void countsByTheFilter() {
         app(() -> {
-            letter(1, "t1", "a", "boom", T0, KEPT);
-            letter(2, "t1", "b", "boom", T0, PENDING);
-            letter(3, "t2", "c", "boom", T0, KEPT);
+            rows().letter(1, "t1", "a", "boom", T0, KEPT);
+            rows().letter(2, "t1", "b", "boom", T0, PENDING);
+            rows().letter(3, "t2", "c", "boom", T0, KEPT);
 
             assertThat(call("GET", "/dead-letters/count", null).body).isEqualTo("{\"count\":3}");
             var t1 = call("GET", "/dead-letters/count?topic=t1", null);
@@ -273,42 +275,42 @@ class AdminHttpIT {
     @Test
     void redrivesByIdsIntoTheOutbox() {
         app(() -> {
-            long a = letter(1, "t", "a", "boom", T0, KEPT);
-            long b = letter(2, "t", "b", "boom", T0, PENDING);
-            long other = letter(3, "t", "c", "boom", T0, KEPT);
-            var sent = List.of(messageId(a), messageId(b));
+            long a = rows().letter(1, "t", "a", "boom", T0, KEPT);
+            long b = rows().letter(2, "t", "b", "boom", T0, PENDING);
+            long other = rows().letter(3, "t", "c", "boom", T0, KEPT);
+            var sent = List.of(rows().messageId(a), rows().messageId(b));
 
             var response = call("POST", "/dead-letters/redrive", "{\"ids\":[" + a + "," + b + ",999999]}");
 
             assertJson(response, 200);
             assertThat(response.body).isEqualTo("{\"count\":2}");
-            assertThat(deadIds()).containsExactly(other);
-            assertThat(outboxMessageIds()).containsExactlyElementsOf(sent);
+            assertThat(rows().deadIds()).containsExactly(other);
+            assertThat(rows().outboxMessageIds()).containsExactlyElementsOf(sent);
         });
     }
 
     @Test
     void redrivesByFilter() {
         app(() -> {
-            long a = letter(1, "t1", "a", "boom", T0, KEPT);
-            long other = letter(2, "t2", "b", "boom", T0, KEPT);
-            var sent = messageId(a);
+            long a = rows().letter(1, "t1", "a", "boom", T0, KEPT);
+            long other = rows().letter(2, "t2", "b", "boom", T0, KEPT);
+            var sent = rows().messageId(a);
 
             var response = call("POST", "/dead-letters/redrive", "{\"filter\":{\"topic\":\"t1\"}}");
 
             assertThat(response.body).isEqualTo("{\"count\":1}");
-            assertThat(deadIds()).containsExactly(other);
-            assertThat(outboxMessageIds()).containsExactly(sent);
+            assertThat(rows().deadIds()).containsExactly(other);
+            assertThat(rows().outboxMessageIds()).containsExactly(sent);
         });
     }
 
     @Test
     void discardsByFilterAndByIds() {
         app(() -> {
-            long a = letter(1, "t1", "a", "disk full", T0, KEPT);
-            letter(2, "t1", "b", "timeout", T0, KEPT);
-            letter(3, "t2", "c", "timeout", T0, KEPT);
-            long kept = letter(4, "t2", "d", "disk full", T0, KEPT);
+            long a = rows().letter(1, "t1", "a", "disk full", T0, KEPT);
+            rows().letter(2, "t1", "b", "timeout", T0, KEPT);
+            rows().letter(3, "t2", "c", "timeout", T0, KEPT);
+            long kept = rows().letter(4, "t2", "d", "disk full", T0, KEPT);
 
             var byFilter = call("POST", "/dead-letters/discard", "{\"filter\":{\"error\":\"timeout\"}}");
             var byIds = call("POST", "/dead-letters/discard", "{\"ids\":[" + a + "]}");
@@ -316,15 +318,15 @@ class AdminHttpIT {
             assertJson(byFilter, 200);
             assertThat(byFilter.body).isEqualTo("{\"count\":2}");
             assertThat(byIds.body).isEqualTo("{\"count\":1}");
-            assertThat(deadIds()).containsExactly(kept);
-            assertThat(outboxMessageIds()).isEmpty();
+            assertThat(rows().deadIds()).containsExactly(kept);
+            assertThat(rows().outboxMessageIds()).isEmpty();
         });
     }
 
     @Test
     void selectionNeedsExactlyOneOfIdsAndFilter() {
         app(() -> {
-            long id = letter(1, "t", "k", "boom", T0, KEPT);
+            long id = rows().letter(1, "t", "k", "boom", T0, KEPT);
 
             for (var operation : List.of("redrive", "discard")) {
                 for (var body : List.of("{\"ids\":[" + id + "],\"filter\":{\"topic\":\"t\"}}", "{}", "{\"filter\":{}}",
@@ -335,8 +337,8 @@ class AdminHttpIT {
                     assertThat(response.body).as(operation + " " + body).startsWith("{\"message\":\"");
                 }
             }
-            assertThat(deadIds()).containsExactly(id);
-            assertThat(outboxMessageIds()).isEmpty();
+            assertThat(rows().deadIds()).containsExactly(id);
+            assertThat(rows().outboxMessageIds()).isEmpty();
         });
     }
 
@@ -344,8 +346,8 @@ class AdminHttpIT {
     @Test
     void blankFilterStringsAreRefusedByBulkCalls() {
         app(() -> {
-            long id = letter(1, "t", "k", "boom", T0, KEPT);
-            long other = letter(2, "u", "k", "boom", T0, KEPT);
+            long id = rows().letter(1, "t", "k", "boom", T0, KEPT);
+            long other = rows().letter(2, "u", "k", "boom", T0, KEPT);
 
             for (var operation : List.of("redrive", "discard")) {
                 for (var body : List.of("{\"filter\":{\"topic\":\"\",\"status\":\"kept\"}}",
@@ -357,8 +359,8 @@ class AdminHttpIT {
                     assertThat(response.body).as(operation + " " + body).startsWith("{\"message\":\"a blank ");
                 }
             }
-            assertThat(deadIds()).containsExactly(id, other);
-            assertThat(outboxMessageIds()).isEmpty();
+            assertThat(rows().deadIds()).containsExactly(id, other);
+            assertThat(rows().outboxMessageIds()).isEmpty();
             assertThat(find("topic=&status=kept")).as("reads still take a blank one as absent")
                 .containsExactly(id, other);
         });
@@ -374,8 +376,8 @@ class AdminHttpIT {
     }
 
     private void assertUnknownFieldsRefused() throws Exception {
-        long id = letter(1, "t", "k", "boom", T0, KEPT);
-        seedWaiting();
+        long id = rows().letter(1, "t", "k", "boom", T0, KEPT);
+        rows().seedWaiting();
 
         for (var operation : List.of("redrive", "discard")) {
             for (var body : List.of("{\"filter\":{\"topic\":\"t\",\"eror\":\"x\"}}",
@@ -394,8 +396,8 @@ class AdminHttpIT {
         var inFilter = call("POST", "/dead-letters/discard", "{\"filter\":{\"topic\":\"t\",\"kye\":\"k\"}}");
         assertThat(inFilter.body).isEqualTo("{\"message\":\"unknown field 'kye' in Filter; its fields: topic, key,"
             + " error, failedFrom, failedTo, status\"}");
-        assertThat(deadIds()).containsExactly(id);
-        assertThat(outboxMessageIds()).isEmpty();
+        assertThat(rows().deadIds()).containsExactly(id);
+        assertThat(rows().outboxMessageIds()).isEmpty();
         assertThat(retryCount()).isEqualTo(4);
     }
 
@@ -403,9 +405,9 @@ class AdminHttpIT {
     @Test
     void duplicateFieldRefused() {
         app(() -> {
-            long x = letter(1, "t", "k", "x", T0, KEPT);
-            long y = letter(2, "t", "k", "y", T0, KEPT);
-            seedWaiting();
+            long x = rows().letter(1, "t", "k", "x", T0, KEPT);
+            long y = rows().letter(2, "t", "k", "y", T0, KEPT);
+            rows().seedWaiting();
 
             for (var operation : List.of("redrive", "discard")) {
                 for (var body : List.of("{\"filter\":{\"topic\":\"t\",\"error\":\"x\",\"error\":null}}",
@@ -422,8 +424,8 @@ class AdminHttpIT {
                 assertJson(response, 400);
                 assertThat(response.body).as(path).startsWith("{\"message\":\"Duplicate ").contains("key");
             }
-            assertThat(deadIds()).containsExactly(x, y);
-            assertThat(outboxMessageIds()).isEmpty();
+            assertThat(rows().deadIds()).containsExactly(x, y);
+            assertThat(rows().outboxMessageIds()).isEmpty();
             assertThat(retryCount()).isEqualTo(4);
         });
     }
@@ -435,8 +437,8 @@ class AdminHttpIT {
     @Test
     void valuesAMapperWouldCoerceAreRefused() {
         app(() -> {
-            long id = letter(1, "t", "k", "boom", T0, KEPT);
-            seedWaiting();
+            long id = rows().letter(1, "t", "k", "boom", T0, KEPT);
+            rows().seedWaiting();
 
             for (var body : List.of("{\"ids\":[1.5]}", "{\"ids\":[\"1\"]}", "{\"ids\":1}", "{\"ids\":{}}",
                 "{\"ids\":[9223372036854775808]}", "{\"filter\":\"t\"}", "{\"filter\":[]}",
@@ -457,7 +459,7 @@ class AdminHttpIT {
                 assertJson(response, 400);
                 assertThat(response.body).as(dryRun).startsWith("{\"message\":\"");
             }
-            assertThat(deadIds()).containsExactly(id);
+            assertThat(rows().deadIds()).containsExactly(id);
             assertThat(retryCount()).isEqualTo(4);
         });
     }
@@ -466,8 +468,8 @@ class AdminHttpIT {
     @Test
     void blankValuesAreRefusedUnlessTheyAreAKey() {
         app(() -> {
-            long id = letter(1, "t", "k", "boom", T0, KEPT);
-            seedWaiting();
+            long id = rows().letter(1, "t", "k", "boom", T0, KEPT);
+            rows().seedWaiting();
 
             for (var blank : List.of("", " ")) {
                 for (var field : List.of("topic", "error")) {
@@ -495,7 +497,7 @@ class AdminHttpIT {
                 assertSameJson(call("POST", "/waiting/abandon", "{\"topic\":\"t\",\"key\":\"" + blank
                     + "\",\"reason\":\"r\"}").body, "{\"keys\":0,\"records\":0}");
             }
-            assertThat(deadIds()).containsExactly(id);
+            assertThat(rows().deadIds()).containsExactly(id);
             assertThat(retryCount()).isEqualTo(4);
         });
     }
@@ -507,7 +509,7 @@ class AdminHttpIT {
             ? "spring.jackson.datatype.enum.read-unknown-enum-values-as-null=true"
             : "spring.jackson.deserialization.read-unknown-enum-values-as-null=true";
         app(() -> {
-            long id = letter(1, "t", "k", "boom", T0, KEPT);
+            long id = rows().letter(1, "t", "k", "boom", T0, KEPT);
 
             for (var operation : List.of("redrive", "discard")) {
                 var response = call("POST", "/dead-letters/" + operation,
@@ -516,8 +518,8 @@ class AdminHttpIT {
                 assertJson(response, 400);
                 assertThat(response.body).startsWith("{\"message\":\"");
             }
-            assertThat(deadIds()).containsExactly(id);
-            assertThat(outboxMessageIds()).isEmpty();
+            assertThat(rows().deadIds()).containsExactly(id);
+            assertThat(rows().outboxMessageIds()).isEmpty();
         }, unknownAsNull);
     }
 
@@ -525,7 +527,7 @@ class AdminHttpIT {
     @Test
     void aBodyOverTheLimitIsRefused() {
         app(() -> {
-            long id = letter(1, "t", "k", "boom", T0, KEPT);
+            long id = rows().letter(1, "t", "k", "boom", T0, KEPT);
             var start = "{\"ids\":[" + id + "]";
             var atTheLimit = start + " ".repeat(1024 * 1024 - start.length() - 1) + "}";
 
@@ -534,7 +536,7 @@ class AdminHttpIT {
             assertJson(over, 400);
             assertThat(over.body)
                 .isEqualTo("{\"message\":\"a request body of at most 1048576 bytes, not more\"}");
-            assertThat(deadIds()).containsExactly(id);
+            assertThat(rows().deadIds()).containsExactly(id);
 
             var at = call("POST", "/dead-letters/discard", atTheLimit);
 
@@ -546,14 +548,14 @@ class AdminHttpIT {
     @Test
     void idsAreCappedAt1000() {
         app(() -> {
-            long id = letter(1, "t", "k", "boom", T0, KEPT);
+            long id = rows().letter(1, "t", "k", "boom", T0, KEPT);
             var thousand = LongStream.rangeClosed(1, 1000).mapToObj(Long::toString).collect(Collectors.joining(","));
 
             var tooMany = call("POST", "/dead-letters/discard", "{\"ids\":[" + thousand + ",1001]}");
 
             assertJson(tooMany, 400);
             assertThat(tooMany.body).startsWith("{\"message\":\"at most 1000 ids");
-            assertThat(deadIds()).containsExactly(id);
+            assertThat(rows().deadIds()).containsExactly(id);
             assertThat(call("POST", "/dead-letters/discard", "{\"ids\":[" + thousand + "]}").body)
                 .isEqualTo("{\"count\":1}");
         });
@@ -562,32 +564,32 @@ class AdminHttpIT {
     @Test
     void restoresAStandaloneRangeFromTheCut() {
         app(() -> {
-            var orphan = foreignOrphan();
-            orphanRow(orphan, 1, 10);
-            var at = orphanRow(orphan, 2, 20);
-            var above = orphanRow(orphan, 3, 30);
+            var orphan = rows().foreignOrphan();
+            rows().orphanRow(orphan, 1, 10);
+            var at = rows().orphanRow(orphan, 2, 20);
+            var above = rows().orphanRow(orphan, 3, 30);
 
             var response = call("POST", "/orphans/" + orphan + "/restore?fromXid=20", null);
 
             assertJson(response, 200);
             assertThat(response.body).isEqualTo("{\"count\":2}");
-            assertThat(exists(orphan)).as("dropped").isFalse();
-            assertThat(outboxMessageIds()).containsExactly(at, above);
+            assertThat(rows().exists(orphan)).as("dropped").isFalse();
+            assertThat(rows().outboxMessageIds()).containsExactly(at, above);
         });
     }
 
     @Test
     void aNegativeFromXidIs400AndKeepsTheOrphan() {
         app(() -> {
-            var orphan = foreignOrphan();
-            orphanRow(orphan, 1, 10);
+            var orphan = rows().foreignOrphan();
+            rows().orphanRow(orphan, 1, 10);
 
             var response = call("POST", "/orphans/" + orphan + "/restore?fromXid=-1", null);
 
             assertJson(response, 400);
             assertThat(response.body).startsWith("{\"message\":\"fromXid -1 is below 0");
-            assertThat(exists(orphan)).isTrue();
-            assertThat(outboxMessageIds()).isEmpty();
+            assertThat(rows().exists(orphan)).isTrue();
+            assertThat(rows().outboxMessageIds()).isEmpty();
         });
     }
 
@@ -595,9 +597,9 @@ class AdminHttpIT {
     void tableNameIsNeverInterpolated() {
         app(() -> {
             var victim = TestSql.uniqueTable();
-            execute("create table " + victim + " (id bigint)");
-            var orphan = foreignOrphan();
-            orphanRow(orphan, 1, 10);
+            rows().execute("create table " + victim + " (id bigint)");
+            var orphan = rows().foreignOrphan();
+            rows().orphanRow(orphan, 1, 10);
 
             for (var table : List.of(orphan + ";drop table " + victim, names.base() + "_x1000' or '1'='1",
                 victim, names.base(), "otherschema." + orphan)) {
@@ -608,9 +610,9 @@ class AdminHttpIT {
                 assertThat(response.body).as("the decoded name reached the call")
                     .startsWith("{\"message\":\"" + table + " is not ");
             }
-            assertThat(exists(victim)).isTrue();
-            assertThat(exists(orphan)).isTrue();
-            assertThat(outboxMessageIds()).isEmpty();
+            assertThat(rows().exists(victim)).isTrue();
+            assertThat(rows().exists(orphan)).isTrue();
+            assertThat(rows().outboxMessageIds()).isEmpty();
         });
     }
 
@@ -626,13 +628,13 @@ class AdminHttpIT {
             var sent = new TransactionTemplate(context.getBean(PlatformTransactionManager.class))
                 .execute(status -> outbox.sendAll(List.of(OutboxMessage.of("t", "a", bytes("1")),
                     OutboxMessage.of("t", "b", bytes("2")), OutboxMessage.of("t", "c", bytes("3")))));
-            forgeRegression();
+            rows().forgeRegression();
 
             var recovered = call("POST", "/recovery/xid-regression", null);
 
             assertJson(recovered, 200);
             assertThat(recovered.body).isEqualTo("{\"count\":3}");
-            assertThat(outboxMessageIds()).as("re-sent with the same message ids").containsAll(sent);
+            assertThat(rows().outboxMessageIds()).as("re-sent with the same message ids").containsAll(sent);
             assertThat((Boolean) JsonPath.read(call("GET", "/status", null).body, "$.halted")).isFalse();
         });
     }
@@ -649,15 +651,16 @@ class AdminHttpIT {
             var sent = new TransactionTemplate(context.getBean(PlatformTransactionManager.class))
                 .execute(status -> outbox.sendAll(List.of(OutboxMessage.of("t", "a", bytes("1")),
                     OutboxMessage.of("t", "b", bytes("2")), OutboxMessage.of("t", "c", bytes("3")))));
-            execute("insert into " + names.tick() + " (snapshot) values (pg_current_snapshot())");
-            execute("delete from " + names.tick() + " where id = (select min(tick_id) from " + names.cursor() + ")");
-            execute("delete from " + names.checkpoint());
+            rows().execute("insert into " + names.tick() + " (snapshot) values (pg_current_snapshot())");
+            rows().execute("delete from " + names.tick() + " where id = (select min(tick_id) from "
+                + names.cursor() + ")");
+            rows().execute("delete from " + names.checkpoint());
 
             var repaired = call("POST", "/recovery/stranded-shards", null);
 
             assertJson(repaired, 200);
             assertThat(repaired.body).isEqualTo("{\"count\":3}");
-            assertThat(outboxMessageIds()).as("re-sent with the same message ids").containsAll(sent);
+            assertThat(rows().outboxMessageIds()).as("re-sent with the same message ids").containsAll(sent);
             assertJson(call("POST", "/recovery/stranded-shards", null), 409);
         });
     }
@@ -665,18 +668,18 @@ class AdminHttpIT {
     @Test
     void abandonsAKeyOrAnUnkeyedRecord() {
         app(() -> {
-            seedWaiting();
+            rows().seedWaiting();
 
             var dryRun = call("POST", "/keys/abandon",
                 "{\"topic\":\"t\",\"key\":\"k\",\"reason\":\"stuck\",\"dryRun\":true}");
             assertJson(dryRun, 200);
             assertSameJson(dryRun.body, "{\"keys\":1,\"records\":3}");
-            assertThat(deadIds()).isEmpty();
+            assertThat(rows().deadIds()).isEmpty();
 
             var key = call("POST", "/keys/abandon", "{\"topic\":\"t\",\"key\":\"k\",\"reason\":\"stuck\"}");
             assertJson(key, 200);
             assertSameJson(key.body, "{\"keys\":1,\"records\":3}"); // head, follower and parked row
-            assertThat(deadIds()).containsExactly(5L, 10L, 11L);
+            assertThat(rows().deadIds()).containsExactly(5L, 10L, 11L);
 
             String unkeyed;
             try (var c = connect()) {
@@ -685,7 +688,7 @@ class AdminHttpIT {
             var record = call("POST", "/keys/abandon",
                 "{\"topic\":\"t\",\"messageId\":\"" + unkeyed + "\",\"reason\":\"poison\"}");
             assertSameJson(record.body, "{\"keys\":1,\"records\":1}");
-            assertThat(deadIds()).containsExactly(5L, 10L, 11L, 20L);
+            assertThat(rows().deadIds()).containsExactly(5L, 10L, 11L, 20L);
             try (var c = connect()) {
                 assertThat(TestSql.queryString(c, "select string_agg(distinct status || ' ' || error, ', ' order by"
                     + " status || ' ' || error) from " + names.dead())).isEqualTo("kept abandoned: poison, kept"
@@ -700,7 +703,7 @@ class AdminHttpIT {
     @Test
     void abandonKeyLeavesItsDetailForTheAuditLine() {
         app(() -> {
-            seedWaiting();
+            rows().seedWaiting();
 
             var result = perform("POST", API + "/keys/abandon", "application/json",
                 "{\"topic\":\"t\",\"key\":\"ключ\",\"reason\":\"stuck\"}");
@@ -711,7 +714,7 @@ class AdminHttpIT {
                 .containsExactly("topic", "key", "messageId", "reason", "dryRun");
             assertThat(detail.get("key")).isEqualTo("ключ");
             assertThat(detail.get("reason")).isEqualTo("stuck");
-            assertThat(deadIds()).as("the key's UTF-8 bytes").containsExactly(30L);
+            assertThat(rows().deadIds()).as("the key's UTF-8 bytes").containsExactly(30L);
         });
     }
 
@@ -719,7 +722,7 @@ class AdminHttpIT {
     @Test
     void abandonKeyRefusesBadInput() {
         app(() -> {
-            seedWaiting();
+            rows().seedWaiting();
             String keyed;
             try (var c = connect()) {
                 keyed = TestSql.queryString(c, "select message_id::text from " + names.retry() + " where id = 10");
@@ -742,14 +745,14 @@ class AdminHttpIT {
             assertJson(call("POST", "/keys/abandon", null), 400); // no body, no Content-Type
             assertThat(call("POST", "/keys/abandon", "{\"topic\":\"t\",\"reason\":\"r\"}").body)
                 .isEqualTo("{\"message\":\"AbandonKey needs exactly one of 'key' and 'messageId'\"}");
-            assertThat(deadIds()).isEmpty();
+            assertThat(rows().deadIds()).isEmpty();
         });
     }
 
     @Test
     void abandonKeyOnABusyShardIsAConflict() {
         app(() -> {
-            seedWaiting();
+            rows().seedWaiting();
             try (var holder = connect()) {
                 holder.setAutoCommit(false);
                 try (var ps = holder.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {
@@ -764,31 +767,31 @@ class AdminHttpIT {
                 assertThat(busy.body).contains("busy, retry");
                 holder.rollback();
             }
-            assertThat(deadIds()).isEmpty();
+            assertThat(rows().deadIds()).isEmpty();
         });
     }
 
     @Test
     void abandonsWaitingKeysWhole() {
         app(() -> {
-            seedWaiting();
+            rows().seedWaiting();
 
             var dryRun = call("POST", "/waiting/abandon",
                 "{\"topic\":\"t\",\"reason\":\"rolled back\",\"dryRun\":true}");
             assertJson(dryRun, 200);
             assertSameJson(dryRun.body, "{\"keys\":3,\"records\":5}");
-            assertThat(deadIds()).as("a dry run moves nothing").isEmpty();
+            assertThat(rows().deadIds()).as("a dry run moves nothing").isEmpty();
 
             var oneKey = call("POST", "/waiting/abandon",
                 "{\"topic\":\"t\",\"key\":\"ключ\",\"reason\":\"rolled back\"}");
             assertJson(oneKey, 200);
             assertSameJson(oneKey.body, "{\"keys\":1,\"records\":1}");
-            assertThat(deadIds()).as("the key's UTF-8 bytes").containsExactly(30L);
+            assertThat(rows().deadIds()).as("the key's UTF-8 bytes").containsExactly(30L);
 
             var rest = call("POST", "/waiting/abandon",
                 "{\"topic\":\"t\",\"reason\":\"rolled back\",\"dryRun\":false}");
             assertSameJson(rest.body, "{\"keys\":2,\"records\":4}");
-            assertThat(deadIds()).containsExactly(5L, 10L, 11L, 20L, 30L);
+            assertThat(rows().deadIds()).containsExactly(5L, 10L, 11L, 20L, 30L);
             try (var c = connect()) {
                 assertThat(TestSql.queryString(c, "select string_agg(distinct status || ' ' || error, ', ') from "
                     + names.dead())).isEqualTo("kept abandoned: rolled back");
@@ -801,7 +804,7 @@ class AdminHttpIT {
     @Test
     void abandonLeavesItsDetailForTheAuditLine() {
         app(() -> {
-            seedWaiting();
+            rows().seedWaiting();
             var reason = "v2 rolled back\", dryRun \"true\r\nINFO forged";
 
             var result = perform("POST", API + "/waiting/abandon", "application/json",
@@ -821,8 +824,8 @@ class AdminHttpIT {
     @Test
     void destructiveAuditLinesNameTheirSelection() {
         app(() -> {
-            var orphan = foreignOrphan();
-            orphanRow(orphan, 1, 10);
+            var orphan = rows().foreignOrphan();
+            rows().orphanRow(orphan, 1, 10);
             var ids = LongStream.rangeClosed(1, 12).boxed().toList();
 
             List<String> audit;
@@ -862,7 +865,7 @@ class AdminHttpIT {
     @Test
     void abandonRefusesBadInput() {
         app(() -> {
-            seedWaiting();
+            rows().seedWaiting();
 
             for (var body : List.of("{\"reason\":\"r\"}", "{\"topic\":\"t\"}", "{\"topic\":\"t\",\"reason\":\" \"}",
                 "{\"topic\":\"\",\"reason\":\"r\"}", "{\"topic\":\"t\",\"kye\":\"k\",\"reason\":\"r\"}",
@@ -875,7 +878,7 @@ class AdminHttpIT {
             }
             assertThat(call("POST", "/waiting/abandon", "{\"reason\":\"r\"}").body)
                 .isEqualTo("{\"message\":\"missing field 'topic' in AbandonWaiting\"}");
-            assertThat(deadIds()).isEmpty();
+            assertThat(rows().deadIds()).isEmpty();
         });
     }
 
@@ -883,7 +886,7 @@ class AdminHttpIT {
     @Test
     void badInputIs400() {
         app(() -> {
-            long id = letter(1, "t", "k", "boom", T0, KEPT);
+            long id = rows().letter(1, "t", "k", "boom", T0, KEPT);
 
             for (var query : List.of("limit=0", "limit=1001")) {
                 var response = call("GET", "/dead-letters?" + query, null);
@@ -915,7 +918,7 @@ class AdminHttpIT {
                 assertJson(response, 400);
                 assertThat(response.body).as(response.uri).startsWith("{\"message\":\"");
             }
-            assertThat(deadIds()).containsExactly(id);
+            assertThat(rows().deadIds()).containsExactly(id);
         });
     }
 
@@ -923,7 +926,7 @@ class AdminHttpIT {
     @Test
     void anotherContentTypeIs415() {
         app(() -> {
-            long id = letter(1, "t", "k", "boom", T0, KEPT);
+            long id = rows().letter(1, "t", "k", "boom", T0, KEPT);
 
             for (var type : List.of("text/plain", "application/x-www-form-urlencoded")) {
                 var result = perform("POST", API + "/dead-letters/discard", type, "{\"ids\":[" + id + "]}");
@@ -932,7 +935,7 @@ class AdminHttpIT {
                 assertThat(result.getResponse().getContentType()).startsWith("application/json");
                 assertThat(result.getResponse().getContentAsString(UTF_8)).startsWith("{\"message\":\"");
             }
-            assertThat(deadIds()).containsExactly(id);
+            assertThat(rows().deadIds()).containsExactly(id);
         });
     }
 
@@ -943,7 +946,7 @@ class AdminHttpIT {
     @Test
     void otherFailuresAreA500Error() {
         app(() -> {
-            execute("drop table " + names.dead() + " cascade");
+            rows().execute("drop table " + names.dead() + " cascade");
 
             Response response;
             String log;
@@ -965,13 +968,13 @@ class AdminHttpIT {
     @Test
     void theAppsMapperSettingsDoNotChangeTheJson() {
         app(() -> {
-            long id = letter(7, "t", "k", "timeout", T0, PENDING);
-            execute("update " + names.dead() + " set redrives = 2, handler_attempts = 1 where id = " + id);
+            long id = rows().letter(7, "t", "k", "timeout", T0, PENDING);
+            rows().execute("update " + names.dead() + " set redrives = 2, handler_attempts = 1 where id = " + id);
 
             var response = call("GET", "/dead-letters?topic=t", null);
 
             assertJson(response, 200);
-            assertSameJson(response.body, letterJson(id, messageId(id)));
+            assertSameJson(response.body, letterJson(id, rows().messageId(id)));
             assertThat(call("POST", "/dead-letters/discard", "{\"filter\":{\"topic\":\"t\",\"failedTo\":"
                 + "\"2026-01-15T10:00:00.001Z\"}}").body).isEqualTo("{\"count\":1}");
         }, "spring.jackson.property-naming-strategy=SNAKE_CASE", "spring.jackson.default-property-inclusion=always",
@@ -983,10 +986,10 @@ class AdminHttpIT {
     void anAppsTrimmingDeserializerCannotWidenACall() throws Exception {
         appWithStrings("trim", server -> {
             assertThat(server.post("/app/echo", "{\"name\":\" a \"}").body()).as("the app's mapper").isEqualTo("a");
-            long first = letter(1, "t", "k", "boom", T0, KEPT);
-            long second = letter(2, "t", "k", "disk full", T0, KEPT);
-            long spaces = letter(3, "t", "  ", "boom", T0, KEPT);
-            seedWaiting();
+            long first = rows().letter(1, "t", "k", "boom", T0, KEPT);
+            long second = rows().letter(2, "t", "k", "disk full", T0, KEPT);
+            long spaces = rows().letter(3, "t", "  ", "boom", T0, KEPT);
+            rows().seedWaiting();
 
             for (var operation : List.of("redrive", "discard")) {
                 var path = API + "/dead-letters/" + operation;
@@ -999,14 +1002,14 @@ class AdminHttpIT {
                         .as(field).isEqualTo(400);
                 }
             }
-            assertThat(deadIds()).containsExactly(first, second, spaces);
-            assertThat(outboxMessageIds()).isEmpty();
+            assertThat(rows().deadIds()).containsExactly(first, second, spaces);
+            assertThat(rows().outboxMessageIds()).isEmpty();
 
             assertThat(server.post(API + "/dead-letters/discard", "{\"filter\":{\"topic\":\"t\",\"error\":\" boom \"}}")
                 .body()).as("the value as sent, no trimmed one").isEqualTo("{\"count\":0}");
             assertThat(server.post(API + "/dead-letters/discard", "{\"filter\":{\"topic\":\"t\",\"key\":\"  \"}}").body())
                 .isEqualTo("{\"count\":1}");
-            assertThat(deadIds()).containsExactly(first, second);
+            assertThat(rows().deadIds()).containsExactly(first, second);
 
             assertSameJson(server.post(API + "/waiting/abandon", "{\"topic\":\"t\",\"key\":\"  \",\"reason\":\"r\"}")
                 .body(), "{\"keys\":0,\"records\":0}");
@@ -1019,12 +1022,13 @@ class AdminHttpIT {
     void anAppsSanitisingDeserializerCannotWidenACall() throws Exception {
         appWithStrings("sanitise", server -> {
             assertThat(server.post("/app/echo", "{\"name\":\"x\"}").body()).as("the app's mapper").isNullOrEmpty();
-            long other = letter(1, "t", "k", "boom", T0, KEPT);
-            long byError = letter(2, "t", "k", "x failed", T0, KEPT);
-            long byKey = letter(3, "t", "x", "boom", T0, KEPT);
-            long byTopic = letter(4, "xt", "k", "boom", T0, KEPT);
-            seedWaiting();
-            execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, created_at, next_attempt_at,"
+            long other = rows().letter(1, "t", "k", "boom", T0, KEPT);
+            long byError = rows().letter(2, "t", "k", "x failed", T0, KEPT);
+            long byKey = rows().letter(3, "t", "x", "boom", T0, KEPT);
+            long byTopic = rows().letter(4, "xt", "k", "boom", T0, KEPT);
+            rows().seedWaiting();
+            rows().execute("insert into " + names.retry()
+                + " (id, shard, message_id, topic, key, created_at, next_attempt_at,"
                 + " waiting_since) values (40, 0, gen_random_uuid(), 't', 'x', now(), now(), now())");
 
             var discard = API + "/dead-letters/discard";
@@ -1032,20 +1036,20 @@ class AdminHttpIT {
                 "{\"filter\":{\"topic\":\"t\",\"failedFrom\":\"x\"}}", "{\"filter\":{\"topic\":\"t\",\"status\":\"xkept\"}}")) {
                 assertThat(server.post(discard, body).statusCode()).as(body).isEqualTo(400);
             }
-            assertThat(deadIds()).containsExactly(other, byError, byKey, byTopic);
+            assertThat(rows().deadIds()).containsExactly(other, byError, byKey, byTopic);
 
             assertThat(server.post(discard, "{\"filter\":{\"topic\":\"t\",\"error\":\"x\"}}").body())
                 .isEqualTo("{\"count\":1}");
-            assertThat(deadIds()).containsExactly(other, byKey, byTopic);
+            assertThat(rows().deadIds()).containsExactly(other, byKey, byTopic);
             assertThat(server.post(discard, "{\"filter\":{\"topic\":\"t\",\"key\":\"x\"}}").body())
                 .isEqualTo("{\"count\":1}");
-            assertThat(deadIds()).containsExactly(other, byTopic);
+            assertThat(rows().deadIds()).containsExactly(other, byTopic);
             assertThat(server.post(discard, "{\"filter\":{\"topic\":\"xt\"}}").body()).isEqualTo("{\"count\":1}");
-            assertThat(deadIds()).containsExactly(other);
+            assertThat(rows().deadIds()).containsExactly(other);
 
             assertSameJson(server.post(API + "/waiting/abandon", "{\"topic\":\"t\",\"key\":\"x\",\"reason\":\"r\"}")
                 .body(), "{\"keys\":1,\"records\":1}");
-            assertThat(deadIds()).containsExactly(other, 40L);
+            assertThat(rows().deadIds()).containsExactly(other, 40L);
             assertThat(retryCount()).isEqualTo(4);
         });
     }
@@ -1055,14 +1059,14 @@ class AdminHttpIT {
     void theAppsMapperSettingsDoNotChangeWhatAnIdsCallIs() throws Exception {
         for (var setting : List.of("use-java-array-for-json-array", "use-big-integer-for-ints")) {
             onServer(server -> {
-                long id = letter(1, "t", "k", "boom", T0, KEPT);
-                long other = letter(2, "t", "k", "boom", T0, KEPT);
+                long id = rows().letter(1, "t", "k", "boom", T0, KEPT);
+                long other = rows().letter(2, "t", "k", "boom", T0, KEPT);
 
                 var response = server.post(API + "/dead-letters/discard", "{\"ids\":[" + id + "]}");
 
                 assertThat(response.statusCode()).as(response.body()).isEqualTo(200);
                 assertThat(response.body()).isEqualTo("{\"count\":1}");
-                assertThat(deadIds()).containsExactly(other);
+                assertThat(rows().deadIds()).containsExactly(other);
             }, List.of("spring.jackson.deserialization." + setting + "=true"));
         }
     }
@@ -1071,26 +1075,27 @@ class AdminHttpIT {
     @Test
     void anEmptyKeyActsOnThatKeyAndNullIsAbsent() throws Exception {
         onServer(server -> {
-            long empty = letter(1, "t", "", "boom", T0, KEPT);
-            long keyed = letter(2, "t", "k", "boom", T0, KEPT);
-            seedWaiting();
-            execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, created_at, next_attempt_at,"
+            long empty = rows().letter(1, "t", "", "boom", T0, KEPT);
+            long keyed = rows().letter(2, "t", "k", "boom", T0, KEPT);
+            rows().seedWaiting();
+            rows().execute("insert into " + names.retry()
+                + " (id, shard, message_id, topic, key, created_at, next_attempt_at,"
                 + " waiting_since) values (50, 0, gen_random_uuid(), 't', ''::bytea, now(), now(), now())");
             var discard = API + "/dead-letters/discard";
 
             assertThat(server.post(discard, "{\"filter\":{\"topic\":\"t\",\"key\":\"\"}}").body())
                 .isEqualTo("{\"count\":1}");
-            assertThat(deadIds()).doesNotContain(empty).contains(keyed);
+            assertThat(rows().deadIds()).doesNotContain(empty).contains(keyed);
 
             assertThat(server.post(discard, "{\"filter\":{\"error\":null}}").statusCode())
                 .as("a filter of nothing").isEqualTo(400);
             assertThat(server.post(discard, "{\"filter\":{\"topic\":\"t\",\"error\":null}}").body())
                 .isEqualTo("{\"count\":1}");
-            assertThat(deadIds()).isEmpty();
+            assertThat(rows().deadIds()).isEmpty();
 
             assertSameJson(server.post(API + "/waiting/abandon", "{\"topic\":\"t\",\"key\":\"\",\"reason\":\"r\"}").body(),
                 "{\"keys\":1,\"records\":1}");
-            assertThat(deadIds()).containsExactly(50L);
+            assertThat(rows().deadIds()).containsExactly(50L);
             assertSameJson(server.post(API + "/waiting/abandon",
                 "{\"topic\":\"t\",\"key\":null,\"reason\":\"r\",\"dryRun\":true}").body(), "{\"keys\":3,\"records\":5}");
         }, List.of());
@@ -1100,7 +1105,7 @@ class AdminHttpIT {
     @Test
     void trailingTokensAreRefused() throws Exception {
         onServer(server -> {
-            long id = letter(1, "t", "k", "boom", T0, KEPT);
+            long id = rows().letter(1, "t", "k", "boom", T0, KEPT);
             var ids = "{\"ids\":[" + id + "]}";
 
             for (var body : List.of(ids + " " + ids, ids + " x", ids + "}", "{\"filter\":{\"topic\":\"t\"}} 1")) {
@@ -1111,7 +1116,7 @@ class AdminHttpIT {
             }
             assertThat(server.post(API + "/waiting/abandon", "{\"topic\":\"t\",\"reason\":\"r\"} 1").statusCode())
                 .isEqualTo(400);
-            assertThat(deadIds()).containsExactly(id);
+            assertThat(rows().deadIds()).containsExactly(id);
             assertThat(server.post(API + "/dead-letters/discard", ids + " \n").body()).isEqualTo("{\"count\":1}");
         }, List.of());
     }
@@ -1135,7 +1140,7 @@ class AdminHttpIT {
             assertThat(context.getBean(RequestMappingHandlerAdapter.class).getMessageConverters())
                 .anyMatch(c -> c.getClass().getName().endsWith("MappingJackson2HttpMessageConverter"));
             assertUnknownFieldsRefused();
-            execute("update " + names.dead() + " set redrives = 2, handler_attempts = 1");
+            rows().execute("update " + names.dead() + " set redrives = 2, handler_attempts = 1");
             assertThat(JsonPath.<List<String>>read(call("GET", "/dead-letters", null).body, "$.items[*].failedAt"))
                 .containsExactly("2026-01-15T10:00:00.000Z");
         }, "spring.http.converters.preferred-json-mapper=jackson2");
@@ -1198,7 +1203,7 @@ class AdminHttpIT {
                 var badLimit = call("GET", "/dead-letters?limit=x", null);
                 assertJson(badLimit, 400);
                 assertThat(badLimit.body).startsWith("{\"message\":\"Query parameter 'limit'");
-                execute("drop table " + names.dead() + " cascade");
+                rows().execute("drop table " + names.dead() + " cascade");
                 assertJson(call("GET", "/dead-letters/count", null), 500);
             }, "spring.mvc.problemdetails.enabled=" + problemDetails);
         }
@@ -1240,7 +1245,7 @@ class AdminHttpIT {
             var conflict = call("POST", "/recovery/xid-regression", null);
             assertJson(conflict, 409);
             assertThat(conflict.body).startsWith("{\"message\":\"no xid regression to recover");
-            execute("drop table " + names.dead() + " cascade");
+            rows().execute("drop table " + names.dead() + " cascade");
             var failed = call("GET", "/dead-letters/count", null);
             assertJson(failed, 500);
             assertThat(failed.body).contains(names.dead() + "\\\" does not exist");
@@ -1265,13 +1270,13 @@ class AdminHttpIT {
     @Test
     void anExceptionBeforeTheMethodRunsGetsAnError() {
         app(new Class<?>[] {FirstApp.class, RefusingInterceptor.class}, () -> {
-            long id = letter(1, "t", "k", "boom", T0, KEPT);
+            long id = rows().letter(1, "t", "k", "boom", T0, KEPT);
 
             var refused = call("POST", "/dead-letters/discard", "{\"ids\":[" + id + "]}");
 
             assertJson(refused, 400);
             assertThat(refused.body).isEqualTo("{\"message\":\"refused before the method\"}");
-            assertThat(deadIds()).containsExactly(id);
+            assertThat(rows().deadIds()).containsExactly(id);
         });
     }
 
@@ -1298,7 +1303,7 @@ class AdminHttpIT {
     void worksBehindAnAppsAspect() {
         app(new Class<?>[] {WithAspect.class}, () -> {
             assertThat(context.getBean(OutboxAdminController.class).getClass().getName()).contains("$$");
-            letter(1, "t", "k", "boom", T0, KEPT);
+            rows().letter(1, "t", "k", "boom", T0, KEPT);
 
             assertThat(call("GET", "/dead-letters/count", null).body).isEqualTo("{\"count\":1}");
             assertThat(call("POST", "/dead-letters/discard", "{\"idz\":[1]}").body)
@@ -1308,10 +1313,10 @@ class AdminHttpIT {
 
     @Test
     void noControllerWithoutTheOutboxOrServletMvc() {
-        app(() -> assertThat(context.getBeansOfType(OutboxAdminController.class)).hasSize(1));
         new WebApplicationContextRunner()
             .withUserConfiguration(Boot.class).withPropertyValues(properties("outbox.enabled=false"))
-            .run(c -> assertThat(c).hasNotFailed().doesNotHaveBean(OutboxAdminController.class));
+            .run(c -> assertThat(c).hasNotFailed().doesNotHaveBean(OutboxAdminController.class)
+                .doesNotHaveBean("outboxAdminGuard"));
         new ApplicationContextRunner().withUserConfiguration(Boot.class).withPropertyValues(properties())
             .run(c -> assertThat(c).hasNotFailed().doesNotHaveBean(OutboxAdminController.class));
         new WebApplicationContextRunner()
@@ -1390,121 +1395,13 @@ class AdminHttpIT {
 
     // ---------------------------------------------------------------------------------------------------- fixtures
 
-    /**
-     * A dead letter as the relay writes one: payload p, headers h1=v and h2 without a value, created an hour before
-     * {@code failedAt}; a pending or scheduled one is due an hour after it.
-     */
-    private long letter(long id, String topic, String key, String error, Instant failedAt, DeadLetter.Status status)
-        throws SQLException {
-        var headers = HeaderCodec.encode(List.of(new OutboxHeader("h1", bytes("v")), new OutboxHeader("h2", null)));
-        try (var c = connect(); var ps = c.prepareStatement("insert into " + names.dead()
-            + " (id, shard, message_id, topic, key, payload, headers, created_at, attempts, failed_at, error,"
-            + " status, due_at) values (?, 0, gen_random_uuid(), ?, ?, ?, ?, ?, 3, ?, ?, ?, ?)")) {
-            ps.setLong(1, id);
-            ps.setString(2, topic);
-            ps.setBytes(3, bytes(key));
-            ps.setBytes(4, bytes("p"));
-            ps.setBytes(5, headers);
-            ps.setObject(6, failedAt.minusSeconds(3600).atOffset(ZoneOffset.UTC));
-            ps.setObject(7, failedAt.atOffset(ZoneOffset.UTC));
-            ps.setString(8, error);
-            ps.setString(9, status.name().toLowerCase(Locale.ROOT));
-            ps.setObject(10, status == KEPT ? null : failedAt.plusSeconds(3600).atOffset(ZoneOffset.UTC));
-            ps.executeUpdate();
-        }
-        return id;
-    }
-
-    /**
-     * Topic t, shard 0: waiting head 10 of key k with follower 11 and parked row 5; unkeyed waiting head 20; waiting
-     * head 30 of key ключ.
-     */
-    private void seedWaiting() throws SQLException {
-        execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, created_at, next_attempt_at,"
-            + " waiting_since) values (10, 0, gen_random_uuid(), 't', 'k', now(), now(), now()),"
-            + " (11, 0, gen_random_uuid(), 't', 'k', now(), null, null),"
-            + " (20, 0, gen_random_uuid(), 't', null, now(), now(), now()),"
-            + " (30, 0, gen_random_uuid(), 't', convert_to('ключ', 'UTF8'), now(), now(), now())");
-        execute("insert into " + names.parked() + " (id, shard, message_id, topic, key, created_at, due_at)"
-            + " values (5, 0, gen_random_uuid(), 't', 'k', now(), now())");
+    private AdminRows rows() {
+        return new AdminRows(AdminHttpIT::connect, names);
     }
 
     private long retryCount() throws SQLException {
         try (var c = connect()) {
             return TestSql.queryLong(c, "select count(*) from " + names.retry());
-        }
-    }
-
-    private UUID messageId(long letter) throws SQLException {
-        try (var c = connect()) {
-            return UUID.fromString(TestSql.queryString(c, "select message_id::text from " + names.dead()
-                + " where id = " + letter));
-        }
-    }
-
-    /** A standalone {@code <base>_x1000}, below every range of the outbox, as someone else's detach leaves one. */
-    private String foreignOrphan() throws SQLException {
-        var orphan = names.partitionPrefix() + "1000";
-        execute("create table " + orphan + " (like " + names.base() + " including defaults)");
-        return orphan;
-    }
-
-    /** A row of a standalone range with that xid; returns its message id. */
-    private UUID orphanRow(String table, long id, long xid) throws SQLException {
-        var messageId = UUID.randomUUID();
-        try (var c = connect(); var ps = c.prepareStatement("insert into " + table
-            + " (id, shard, xid, message_id, topic, key, payload) values (?, 0, ?::text::xid8, ?, 't', ?, ?)")) {
-            ps.setLong(1, id);
-            ps.setString(2, Long.toString(xid));
-            ps.setObject(3, messageId);
-            ps.setBytes(4, bytes("k" + id));
-            ps.setBytes(5, bytes("row"));
-            ps.executeUpdate();
-        }
-        return messageId;
-    }
-
-    /** As after a dump/restore: a tick whose snapshot xmax lies 10⁹ xids past the counter, made a minute ago. */
-    private void forgeRegression() throws SQLException {
-        try (var c = connect()) {
-            long xmax = TestSql.queryLong(c, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint")
-                + 1_000_000_000L;
-            TestSql.execute(c, "insert into " + names.tick() + " (snapshot, created_at) values ('" + xmax + ":" + xmax
-                + ":'::pg_snapshot, now() - interval '1 minute')");
-        }
-    }
-
-    private List<Long> deadIds() throws SQLException {
-        var all = new ArrayList<Long>();
-        try (var c = connect(); var st = c.createStatement();
-            var rs = st.executeQuery("select id from " + names.dead() + " order by id")) {
-            while (rs.next()) {
-                all.add(rs.getLong(1));
-            }
-        }
-        return all;
-    }
-
-    private List<UUID> outboxMessageIds() throws SQLException {
-        var all = new ArrayList<UUID>();
-        try (var c = connect(); var st = c.createStatement();
-            var rs = st.executeQuery("select message_id from " + names.base() + " order by id")) {
-            while (rs.next()) {
-                all.add(rs.getObject(1, UUID.class));
-            }
-        }
-        return all;
-    }
-
-    private static boolean exists(String table) throws SQLException {
-        try (var c = connect()) {
-            return TestSql.queryString(c, "select to_regclass(?)::text", table) != null;
-        }
-    }
-
-    private static void execute(String sql) throws SQLException {
-        try (var c = connect()) {
-            TestSql.execute(c, sql);
         }
     }
 

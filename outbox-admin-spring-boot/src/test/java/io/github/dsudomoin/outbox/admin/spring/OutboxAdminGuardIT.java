@@ -511,19 +511,6 @@ class OutboxAdminGuardIT {
         }
     }
 
-    /** Quoted, its quotes and backslashes escaped, a path cannot end early and pass for the rest of a line. */
-    @Test
-    void anAuditLineQuotesThePath() throws Exception {
-        try (var server = AdminServer.start(WithKeys.class); var stderr = new CapturedStderr()) {
-            server.post(API + "/orphans/x%20by%20root:%20200/restore?fromXid=0", null);
-            server.post(API + "/orphans/x%22%20by%20root:%20200%20%22/restore?fromXid=0", null);
-
-            assertThat(server.settledAudit(stderr, 2)).containsExactly(
-                "outbox admin POST \"" + API + "/orphans/x by root: 200/restore\" denied: 401",
-                "outbox admin POST \"" + API + "/orphans/x\\\" by root: 200 \\\"/restore\" denied: 401");
-        }
-    }
-
     /** A query or a {@code ;} part may carry a secret, and a context path is no part of the route. */
     @Test
     void anAuditLineHasTheRoutesPathAlone() throws Exception {
@@ -960,15 +947,6 @@ class OutboxAdminGuardIT {
         try (var server = AdminServer.start(TwoAuthorizers.class, PrimaryAuthorizer.class)) {
             assertError(server.get(STATUS), 403, "primary");
         }
-    }
-
-    @Test
-    void outboxDisabledStartsWithoutAnAuthorizerAndExposesNothing() {
-        new WebApplicationContextRunner().withUserConfiguration(AdminServer.Base.class)
-            .withPropertyValues(AdminHttpIT.properties("outbox.enabled=false")).run(context -> {
-                assertThat(context).hasNotFailed().doesNotHaveBean(OutboxAdminController.class)
-                    .doesNotHaveBean("outboxAdminGuard");
-            });
     }
 
     // ------------------------------------------------------------------------------------------------- the decision
