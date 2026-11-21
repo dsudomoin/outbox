@@ -504,6 +504,11 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
 
     // InboxConfig
 
+    /** This config on {@code other}'s outbox and inbox tables: a second instance of the same outbox. */
+    public TestOutboxConfig sameTablesAs(TestOutboxConfig other) {
+        return table(other.table()).inboxTable(other.inbox().table());
+    }
+
     public TestOutboxConfig inboxTable(String inboxTable) {
         this.inboxTable = inboxTable;
         return this;

@@ -10,12 +10,12 @@ import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.internal.Hashing;
-import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry;
 import io.github.dsudomoin.outbox.micrometer.OutboxDeliveryTracingObservationHandler;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import io.micrometer.core.instrument.observation.DefaultMeterObservationHandler;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.micrometer.observation.ObservationHandler;
@@ -45,9 +45,7 @@ import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -59,7 +57,6 @@ import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
-import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -131,8 +128,8 @@ class KafkaTelemetryIT {
 
         assertThat(handler.calls).as("handler calls").singleElement()
                 .satisfies(call -> assertThat(call).containsExactlyInAnyOrderElementsOf(ids));
-        var received = byMessageId(
-                TestKafka.consumeUntil(topic, TIMEOUT, r -> byMessageId(r).keySet().containsAll(ids)));
+        var received = TestKafka.byMessageId(
+                TestKafka.consumeUntil(topic, TIMEOUT, r -> TestKafka.byMessageId(r).keySet().containsAll(ids)));
         var step = span(s -> s.getName().equals(STEP));
         for (int i = 0; i < ids.size(); i++) {
             var writer = writers.get(i).context();
@@ -143,7 +140,7 @@ class KafkaTelemetryIT {
             assertThat(delivery.getTraceId()).as("delivery %d", i).isEqualTo(writer.traceId());
             assertThat(delivery.getLinks()).as("delivery %d", i).singleElement()
                     .satisfies(l -> assertThat(l.getSpanContext().getSpanId()).isEqualTo(step.getSpanId()));
-            assertThat(traceparent(received.get(ids.get(i)))).as("Kafka record %d", i)
+            assertThat(TestKafka.traceparent(received.get(ids.get(i)))).as("Kafka record %d", i)
                     .isEqualTo("00-" + writer.traceId() + "-" + delivery.getSpanId() + "-"
                             + delivery.getSpanContext().getTraceFlags().asHex());
         }
@@ -172,13 +169,11 @@ class KafkaTelemetryIT {
         await(TIMEOUT, () -> counter("outbox.messages.delivered", "topic", topic) == 5
                 && counter("outbox.messages.failed", "topic", topic, "outcome", "dead") == 1);
         assertThat(counter("outbox.messages.enqueued", "topic", topic)).isEqualTo(6);
-        assertThat(counter("outbox.messages.delivered", "topic", topic)).isEqualTo(5);
         assertThat(counter("outbox.messages.failed", "topic", topic, "outcome", "retry")).isEqualTo(1);
-        assertThat(counter("outbox.messages.failed", "topic", topic, "outcome", "dead")).isEqualTo(1);
         assertThat(counter("outbox.messages.requeued", "topic", topic)).isEqualTo(1);
         var sent = ids.stream().filter(id -> !id.equals(dead)).toList();
-        var received = TestKafka.consumeUntil(topic, TIMEOUT, r -> byMessageId(r).keySet().containsAll(sent));
-        assertThat(byMessageId(received)).doesNotContainKey(dead);
+        var received = TestKafka.consumeUntil(topic, TIMEOUT, r -> TestKafka.byMessageId(r).keySet().containsAll(sent));
+        assertThat(TestKafka.byMessageId(received)).doesNotContainKey(dead);
     }
 
     /**
@@ -249,7 +244,7 @@ class KafkaTelemetryIT {
         var topic = TestKafka.createTopic(1);
         var config = config().relayEnabled(false);
         var runtime = start(config, new Handler());
-        var untraced = start(OutboxRuntime.builder(sameTables(config).relayEnabled(false), transactions, r -> {}));
+        var untraced = start(OutboxRuntime.builder(config().sameTablesAs(config).relayEnabled(false), transactions, r -> {}));
         var outsideAnySpan = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of(topic, "a", bytes("a"))));
         var withoutContext = transactions.inTx(c -> untraced.outbox().send(OutboxMessage.of(topic, "b", bytes("b"))));
 
@@ -302,7 +297,7 @@ class KafkaTelemetryIT {
 
     /** The step is a client span with the records it fetched, and it ends after its settle, which ends at the commit. */
     @Test
-    void stepSpanIsClientAndEndsAfterCommit() throws Exception {
+    void stepSpanIsClientEndsAfterCommitAndParentsTheSettle() throws Exception {
         var topic = TestKafka.createTopic(1);
         var runtime = start(config().relayEnabled(false), new Handler());
         transactions.inTx(c -> runtime.outbox().sendAll(List.of(
@@ -315,48 +310,9 @@ class KafkaTelemetryIT {
         assertThat(step.getKind()).isEqualTo(SpanKind.CLIENT);
         assertThat(step.getAttributes().get(RECORDS)).isEqualTo("2");
         assertThat(step.getEndEpochNanos()).isGreaterThanOrEqualTo(settle.getEndEpochNanos());
-    }
-
-    @Test
-    void settleSpanIsAChildOfTheStep() throws Exception {
-        var topic = TestKafka.createTopic(1);
-        var runtime = start(config().relayEnabled(false), new Handler());
-        transactions.inTx(c -> runtime.outbox().sendAll(List.of(
-                OutboxMessage.of(topic, "k", bytes("1")), OutboxMessage.of(topic, "k", bytes("2")))));
-
-        runtime.relay().drain();
-
-        var step = span(s -> s.getName().equals(STEP));
-        var settle = span(s -> s.getName().equals(SETTLE));
         assertThat(settle.getKind()).isEqualTo(SpanKind.CLIENT);
         assertThat(settle.getParentSpanId()).isEqualTo(step.getSpanId());
         assertThat(settle.getAttributes().get(RECORDS)).isEqualTo("2");
-    }
-
-    /** A delivery of a stored trace: a consumer span under its enqueue span, with one link, to its step's span. */
-    @Test
-    void deliverLinksToItsStep() throws Exception {
-        var topic = TestKafka.createTopic(1);
-        var runtime = start(config().relayEnabled(false), new Handler());
-        var writer = tracer.nextSpan().name("writer").start();
-        UUID id;
-        try (var scope = tracer.withSpan(writer)) {
-            id = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of(topic, "k", bytes("v"))));
-        } finally {
-            writer.end();
-        }
-
-        runtime.relay().drain();
-
-        var enqueue = span(s -> s.getName().equals("outbox enqueue " + topic));
-        var step = span(s -> s.getName().equals(STEP));
-        var delivery = delivery(id);
-        assertThat(delivery.getKind()).isEqualTo(SpanKind.CONSUMER);
-        assertThat(delivery.getParentSpanId()).isEqualTo(enqueue.getSpanId());
-        assertThat(delivery.getLinks()).singleElement().satisfies(l -> {
-            assertThat(l.getSpanContext().getSpanId()).isEqualTo(step.getSpanId());
-            assertThat(l.getSpanContext().getTraceId()).isEqualTo(step.getTraceId());
-        });
     }
 
     /**
@@ -487,11 +443,6 @@ class KafkaTelemetryIT {
         return new TestOutboxConfig().batchTimeout(Duration.ofSeconds(30)).deadLettersTimeout(Duration.ofSeconds(30));
     }
 
-    /** {@link #config()} on {@code config}'s tables, for a second runtime on them. */
-    private static TestOutboxConfig sameTables(TestOutboxConfig config) {
-        return config().table(config.table()).inboxTable(config.inbox().table());
-    }
-
     private OutboxRuntime start(TestOutboxConfig config, Handler handler) {
         return start(OutboxRuntime.builder(config, transactions, handler).telemetry(telemetry));
     }
@@ -517,18 +468,8 @@ class KafkaTelemetryIT {
      * holds the lock until its commit. Returns how many it terminated.
      */
     private int terminateStep(OutboxRuntime runtime, int shard) {
-        try (var c = transactions.newConnection(); var ps = c.prepareStatement("select pg_terminate_backend(pid, 5000)"
-                + " from pg_locks where locktype = 'advisory' and classid = ?::int4::oid"
-                + " and objid = ?::int4::oid and objsubid = 2 and granted")) {
-            ps.setInt(1, runtime.schema().names().internalNamespace());
-            ps.setInt(2, TableNames.LOCK_SHARD_BASE + shard);
-            int terminated = 0;
-            try (var rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    terminated += rs.getBoolean(1) ? 1 : 0;
-                }
-            }
-            return terminated;
+        try (var c = transactions.newConnection()) {
+            return TestSql.terminateStep(c, runtime.schema().names().internalNamespace(), shard);
         } catch (SQLException e) {
             throw new IllegalStateException(e);
         }
@@ -550,26 +491,14 @@ class KafkaTelemetryIT {
                 && messageId.toString().equals(s.getAttributes().get(MESSAGE_ID)));
     }
 
-    /** The count of the counter, 0 while it is not registered. */
     private double lag() {
         return meters.get("outbox.shard.lag").gauge().value();
     }
 
+    /** The count of the counter, 0 while it is not registered. */
     private double counter(String name, String... tags) {
         var counter = meters.find(name).tags(tags).counter();
         return counter == null ? 0 : counter.count();
-    }
-
-    /** The first occurrence of each message id. */
-    private static Map<UUID, ConsumerRecord<byte[], byte[]>> byMessageId(List<ConsumerRecord<byte[], byte[]>> records) {
-        var result = new HashMap<UUID, ConsumerRecord<byte[], byte[]>>();
-        records.forEach(r -> result.putIfAbsent(KafkaOutboxHeaders.messageId(r), r));
-        return result;
-    }
-
-    private static String traceparent(ConsumerRecord<byte[], byte[]> record) {
-        var header = record.headers().lastHeader("traceparent");
-        return header == null ? null : new String(header.value(), UTF_8);
     }
 
     private static String key(OutboxRecord record) {

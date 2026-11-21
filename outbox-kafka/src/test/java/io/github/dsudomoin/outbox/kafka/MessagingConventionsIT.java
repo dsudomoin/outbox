@@ -54,7 +54,6 @@ import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
-import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.Callback;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
@@ -186,7 +185,7 @@ class MessagingConventionsIT {
         var config = config().relayEnabled(false);
         var writing = start(config, telemetry(config), new Handler());
         var handler = new Handler();
-        var relaying = start(sameTables(config).relayEnabled(false), telemetry(config), handler);
+        var relaying = start(config().sameTablesAs(config).relayEnabled(false), telemetry(config), handler);
         var writer = tracer.spanBuilder("writer").startSpan();
         UUID id;
         try (var scope = writer.makeCurrent()) {
@@ -234,7 +233,7 @@ class MessagingConventionsIT {
         assertThat(send.getKind()).isEqualTo(SpanKind.PRODUCER);
         assertThat(send.getParentSpanId()).isEqualTo(deliver.getSpanId());
         assertThat(send.getTraceId()).isEqualTo(writer.getSpanContext().getTraceId());
-        assertThat(traceparent(record)).as("the Kafka record's context")
+        assertThat(TestKafka.traceparent(record)).as("the Kafka record's context")
                 .isEqualTo("00-" + send.getTraceId() + "-" + send.getSpanId() + "-01");
         assertThat(deliver.getEndEpochNanos()).as("the delivery ends at the ack, after the send")
                 .isGreaterThanOrEqualTo(send.getEndEpochNanos());
@@ -249,7 +248,7 @@ class MessagingConventionsIT {
         var topic = TestKafka.createTopic(1);
         var config = config().shards(1).relayEnabled(false);
         var runtime = start(config, telemetry(config), new Handler());
-        var untraced = start(OutboxRuntime.builder(sameTables(config).shards(1).relayEnabled(false), transactions,
+        var untraced = start(OutboxRuntime.builder(config().sameTablesAs(config).shards(1).relayEnabled(false), transactions,
                 r -> {}));
         var writer = tracer.spanBuilder("writer").startSpan();
         UUID traced;
@@ -531,14 +530,9 @@ class MessagingConventionsIT {
         return new MessagingConventionsTelemetry(tracer, propagator, config.table());
     }
 
-    /** A fresh table; the sender bounds a call by delivery.timeout.ms (20 s) + 5 s, so the relay gives it longer. */
+    /** A fresh table. */
     private static TestOutboxConfig config() {
         return new TestOutboxConfig().batchTimeout(Duration.ofSeconds(30)).deadLettersTimeout(Duration.ofSeconds(30));
-    }
-
-    /** {@link #config()} on {@code config}'s tables, for a second runtime on them. */
-    private static TestOutboxConfig sameTables(TestOutboxConfig config) {
-        return config().table(config.table()).inboxTable(config.inbox().table());
     }
 
     private OutboxRuntime start(TestOutboxConfig config, MessagingConventionsTelemetry telemetry, Handler handler) {
@@ -613,12 +607,6 @@ class MessagingConventionsIT {
             }
         }
         return last;
-    }
-
-    @Nullable
-    private static String traceparent(ConsumerRecord<byte[], byte[]> record) {
-        var header = record.headers().lastHeader("traceparent");
-        return header == null ? null : new String(header.value(), UTF_8);
     }
 
     private static String key(OutboxRecord record) {

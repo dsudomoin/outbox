@@ -1,7 +1,9 @@
 package io.github.dsudomoin.outbox.kafka;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -112,5 +114,18 @@ public final class TestKafka {
             }
         }
         return records;
+    }
+
+    /** The first occurrence of each message id. */
+    public static Map<UUID, ConsumerRecord<byte[], byte[]>> byMessageId(List<ConsumerRecord<byte[], byte[]>> records) {
+        var result = new HashMap<UUID, ConsumerRecord<byte[], byte[]>>();
+        records.forEach(r -> result.putIfAbsent(KafkaOutboxHeaders.messageId(r), r));
+        return result;
+    }
+
+    /** The record's last {@code traceparent} header, null without one. */
+    public static String traceparent(ConsumerRecord<byte[], byte[]> record) {
+        var header = record.headers().lastHeader("traceparent");
+        return header == null ? null : new String(header.value(), UTF_8);
     }
 }

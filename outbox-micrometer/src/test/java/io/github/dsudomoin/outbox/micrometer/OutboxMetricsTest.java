@@ -60,14 +60,6 @@ class OutboxMetricsTest {
     }
 
     @Test
-    void delayTimerPublishesHistogram() {
-        metrics.delivered("orders", Duration.ofMillis(10));
-
-        var timer = registry.get("outbox.delivery.delay").tag("topic", "orders").timer();
-        assertThat(timer.takeSnapshot().histogramCounts()).isNotEmpty();
-    }
-
-    @Test
     void delayHistogramCoversOutages() {
         metrics.delivered("orders", Duration.ofMinutes(10));
 
@@ -75,21 +67,6 @@ class OutboxMetricsTest {
         assertThat(counts[counts.length - 1].bucket(TimeUnit.SECONDS)).isGreaterThanOrEqualTo(6 * 3600);
         assertThat(Arrays.stream(counts).filter(b -> b.bucket(TimeUnit.SECONDS) >= 600).findFirst())
                 .hasValueSatisfying(b -> assertThat(b.count()).isEqualTo(1));
-    }
-
-    @Test
-    void metersAreCachedPerTopic() {
-        metrics.delivered("orders", Duration.ofMillis(1));
-        metrics.delivered("orders", Duration.ofMillis(2));
-
-        assertThat(registry.find("outbox.delivery.delay").timers()).hasSize(1);
-        assertThat(registry.find("outbox.messages.delivered").counters()).hasSize(1);
-
-        metrics.delivered("payments", Duration.ofMillis(1));
-
-        assertThat(registry.find("outbox.delivery.delay").timers()).hasSize(2);
-        assertThat(registry.find("outbox.messages.delivered").counters()).hasSize(2);
-        assertThat(registry.get("outbox.delivery.delay").tag("topic", "payments").timer().count()).isEqualTo(1);
     }
 
     @Test

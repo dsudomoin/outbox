@@ -56,7 +56,7 @@ import org.testcontainers.lifecycle.Startables;
  */
 final class KafkaCluster implements AutoCloseable {
 
-    static final String APP = "app";
+    private static final String APP = "app";
     private static final String ADMIN = "admin";
     private static final int CLIENT_PORT = 9092;
     private static final Duration UP = Duration.ofSeconds(120);
@@ -112,7 +112,7 @@ final class KafkaCluster implements AutoCloseable {
                     .waitingFor(Wait.forLogMessage(".*Kafka Server started.*", 1).withStartupTimeout(UP)));
         }
         Startables.deepStart(brokers).join();
-        awaitBrokers(Set.of(1, 2, 3), UP);
+        awaitAllBrokers();
     }
 
     String bootstrapServers() {
@@ -266,15 +266,15 @@ final class KafkaCluster implements AutoCloseable {
                 start(node);
             }
         }
-        awaitBrokers(Set.of(1, 2, 3), UP);
+        awaitAllBrokers();
     }
 
     /** Waits until the cluster lists {@code nodes} among its live brokers. */
-    void awaitBrokers(Set<Integer> nodes, Duration timeout) {
-        await(timeout, () -> {
+    private void awaitAllBrokers() {
+        await(UP, () -> {
             try (var admin = admin()) {
                 return admin.describeCluster().nodes().get(10, TimeUnit.SECONDS).stream()
-                        .map(n -> n.id()).collect(Collectors.toSet()).containsAll(nodes);
+                        .map(n -> n.id()).collect(Collectors.toSet()).containsAll(Set.of(1, 2, 3));
             } catch (Exception e) {
                 return false;
             }

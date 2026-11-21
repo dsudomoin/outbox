@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.testing;
 
+import io.github.dsudomoin.outbox.internal.TableNames;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
@@ -54,6 +55,25 @@ public final class TestSql {
                 rs.next();
                 return rs.getString(1);
             }
+        }
+    }
+
+    /**
+     * Terminates the backend holding {@code shard}'s advisory lock: the connection of the step working on it, which
+     * holds the lock until its commit. Returns how many it terminated.
+     */
+    public static int terminateStep(Connection c, int internalNamespace, int shard) throws SQLException {
+        try (var ps = c.prepareStatement("select pg_terminate_backend(pid, 5000) from pg_locks where locktype ="
+                + " 'advisory' and classid = ?::int4::oid and objid = ?::int4::oid and objsubid = 2 and granted")) {
+            ps.setInt(1, internalNamespace);
+            ps.setInt(2, TableNames.LOCK_SHARD_BASE + shard);
+            int terminated = 0;
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    terminated += rs.getBoolean(1) ? 1 : 0;
+                }
+            }
+            return terminated;
         }
     }
 }

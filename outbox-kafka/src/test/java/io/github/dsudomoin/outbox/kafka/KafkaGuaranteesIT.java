@@ -11,9 +11,9 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.Outcome;
-import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -151,7 +151,7 @@ class KafkaGuaranteesIT {
 
         TestKafka.createTopic(missing, 1, Map.of());
         var arrived = TestKafka.consumeUntil(missing, CONSUME_TIMEOUT,
-                r -> byMessageId(r).keySet().containsAll(bad));
+                r -> TestKafka.byMessageId(r).keySet().containsAll(bad));
         assertThat(firstOccurrenceOrderPerKey(arrived)).isEqualTo(Map.of("bad", bad));
         await(Duration.ofSeconds(10), () -> count(retryRows) == 0);
     }
@@ -164,7 +164,7 @@ class KafkaGuaranteesIT {
         var topic = TestKafka.createTopic(6);
         var config = config();
         var handlers = List.of(new Handler(), new Handler());
-        var runtimes = List.of(start(config, handlers.get(0)), start(sameTables(config), handlers.get(1)));
+        var runtimes = List.of(start(config, handlers.get(0)), start(config().sameTablesAs(config), handlers.get(1)));
 
         var pool = Executors.newFixedThreadPool(writers);
         try {
@@ -338,7 +338,7 @@ class KafkaGuaranteesIT {
 
         runtime.close();
         var sender = sender();
-        var next = start(OutboxRuntime.builder(sameTables(config).holdPermanent(true), transactions,
+        var next = start(OutboxRuntime.builder(config().sameTablesAs(config).holdPermanent(true), transactions,
                 new Handler(sender)).deadLetterHandler(new KafkaDeadLetterHandler(sender, "{topic}.dlq")));
         consumeCommitted(topic, r -> true);
         await(CONSUME_TIMEOUT, () -> count("select count(*) from " + next.schema().names().retry()) == 0);
@@ -358,7 +358,7 @@ class KafkaGuaranteesIT {
         assertThat(count("select count(*) from " + names.retry() + " where message_id = '" + ids.get(2)
                 + "' and next_attempt_at is null")).as("after, a follower").isEqualTo(1);
         var main = TestKafka.consumeUntil(topic, CONSUME_TIMEOUT,
-                r -> byMessageId(r).keySet().containsAll(List.of(ids.get(0), ids.get(3))));
+                r -> TestKafka.byMessageId(r).keySet().containsAll(List.of(ids.get(0), ids.get(3))));
         assertThat(main).extracting(KafkaOutboxHeaders::messageId).doesNotContain(poison, ids.get(2));
         assertThat(count("select count(*) from " + names.dead())).isZero();
         assertNothingIn(dlq);
@@ -400,7 +400,7 @@ class KafkaGuaranteesIT {
         await(Duration.ofSeconds(30), () -> slow.delivered.get() >= 50); // acknowledged with acks=all: in the topic
         a.close();
         var next = new Handler();
-        start(sameTables(config), next);
+        start(config().sameTablesAs(config), next);
 
         var records = consumeCommitted(topic, r -> true);
         assertThat(next.delivered).as("the backlog A left").hasPositiveValue();
@@ -454,11 +454,6 @@ class KafkaGuaranteesIT {
         return new TestOutboxConfig().batchTimeout(Duration.ofSeconds(30)).deadLettersTimeout(Duration.ofSeconds(30));
     }
 
-    /** {@link #config()} on {@code config}'s tables, for a second runtime on them. */
-    private static TestOutboxConfig sameTables(TestOutboxConfig config) {
-        return config().table(config.table()).inboxTable(config.inbox().table());
-    }
-
     private OutboxRuntime start(TestOutboxConfig config, Handler handler) {
         return start(OutboxRuntime.builder(config, transactions, handler));
     }
@@ -501,7 +496,7 @@ class KafkaGuaranteesIT {
             String topic, Predicate<List<ConsumerRecord<byte[], byte[]>>> until) {
         var expected = committed.values().stream().flatMap(List::stream).collect(Collectors.toSet());
         var records = TestKafka.consumeUntil(topic, CONSUME_TIMEOUT,
-                r -> byMessageId(r).keySet().containsAll(expected) && until.test(r));
+                r -> TestKafka.byMessageId(r).keySet().containsAll(expected) && until.test(r));
         var firstOccurrences = firstOccurrenceOrderPerKey(records);
         assertThat(firstOccurrences.keySet()).isEqualTo(committed.keySet());
         committed.forEach((key, ids) -> assertThat(firstOccurrences.get(key)).as(key).isEqualTo(ids));
@@ -513,18 +508,8 @@ class KafkaGuaranteesIT {
      * holds the lock until its commit. Returns how many it terminated.
      */
     private int terminateStep(OutboxRuntime runtime, int shard) {
-        try (var c = transactions.newConnection(); var ps = c.prepareStatement("select pg_terminate_backend(pid, 5000)"
-                + " from pg_locks where locktype = 'advisory' and classid = ?::int4::oid"
-                + " and objid = ?::int4::oid and objsubid = 2 and granted")) {
-            ps.setInt(1, runtime.schema().names().internalNamespace());
-            ps.setInt(2, TableNames.LOCK_SHARD_BASE + shard);
-            int terminated = 0;
-            try (var rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    terminated += rs.getBoolean(1) ? 1 : 0;
-                }
-            }
-            return terminated;
+        try (var c = transactions.newConnection()) {
+            return TestSql.terminateStep(c, runtime.schema().names().internalNamespace(), shard);
         } catch (SQLException e) {
             throw new IllegalStateException(e);
         }
@@ -537,13 +522,6 @@ class KafkaGuaranteesIT {
         } catch (SQLException e) {
             throw new IllegalStateException(e);
         }
-    }
-
-    /** The first occurrence of each message id. */
-    private static Map<UUID, ConsumerRecord<byte[], byte[]>> byMessageId(List<ConsumerRecord<byte[], byte[]>> records) {
-        var result = new HashMap<UUID, ConsumerRecord<byte[], byte[]>>();
-        records.forEach(r -> result.putIfAbsent(KafkaOutboxHeaders.messageId(r), r));
-        return result;
     }
 
     /** Per key, the message ids in the order of their first occurrence; a key lives in one partition, read in order. */

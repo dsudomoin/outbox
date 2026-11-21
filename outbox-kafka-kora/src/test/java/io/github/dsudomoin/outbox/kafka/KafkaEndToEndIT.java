@@ -86,7 +86,7 @@ class KafkaEndToEndIT {
                 .withHeader("h", bytes("b")));
         var tombstone = send(OutboxMessage.of(topic, (byte[]) null));
 
-        var received = byMessageId(TestKafka.consumeUntil(topic, CONSUME_TIMEOUT, r -> r.size() >= 2));
+        var received = TestKafka.byMessageId(TestKafka.consumeUntil(topic, CONSUME_TIMEOUT, r -> r.size() >= 2));
         assertThat(received.keySet()).containsExactlyInAnyOrder(keyed, tombstone);
         var record = received.get(keyed);
         assertThat(record.key()).isEqualTo(bytes("k1"));
@@ -257,7 +257,7 @@ class KafkaEndToEndIT {
         var id = send(OutboxMessage.of(topic, "k", bytes("traced")));
         Context.clear();
 
-        var record = byMessageId(TestKafka.consumeUntil(topic, CONSUME_TIMEOUT, r -> !r.isEmpty())).get(id);
+        var record = TestKafka.byMessageId(TestKafka.consumeUntil(topic, CONSUME_TIMEOUT, r -> !r.isEmpty())).get(id);
         var traceparent = new String(record.headers().lastHeader("traceparent").value(), UTF_8).split("-");
         assertThat(traceparent[1]).isEqualTo(TestTracing.TRACE_ID);
         if (relayTraces) {
@@ -289,12 +289,6 @@ class KafkaEndToEndIT {
         var sender = new KafkaOutboxSender(() -> properties);
         senders.add(sender);
         return sender;
-    }
-
-    private static Map<UUID, ConsumerRecord<byte[], byte[]>> byMessageId(List<ConsumerRecord<byte[], byte[]>> records) {
-        var result = new HashMap<UUID, ConsumerRecord<byte[], byte[]>>();
-        records.forEach(r -> result.putIfAbsent(KafkaOutboxHeaders.messageId(r), r));
-        return result;
     }
 
     private static List<Map.Entry<String, String>> headers(ConsumerRecord<byte[], byte[]> record) {

@@ -243,13 +243,7 @@ class KafkaClusterFaultsIT {
     /** (c) the node leading the most partitions frozen (docker pause) for 25 s. */
     @Test
     void theLeaderOfMostPartitionsFreezes() {
-        start();
-        int leader = cluster.leaderOfMostPartitions(topic);
-        System.out.println("c: pausing node " + leader + ", leaders " + cluster.leaders(topic));
-        cluster.pause(leader);
-        hold(Duration.ofSeconds(25));
-        cluster.unpause(leader);
-        finish("c-frozen-leader", Long.MIN_VALUE);
+        leaderFreezes("c-frozen-leader", Duration.ofSeconds(25));
     }
 
     /**
@@ -259,13 +253,18 @@ class KafkaClusterFaultsIT {
     @Test
     @Timeout(value = 5, unit = TimeUnit.MINUTES)
     void theLeaderOfMostPartitionsFreezesForAMinute() {
+        leaderFreezes("c60-frozen-leader-60s", Duration.ofSeconds(60));
+    }
+
+    /** The node leading the most partitions paused for {@code frozen}, then the run finished as {@code name}. */
+    private void leaderFreezes(String name, Duration frozen) {
         start();
         int leader = cluster.leaderOfMostPartitions(topic);
-        System.out.println("c60: pausing node " + leader + ", leaders " + cluster.leaders(topic));
+        System.out.println(name + ": pausing node " + leader + ", leaders " + cluster.leaders(topic));
         cluster.pause(leader);
-        hold(Duration.ofSeconds(60));
+        hold(frozen);
         cluster.unpause(leader);
-        finish("c60-frozen-leader-60s", Long.MIN_VALUE);
+        finish(name, Long.MIN_VALUE);
     }
 
     /** (d) every node unreachable from the clients for 25 s, the brokers still in touch with each other. */
@@ -332,7 +331,7 @@ class KafkaClusterFaultsIT {
         topic = "faults-" + UUID.randomUUID();
         createTopic();
         var config = config();
-        runtimes = List.of(runtime(config), runtime(sameTables(config)));
+        runtimes = List.of(runtime(config), runtime(config().sameTablesAs(config)));
         startWriting();
         sleep(WARMUP);
         assertThat(deliveredInCallFrom).as("delivered before the fault").isNotEmpty();
@@ -619,7 +618,4 @@ class KafkaClusterFaultsIT {
         return new TestOutboxConfig().batchTimeout(timeout).deadLettersTimeout(timeout);
     }
 
-    private static TestOutboxConfig sameTables(TestOutboxConfig config) {
-        return config().table(config.table()).inboxTable(config.inbox().table());
-    }
 }
