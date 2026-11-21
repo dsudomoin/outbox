@@ -7,9 +7,7 @@ STEP=${STEP:-120}
 table=bench_ramp
 
 log ramp
-drop_outbox "$table"
-kafka_reset
-app_start ramp "${SINGLE_ENV[@]}" OUTBOX_TABLE="$table"
+fresh_app ramp "$table" "${SINGLE_ENV[@]}"
 id=$(mark ramp "ramp $RATES msg/s, 1 message per transaction")
 rows=""
 for rate in $RATES; do
@@ -17,15 +15,15 @@ for rate in $RATES; do
   sleep 30
   t0=$(now); cpu_start
   sleep $((STEP - 30))
-  t1=$(now); cpu_stop; cpu=$CPU
+  t1=$(now); cpu_stop
   window "$t0" "$t1"
   rows="$rows| $rate | $(f0 "$COMMITTED") | $(f0 "$DELIVERED") | $(f0 "$CONSUMED") | $(f3 "$P50") s | $(f3 "$P99") s \
-| $(f3 "$TX99") s | $cpu% | $(hms "$t0") – $(hms "$t1") |
+| $(f3 "$TX99") s | $CPU% | $(hms "$t0") – $(hms "$t1") |
 "
   first=${first:-$t0}
 done
 load_stop
-reconcile_timed "$table" 900 "$(metric bench_messages_sent_total)"; rc=$RC drain=$DRAIN
+reconcile_timed "$table" 900 "$(metric bench_messages_sent_total)"
 mark_end "$id"
 end=$(totals)
 app_stop
@@ -44,9 +42,9 @@ $(utc "$first" | cut -c1-10) (UTC).
 | цель msg/s | закоммичено msg/s | доставлено msg/s | потреблено msg/s | задержка p50 | задержка p99 | транзакция писателя p99 | CPU БД (из 200%) | окно (UTC) |
 |---|---|---|---|---|---|---|---|---|
 ${rows}
-После ramp консьюмер всё выбрал $drain после остановки писателей. Итого: $end. Сверка (SQL, после выборки):
+После ramp консьюмер всё выбрал $DRAIN после остановки писателей. Итого: $end. Сверка (SQL, после выборки):
 закоммиченных строк, не потреблённых и не dead: $RECON.
 
 $(consumer_note)
 EOF
-verdict "$table" "$rc"
+verdict "$table" "$RC"

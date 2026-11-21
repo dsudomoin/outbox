@@ -140,6 +140,8 @@ inst_kill9() {
 
 # The single-instance scenarios' app: instance 1.
 app_start() { inst_start 1 "$@"; }
+# fresh_app NAME TABLE [ENV=VALUE...]: TABLE dropped, the topic and group reset, then instance 1 on TABLE
+fresh_app() { drop_outbox "$2"; kafka_reset; app_start "$1" OUTBOX_TABLE="$2" "${@:3}"; }
 app_stop() { inst_stop 1; }
 app_kill9() { inst_kill9 1; }
 
@@ -345,6 +347,13 @@ xmin_pinned() {
     sleep 10
   done
   echo "$n из $m замеров"
+}
+
+# long_tx_phase BASE SECONDS: a SECONDS s long transaction with DB CPU sampled while open; sets PINNED, CPU, T2 (it
+# ended) and T3 (60 s later).
+long_tx_phase() {
+  long_tx "$2"; cpu_start; PINNED=$(xmin_pinned "$1" "$LONG_TX_XID"); long_tx_wait
+  T2=$(now); cpu_stop; sleep 60; T3=$(now)
 }
 
 # --- DB CPU ------------------------------------------------------------------------------------------------------

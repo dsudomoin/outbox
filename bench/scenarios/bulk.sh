@@ -40,18 +40,16 @@ run() {
   local relay=(OUTBOX_RELAY_WORKERS=4 OUTBOX_RELAY_BATCH_SIZE=20000 OUTBOX_RELAY_IDLE_POLL=100ms)
   if [ "${3:-}" = defaults ]; then relay=(); label="$2, relay по умолчанию"; fi
   log "$name"
-  drop_outbox "$table"
-  kafka_reset
-  app_start "$name" CONSUMER_THREADS=0 BENCH_HANDLER="$handler" OUTBOX_TABLE="$table" OUTBOX_SHARDS="$shards" ${relay[@]+"${relay[@]}"}
+  fresh_app "$name" "$table" CONSUMER_THREADS=0 BENCH_HANDLER="$handler" OUTBOX_SHARDS="$shards" ${relay[@]+"${relay[@]}"}
   local id; id=$(mark bulk "bulk shards=$shards handler=$label")
   load 0 2 10000 100
   sleep "$WARMUP"
   psql_q "select pg_stat_statements_reset()" > /dev/null
-  local t0 t1 cpu steady=$STEADY
+  local t0 t1 steady=$STEADY
   if [ "$shards-$handler-${3:-}" = 4-noop- ]; then steady=$HEADLINE; fi
   t0=$(now); cpu_start
   sleep "$steady"
-  t1=$(now); cpu_stop; cpu=$CPU
+  t1=$(now); cpu_stop
   top_statements > "$LOGS/$name-statements.txt" # evidence for the notes, not in RESULTS.md
   load_stop
   local stopped drained; stopped=$(now)
@@ -62,7 +60,7 @@ run() {
   drop_outbox "$table"
   echo "$DELIVERED" > "$LOGS/$name.rate"
   echo "| $shards | $label | $(f0 "$COMMITTED") | $(f0 "$DELIVERED") \
-| $(f3 "$P50") s | $(f3 "$P99") s | $(f3 "$TX50") s | $cpu% | $(f0 "$GROWTH") | $drained \
+| $(f3 "$P50") s | $(f3 "$P99") s | $(f3 "$TX50") s | $CPU% | $(f0 "$GROWTH") | $drained \
 | $(utc "$t0") – $(hms "$t1") |" | out
 }
 
@@ -80,7 +78,6 @@ else
   done
   [ -n "${HANDLERS:-}${SHARDS:-}" ] || run 4 noop defaults # what an untuned user gets
 fi
-
 
 out << EOF
 

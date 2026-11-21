@@ -9,9 +9,7 @@ backlog() { echo $(($(metric bench_messages_sent_total) - $(metric outbox_messag
 sample() { B=$(backlog); if [ "$B" -gt "$peak" ]; then peak=$B; fi; } # sets B, raises peak
 
 log kafka-outage
-drop_outbox "$table"
-kafka_reset
-app_start kafka-outage "${SINGLE_ENV[@]}" OUTBOX_TABLE="$table"
+fresh_app kafka-outage "$table" "${SINGLE_ENV[@]}"
 id=$(mark kafka-outage "kafka-outage: $RATE msg/s, Kafka stopped ${OUTAGE} s")
 load "$RATE" "$WRITERS"
 sleep 30
@@ -32,7 +30,7 @@ while [ "$(now)" -lt $((up + 1200)) ]; do
 done
 sleep 30
 load_stop
-reconcile_timed "$table" 900 "$(metric bench_messages_sent_total)"; rc=$RC drain=$DRAIN
+reconcile_timed "$table" 900 "$(metric bench_messages_sent_total)"
 mark_end "$id"
 window "$t0" "$t1"
 base_p99=$P99
@@ -58,10 +56,10 @@ out << EOF
 |---|---|---|---|---|
 | $(f3 "$base_p99") s | $peak сообщений | $relay_drain | $drain_p99 s | $dead |
 
-Консьюмер всё выбрал $drain после остановки писателей. Итого: $end. Сверка (SQL, после выборки): закоммиченных строк,
+Консьюмер всё выбрал $DRAIN после остановки писателей. Итого: $end. Сверка (SQL, после выборки): закоммиченных строк,
 не потреблённых и не dead: $RECON. Дубликат здесь — запись, которую Kafka сохранила, но ack на которую relay не получил
 до сбоя; relay отправляет её повторно, и inbox отбрасывает вторую копию.
 
 $(consumer_note)
 EOF
-verdict "$table" "$rc"
+verdict "$table" "$RC"

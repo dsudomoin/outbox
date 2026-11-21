@@ -42,9 +42,7 @@ EOF
 run() { # run RATE SHARDS
   local rate=$1 shards=$2 table=bench_lowload_r$1_s$2 name=low-load-r$1-s$2 id t0 t1 x0 x1 calls rd tk cu all
   log "$name"
-  drop_outbox "$table"
-  kafka_reset
-  app_start "$name" DB_POOL_SIZE=48 CONSUMER_THREADS=12 OUTBOX_TABLE="$table" OUTBOX_SHARDS="$shards" \
+  fresh_app "$name" "$table" DB_POOL_SIZE=48 CONSUMER_THREADS=12 OUTBOX_SHARDS="$shards" \
     OUTBOX_RELAY_WORKERS=4 OUTBOX_RELAY_BATCH_SIZE=1000
   id=$(mark low-load "low load: $rate msg/s, shards $shards")
   load "$rate" 8

@@ -32,9 +32,7 @@ chaos_begin() {
   for i in $(seq 1 "$N"); do : > "$LOGS/chaos-$NAME-$i.log"; done # this run's logs only (restarts append)
   chaos_start 1
   psql_q "truncate orders, bench_rolled_back, bench_consumed" > /dev/null # only this run's rows are reconciled
-  INBOX_FILTER="" # a scoped inbox (consumer column): the bench consumer is unscoped, consumer ''
-  if [ "$(psql_q "select count(*) from information_schema.columns where table_schema = current_schema()
-      and table_name = 'inbox' and column_name = 'consumer'")" = 1 ]; then INBOX_FILTER="and i.consumer = ''"; fi
+  INBOX_FILTER="and i.consumer = ''" # the bench consumer is unscoped: consumer ''
   for ((i = 2; i <= N; i++)); do chaos_start "$i"; done # not seq: BSD `seq 2 1` counts down
   MARK=$(mark "chaos-$NAME" "chaos $NAME: $TEXT")
   T0=$(now)
@@ -46,6 +44,24 @@ chaos_begin() {
   echo "utc,elapsed_s,instances_up,committed,consumed,duplicates,order_violations,failed_tx,rolled_back,relay_lag_s,\
 group_lag,retry_rows,dead_rows,tick_rows,cursor_rows,tick_bytes,cursor_bytes,retry_bytes,outbox_bytes,partitions,\
 pending_detach,db_connections,delay_p99_s$heap" > "$CSV"
+}
+
+# chaos_restart NAME TABLE CONTAINER: 3 instances at RATE (1000) msg/s each, DURATION (300) s; FAULT_AT (120) s in,
+# `docker restart` of CONTAINER under load, then the run's end.
+chaos_restart() {
+  DURATION=${DURATION:-300}
+  RATE=${RATE:-1000}
+  FAULT_AT=${FAULT_AT:-120}
+  chaos_begin "$1" "$2" 3 "Режим заказов, 3 экземпляра × $RATE msg/s в течение $DURATION с; \
+\`docker restart $3\` на $FAULT_AT-й секунде"
+  for i in 1 2 3; do chaos_load "$i" "$RATE" "$CHAOS_WRITERS"; done
+  chaos_for "$FAULT_AT"
+  fault "docker restart $3"
+  docker restart "$3" > /dev/null
+  fault "$3 перезапущен"
+  chaos_for $((DURATION - FAULT_AT - 20))
+  chaos_progress
+  chaos_end 900
 }
 
 # chaos_start I: instance I with the run's env; STARTED[I] is the database time just before, so sessions of a killed
@@ -218,7 +234,7 @@ chaos_progress() {
 # duplicates are counted from the consumer counters. Sets RECON and R_* and returns 0 clean, 1 NOT DRAINED (nothing is
 # known about loss), 2 a defect, 3 inconclusive (no orders, or no rolled-back ids although ROLLBACK > 0).
 reconcile_orders() {
-  local deadline=$(($(now) + $1)) bulk=${2:-0} lag retry paused passed cur prev="" heavy
+  local deadline=$(($(now) + $1)) bulk=${2:-0} lag retry paused passed cur prev=""
   R_DRAINED=""
   while [ "$(now)" -lt "$deadline" ]; do
     lag=$(group_lag) || lag=""
@@ -226,13 +242,12 @@ reconcile_orders() {
       $(relay_passed "$TABLE" "created_at > '$STOPPED_AT'")" 2> /dev/null | tr '|' ' ')" || true
     cur=""
     if [ "$lag" = 0 ] && [ "${retry:-}" = 0 ] && [ "${paused:-}" = 0 ] && [ "${passed:-}" = t ]; then
-      heavy=$(psql_q "set work_mem = '256MB';
+      cur=$(psql_q "set work_mem = '256MB';
         select (select count(*) from orders o where not exists
             (select 1 from inbox i where i.message_id = o.message_id $INBOX_FILTER)),
           (select count(*) from bench_rolled_back r where exists
             (select 1 from inbox i where i.message_id = r.message_id $INBOX_FILTER)),
-          (select count(*) from inbox i where i.message_id >= '$RUN_UUID' $INBOX_FILTER)" | tr '|' ' ') || heavy=""
-      cur="$heavy"
+          (select count(*) from inbox i where i.message_id >= '$RUN_UUID' $INBOX_FILTER)" | tr '|' ' ') || cur=""
     fi
     if [ -n "$cur" ] && [ "$cur" = "$prev" ]; then R_DRAINED=$(now); break; fi
     prev=$cur

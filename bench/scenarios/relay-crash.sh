@@ -10,9 +10,7 @@ table=bench_relay_crash
 env_=("${SINGLE_ENV[@]}" OUTBOX_TABLE="$table")
 
 log relay-crash
-drop_outbox "$table"
-kafka_reset
-app_start relay-crash "${env_[@]}"
+fresh_app relay-crash "$table" "${SINGLE_ENV[@]}"
 id=$(mark relay-crash "relay-crash: $RATE msg/s, kill -9, restart after 10 s")
 load "$RATE" "$WRITERS"
 sleep 30
@@ -52,7 +50,7 @@ done
 sleep 30
 load_stop
 post=$(metric bench_messages_sent_total) || post=""
-reconcile_timed "$table" 900 "${post:+$((pre + post))}" "$pre_consumed"; rc=$RC drain=$DRAIN
+reconcile_timed "$table" 900 "${post:+$((pre + post))}" "$pre_consumed"
 mark_end "$id"
 window "$t0" "$t1"
 after=$(totals)
@@ -78,7 +76,7 @@ $(rate_note "$RATE")
 этого счётчика и числа строк в таблице после убийства). Её счётчик потреблённых — сумма по обоим процессам
 ($pre_consumed до убийства): запись, которую убитый процесс потребил после этого чтения, только уменьшает сумму, поэтому
 проверка с партициями, удалёнными обслуживанием, может пройти, и только если потреблено каждое закоммиченное сообщение.
-Консьюмер всё выбрал $drain после остановки писателей. Сверка (SQL, после выборки), по обоим прогонам: закоммиченных
+Консьюмер всё выбрал $DRAIN после остановки писателей. Сверка (SQL, после выборки), по обоим прогонам: закоммиченных
 строк, не потреблённых и не dead: $RECON. «Relay догнал»: курсор каждого шарда дошёл до первого тика, сделанного после
 падения, то есть все коммиты до падения переданы в Kafka. Сквозное время включает и ожидание, пока consumer group Kafka
 исключит убитых консьюмеров (\`session.timeout.ms\`, по умолчанию 45 с). Дубликат — запись, которую убитый relay
@@ -87,4 +85,4 @@ $(rate_note "$RATE")
 
 $(consumer_note)
 EOF
-verdict "$table" "$rc"
+verdict "$table" "$RC"

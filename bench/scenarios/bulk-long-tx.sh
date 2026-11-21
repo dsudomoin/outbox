@@ -9,9 +9,7 @@ RATE=${BULK_LONG_TX_RATE:-$(python3 -c "print(int($max / 2 // 10000 * 10000))")}
 table=bench_bulk_long_tx
 
 log "bulk-long-tx at $RATE msg/s"
-drop_outbox "$table"
-kafka_reset
-app_start bulk-long-tx CONSUMER_THREADS=0 BENCH_HANDLER=noop OUTBOX_TABLE="$table" OUTBOX_SHARDS=4 \
+fresh_app bulk-long-tx "$table" CONSUMER_THREADS=0 BENCH_HANDLER=noop OUTBOX_SHARDS=4 \
   OUTBOX_RELAY_WORKERS=4 OUTBOX_RELAY_BATCH_SIZE=20000 OUTBOX_RELAY_IDLE_POLL=100ms
 id=$(mark bulk-long-tx "bulk-long-tx: $RATE msg/s, ${LONG_TX} s open transaction")
 load "$RATE" 2 10000 100
@@ -19,19 +17,11 @@ sleep 60
 t0=$(now)
 sleep 60
 t1=$(now)
-long_tx "$LONG_TX"
-xid=$LONG_TX_XID
-cpu_start
-pinned=$(xmin_pinned "$table" "$xid")
-long_tx_wait
-t2=$(now)
-cpu_stop; cpu=$CPU
-sleep 60
-t3=$(now)
+long_tx_phase "$table" "$LONG_TX"
 load_stop
 wait_delivered 120 || true
 mark_end "$id"
-minutes=$(p99_by_minute "$t1" "$t2")
+minutes=$(p99_by_minute "$t1" "$T2")
 app_stop
 
 row() { # row PHASE T0 T1
@@ -47,15 +37,15 @@ row() { # row PHASE T0 T1
 
 Конфигурация bulk (шардов 4, noop), ограниченная до **$RATE msg/s** (половина максимума bulk при шардах 4 и noop,
 округлённая вниз до 10 000), с сессией, которая держит xid открытым $LONG_TX с (\`begin; select pg_current_xact_id();
-select pg_sleep($LONG_TX)\`, xid $xid). snapshot xmin самого нового тика был равен этому xid в $pinned, снятых каждые
-10 с, пока транзакция была открыта. CPU БД, пока она была открыта: $cpu% из 200%. Дата $(utc "$t0" | cut -c1-10) (UTC).
+select pg_sleep($LONG_TX)\`, xid $LONG_TX_XID). snapshot xmin самого нового тика был равен этому xid в $PINNED, снятых каждые
+10 с, пока транзакция была открыта. CPU БД, пока она была открыта: $CPU% из 200%. Дата $(utc "$t0" | cut -c1-10) (UTC).
 
 | фаза | окно (UTC) | записано msg/s | доставлено msg/s | задержка p50 | задержка p99 | наибольший лаг шарда |
 |---|---|---|---|---|---|---|
 EOF
   row до "$t0" "$t1"
-  row "транзакция открыта" "$t1" "$t2"
-  row после "$t2" "$t3"
+  row "транзакция открыта" "$t1" "$T2"
+  row после "$T2" "$T3"
   cat << EOF
 
 p99 задержки по минутам, пока транзакция была открыта: $minutes с.

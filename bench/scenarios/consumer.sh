@@ -12,9 +12,7 @@ FILL_PER_TX=${FILL_PER_TX:-1}
 table=bench_consumer
 
 log consumer
-drop_outbox "$table"
-kafka_reset
-app_start consumer-fill "${SINGLE_ENV[@]}" CONSUMER_THREADS=0 OUTBOX_TABLE="$table"
+fresh_app consumer-fill "$table" "${SINGLE_ENV[@]}" CONSUMER_THREADS=0
 id=$(mark consumer "consumer ceiling: $FILL s backlog, then drain with $CONSUMER_THREADS consumer threads")
 load 0 "$FILL_WRITERS" "$FILL_PER_TX" 300
 sleep 30

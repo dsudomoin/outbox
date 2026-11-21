@@ -16,15 +16,13 @@ measure() { # warm-up, window; sets T0 T1 CPU and the window() values
   T1=$(now); cpu_stop
 }
 
+table=bench_max_single
 log max-single
-drop_outbox bench_max_single
-kafka_reset
-app_start max-single "${SINGLE_ENV[@]}" OUTBOX_TABLE=bench_max_single
+fresh_app max-single "$table" "${SINGLE_ENV[@]}"
 id=$(mark max "max single: $WRITERS writers unthrottled, 1 message per transaction")
 load 0 "$WRITERS"
 measure
 load_stop
-table=bench_max_single
 reconcile_timed "$table" 900 "$(metric bench_messages_sent_total)"; single_rc=$RC single_drain=$DRAIN
 single_recon=$RECON
 mark_end "$id"
@@ -49,9 +47,9 @@ $single
 
 Консьюмер всё выбрал $single_drain после остановки писателей; $single_totals. Сверка: $single_recon.
 EOF
-  verdict bench_max_single "$single_rc"
+  verdict "$table" "$single_rc"
 fi
-drop_outbox bench_max_single
+drop_outbox "$table"
 
 # bulk WRITERS MESSAGES_PER_TX SHARDS RELAY_WORKERS: one unthrottled sendAll run; appends a row to $bulk and the
 # drain after the writers stop to $drains.
@@ -59,9 +57,7 @@ bulk="" drains=""
 bulk() {
   local table=bench_max_bulk
   log "max-bulk $1 x $2, shards $3"
-  drop_outbox "$table"
-  kafka_reset
-  app_start "max-bulk-$1x$2" CONSUMER_THREADS=0 BENCH_HANDLER=noop OUTBOX_TABLE="$table" OUTBOX_SHARDS="$3" \
+  fresh_app "max-bulk-$1x$2" "$table" CONSUMER_THREADS=0 BENCH_HANDLER=noop OUTBOX_SHARDS="$3" \
     OUTBOX_RELAY_WORKERS="$4" OUTBOX_RELAY_BATCH_SIZE=20000 OUTBOX_RELAY_IDLE_POLL=100ms
   local id; id=$(mark max "max bulk: $1 writers x $2 messages per transaction, shards $3, noop")
   load 0 "$1" "$2" 100

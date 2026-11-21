@@ -7,9 +7,7 @@ COUNT=${COUNT:-100}
 table=bench_poison
 
 log poison
-drop_outbox "$table"
-kafka_reset
-app_start poison "${SINGLE_ENV[@]}" OUTBOX_TABLE="$table"
+fresh_app poison "$table" "${SINGLE_ENV[@]}"
 id=$(mark poison "poison: $RATE msg/s + $COUNT oversized messages")
 load "$RATE" "$WRITERS"
 sleep 30
@@ -21,7 +19,7 @@ t2=$(now)
 sleep 90
 t3=$(now)
 load_stop
-reconcile_timed "$table" 900 "$(metric bench_messages_sent_total)"; rc=$RC drain=$DRAIN
+reconcile_timed "$table" 900 "$(metric bench_messages_sent_total)"
 sleep 35 # the dead-size gauge comes from maintenance, every 30 s
 mark_end "$id"
 dead=$(psql_q "select count(*) from ${table}_dead")
@@ -54,10 +52,10 @@ EOF
   cat << EOF
 
 dead-таблица: $dead строк (gauge \`outbox.dead.size\` $dead_gauge), retry-таблица: $retry строк. Консьюмер всё
-выбрал $drain после остановки писателей. Итого: $end. Сверка (SQL, после выборки): закоммиченных строк, не потреблённых
+выбрал $DRAIN после остановки писателей. Итого: $end. Сверка (SQL, после выборки): закоммиченных строк, не потреблённых
 и не dead: $RECON (в строках есть $COUNT poison-сообщений, а в счётчике писателей их нет).
 
 $(consumer_note)
 EOF
 } | out
-verdict "$table" "$rc"
+verdict "$table" "$RC"

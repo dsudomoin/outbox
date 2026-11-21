@@ -7,28 +7,18 @@ LONG_TX=${LONG_TX:-600}
 table=bench_long_tx
 
 log long-transaction
-drop_outbox "$table"
-kafka_reset
-app_start long-transaction "${SINGLE_ENV[@]}" OUTBOX_TABLE="$table"
+fresh_app long-transaction "$table" "${SINGLE_ENV[@]}"
 id=$(mark long-transaction "long-transaction: $RATE msg/s, ${LONG_TX} s open transaction")
 load "$RATE" "$WRITERS"
 sleep 30
 t0=$(now)
 sleep 120
 t1=$(now)
-long_tx "$LONG_TX"
-xid=$LONG_TX_XID
-cpu_start
-pinned=$(xmin_pinned "$table" "$xid")
-long_tx_wait
-t2=$(now)
-cpu_stop; cpu=$CPU
-sleep 60
-t3=$(now)
+long_tx_phase "$table" "$LONG_TX"
 load_stop
-reconcile_timed "$table" 900 "$(metric bench_messages_sent_total)"; rc=$RC drain=$DRAIN
+reconcile_timed "$table" 900 "$(metric bench_messages_sent_total)"
 mark_end "$id"
-minutes=$(p99_by_minute "$t1" "$t2")
+minutes=$(p99_by_minute "$t1" "$T2")
 end=$(totals)
 app_stop
 
@@ -44,22 +34,22 @@ row() { # row PHASE T0 T1
 ## long-transaction
 
 Режим заказов (1 сообщение на транзакцию, писателей $WRITERS), $RATE msg/s, обработчик Kafka, консьюмер с inbox;
-шардов 32, relay workers 8. Сессия держала xid $xid открытым $LONG_TX с (\`begin; select pg_current_xact_id(); select
-pg_sleep($LONG_TX)\`); snapshot xmin самого нового тика был равен этому xid в $pinned, снятых каждые 10 с, пока она
-была открыта. CPU БД, пока она была открыта: $cpu% из 200%. Дата $(utc "$t0" | cut -c1-10) (UTC). $(rate_note "$RATE")
+шардов 32, relay workers 8. Сессия держала xid $LONG_TX_XID открытым $LONG_TX с (\`begin; select pg_current_xact_id(); select
+pg_sleep($LONG_TX)\`); snapshot xmin самого нового тика был равен этому xid в $PINNED, снятых каждые 10 с, пока она
+была открыта. CPU БД, пока она была открыта: $CPU% из 200%. Дата $(utc "$t0" | cut -c1-10) (UTC). $(rate_note "$RATE")
 
 | фаза | окно (UTC) | закоммичено msg/s | доставлено msg/s | потреблено msg/s | задержка p50 | задержка p99 | наибольший лаг шарда |
 |---|---|---|---|---|---|---|---|
 EOF
   row до "$t0" "$t1"
-  row "транзакция открыта" "$t1" "$t2"
-  row после "$t2" "$t3"
+  row "транзакция открыта" "$t1" "$T2"
+  row после "$T2" "$T3"
   cat << EOF
 
-p99 задержки по минутам, пока транзакция была открыта: $minutes с. Консьюмер всё выбрал $drain после остановки
+p99 задержки по минутам, пока транзакция была открыта: $minutes с. Консьюмер всё выбрал $DRAIN после остановки
 писателей. Итого: $end. Сверка (SQL, после выборки): закоммиченных строк, не потреблённых и не dead: $RECON.
 
 $(consumer_note)
 EOF
 } | out
-verdict "$table" "$rc"
+verdict "$table" "$RC"

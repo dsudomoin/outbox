@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # chaos kill: 3 instances at RATE msg/s each (order mode), DURATION s; every KILL_MIN–KILL_MAX s one
 # instance at random gets kill -9 (by its recorded PID) and restarts after DOWN_MIN–DOWN_MAX s.
-# Pass: clean reconciliation; no shard's relay stuck 60 s or more (cursor tick age from SQL, every 5 s).
+# Pass: clean reconciliation; no shard's relay stuck 60 s or more (age of the slowest shard's effective tick, from SQL
+# every 5 s).
 source "$(dirname "$0")/chaos-lib.sh"
 DURATION=${DURATION:-900}
 RATE=${RATE:-1000}

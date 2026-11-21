@@ -168,10 +168,7 @@ bulk() { # bulk SHARDS
 low() { # low SHARDS RATE
   local shards=$1 rate=$2 table=bench_shardcost_s$1_r$2 id
   log "shard-cost-s$shards-r$rate"
-  drop_outbox "$table"
-  kafka_reset
-  app_start "shard-cost-s$shards-r$rate" "${DEFAULTS[@]}" DB_POOL_SIZE=48 CONSUMER_THREADS=12 OUTBOX_TABLE="$table" \
-    OUTBOX_SHARDS="$shards"
+  fresh_app "shard-cost-s$shards-r$rate" "$table" "${DEFAULTS[@]}" DB_POOL_SIZE=48 CONSUMER_THREADS=12 OUTBOX_SHARDS="$shards"
   id=$(mark shard-cost "shard cost: low load $rate msg/s, shards $shards")
   load "$rate" 8
   sleep "$WARMUP"
