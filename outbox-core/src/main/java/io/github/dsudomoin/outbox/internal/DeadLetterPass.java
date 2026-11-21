@@ -132,7 +132,7 @@ public final class DeadLetterPass {
         this.initialDelay = config.relay().retry().initialDelay();
         this.maxDelay = config.relay().retry().maxDelay();
         this.asciiText = OutboxSchema.asciiText(config);
-        claim = "select " + DeadLetters.COLUMNS + " from " + dead + " where status = ? and due_at <= now()"
+        claim = "select " + DeadLetters.COLUMNS + " from " + dead + " where status = 'pending' and due_at <= now()"
                 + " order by due_at, id limit ? for update skip locked";
         // a redrive copies payloads and headers inside the database: they stay out of the heap
         claimScheduled = "select " + DeadLetters.REF_COLUMNS + " from " + dead + " where status = 'scheduled'"
@@ -286,7 +286,7 @@ public final class DeadLetterPass {
 
     /** {@code ids} gets the claimed letters' ids, for {@link #deferStillDue} should the transaction fail later. */
     private Batch handOverBatch(Connection tx, List<Long> ids) throws SQLException {
-        var claimed = claim(tx, "pending");
+        var claimed = claim(tx);
         claimed.forEach(c -> ids.add(c.letter().id()));
         if (claimed.isEmpty()) {
             return new Batch(0, null, List.of());
@@ -513,10 +513,9 @@ public final class DeadLetterPass {
         }
     }
 
-    private List<DeadLetters.Claimed> claim(Connection tx, String status) throws SQLException {
+    private List<DeadLetters.Claimed> claim(Connection tx) throws SQLException {
         try (var ps = tx.prepareStatement(claim)) {
-            ps.setString(1, status);
-            ps.setInt(2, batchSize);
+            ps.setInt(1, batchSize);
             try (var rs = ps.executeQuery()) {
                 var claimed = new ArrayList<DeadLetters.Claimed>();
                 while (rs.next()) {

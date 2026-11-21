@@ -17,7 +17,6 @@ import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
-import java.nio.ByteBuffer;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
@@ -263,25 +262,29 @@ public final class ParkedStore {
         }
         var turns = new HashMap<Object, Instant>();
         try (var ps = c.prepareStatement(countOfKeys)) {
-            ps.setArray(1, c.createArrayOf("text", parks.stream().map(OutboxRecord::topic).toArray()));
-            ps.setArray(2, c.createArrayOf("bytea", parks.stream().map(OutboxRecord::key).toArray(byte[][]::new)));
+            bindTopicsAndKeys(c, ps, 1, parks);
             ps.setShort(3, (short) shard);
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    var key = List.of(rs.getString(1), ByteBuffer.wrap(rs.getBytes(2)));
+                    var key = BatchClassifier.orderingKey(rs.getString(1), rs.getBytes(2));
                     long rows = rs.getLong(3) + added.getOrDefault(key, 0);
                     if (rows > batch) {
-                        turns.put(key, now.plus(delay.multipliedBy((rows + batch - 1) / batch)));
+                        turns.put(key, turn(now, rows));
                     }
                 }
             }
         }
         added.forEach((key, rows) -> {
             if (rows > batch) { // none parked before them
-                turns.putIfAbsent(key, now.plus(delay.multipliedBy((rows + batch - 1) / batch)));
+                turns.putIfAbsent(key, turn(now, rows));
             }
         });
         return turns;
+    }
+
+    /** When a key of {@code rows} parked rows comes round: a batch per delay. */
+    private Instant turn(Instant now, long rows) {
+        return now.plus(delay.multipliedBy((rows + batch - 1) / batch));
     }
 
     private static void bindInsert(PreparedStatement ps, int shard, OutboxRecord r, int requeues, Instant due)
@@ -301,17 +304,7 @@ public final class ParkedStore {
 
     /** Deletes delivered rows; a row that is not in the table is a bug, so it fails and the step rolls back. */
     public void unpark(Connection c, List<OutboxRecord> rows) throws SQLException {
-        if (rows.isEmpty()) {
-            return;
-        }
-        try (var ps = c.prepareStatement(delete)) {
-            ps.setArray(1, RetryStore.ids(c, rows));
-            int deleted = ps.executeUpdate();
-            if (deleted != rows.size()) {
-                throw new IllegalStateException("parked rows " + rows.stream().map(OutboxRecord::id).toList()
-                        + " not all found (" + deleted + " deleted)");
-            }
-        }
+        RetryStore.deleteAll(c, delete, rows, "parked");
     }
 
     /**
@@ -471,14 +464,13 @@ public final class ParkedStore {
             return rows;
         }
         try (var ps = c.prepareStatement(fitting)) {
-            ps.setArray(1, c.createArrayOf("text", withKey.stream().map(OutboxRecord::topic).toArray()));
-            ps.setArray(2, c.createArrayOf("bytea", withKey.stream().map(OutboxRecord::key).toArray(byte[][]::new)));
+            bindTopicsAndKeys(c, ps, 1, withKey);
             ps.setShort(3, (short) shard);
             ps.setInt(4, batch == Integer.MAX_VALUE ? batch : batch + 1);
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
                     if (rs.getLong(3) > 0) {
-                        rows.put(List.of(rs.getString(1), ByteBuffer.wrap(rs.getBytes(2))),
+                        rows.put(BatchClassifier.orderingKey(rs.getString(1), rs.getBytes(2)),
                                 new KeySize(rs.getLong(3), rs.getLong(4)));
                     }
                 }
@@ -524,12 +516,11 @@ public final class ParkedStore {
         }
         var eligible = new ArrayList<OutboxRecord>();
         try (var ps = c.prepareStatement(lowestOfKeys)) {
-            ps.setArray(1, c.createArrayOf("text", gone.values().stream().map(OutboxRecord::topic).toArray()));
-            ps.setArray(2, c.createArrayOf("bytea", gone.values().stream().map(OutboxRecord::key).toArray(byte[][]::new)));
+            bindTopicsAndKeys(c, ps, 1, gone.values());
             ps.setShort(3, (short) shard);
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    var key = List.of(rs.getString(1), ByteBuffer.wrap(rs.getBytes(2)));
+                    var key = BatchClassifier.orderingKey(rs.getString(1), rs.getBytes(2));
                     var left = gone.get(key);
                     if (rs.getLong(3) > left.id() || offTheBottom(key, now)) {
                         eligible.add(left);
@@ -543,8 +534,7 @@ public final class ParkedStore {
         try (var ps = c.prepareStatement(pullNext)) {
             ps.setObject(1, timestamp(now));
             ps.setShort(2, (short) shard);
-            ps.setArray(3, c.createArrayOf("text", eligible.stream().map(OutboxRecord::topic).toArray()));
-            ps.setArray(4, c.createArrayOf("bytea", eligible.stream().map(OutboxRecord::key).toArray(byte[][]::new)));
+            bindTopicsAndKeys(c, ps, 3, eligible);
             ps.setShort(5, (short) shard);
             ps.setInt(6, batch);
             return ps.executeUpdate() > 0;
@@ -566,9 +556,15 @@ public final class ParkedStore {
     /** Parameters {@code first..first+2} of a statement per (topic, key) and an id: each of {@code rows}'. */
     private static void bindKeys(Connection c, PreparedStatement ps, int first, Collection<OutboxRecord> rows)
             throws SQLException {
+        bindTopicsAndKeys(c, ps, first, rows);
+        ps.setArray(first + 2, c.createArrayOf("int8", rows.stream().map(OutboxRecord::id).toArray()));
+    }
+
+    /** Parameters {@code first} and {@code first + 1}: the topics and the keys of {@code rows}, in order. */
+    private static void bindTopicsAndKeys(Connection c, PreparedStatement ps, int first, Collection<OutboxRecord> rows)
+            throws SQLException {
         ps.setArray(first, c.createArrayOf("text", rows.stream().map(OutboxRecord::topic).toArray()));
         ps.setArray(first + 1, c.createArrayOf("bytea", rows.stream().map(OutboxRecord::key).toArray(byte[][]::new)));
-        ps.setArray(first + 2, c.createArrayOf("int8", rows.stream().map(OutboxRecord::id).toArray()));
     }
 
     /**
@@ -581,8 +577,7 @@ public final class ParkedStore {
             return List.of();
         }
         try (var ps = c.prepareStatement(selectOfKeys)) {
-            ps.setArray(1, c.createArrayOf("text", keyed.stream().map(OutboxRecord::topic).toArray()));
-            ps.setArray(2, c.createArrayOf("bytea", keyed.stream().map(OutboxRecord::key).toArray(byte[][]::new)));
+            bindTopicsAndKeys(c, ps, 1, keyed);
             ps.setShort(3, (short) shard);
             ps.setInt(4, perKey);
             ps.setInt(5, (int) Math.min((long) perKey * keyed.size(), Integer.MAX_VALUE));

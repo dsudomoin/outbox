@@ -102,7 +102,12 @@ public final class BatchClassifier {
      * so unkeyed records never block or follow each other.
      */
     public static Object orderingKey(OutboxRecord r) {
-        return r.key() == null ? new Object() : List.of(r.topic(), ByteBuffer.wrap(r.key()));
+        return orderingKey(r.topic(), r.key());
+    }
+
+    /** {@link #orderingKey(OutboxRecord)} of a record of {@code topic} and {@code key}. */
+    public static Object orderingKey(String topic, @Nullable byte[] key) {
+        return key == null ? new Object() : List.of(topic, ByteBuffer.wrap(key));
     }
 
     /**

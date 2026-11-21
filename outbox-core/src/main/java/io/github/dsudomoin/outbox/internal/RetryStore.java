@@ -239,14 +239,19 @@ public final class RetryStore {
 
     /** Deletes delivered rows; a row that is not in the table is a bug (see {@link #requireOneRow}). */
     public void delete(Connection c, List<OutboxRecord> rows) throws SQLException {
+        deleteAll(c, delete, rows, "retry");
+    }
+
+    /** {@code sql} deleting the rows of the ids it takes, every one of {@code rows}, or the {@code table} word fails. */
+    static void deleteAll(Connection c, String sql, List<OutboxRecord> rows, String table) throws SQLException {
         if (rows.isEmpty()) {
             return;
         }
-        try (var ps = c.prepareStatement(delete)) {
+        try (var ps = c.prepareStatement(sql)) {
             ps.setArray(1, ids(c, rows));
             int deleted = ps.executeUpdate();
             if (deleted != rows.size()) {
-                throw new IllegalStateException("retry rows " + rows.stream().map(OutboxRecord::id).toList()
+                throw new IllegalStateException(table + " rows " + rows.stream().map(OutboxRecord::id).toList()
                         + " not all found (" + deleted + " deleted)");
             }
         }

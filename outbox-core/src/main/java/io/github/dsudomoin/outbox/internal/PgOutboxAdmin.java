@@ -327,7 +327,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             if (restoring.get() && !(e instanceof IllegalArgumentException)) {
                 wakeRelay.run(); // for the chunks it may have moved before it failed
             }
-            throw e instanceof SQLException s ? db.translate(s) : (RuntimeException) e;
+            throw rethrown(e);
         }
         log.info("outbox admin {} on {} returned {}", call, names.base(), moved);
         if (moved > 0) {
@@ -382,7 +382,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                     log.warn("outbox admin {} on {} failed, nothing re-sent: {}", call, names.base(),
                             printable(e.toString()));
                 }
-                throw e instanceof SQLException s ? db.translate(s) : (RuntimeException) e;
+                throw rethrown(e);
             }
             cleanup = e; // after the commit: releasing the maintenance lock, the session setting or the connection
         }
@@ -478,7 +478,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                         + " on: {}", call, names.base(), moved.get(), printable(e.toString()));
                 wakeRelay.run(); // for the shards it repaired before it failed
             }
-            throw e instanceof SQLException s ? db.translate(s) : (RuntimeException) e;
+            throw rethrown(e);
         }
         log.info("outbox admin {} on {} returned {}, the rows re-sent, for shards {}", call, names.base(), moved.get(),
                 stranded);
@@ -662,14 +662,15 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                 readyXids.add(Long.toString(xidsOf.get(i)));
             }
         }
-        var xidList = String.join(",", readyXids.stream().distinct().toList());
+        var distinctXids = readyXids.stream().distinct().toList();
+        var xidList = String.join(",", distinctXids);
         // the shard and xids find the rows by the (shard, xid) index: the outbox has none on id. Numbers only, inlined
         resender.insertFrom(tx, "(select id, message_id, topic, key, payload, headers from " + names.base()
                 + " where shard = " + shard + " and xid = any('{" + xidList + "}'::xid8[]))", ready);
         try (var ps = tx.prepareStatement("delete from " + names.base() + " where shard = ?"
                 + " and xid = any(?::text[]::xid8[]) and id = any(?)")) {
             ps.setShort(1, (short) shard);
-            ps.setArray(2, tx.createArrayOf("text", readyXids.stream().distinct().toArray()));
+            ps.setArray(2, tx.createArrayOf("text", distinctXids.toArray()));
             ps.setArray(3, tx.createArrayOf("int8", readyIds.toArray()));
             ps.executeUpdate();
         }
@@ -719,7 +720,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             log.warn("outbox admin {} on {} failed after {} keys ({} records) {}; calling again goes on: {}", call,
                     names.base(), keys, records, dryRun ? "counted" : "moved, which stay dead letters",
                     printable(e.toString()));
-            throw e instanceof SQLException s ? db.translate(s) : (RuntimeException) e;
+            throw rethrown(e);
         }
         var abandoned = new Abandoned(keys, records);
         log.info("outbox admin {} on {} returned {}", call, names.base(), abandoned);
@@ -783,7 +784,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         } catch (SQLException | RuntimeException e) {
             log.warn("outbox admin {} on {} failed after {} records {}; calling again goes on: {}", call, names.base(),
                     records, dryRun ? "counted" : "moved, which stay dead letters", printable(e.toString()));
-            throw e instanceof SQLException s ? db.translate(s) : (RuntimeException) e;
+            throw rethrown(e);
         }
         var abandoned = new Abandoned(records > 0 ? 1 : 0, records);
         log.info("outbox admin {} on {} returned {}", call, names.base(), abandoned);
@@ -1080,7 +1081,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             if (putsBack && done > 0) {
                 wakeRelay.run();
             }
-            throw e instanceof SQLException s ? db.translate(s) : (RuntimeException) e;
+            throw rethrown(e);
         }
         log.info("outbox admin {} on {} returned {}", call, dead, done);
         if (putsBack && done > 0) {
@@ -1196,6 +1197,11 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             }
         }
         return counts;
+    }
+
+    /** {@code e} as a call throws it: an {@link SQLException} translated by the transactions, any other as it is. */
+    private RuntimeException rethrown(Exception e) {
+        return e instanceof SQLException s ? db.translate(s) : (RuntimeException) e;
     }
 
     private void requireOwnTransactions() {

@@ -108,13 +108,13 @@ final class DeadLetters {
     /**
      * Back into the outbox, copied from the dead table ({@link Resender#insertFrom}), the redrive counted in {@code <redriven>}, the dead rows deleted. Their
      * key locks are {@code tx}'s already ({@link #tryKeyLocks}), so taken again without waiting; any other lock the
-     * insert waits for is waited for at most {@link XidPartitions#lockWait} each.
+     * insert waits for is waited for at most {@link XidPartitions#lockWait} each, as the caller set before them
+     * ({@link #limitLockWaits}).
      */
     void redrive(Connection tx, List<Ref> letters) throws SQLException {
         if (letters.isEmpty()) {
             return;
         }
-        limitLockWaits(tx); // after the claim: the insert waits for a lock no longer than the swap
         resender.insertFrom(tx, dead, letters.stream().map(r -> new Resender.Source(r.id(), r.topic(), r.key()))
                 .toList());
         try (var ps = tx.prepareStatement(remember)) {
