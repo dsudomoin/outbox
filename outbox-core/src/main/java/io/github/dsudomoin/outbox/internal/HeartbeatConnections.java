@@ -262,7 +262,6 @@ final class HeartbeatConnections implements ConnectionSource {
         }
     }
 
-
     private static void close(Connection c, Throwable cause) {
         try {
             c.close();

@@ -75,31 +75,11 @@ public final class AdminHttp {
     }
 
     /**
-     * {@code text} with quotes and backslashes escaped and each control or format character (a bidi override reorders
-     * a line on screen) as its Java escape, so it stays one quoted token on one log line.
+     * {@code text} with quotes and backslashes escaped, then {@link PgOutboxAdmin#printable}'s control and format
+     * escapes, so it stays one quoted token on one log line.
      */
     public static String printable(String text) {
-        var out = new StringBuilder(text.length());
-        text.codePoints().forEach(ch -> {
-            switch (ch) {
-                case '"' -> out.append("\\\"");
-                case '\\' -> out.append("\\\\");
-                case '\n' -> out.append("\\n");
-                case '\r' -> out.append("\\r");
-                case '\t' -> out.append("\\t");
-                default -> {
-                    if (Character.isISOControl(ch) || ch == ' ' || ch == ' '
-                            || Character.getType(ch) == Character.FORMAT) {
-                        for (var unit : Character.toChars(ch)) { // beyond U+FFFF, Java's escape is two of them
-                            out.append(String.format("\\u%04x", (int) unit));
-                        }
-                    } else {
-                        out.appendCodePoint(ch);
-                    }
-                }
-            }
-        });
-        return out.toString();
+        return PgOutboxAdmin.printable(text.replace("\\", "\\\\").replace("\"", "\\\""));
     }
 
     /**

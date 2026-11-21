@@ -114,7 +114,7 @@ public abstract class TypedOutboxTopicHandler<T> implements OutboxTopicHandler {
      * default it moves to the dead table.
      */
     protected void handleTombstone(OutboxRecord record) throws Exception {
-        throw CannotHandle.permanent(record, named.getName() + " takes no tombstones", null);
+        throw permanent(record, named.getName() + " takes no tombstones", null);
     }
 
     /**
@@ -139,10 +139,10 @@ public abstract class TypedOutboxTopicHandler<T> implements OutboxTopicHandler {
         } catch (OutboxWaitException | OutboxPermanentException e) {
             throw e;
         } catch (Exception e) {
-            throw CannotHandle.permanent(record, named.getName() + " cannot decode its payload", e);
+            throw permanent(record, named.getName() + " cannot decode its payload", e);
         }
         if (value == null) {
-            throw CannotHandle.permanent(record, named.getName() + " cannot decode its payload: "
+            throw permanent(record, named.getName() + " cannot decode its payload: "
                     + deserializer.getClass().getName() + " returned null", null);
         }
         return value;
@@ -212,5 +212,14 @@ public abstract class TypedOutboxTopicHandler<T> implements OutboxTopicHandler {
         throw new IllegalArgumentException("cannot tell T of " + handler.getName() + " extending"
                 + " TypedOutboxTopicHandler<T> from its class hierarchy (found " + type + "); pass it to the"
                 + " TypedOutboxTopicHandler(Set, OutboxDeserializer, Class) constructor");
+    }
+
+    /**
+     * {@code Permanent}: no instance reading {@code record}'s contract version can ever handle it (a tombstone this
+     * handler does not take, a payload it cannot decode).
+     */
+    private static OutboxPermanentException permanent(OutboxRecord record, String reason, @Nullable Throwable cause) {
+        return new OutboxPermanentException("cannot handle outbox record " + record.messageId() + " of topic "
+                + record.topic() + ": " + reason, cause);
     }
 }

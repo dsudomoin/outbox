@@ -131,9 +131,7 @@ final class DeadLetters {
      * writers of those keys waiting no longer than that.
      */
     void limitLockWaits(Connection tx) throws SQLException {
-        try (var st = tx.createStatement()) {
-            st.execute(lockTimeout);
-        }
+        Sql.execute(tx, lockTimeout);
     }
 
     void delete(Connection tx, List<Long> ids) throws SQLException {

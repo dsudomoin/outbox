@@ -1434,9 +1434,7 @@ public final class ShardProcessor implements AutoCloseable {
             Map<Integer, Cursors.Targeted> currents) throws SQLException {
         var locked = new boolean[shards.size()];
         if (shards.isEmpty()) {
-            try (var st = c.createStatement()) {
-                st.execute(settings);
-            }
+            Sql.execute(c, settings);
             return locked;
         }
         var read = new HashMap<Integer, Cursors.Targeted>();

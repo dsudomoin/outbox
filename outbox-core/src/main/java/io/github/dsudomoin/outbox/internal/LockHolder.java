@@ -160,17 +160,13 @@ final class LockHolder implements AutoCloseable {
         try {
             requireOpen();
             var savepoint = "outbox_lock_" + savepoints.incrementAndGet();
-            try (var st = c.createStatement()) {
-                st.execute("savepoint " + savepoint);
-            }
+            Sql.execute(c, "savepoint " + savepoint);
             long deadline = System.nanoTime() + wait.toNanos();
             while (!take(ns, key)) {
                 dropPortal(c);
                 long left = deadline - System.nanoTime();
                 if (left <= 0) {
-                    try (var st = c.createStatement()) {
-                        st.execute("rollback to savepoint " + savepoint);
-                    }
+                    Sql.execute(c, "rollback to savepoint " + savepoint);
                     return null;
                 }
                 try {
@@ -359,9 +355,7 @@ final class LockHolder implements AutoCloseable {
     }
 
     private static void dropPortal(Connection c) throws SQLException {
-        try (var st = c.createStatement()) {
-            st.execute(DROP_PORTAL);
-        }
+        Sql.execute(c, DROP_PORTAL);
     }
 
     private void requireOpen() throws SQLException {

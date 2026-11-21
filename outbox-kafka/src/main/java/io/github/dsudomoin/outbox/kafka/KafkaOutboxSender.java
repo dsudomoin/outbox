@@ -870,15 +870,6 @@ public final class KafkaOutboxSender implements AutoCloseable {
         }
     }
 
-    /**
-     * A pooled producer and the topics it has fetched metadata for, by last lookup: {@code partitionsFor} does not wait
-     * for those. Kafka drops a topic unused for {@code metadata.max.idle.ms} (5 min by default) from its metadata, so
-     * an entry is trusted for 5 min after its last lookup, and at most 10 000 are kept, the least recently used dropped
-     * first. A topic wrongly taken as resolved (deleted since, or dropped by a {@code metadata.max.idle.ms} below
-     * 5 min) can cost a call that already timed out one more metadata wait, and is then forgotten; one wrongly taken as
-     * unresolved costs no wait: Kafka answers its lookup from cache, and after a timeout the call skips it. Used by
-     * one call at a time.
-     */
     /** A pool: what makes its producers, and its idle ones, most recently used first. */
     private static final class Pool {
 
@@ -890,6 +881,15 @@ public final class KafkaOutboxSender implements AutoCloseable {
         }
     }
 
+    /**
+     * A pooled producer and the topics it has fetched metadata for, by last lookup: {@code partitionsFor} does not wait
+     * for those. Kafka drops a topic unused for {@code metadata.max.idle.ms} (5 min by default) from its metadata, so
+     * an entry is trusted for 5 min after its last lookup, and at most 10 000 are kept, the least recently used dropped
+     * first. A topic wrongly taken as resolved (deleted since, or dropped by a {@code metadata.max.idle.ms} below
+     * 5 min) can cost a call that already timed out one more metadata wait, and is then forgotten; one wrongly taken as
+     * unresolved costs no wait: Kafka answers its lookup from cache, and after a timeout the call skips it. Used by
+     * one call at a time.
+     */
     private static final class Pooled {
         private static final long IDLE = Duration.ofMinutes(5).toNanos();
         private static final int MAX_TOPICS = 10_000;
