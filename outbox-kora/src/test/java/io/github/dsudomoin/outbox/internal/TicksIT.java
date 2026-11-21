@@ -468,21 +468,21 @@ class TicksIT {
     void getManyReadsSnapshots() throws Exception {
         try (var c = TestDb.connect()) {
             var first = ticks.latest(c);
-            var running = TestDb.connect(); // in flight at the ticks below: a snapshot with an xip
+            var running = TestDb.connect(); // in flight at the tick below: a snapshot with an xip
             running.setAutoCommit(false);
             xid(running);
             xid(c); // a later xid ends, so the running one lies below xmax
             ticks.make(c, Duration.ZERO);
-            var middle = ticks.latest(c);
+            var withXip = ticks.latest(c);
             running.rollback();
             running.close();
-            assertThat(middle.snapshot().xip()).isNotEmpty();
+            assertThat(withXip.snapshot().xip()).isNotEmpty();
 
-            var many = ticks.get(c, List.of(first.id(), middle.id(), middle.id() + 100));
-            assertThat(many).containsOnlyKeys(first.id(), middle.id());
+            var many = ticks.get(c, List.of(first.id(), withXip.id(), withXip.id() + 100));
+            assertThat(many).containsOnlyKeys(first.id(), withXip.id());
             assertThat(many.get(first.id())).usingRecursiveComparison().isEqualTo(first);
-            assertThat(many.get(middle.id())).as("as the single get reads it").usingRecursiveComparison()
-                    .isEqualTo(ticks.get(c, middle.id()));
+            assertThat(many.get(withXip.id())).as("as the single get reads it").usingRecursiveComparison()
+                    .isEqualTo(ticks.get(c, withXip.id()));
             assertThat(ticks.get(c, List.of())).isEmpty();
         }
     }
