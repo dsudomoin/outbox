@@ -1,6 +1,7 @@
 package io.github.dsudomoin.outbox.spring;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.Outbox;
 import io.github.dsudomoin.outbox.OutboxConfig;
@@ -16,6 +17,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Stream;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
+import org.springframework.boot.test.context.assertj.AssertableApplicationContext;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
@@ -27,6 +29,9 @@ import org.springframework.transaction.support.TransactionTemplate;
 final class TestApps {
 
     private TestApps() {}
+
+    /** JDK proxies instead of Boot's class proxies. */
+    static final String JDK_PROXIES = "spring.aop.proxy-target-class=false";
 
     @Configuration(proxyBeanMethods = false)
     @EnableAutoConfiguration
@@ -88,6 +93,20 @@ final class TestApps {
 
     static String table(ApplicationContext context) {
         return context.getBean(OutboxConfig.class).table();
+    }
+
+    /** The innermost cause of the context's startup failure. */
+    static Throwable rootCause(AssertableApplicationContext context) {
+        assertThat(context).hasFailed();
+        var cause = context.getStartupFailure();
+        while (cause.getCause() != null) {
+            cause = cause.getCause();
+        }
+        return cause;
+    }
+
+    static String failure(AssertableApplicationContext context) {
+        return rootCause(context).getMessage();
     }
 
     /** On a connection of its own. */

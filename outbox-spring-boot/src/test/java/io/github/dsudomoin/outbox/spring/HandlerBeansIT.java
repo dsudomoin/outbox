@@ -1,5 +1,7 @@
 package io.github.dsudomoin.outbox.spring;
 
+import static io.github.dsudomoin.outbox.spring.TestApps.failure;
+import static io.github.dsudomoin.outbox.spring.TestApps.rootCause;
 import static io.github.dsudomoin.outbox.spring.TestApps.runner;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -12,7 +14,6 @@ import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import java.util.List;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
-import org.springframework.boot.test.context.assertj.AssertableApplicationContext;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -64,15 +65,6 @@ class HandlerBeansIT {
         public List<Outcome> handleBatch(List<OutboxRecord> records) {
             return OutboxHandler.super.handleBatch(records);
         }
-    }
-
-    private static String failure(AssertableApplicationContext context) {
-        assertThat(context).hasFailed();
-        var cause = context.getStartupFailure();
-        while (cause.getCause() != null) {
-            cause = cause.getCause();
-        }
-        return cause.getMessage();
     }
 
     @Configuration(proxyBeanMethods = false)
@@ -220,11 +212,7 @@ class HandlerBeansIT {
         runner().withUserConfiguration(UnbuildableKafkaBesideAppHandler.class).run(context -> {
             assertThat(failure(context)).contains("several OutboxHandler beans: ")
                 .contains("outboxKafkaFallbackHandler").contains("appHandler").contains("outbox.kafka.fallback=false");
-            var conflict = context.getStartupFailure();
-            while (conflict.getCause() != null) {
-                conflict = conflict.getCause();
-            }
-            assertThat(conflict.getSuppressed()).isNotEmpty();
+            assertThat(rootCause(context).getSuppressed()).isNotEmpty();
         });
     }
 

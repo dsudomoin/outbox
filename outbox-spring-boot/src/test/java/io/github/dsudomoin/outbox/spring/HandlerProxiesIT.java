@@ -1,5 +1,7 @@
 package io.github.dsudomoin.outbox.spring;
 
+import static io.github.dsudomoin.outbox.spring.TestApps.JDK_PROXIES;
+import static io.github.dsudomoin.outbox.spring.TestApps.failure;
 import static io.github.dsudomoin.outbox.spring.TestApps.runner;
 import static io.github.dsudomoin.outbox.spring.TestApps.send;
 import static io.github.dsudomoin.outbox.spring.TestApps.table;
@@ -35,7 +37,6 @@ import org.springframework.aop.support.DefaultPointcutAdvisor;
 import org.springframework.aop.support.annotation.AnnotationMatchingPointcut;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.config.CustomScopeConfigurer;
-import org.springframework.boot.test.context.assertj.AssertableApplicationContext;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
@@ -54,7 +55,6 @@ import org.springframework.transaction.support.TransactionTemplate;
 class HandlerProxiesIT {
 
     private static final Duration WAIT = Duration.ofSeconds(10);
-    private static final String JDK = "spring.aop.proxy-target-class=false";
 
     /** What the handlers and the aspect saw, in order. */
     static final class Calls {
@@ -697,15 +697,17 @@ class HandlerProxiesIT {
     private static List<String> seenAfter(ApplicationContext context, String topic, int calls) {
         send(context, topic);
         send(context, topic);
-        var seen = context.getBean(Calls.class).seen;
-        await().atMost(WAIT).until(() -> seen.size() >= calls);
-        return seen;
+        return awaitSeen(context, calls);
     }
 
     private static List<String> seenAfterOne(ApplicationContext context, String topic) {
         send(context, topic);
+        return awaitSeen(context, 2);
+    }
+
+    private static List<String> awaitSeen(ApplicationContext context, int calls) {
         var seen = context.getBean(Calls.class).seen;
-        await().atMost(WAIT).until(() -> seen.size() >= 2);
+        await().atMost(WAIT).until(() -> seen.size() >= calls);
         return seen;
     }
 
@@ -713,18 +715,7 @@ class HandlerProxiesIT {
         var outbox = context.getBean(Outbox.class);
         new TransactionTemplate(context.getBean(PlatformTransactionManager.class))
             .executeWithoutResult(status -> outbox.send(OutboxMessage.of("audit", "k", (byte[]) null)));
-        var seen = context.getBean(Calls.class).seen;
-        await().atMost(WAIT).until(() -> seen.size() >= 2);
-        return seen;
-    }
-
-    static String failure(AssertableApplicationContext context) {
-        assertThat(context).hasFailed();
-        var cause = context.getStartupFailure();
-        while (cause.getCause() != null) {
-            cause = cause.getCause();
-        }
-        return cause.getMessage();
+        return awaitSeen(context, 2);
     }
 
     @Test
@@ -759,19 +750,19 @@ class HandlerProxiesIT {
 
     @Test
     void jdkPlainTransactionalWorks() {
-        app(PlainTxApp.class, JDK).run(context ->
+        app(PlainTxApp.class, JDK_PROXIES).run(context ->
             assertThat(seenAfter(context, "orders", 2)).containsExactly("plain in tx", "plain in tx"));
     }
 
     @Test
     void jdkTypedAspectOnInterfaceHandleRuns() {
-        app(TypedAspectApp.class, JDK).run(context -> assertThat(seenAfter(context, "audit", 4))
+        app(TypedAspectApp.class, JDK_PROXIES).run(context -> assertThat(seenAfter(context, "audit", 4))
             .containsExactly("aspect no tx", "typed v no tx", "aspect no tx", "typed v no tx"));
     }
 
     @Test
     void jdkTypedTransactionalHookFailsStart() {
-        app(TypedTxApp.class, JDK).run(context -> assertThat(failure(context)).contains("typedHandler")
+        app(TypedTxApp.class, JDK_PROXIES).run(context -> assertThat(failure(context)).contains("typedHandler")
             .contains("handle(" + AuditEvent.class.getSimpleName() + ", OutboxRecord)")
             .contains("spring.aop.proxy-target-class=true"));
     }
@@ -795,21 +786,21 @@ class HandlerProxiesIT {
         var perRecord = new String[] {"advice no tx", "typed v no tx", "advice no tx", "typed v no tx"};
         app(CountedTypedApp.class).run(context ->
             assertThat(seenAfter(context, "audit", 4)).containsExactly(perRecord));
-        app(CountedTypedApp.class, JDK).run(context ->
+        app(CountedTypedApp.class, JDK_PROXIES).run(context ->
             assertThat(seenAfter(context, "audit", 4)).containsExactly(perRecord));
     }
 
     @Test
     void jdkTypedHookDeclaredByAnInterfaceStillFailsStart() {
-        app(TypedWithApiApp.class, JDK).run(context -> assertThat(failure(context)).contains("typedHandler")
+        app(TypedWithApiApp.class, JDK_PROXIES).run(context -> assertThat(failure(context)).contains("typedHandler")
             .contains("handle(" + AuditEvent.class.getSimpleName() + ", OutboxRecord)")
             .contains("spring.aop.proxy-target-class=true"));
     }
 
     @Test
     void aspectOnInheritedHandleBatchFailsStart() {
-        for (var run : List.of(app(PlainDefaultBatchApp.class), app(PlainDefaultBatchApp.class, JDK),
-                app(TypedDefaultBatchApp.class), app(TypedDefaultBatchApp.class, JDK))) {
+        for (var run : List.of(app(PlainDefaultBatchApp.class), app(PlainDefaultBatchApp.class, JDK_PROXIES),
+                app(TypedDefaultBatchApp.class), app(TypedDefaultBatchApp.class, JDK_PROXIES))) {
             run.run(context -> assertThat(failure(context)).contains("batched").contains("handleBatch(List)")
                 .contains(BatchAspect.class.getName()).contains("override handleBatch or advise handle"));
         }
@@ -829,7 +820,7 @@ class HandlerProxiesIT {
 
     @Test
     void aspectOnOverriddenHandleBatchRuns() {
-        for (var properties : List.of(new String[0], new String[] {JDK})) {
+        for (var properties : List.of(new String[0], new String[] {JDK_PROXIES})) {
             app(PlainBatchApp.class, properties).run(context -> assertThat(seenAfterOne(context, "orders"))
                 .containsExactly("batch aspect no tx", "plain no tx"));
             app(FallbackBatchApp.class, properties).run(context -> assertThat(seenAfterOne(context, "other"))
@@ -841,7 +832,7 @@ class HandlerProxiesIT {
 
     @Test
     void adviceOnHandleOfBatchOverrideFailsStart() {
-        for (var properties : List.of(new String[0], new String[] {JDK})) {
+        for (var properties : List.of(new String[0], new String[] {JDK_PROXIES})) {
             app(PlainTxBatchApp.class, properties).run(context -> assertThat(failure(context)).contains("txBatch")
                 .contains("handle(OutboxRecord)").contains("TransactionAttributeSourceAdvisor")
                 .contains("advise handleBatch, or use a TransactionTemplate inside the override"));
@@ -854,7 +845,7 @@ class HandlerProxiesIT {
 
     @Test
     void classWideAdvisorOnBatchOverrideRuns() {
-        for (var properties : List.of(new String[0], new String[] {JDK})) {
+        for (var properties : List.of(new String[0], new String[] {JDK_PROXIES})) {
             app(CountedTypedBatchApp.class, properties).run(context -> assertThat(seenAfterOne(context, "audit"))
                 .containsExactly("advice no tx", "typed v no tx"));
         }
@@ -864,13 +855,13 @@ class HandlerProxiesIT {
     void tombstoneReachesTheAdvice() {
         app(TombstoneAspectApp.class).run(context -> assertThat(seenAfterTombstone(context))
             .containsExactly("tombstone aspect no tx", "tombstone no tx"));
-        app(TypedAspectApp.class, JDK).run(context -> assertThat(seenAfterTombstone(context))
+        app(TypedAspectApp.class, JDK_PROXIES).run(context -> assertThat(seenAfterTombstone(context))
             .containsExactly("aspect no tx", "tombstone no tx"));
     }
 
     @Test
     void unnamedBeanBehindJdkProxyNamedByItsClass() {
-        app(PrototypeApp.class, JDK).run(context -> assertThat(failure(context))
+        app(PrototypeApp.class, JDK_PROXIES).run(context -> assertThat(failure(context))
             .contains("is claimed by both beans ").contains(PlainTx.class.getName() + " (" + PlainTx.class.getName())
             .doesNotContain("$Proxy"));
     }
@@ -879,7 +870,7 @@ class HandlerProxiesIT {
     @Test
     void typedContractVersionFromTarget() {
         app(TypedTxApp.class).run(context -> assertContractV2(context, "typed v2 in tx"));
-        app(TypedAspectApp.class, JDK).run(context -> assertContractV2(context, "typed v2 no tx"));
+        app(TypedAspectApp.class, JDK_PROXIES).run(context -> assertContractV2(context, "typed v2 no tx"));
     }
 
     private static void assertContractV2(ApplicationContext context, String delivered) throws Exception {

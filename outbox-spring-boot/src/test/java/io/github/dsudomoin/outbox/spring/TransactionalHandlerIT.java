@@ -1,6 +1,7 @@
 package io.github.dsudomoin.outbox.spring;
 
-import static io.github.dsudomoin.outbox.spring.HandlerProxiesIT.failure;
+import static io.github.dsudomoin.outbox.spring.TestApps.JDK_PROXIES;
+import static io.github.dsudomoin.outbox.spring.TestApps.failure;
 import static io.github.dsudomoin.outbox.spring.TestApps.runner;
 import static io.github.dsudomoin.outbox.spring.TestApps.send;
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -57,7 +58,6 @@ import org.springframework.transaction.support.TransactionTemplate;
 class TransactionalHandlerIT {
 
     private static final Duration WAIT = Duration.ofSeconds(20);
-    private static final String JDK = "spring.aop.proxy-target-class=false";
     private static final String ROLLBACK_FIX = "use @Transactional(rollbackFor = Exception.class) without"
         + " noRollbackFor, or @EnableTransactionManagement(rollbackOn = RollbackOn.ALL_EXCEPTIONS)";
     private static final String BATCH_FIX = "put @Transactional(rollbackFor = Exception.class) on handle and keep the"
@@ -191,26 +191,29 @@ class TransactionalHandlerIT {
         }
     }
 
-    /** A transaction per record; {@code Delivered} only for those it committed. */
-    static class TemplatePerRecord implements OutboxTopicHandler {
+    /** Overrides {@code handleBatch} and runs its own transactions; records the size of each batch. */
+    abstract static class BatchTemplate extends Orders {
 
-        private final Effects effects;
-        private final TransactionTemplate transaction;
+        final Effects effects;
+        final TransactionTemplate transaction;
         final List<Integer> calls = new CopyOnWriteArrayList<>();
 
-        TemplatePerRecord(Effects effects, TransactionTemplate transaction) {
+        BatchTemplate(Effects effects, TransactionTemplate transaction) {
             this.effects = effects;
             this.transaction = transaction;
         }
 
         @Override
-        public Set<String> topics() {
-            return Set.of("orders");
-        }
-
-        @Override
         public void handle(OutboxRecord record) {
             throw new AssertionError("the override of handleBatch does not call it");
+        }
+    }
+
+    /** A transaction per record; {@code Delivered} only for those it committed. */
+    static class TemplatePerRecord extends BatchTemplate {
+
+        TemplatePerRecord(Effects effects, TransactionTemplate transaction) {
+            super(effects, transaction);
         }
 
         @Override
@@ -230,25 +233,10 @@ class TransactionalHandlerIT {
     }
 
     /** One transaction for the batch, thrown out of on any failure. */
-    static class TemplateAroundBatch implements OutboxTopicHandler {
-
-        private final Effects effects;
-        private final TransactionTemplate transaction;
-        final List<Integer> calls = new CopyOnWriteArrayList<>();
+    static class TemplateAroundBatch extends BatchTemplate {
 
         TemplateAroundBatch(Effects effects, TransactionTemplate transaction) {
-            this.effects = effects;
-            this.transaction = transaction;
-        }
-
-        @Override
-        public Set<String> topics() {
-            return Set.of("orders");
-        }
-
-        @Override
-        public void handle(OutboxRecord record) {
-            throw new AssertionError("the override of handleBatch does not call it");
+            super(effects, transaction);
         }
 
         @Override
@@ -274,7 +262,7 @@ class TransactionalHandlerIT {
         }
     }
 
-    /** Handlers that only have to start or fail to. */
+    /** On topic {@code orders}. */
     abstract static class Orders implements OutboxTopicHandler {
 
         @Override
@@ -356,12 +344,17 @@ class TransactionalHandlerIT {
         public void handle(OutboxRecord record) {}
     }
 
-    record Audit(String text) {}
+    record Audit(String text) {
+
+        static Audit decode(String topic, byte[] payload) {
+            return new Audit(new String(payload, UTF_8));
+        }
+    }
 
     abstract static class TypedOrders extends TypedOutboxTopicHandler<Audit> {
 
         TypedOrders() {
-            super(Set.of("audit"), (topic, payload) -> new Audit(new String(payload, UTF_8)));
+            super(Set.of("audit"), Audit::decode);
         }
     }
 
@@ -432,53 +425,43 @@ class TransactionalHandlerIT {
         }
     }
 
-    static class TypedRollbackForOnInterface extends TypedOutboxTopicHandler<Audit> implements RollbackForOnInterface {
+    /** On topic {@code orders}, its hook applies the effects. */
+    abstract static class TypedEffects extends TypedOutboxTopicHandler<Audit> {
 
         private final Effects effects;
 
-        TypedRollbackForOnInterface(Effects effects) {
-            super(Set.of("orders"), (topic, payload) -> new Audit(new String(payload, UTF_8)));
+        TypedEffects(Effects effects) {
+            super(Set.of("orders"), Audit::decode);
             this.effects = effects;
         }
 
         @Override
         protected void handle(Audit event, OutboxRecord record) throws Exception {
             effects.apply(record);
+        }
+    }
+
+    static class TypedRollbackForOnInterface extends TypedEffects implements RollbackForOnInterface {
+
+        TypedRollbackForOnInterface(Effects effects) {
+            super(effects);
         }
     }
 
     /** Declares {@code handle(OutboxRecord)}, inherited, with no annotation: what {@code Proxy} sees of it first. */
     interface Marker extends OutboxTopicHandler {}
 
-    static class TypedRollbackForListedLater extends TypedOutboxTopicHandler<Audit>
-            implements Marker, RollbackForOnInterface {
-
-        private final Effects effects;
+    static class TypedRollbackForListedLater extends TypedEffects implements Marker, RollbackForOnInterface {
 
         TypedRollbackForListedLater(Effects effects) {
-            super(Set.of("orders"), (topic, payload) -> new Audit(new String(payload, UTF_8)));
-            this.effects = effects;
-        }
-
-        @Override
-        protected void handle(Audit event, OutboxRecord record) throws Exception {
-            effects.apply(record);
+            super(effects);
         }
     }
 
-    static class TypedRollbackForListedFirst extends TypedOutboxTopicHandler<Audit>
-            implements RollbackForOnInterface, Marker {
-
-        private final Effects effects;
+    static class TypedRollbackForListedFirst extends TypedEffects implements RollbackForOnInterface, Marker {
 
         TypedRollbackForListedFirst(Effects effects) {
-            super(Set.of("orders"), (topic, payload) -> new Audit(new String(payload, UTF_8)));
-            this.effects = effects;
-        }
-
-        @Override
-        protected void handle(Audit event, OutboxRecord record) throws Exception {
-            effects.apply(record);
+            super(effects);
         }
     }
 
@@ -644,6 +627,12 @@ class TransactionalHandlerIT {
         return runner(properties).withBean(name, type, () -> bean);
     }
 
+    /** The context refuses to start on the bean, naming the method and the fix. */
+    private static <T> void assertRefused(Class<T> type, T bean, String method, String fix, String... properties) {
+        starting("refused", type, bean, properties).run(context ->
+            assertThat(failure(context)).contains("refused").contains(method).contains(fix));
+    }
+
     private static Effects effects(ApplicationContext context) {
         return context.getBean(Effects.class);
     }
@@ -760,101 +749,86 @@ class TransactionalHandlerIT {
 
     @Test
     void plainTransactionalHandleRefused() {
-        starting("refused", OutboxTopicHandler.class, new PlainHandle()).run(context ->
-            assertThat(failure(context)).contains("refused").contains("handle(OutboxRecord)").contains(ROLLBACK_FIX));
+        assertRefused(OutboxTopicHandler.class, new PlainHandle(), "handle(OutboxRecord)", ROLLBACK_FIX);
     }
 
     @Test
     void plainTransactionalHandleRefusedOnInterfaceProxy() {
-        starting("refused", OutboxTopicHandler.class, new PlainHandle(), JDK)
-            .run(context -> assertThat(failure(context)).contains("refused").contains("handle(OutboxRecord)")
-                .contains(ROLLBACK_FIX));
+        assertRefused(OutboxTopicHandler.class, new PlainHandle(), "handle(OutboxRecord)", ROLLBACK_FIX, JDK_PROXIES);
     }
 
     @Test
     void plainTransactionalFallbackRefused() {
-        starting("refused", OutboxHandler.class, new PlainFallback()).run(context ->
-            assertThat(failure(context)).contains("refused").contains("handle(OutboxRecord)").contains(ROLLBACK_FIX));
+        assertRefused(OutboxHandler.class, new PlainFallback(), "handle(OutboxRecord)", ROLLBACK_FIX);
     }
 
     @Test
     void plainTransactionalTypedHookRefused() {
-        starting("refused", OutboxTopicHandler.class, new PlainHook()).run(context ->
-            assertThat(failure(context)).contains("refused").contains("handle(Audit, OutboxRecord)")
-                .contains(ROLLBACK_FIX));
+        assertRefused(OutboxTopicHandler.class, new PlainHook(), "handle(Audit, OutboxRecord)", ROLLBACK_FIX);
     }
 
     @Test
     void plainTransactionalTombstoneRefused() {
-        starting("refused", OutboxTopicHandler.class, new PlainTombstone()).run(context ->
-            assertThat(failure(context)).contains("refused").contains("handleTombstone(OutboxRecord)")
-                .contains(ROLLBACK_FIX));
+        assertRefused(OutboxTopicHandler.class, new PlainTombstone(), "handleTombstone(OutboxRecord)", ROLLBACK_FIX);
     }
 
     @Test
     void classLevelPlainTransactionalRefused() {
-        starting("refused", OutboxTopicHandler.class, new ClassLevelPlain()).run(context ->
-            assertThat(failure(context)).contains("refused").contains("handle(OutboxRecord)").contains(ROLLBACK_FIX));
-        starting("refused", OutboxTopicHandler.class, new ClassLevelPlainTyped()).run(context ->
-            assertThat(failure(context)).contains("refused").contains("handle(Audit, OutboxRecord)")
-                .contains(ROLLBACK_FIX));
+        assertRefused(OutboxTopicHandler.class, new ClassLevelPlain(), "handle(OutboxRecord)", ROLLBACK_FIX);
+        assertRefused(OutboxTopicHandler.class, new ClassLevelPlainTyped(), "handle(Audit, OutboxRecord)",
+            ROLLBACK_FIX);
     }
 
     @Test
     void noRollbackForRefused() {
-        starting("refused", OutboxTopicHandler.class, new NoRollbackFor()).run(context ->
-            assertThat(failure(context)).contains("refused").contains("handle(OutboxRecord)").contains(ROLLBACK_FIX));
+        assertRefused(OutboxTopicHandler.class, new NoRollbackFor(), "handle(OutboxRecord)", ROLLBACK_FIX);
     }
 
     @Test
     void transactionalHandleBatchOverrideRefused() {
-        starting("refused", OutboxTopicHandler.class, new TransactionalBatch()).run(context ->
-            assertThat(failure(context)).contains("refused").contains("handleBatch(List)").contains(BATCH_FIX));
-        starting("refused", OutboxTopicHandler.class, new ClassLevelPlainBatch()).run(context ->
-            assertThat(failure(context)).contains("refused").contains("handleBatch(List)").contains(BATCH_FIX));
+        assertRefused(OutboxTopicHandler.class, new TransactionalBatch(), "handleBatch(List)", BATCH_FIX);
+        assertRefused(OutboxTopicHandler.class, new ClassLevelPlainBatch(), "handleBatch(List)", BATCH_FIX);
     }
 
     @Test
     void mandatoryRefused() {
-        starting("refused", OutboxTopicHandler.class, new MandatoryRollbackFor()).run(context ->
-            assertThat(failure(context)).contains("refused").contains("handle(OutboxRecord)").contains("MANDATORY"));
+        assertRefused(OutboxTopicHandler.class, new MandatoryRollbackFor(), "handle(OutboxRecord)", "MANDATORY");
     }
 
     @Test
     void plainOnInterfaceRefusedOnInterfaceProxy() {
-        starting("refused", OutboxTopicHandler.class, new TypedPlainOnInterface(), JDK).run(context ->
-            assertThat(failure(context)).contains("refused").contains("handle(OutboxRecord)").contains(ROLLBACK_FIX));
-        starting("refused", OutboxTopicHandler.class, new PlainOnInterfaceViaBase(), JDK).run(context ->
-            assertThat(failure(context)).contains("refused").contains("handle(OutboxRecord)").contains(ROLLBACK_FIX));
+        assertRefused(OutboxTopicHandler.class, new TypedPlainOnInterface(), "handle(OutboxRecord)", ROLLBACK_FIX,
+            JDK_PROXIES);
+        assertRefused(OutboxTopicHandler.class, new PlainOnInterfaceViaBase(), "handle(OutboxRecord)", ROLLBACK_FIX,
+            JDK_PROXIES);
     }
 
     @Test
     void rollbackForOnInterfaceRollsBackOnInterfaceProxy() throws Exception {
-        app(TypedRollbackForOnInterfaceApp.class, JDK).run(context -> assertRetriedFromNothing(context));
+        app(TypedRollbackForOnInterfaceApp.class, JDK_PROXIES).run(context -> assertRetriedFromNothing(context));
     }
 
     /** {@code Proxy} hands over the method of the first listed interface having it, where Spring finds no annotation. */
     @Test
     void annotationOnALaterListedInterfaceRefusedForATypedHandler() throws Exception {
-        app(TypedRollbackForListedLaterApp.class, JDK).run(context -> assertThat(failure(context)).contains("handler")
-            .contains("handle(OutboxRecord)")
+        app(TypedRollbackForListedLaterApp.class, JDK_PROXIES).run(context -> assertThat(failure(context))
+            .contains("handler").contains("handle(OutboxRecord)")
             .contains("list RollbackForOnInterface first in the class's implements clause"));
     }
 
     @Test
     void annotationOnTheFirstListedInterfaceRollsBackForATypedHandler() throws Exception {
-        app(TypedRollbackForListedFirstApp.class, JDK).run(context -> assertRetriedFromNothing(context));
+        app(TypedRollbackForListedFirstApp.class, JDK_PROXIES).run(context -> assertRetriedFromNothing(context));
     }
 
     @Test
     void annotationOnALaterListedInterfaceRollsBackForAPlainHandler() throws Exception {
-        app(PlainRollbackForListedLaterApp.class, JDK).run(context -> assertRetriedFromNothing(context));
+        app(PlainRollbackForListedLaterApp.class, JDK_PROXIES).run(context -> assertRetriedFromNothing(context));
     }
 
     @Test
     void requiresNewPlainRefused() {
-        starting("refused", OutboxTopicHandler.class, new RequiresNewPlain()).run(context ->
-            assertThat(failure(context)).contains("refused").contains("handle(OutboxRecord)").contains(ROLLBACK_FIX));
+        assertRefused(OutboxTopicHandler.class, new RequiresNewPlain(), "handle(OutboxRecord)", ROLLBACK_FIX);
     }
 
     @Test

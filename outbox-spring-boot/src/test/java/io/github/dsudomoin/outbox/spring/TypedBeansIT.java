@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.spring;
 
+import static io.github.dsudomoin.outbox.spring.TestApps.failure;
 import static io.github.dsudomoin.outbox.spring.TestApps.runner;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -143,8 +144,8 @@ class TypedBeansIT {
         return new String(events.message("orders", "k", ORDER).payload(), UTF_8);
     }
 
-    private static String failure(AssertableApplicationContext context) {
-        return HandlerProxiesIT.failure(context);
+    private static String refundJson(TypedOutbox<Refund> events) {
+        return new String(events.message("t", "k", new Refund(7)).payload(), UTF_8);
     }
 
     @Test
@@ -290,8 +291,7 @@ class TypedBeansIT {
             assertThat(payload(context.getBean(Orders.class).events)).isEqualTo("explicit");
             var refunds = context.getBean(Refunds.class);
             assertThat(refunds.orders).isSameAs(context.getBean("explicitSerializer"));
-            assertThat(new String(refunds.events.message("refunds", "k", new Refund(7)).payload(), UTF_8))
-                .as("other types still get JSON").isEqualTo("{\"orderId\":7}");
+            assertThat(refundJson(refunds.events)).as("other types still get JSON").isEqualTo("{\"orderId\":7}");
         });
     }
 
@@ -334,8 +334,7 @@ class TypedBeansIT {
     void explicitTypedOutboxWins() {
         app().withUserConfiguration(Orders.class, Refunds.class, ExplicitTypedOutbox.class).run(context -> {
             assertThat(context.getBean(Orders.class).events).isSameAs(context.getBean("explicitOrders"));
-            assertThat(new String(context.getBean(Refunds.class).events.message("r", "k", new Refund(7)).payload(),
-                UTF_8)).isEqualTo("{\"orderId\":7}");
+            assertThat(refundJson(context.getBean(Refunds.class).events)).isEqualTo("{\"orderId\":7}");
         });
     }
 
@@ -434,21 +433,6 @@ class TypedBeansIT {
         }
     }
 
-    @Test
-    void genericPayloadKeepsItsElementType() {
-        app().withUserConfiguration(GenericPayloads.class).run(context -> {
-            var beans = context.getBean(GenericPayloads.class);
-            var payload = beans.events.message("t", "k", List.of(new Refund(7))).payload();
-            assertThat(beans.deserializer.deserialize("t", payload)).containsExactly(new Refund(7));
-        });
-        app("outbox.json.mapper=jackson3").withUserConfiguration(GenericPayloads.class, Jackson3Bean.class)
-            .run(context -> {
-                var beans = context.getBean(GenericPayloads.class);
-                var payload = beans.events.message("t", "k", List.of(new Refund(7))).payload();
-                assertThat(beans.deserializer.deserialize("t", payload)).containsExactly(new Refund(7));
-            });
-    }
-
     abstract static class Sender<T> {
 
         @Autowired
@@ -460,8 +444,7 @@ class TypedBeansIT {
     @Test
     void typeArgumentResolvedThroughASubclass() {
         app().withUserConfiguration(RefundSender.class).run(context ->
-            assertThat(new String(context.getBean(RefundSender.class).events
-                .message("t", "k", new Refund(7)).payload(), UTF_8)).isEqualTo("{\"orderId\":7}"));
+            assertThat(refundJson(context.getBean(RefundSender.class).events)).isEqualTo("{\"orderId\":7}"));
     }
 
     /** A handler reaches its outbox lazily (an Outbox is built from the handlers): the provider keeps T. */
@@ -477,8 +460,8 @@ class TypedBeansIT {
     @Test
     void providerInjectionKeepsTheType() {
         app().withUserConfiguration(LazySender.class).run(context ->
-            assertThat(new String(context.getBean(LazySender.class).events.getObject()
-                .message("t", "k", new Refund(7)).payload(), UTF_8)).isEqualTo("{\"orderId\":7}"));
+            assertThat(refundJson(context.getBean(LazySender.class).events.getObject()))
+                .isEqualTo("{\"orderId\":7}"));
     }
 
     @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, property = "kind")
@@ -536,6 +519,15 @@ class TypedBeansIT {
     private static void onEachMajor(Class<?> beans, ContextConsumer<AssertableApplicationContext> test) {
         app("outbox.json.mapper=jackson2").withUserConfiguration(beans).run(test);
         app("outbox.json.mapper=jackson3").withUserConfiguration(beans, Jackson3Bean.class).run(test);
+    }
+
+    @Test
+    void genericPayloadKeepsItsElementType() {
+        onEachMajor(GenericPayloads.class, context -> {
+            var beans = context.getBean(GenericPayloads.class);
+            var payload = beans.events.message("t", "k", List.of(new Refund(7))).payload();
+            assertThat(beans.deserializer.deserialize("t", payload)).containsExactly(new Refund(7));
+        });
     }
 
     /** The declared type is what writes the type id of what a generic class holds. */

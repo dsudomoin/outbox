@@ -380,7 +380,7 @@ class OutboxLifecycleIT {
     @Test
     void relayInjectedBeforeTheStartFails() {
         runner().withUserConfiguration(WithRoute.class, EarlyRelay.class).run(context ->
-            assertThat(HandlerProxiesIT.failure(context)).isEqualTo(OutboxLifecycle.NOT_STARTED));
+            assertThat(TestApps.failure(context)).isEqualTo(OutboxLifecycle.NOT_STARTED));
     }
 
     @Test
