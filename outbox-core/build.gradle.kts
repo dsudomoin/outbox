@@ -8,6 +8,8 @@ dependencies {
     compileOnly("jakarta.annotation:jakarta.annotation-api:2.1.1")
     // optional: ProtobufOutbox needs it on the app's classpath
     compileOnly("com.google.protobuf:protobuf-java:3.25.8")
+    // optional: HeartbeatPoolConfig, for the adapters that derive the heartbeat pool from a Hikari one
+    compileOnly("com.zaxxer:HikariCP:7.1.0")
 
     testFixturesApi("org.testcontainers:testcontainers-postgresql:2.0.5")
     testFixturesApi("org.postgresql:postgresql:42.7.14")
@@ -16,10 +18,4 @@ dependencies {
     testImplementation("jakarta.annotation:jakarta.annotation-api:2.1.1")
     testImplementation("com.google.protobuf:protobuf-java:3.25.8")
     testImplementation("com.zaxxer:HikariCP:7.1.0")
-}
-
-// test fixtures are for this repository's tests only, not part of the published artifact
-(components["java"] as AdhocComponentWithVariants).run {
-    withVariantsFromConfiguration(configurations["testFixturesApiElements"]) { skip() }
-    withVariantsFromConfiguration(configurations["testFixturesRuntimeElements"]) { skip() }
 }

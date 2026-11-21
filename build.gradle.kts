@@ -19,6 +19,14 @@ configure(published.map { project(":$it") }) {
         withSourcesJar()
     }
 
+    // test fixtures are for this repository's tests only, not part of the published artifact
+    plugins.withId("java-test-fixtures") {
+        (components["java"] as AdhocComponentWithVariants).run {
+            withVariantsFromConfiguration(configurations["testFixturesApiElements"]) { skip() }
+            withVariantsFromConfiguration(configurations["testFixturesRuntimeElements"]) { skip() }
+        }
+    }
+
     tasks.withType<JavaCompile>().configureEach {
         options.encoding = "UTF-8"
     }

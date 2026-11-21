@@ -17,9 +17,3 @@ dependencies {
     testImplementation("io.micrometer:micrometer-tracing-bridge-otel:1.2.12")
     testImplementation("io.opentelemetry:opentelemetry-sdk-testing:1.31.0")
 }
-
-// test fixtures are for this repository's tests only, not part of the published artifact
-(components["java"] as AdhocComponentWithVariants).run {
-    withVariantsFromConfiguration(configurations["testFixturesApiElements"]) { skip() }
-    withVariantsFromConfiguration(configurations["testFixturesRuntimeElements"]) { skip() }
-}

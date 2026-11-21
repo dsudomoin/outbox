@@ -7,7 +7,6 @@ dependencies {
     compileOnly("jakarta.annotation:jakarta.annotation-api:2.1.1")
 
     testImplementation(testFixtures(project(":outbox-core")))
-    testImplementation("jakarta.annotation:jakarta.annotation-api:2.1.1")
     testImplementation("io.micrometer:micrometer-tracing-bridge-otel:1.2.12")
     testImplementation("io.opentelemetry:opentelemetry-sdk-testing:1.31.0")
 }

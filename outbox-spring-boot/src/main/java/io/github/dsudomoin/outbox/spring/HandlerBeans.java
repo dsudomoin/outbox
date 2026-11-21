@@ -84,14 +84,11 @@ final class HandlerBeans {
     @Nullable
     private final OutboxHandler fallback;
     private final List<OutboxTopicHandler> routes;
-    private final List<Handler> handlers;
     private final String routesLine;
 
-    private HandlerBeans(@Nullable OutboxHandler fallback, List<OutboxTopicHandler> routes, List<Handler> handlers,
-            String routesLine) {
+    private HandlerBeans(@Nullable OutboxHandler fallback, List<OutboxTopicHandler> routes, String routesLine) {
         this.fallback = fallback;
         this.routes = routes;
-        this.handlers = handlers;
         this.routesLine = routesLine;
     }
 
@@ -158,8 +155,8 @@ final class HandlerBeans {
         handlers.forEach(handler -> TransactionalHandlerCheck.check(handler, beans));
         var line = claims.isEmpty() ? "none" : claims.entrySet().stream()
             .map(e -> e.getKey() + " -> " + e.getValue().name()).collect(Collectors.joining(", "));
-        return new HandlerBeans(fallback, List.copyOf(routes), List.copyOf(handlers),
-            "outbox routes: " + line + "; other topics -> " + fallbackName);
+        return new HandlerBeans(fallback, List.copyOf(routes), "outbox routes: " + line + "; other topics -> "
+            + fallbackName);
     }
 
     /**
@@ -213,11 +210,6 @@ final class HandlerBeans {
     /** The routes, as the runtime takes them. */
     List<OutboxTopicHandler> routes() {
         return routes;
-    }
-
-    /** Every handler bean, the fallback first: for checks of what runs on the relay's path. */
-    List<Handler> handlers() {
-        return handlers;
     }
 
     /** Logs each topic's route bean and where every other topic goes, at INFO. */

@@ -25,9 +25,3 @@ dependencies {
     testImplementation("io.opentelemetry:opentelemetry-sdk-trace:1.53.0")
     testImplementation("io.opentelemetry:opentelemetry-sdk-testing:1.53.0")
 }
-
-// test fixtures are for this repository's tests only, not part of the published artifact
-(components["java"] as AdhocComponentWithVariants).run {
-    withVariantsFromConfiguration(configurations["testFixturesApiElements"]) { skip() }
-    withVariantsFromConfiguration(configurations["testFixturesRuntimeElements"]) { skip() }
-}
