@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox;
 
+import static io.github.dsudomoin.outbox.testing.Handlers.eachRecord;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -135,27 +136,14 @@ class CoolingTargetIT {
         var delivered = new CopyOnWriteArrayList<String>();
         var config = new TestOutboxConfig().shards(1).batchSize(RECORDS).retry(Duration.ofSeconds(1),
                 Duration.ofMinutes(5), 0);
-        var runtime = OutboxRuntime.builder(config, transactions, new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {
-                throw new UnsupportedOperationException();
+        var runtime = OutboxRuntime.builder(config, transactions, eachRecord(r -> {
+            var key = new String(r.key(), UTF_8);
+            if (key.equals("hot") && cooling.get()) {
+                return Outcome.notAttempted(Instant.now().plus(COOLING));
             }
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                var outcomes = new ArrayList<Outcome>();
-                for (var r : records) {
-                    var key = new String(r.key(), UTF_8);
-                    if (key.equals("hot") && cooling.get()) {
-                        outcomes.add(Outcome.notAttempted(Instant.now().plus(COOLING)));
-                    } else {
-                        delivered.add(key + ":" + new String(r.payload(), UTF_8));
-                        outcomes.add(Outcome.delivered());
-                    }
-                }
-                return outcomes;
-            }
-        }).build();
+            delivered.add(key + ":" + new String(r.payload(), UTF_8));
+            return Outcome.delivered();
+        })).build();
         runtimes.add(runtime);
         runtime.start();
         int hotRows = 2 * RECORDS + 3;

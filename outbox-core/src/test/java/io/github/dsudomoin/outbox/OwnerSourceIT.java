@@ -9,6 +9,7 @@ import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.PgInbox;
 import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.internal.UuidV7;
+import io.github.dsudomoin.outbox.testing.AdminRows;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -174,8 +175,6 @@ class OwnerSourceIT {
     @Test
     void ownerMembersShareThePartitions() throws Exception {
         var members = memberRoles();
-        sql("alter schema " + schema + " owner to current_user"); // dropping a range then needs owning it
-        sql("grant usage, create on schema " + schema + " to " + owner);
         migrate();
         config.xidsPerPartition(1000).premake(2);
         try (var first = new OutboxSchema(new JdbcTransactions(as(app)), new JdbcTransactions(as(members[0])),
@@ -199,8 +198,6 @@ class OwnerSourceIT {
     @Test
     void partitionsAMemberMadeEarlierAreGivenToTheOwner() throws Exception {
         var members = memberRoles();
-        sql("alter schema " + schema + " owner to current_user");
-        sql("grant usage, create on schema " + schema + " to " + owner);
         migrate();
         config.xidsPerPartition(1000).premake(2);
         var member = new JdbcTransactions(as(members[0]));
@@ -232,8 +229,6 @@ class OwnerSourceIT {
     @Test
     void handoverNeverQueuesBehindAReader() throws Exception {
         var members = memberRoles();
-        sql("alter schema " + schema + " owner to current_user");
-        sql("grant usage, create on schema " + schema + " to " + owner);
         migrate();
         config.xidsPerPartition(1000).premake(2);
         var member = new JdbcTransactions(as(members[0]));
@@ -278,20 +273,15 @@ class OwnerSourceIT {
 
     /** Gives the schema's tables named like {@code regex} to {@code role}, as an earlier release left them. */
     private List<String> giveTo(String role, String regex) throws SQLException {
-        var tables = new ArrayList<String>();
         try (var c = TestDataSources.newDataSource().getConnection()) {
-            try (var st = c.createStatement(); var rs = st.executeQuery("select c.relname from pg_class c join"
-                    + " pg_namespace n on n.oid = c.relnamespace where n.nspname = '" + schema + "' and c.relkind = 'r'"
-                    + " and c.relname ~ '" + regex + "'")) {
-                while (rs.next()) {
-                    tables.add(rs.getString(1));
-                }
-            }
+            var tables = TestSql.queryStrings(c, "select c.relname from pg_class c join pg_namespace n on n.oid ="
+                    + " c.relnamespace where n.nspname = '" + schema + "' and c.relkind = 'r' and c.relname ~ '" + regex
+                    + "'");
             for (var table : tables) {
                 TestSql.execute(c, "alter table " + schema + "." + table + " owner to " + role);
             }
+            return tables;
         }
-        return tables;
     }
 
     /**
@@ -346,15 +336,9 @@ class OwnerSourceIT {
 
     /** The partitions of the outbox table with their bounds. */
     private List<String> partitions(Connection c) throws SQLException {
-        var partitions = new ArrayList<String>();
-        try (var st = c.createStatement(); var rs = st.executeQuery("select r.relname || ' ' || pg_get_expr("
-                + "r.relpartbound, r.oid) from pg_inherits i join pg_class r on r.oid = i.inhrelid where i.inhparent = '"
-                + names.base() + "'::regclass order by 1")) {
-            while (rs.next()) {
-                partitions.add(rs.getString(1));
-            }
-        }
-        return partitions;
+        return TestSql.queryStrings(c, "select r.relname || ' ' || pg_get_expr(r.relpartbound, r.oid) from pg_inherits"
+                + " i join pg_class r on r.oid = i.inhrelid where i.inhparent = '" + names.base() + "'::regclass order"
+                + " by 1");
     }
 
     /**
@@ -364,8 +348,6 @@ class OwnerSourceIT {
     @Test
     void ownerWithoutCreateOnSchemaKeepsTheCreator() throws Exception {
         var members = memberRoles();
-        sql("alter schema " + schema + " owner to current_user");
-        sql("grant usage, create on schema " + schema + " to " + owner);
         migrate();
         sql("revoke create on schema " + schema + " from " + owner);
         sql("grant create on schema " + schema + " to " + members[0]);
@@ -379,27 +361,25 @@ class OwnerSourceIT {
                 .allMatch(table -> table.endsWith(" (" + members[0] + ")"));
     }
 
+    /** Two login roles in {@link #owner}, and the schema owned by the test's role, {@code owner} creating in it. */
     private String[] memberRoles() throws SQLException {
         var members = new String[] {"m" + TestSql.uniqueTable(), "m" + TestSql.uniqueTable()};
         for (var member : members) {
             sql("create role " + member + " login password 'pw' in role " + owner);
             sql("grant pg_read_all_stats to " + member);
         }
+        sql("alter schema " + schema + " owner to current_user"); // dropping a range then needs owning it
+        sql("grant usage, create on schema " + schema + " to " + owner);
         return members;
     }
 
     /** The schema's tables whose owner is not {@link #owner}. */
     private List<String> foreignTables() throws SQLException {
-        var tables = new ArrayList<String>();
-        try (var c = TestDataSources.newDataSource().getConnection(); var st = c.createStatement();
-                var rs = st.executeQuery("select r.relname || ' (' || pg_get_userbyid(r.relowner) || ')' from pg_class r"
-                        + " join pg_namespace n on n.oid = r.relnamespace where n.nspname = '" + schema + "' and"
-                        + " r.relkind in ('r', 'p') and pg_get_userbyid(r.relowner) <> '" + owner + "'")) {
-            while (rs.next()) {
-                tables.add(rs.getString(1));
-            }
+        try (var c = TestDataSources.newDataSource().getConnection()) {
+            return TestSql.queryStrings(c, "select r.relname || ' (' || pg_get_userbyid(r.relowner) || ')' from"
+                    + " pg_class r join pg_namespace n on n.oid = r.relnamespace where n.nspname = '" + schema + "' and"
+                    + " r.relkind in ('r', 'p') and pg_get_userbyid(r.relowner) <> '" + owner + "'");
         }
-        return tables;
     }
 
     /**
@@ -480,7 +460,8 @@ class OwnerSourceIT {
             Thread.sleep(8_000);
             restoreDetachedRange(outbox.admin()); // a foreign orphan: every row of it back into the outbox
             Thread.sleep(8_000);
-            forgeXidRegression(); // the next tick halts the relay; maintenance recovers it on the owner source
+            // the next tick halts the relay; maintenance recovers it on the owner source
+            new AdminRows(TestDataSources.newDataSource()::getConnection, names).forgeRegression();
             Thread.sleep(14_000);
             stop.set(true);
             for (var t : writers) {
@@ -584,14 +565,6 @@ class OwnerSourceIT {
                 assertThat(System.nanoTime()).as("restoreOrphan(" + range + ") within 30 s: " + e).isLessThan(deadline);
                 Thread.sleep(200);
             }
-        }
-    }
-
-    private void forgeXidRegression() throws SQLException {
-        try (var c = TestDataSources.newDataSource().getConnection()) {
-            long xmax = TestSql.queryLong(c, "select pg_current_xact_id()::text::bigint") + 1_000_000_000L;
-            TestSql.execute(c, "insert into " + names.tick() + " (snapshot, created_at) values ('" + xmax + ":" + xmax
-                    + ":'::pg_snapshot, now() - interval '1 minute')");
         }
     }
 

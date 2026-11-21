@@ -1,19 +1,19 @@
 package io.github.dsudomoin.outbox;
 
+import static io.github.dsudomoin.outbox.testing.Handlers.eachRecord;
+import static io.github.dsudomoin.outbox.testing.Intercepting.intercepting;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import io.github.dsudomoin.outbox.testing.AdminRows;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import java.io.IOException;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -55,6 +55,7 @@ class NetworkBlackholeIT {
 
     private final Blackhole hole = new Blackhole();
     private final List<AutoCloseable> closing = new ArrayList<>();
+    private final JdbcTransactions direct = new JdbcTransactions(DIRECT);
 
     NetworkBlackholeIT() throws IOException {}
 
@@ -81,28 +82,25 @@ class NetworkBlackholeIT {
                 }).build();
         closing.add(relay);
         relay.start();
-        var writerTransactions = new JdbcTransactions(DIRECT);
         var writer = OutboxRuntime.builder(new TestOutboxConfig().table(config.table()).relayEnabled(false)
-                .maintenanceInterval(Duration.ofMillis(500)), writerTransactions, record -> {}).build();
+                .maintenanceInterval(Duration.ofMillis(500)), direct, record -> {}).build();
         closing.add(writer);
         writer.start();
         var sent = new HashSet<UUID>();
-        sent.add(send(writer, writerTransactions, "before"));
+        sent.add(send(writer, direct, "before"));
         await(() -> delivered.containsAll(sent));
 
         hole.shut();
-        sent.add(send(writer, writerTransactions, "during"));
+        sent.add(send(writer, direct, "during"));
         int failed = failures.get();
         await(() -> failures.get() > failed);
         assertThat(delivered.containsAll(sent)).as("what was sent during it waits").isFalse();
 
         hole.open();
-        sent.add(send(writer, writerTransactions, "after"));
+        sent.add(send(writer, direct, "after"));
         await(() -> delivered.containsAll(sent));
         assertThat(relay.relay().running()).isTrue();
-        var names = relay.schema().names();
-        long seen = lastSeen(names.instance(), relay);
-        await(() -> lastSeen(names.instance(), relay) > seen);
+        awaitBeat(relay);
     }
 
     @Test
@@ -167,17 +165,13 @@ class NetworkBlackholeIT {
                 record -> delivered.add(record.messageId())).build();
         closing.add(relay);
         relay.start();
-        var writerTransactions = new JdbcTransactions(DIRECT);
-        var writer = OutboxRuntime.builder(new TestOutboxConfig().table(config.table()).relayEnabled(false),
-                writerTransactions, record -> {}).build();
-        closing.add(writer);
-        writer.start();
+        var writer = writer(config.table());
         var sent = new HashSet<UUID>();
-        sent.add(send(writer, writerTransactions, "before"));
+        sent.add(send(writer, direct, "before"));
         await(() -> delivered.containsAll(sent));
 
         hole.forget(); // each worker's next statement, on its pooled connection, waits on a silent socket
-        sent.add(send(writer, writerTransactions, "after"));
+        sent.add(send(writer, direct, "after"));
 
         await(() -> delivered.containsAll(sent));
         assertThat(relay.relay().running()).isTrue();
@@ -191,14 +185,10 @@ class NetworkBlackholeIT {
                 record -> delivered.add(record.messageId())).build();
         closing.add(relay);
         relay.start();
-        var writerTransactions = new JdbcTransactions(DIRECT);
-        var writer = OutboxRuntime.builder(new TestOutboxConfig().table(config.table()).relayEnabled(false),
-                writerTransactions, record -> {}).build();
-        closing.add(writer);
-        writer.start();
+        var writer = writer(config.table());
 
         hole.forget();
-        var after = send(writer, writerTransactions, "after");
+        var after = send(writer, direct, "after");
 
         await(() -> delivered.contains(after)); // within the await, so by the 1 s of the DataSource, not by the hour
     }
@@ -330,11 +320,8 @@ class NetworkBlackholeIT {
         runtime.start();
         var names = runtime.schema().names();
         send(runtime, transactions, "k");
+        new AdminRows(DIRECT::getConnection, names).forgeRegression();
         try (var holder = DIRECT.getConnection()) {
-            long xmax = TestSql.queryLong(holder, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint")
-                    + 1_000_000_000L;
-            TestSql.execute(holder, "insert into " + names.tick() + " (snapshot, created_at) values ('" + xmax + ":"
-                    + xmax + ":'::pg_snapshot, now() - interval '1 minute')");
             holder.setAutoCommit(false);
             TestSql.execute(holder, "lock table " + names.cursor() + " in access exclusive mode");
             var release = CompletableFuture.runAsync(() -> {
@@ -389,31 +376,20 @@ class NetworkBlackholeIT {
                 .maintenanceInterval(Duration.ofMillis(100));
         Set<UUID> handed = ConcurrentHashMap.newKeySet();
         var transactions = new JdbcTransactions(pool(throughTheHole(3, 0)));
-        var relay = OutboxRuntime.builder(config, transactions, new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {}
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                return records.stream().map(r -> Outcome.permanent(new IOException("never"))).toList();
-            }
-        }).deadLetterHandler(letters -> {
+        var relay = OutboxRuntime.builder(config, transactions,
+                eachRecord(r -> Outcome.permanent(new IOException("never")))).deadLetterHandler(letters -> {
             letters.forEach(letter -> handed.add(letter.messageId()));
             return letters.stream().map(letter -> DeadLetterDecision.keep()).toList();
         }).build();
         closing.add(relay);
         relay.start();
-        var writerTransactions = new JdbcTransactions(DIRECT);
-        var writer = OutboxRuntime.builder(new TestOutboxConfig().table(config.table()).relayEnabled(false),
-                writerTransactions, record -> {}).build();
-        closing.add(writer);
-        writer.start();
-        var before = send(writer, writerTransactions, "before");
+        var writer = writer(config.table());
+        var before = send(writer, direct, "before");
         await(() -> handed.contains(before));
 
         Thread.sleep(150); // past its run, so it waits on its next statement
         hole.forget();
-        var after = send(writer, writerTransactions, "after");
+        var after = send(writer, direct, "after");
 
         await(() -> handed.contains(after));
     }
@@ -426,15 +402,8 @@ class NetworkBlackholeIT {
         var calls = new AtomicInteger();
         var inHook = new CountDownLatch(1);
         var transactions = new JdbcTransactions(pool(throughTheHole(3, 0)));
-        var relay = OutboxRuntime.builder(config, transactions, new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {}
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                return records.stream().map(r -> Outcome.permanent(new IOException("never"))).toList();
-            }
-        }).deadLetterHandler(letters -> {
+        var relay = OutboxRuntime.builder(config, transactions,
+                eachRecord(r -> Outcome.permanent(new IOException("never")))).deadLetterHandler(letters -> {
             if (calls.getAndIncrement() == 0) {
                 inHook.countDown();
                 try {
@@ -447,12 +416,8 @@ class NetworkBlackholeIT {
         }).build();
         closing.add(relay);
         relay.start();
-        var writerTransactions = new JdbcTransactions(DIRECT);
-        var writer = OutboxRuntime.builder(new TestOutboxConfig().table(config.table()).relayEnabled(false),
-                writerTransactions, record -> {}).build();
-        closing.add(writer);
-        writer.start();
-        send(writer, writerTransactions, "cut");
+        var writer = writer(config.table());
+        send(writer, direct, "cut");
         assertThat(inHook.await(30, TimeUnit.SECONDS)).isTrue();
 
         hole.forget();
@@ -475,12 +440,10 @@ class NetworkBlackholeIT {
                 .heartbeatConnections(own::getConnection).build();
         closing.add(relay);
         relay.start();
-        var names = relay.schema().names();
 
         hole.forget();
 
-        long seen = lastSeen(names.instance(), relay);
-        await(() -> lastSeen(names.instance(), relay) > seen);
+        awaitBeat(relay);
     }
 
     @Test
@@ -493,12 +456,10 @@ class NetworkBlackholeIT {
                 }).build();
         closing.add(relay);
         relay.start();
-        var names = relay.schema().names();
 
         hole.forget();
 
-        long seen = lastSeen(names.instance(), relay);
-        await(() -> lastSeen(names.instance(), relay) > seen);
+        awaitBeat(relay);
     }
 
     @Test
@@ -515,12 +476,10 @@ class NetworkBlackholeIT {
                 .heartbeatConnections(source::getConnection).build();
         closing.add(relay);
         relay.start();
-        var names = relay.schema().names();
         armed.set(true);
         await(() -> !armed.get());
 
-        long seen = lastSeen(names.instance(), relay);
-        await(Duration.ofSeconds(20), () -> lastSeen(names.instance(), relay) > seen); // not the 60 s socketTimeout
+        awaitBeat(Duration.ofSeconds(20), relay); // not the 60 s socketTimeout
     }
 
     @Test
@@ -537,13 +496,11 @@ class NetworkBlackholeIT {
         var relay = OutboxRuntime.builder(config, new JdbcTransactions(source), record -> {}).build();
         closing.add(relay);
         relay.start();
-        var names = relay.schema().names();
         armed.set(true);
         await(() -> !armed.get());
 
         Thread.sleep(1500); // the client has given that beat up
-        long seen = lastSeen(names.instance(), relay);
-        await(() -> lastSeen(names.instance(), relay) > seen);
+        awaitBeat(relay);
     }
 
     @Test
@@ -567,16 +524,12 @@ class NetworkBlackholeIT {
                 record -> delivered.add(record.messageId())).build();
         closing.add(relay);
         relay.start();
-        var writerTransactions = new JdbcTransactions(DIRECT);
-        var writer = OutboxRuntime.builder(new TestOutboxConfig().table(config.table()).relayEnabled(false),
-                writerTransactions, record -> {}).build();
-        closing.add(writer);
-        writer.start();
+        var writer = writer(config.table());
         await(cut::get);
 
         var sent = new HashSet<UUID>();
         for (int i = 0; i < 64; i++) { // on every shard
-            sent.add(send(writer, writerTransactions, "k" + i));
+            sent.add(send(writer, direct, "k" + i));
         }
 
         await(() -> delivered.containsAll(sent));
@@ -807,16 +760,12 @@ class NetworkBlackholeIT {
     void aBatchStreamedIntoASilentNetworkFreesItsShard() throws Exception {
         var config = new TestOutboxConfig().batchTimeout(Duration.ofSeconds(1)).batchSize(1000)
                 .maintenanceInterval(Duration.ofMillis(500));
-        var writerTransactions = new JdbcTransactions(DIRECT);
-        var writer = OutboxRuntime.builder(new TestOutboxConfig().table(config.table()).relayEnabled(false),
-                writerTransactions, record -> {}).build();
-        closing.add(writer);
-        writer.start();
+        var writer = writer(config.table());
         var payload = new byte[20_000];
         Arrays.fill(payload, (byte) 'p');
         var sent = new HashSet<UUID>();
         for (int t = 0; t < 15; t++) { // ~60 MB on the wire as hex: past any buffer between the backend and the relay
-            sent.addAll(writerTransactions.inTx(c -> {
+            sent.addAll(direct.inTx(c -> {
                 var ids = new ArrayList<UUID>();
                 for (int i = 0; i < 100; i++) {
                     ids.add(writer.outbox().send(OutboxMessage.of("t", "one-shard", payload)));
@@ -1035,13 +984,11 @@ class NetworkBlackholeIT {
                 }).build();
         closing.add(relay);
         relay.start();
-        var instances = relay.schema().names().instance();
 
         reachable.set(true);
 
         Thread.sleep(500); // on the beat that takes it
-        long seen = lastSeen(instances, relay);
-        await(() -> lastSeen(instances, relay) > seen);
+        awaitBeat(relay);
     }
 
     @Test
@@ -1126,6 +1073,26 @@ class NetworkBlackholeIT {
         return transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", key, "p".getBytes(UTF_8))));
     }
 
+    /** A writer-only instance on {@link #DIRECT} for {@code table}, started; closed after the test. */
+    private OutboxRuntime writer(String table) {
+        var writer = OutboxRuntime.builder(new TestOutboxConfig().table(table).relayEnabled(false), direct,
+                record -> {}).build();
+        closing.add(writer);
+        writer.start();
+        return writer;
+    }
+
+    /** Until {@code relay}'s heartbeat beats again, within 30 s. */
+    private static void awaitBeat(OutboxRuntime relay) throws Exception {
+        awaitBeat(Duration.ofSeconds(30), relay);
+    }
+
+    private static void awaitBeat(Duration bound, OutboxRuntime relay) throws Exception {
+        var instances = relay.schema().names().instance();
+        long seen = lastSeen(instances, relay);
+        await(bound, () -> lastSeen(instances, relay) > seen);
+    }
+
     private static long lastSeen(String instances, OutboxRuntime runtime) throws Exception {
         try (var c = DIRECT.getConnection()) {
             return TestSql.queryLong(c, "select (extract(epoch from last_seen) * 1000000)::bigint from " + instances
@@ -1170,32 +1137,6 @@ class NetworkBlackholeIT {
                 calls.add(Thread.currentThread().getName() + ":" + args[1]);
             }
         });
-    }
-
-    /** {@code source}, a plain wrapper restoring nothing, with {@code before} run ahead of each connection's call. */
-    private static DataSource intercepting(DataSource source, ConnectionCall before) {
-        return (DataSource) Proxy.newProxyInstance(DataSource.class.getClassLoader(), new Class<?>[] {DataSource.class},
-                (ds, method, args) -> {
-                    var result = invoke(source, method, args);
-                    return !method.getName().equals("getConnection") ? result : Proxy.newProxyInstance(
-                            Connection.class.getClassLoader(), new Class<?>[] {Connection.class}, (c, call, values) -> {
-                                before.run((Connection) result, call, values);
-                                return invoke(result, call, values);
-                            });
-                });
-    }
-
-    @FunctionalInterface
-    private interface ConnectionCall {
-        void run(Connection real, Method call, Object[] args) throws Exception;
-    }
-
-    private static Object invoke(Object target, Method method, Object[] args) throws Throwable {
-        try {
-            return method.invoke(target, args);
-        } catch (InvocationTargetException e) {
-            throw e.getCause();
-        }
     }
 
     private static void await(Check condition) throws Exception {

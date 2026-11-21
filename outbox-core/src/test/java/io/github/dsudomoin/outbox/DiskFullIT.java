@@ -2,13 +2,9 @@ package io.github.dsudomoin.outbox;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.github.dockerjava.api.model.ExposedPort;
-import com.github.dockerjava.api.model.PortBinding;
-import com.github.dockerjava.api.model.Ports;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
-import java.net.ServerSocket;
 import java.time.Duration;
 import java.util.Map;
 import java.util.Set;
@@ -33,15 +29,9 @@ class DiskFullIT {
 
     @Test
     void aFullDiskRefusesWritesAndLosesNothing() throws Exception {
-        int port;
-        try (var socket = new ServerSocket(0)) {
-            port = socket.getLocalPort();
-        }
         try (var pg = new PostgreSQLContainer("postgres:16-alpine")
                 .withTmpFs(Map.of("/var/lib/postgresql/data", "rw,size=256m"))
-                .withCommand("postgres", "-c", "max_wal_size=64MB", "-c", "min_wal_size=32MB")
-                .withCreateContainerCmdModifier(cmd -> cmd.getHostConfig().withPortBindings(
-                        new PortBinding(Ports.Binding.bindPort(port), new ExposedPort(5432))))) {
+                .withCommand("postgres", "-c", "max_wal_size=64MB", "-c", "min_wal_size=32MB")) {
             pg.start();
             var hikari = new HikariConfig();
             hikari.setJdbcUrl(pg.getJdbcUrl());
@@ -58,7 +48,6 @@ class DiskFullIT {
                         record -> delivered.add(record.messageId())).build()) {
                     runtime.start();
                     // the filler leaves about 24 MB: the writers below fill that in seconds
-                    exec(pg, "df -m /var/lib/postgresql/data | tail -1");
                     exec(pg, "fallocate -l $(( $(df -m /var/lib/postgresql/data | tail -1 | awk '{print $4}') - 24 ))M"
                             + " /var/lib/postgresql/data/filler || dd if=/dev/zero of=/var/lib/postgresql/data/filler"
                             + " bs=1M count=$(( $(df -m /var/lib/postgresql/data | tail -1 | awk '{print $4}') - 24 ))");

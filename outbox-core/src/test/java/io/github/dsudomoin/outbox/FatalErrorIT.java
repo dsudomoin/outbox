@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox;
 
+import static io.github.dsudomoin.outbox.testing.Intercepting.intercepting;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -9,10 +10,6 @@ import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import java.io.OutputStream;
 import java.io.PrintStream;
-import java.io.PrintWriter;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Proxy;
-import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -23,7 +20,6 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.logging.Logger;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
 
@@ -39,78 +35,30 @@ class FatalErrorIT {
      * While {@code on}, a statement prepared on a thread whose name starts with one of the prefixes throws OOM, or with
      * {@code ordinary} an SQLException that loses no connection.
      */
-    private static final class Failing implements DataSource {
+    private static final class Failing {
 
         volatile boolean on;
         volatile boolean ordinary;
         final AtomicInteger thrown = new AtomicInteger();
         final Set<String> threads = ConcurrentHashMap.newKeySet();
-
-        @Override
-        public Connection getConnection() throws SQLException {
-            var c = DIRECT.getConnection();
-            return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
-                    new Class<?>[] {Connection.class}, (proxy, method, args) -> {
-                        var name = Thread.currentThread().getName();
-                        if (on && method.getName().startsWith("prepare")
-                                && (name.startsWith("outbox-relay-") || name.startsWith("outbox-maintenance")
-                                        || name.startsWith("outbox-dead-letters"))) {
-                            thrown.incrementAndGet();
-                            threads.add(name.replaceAll("-\\d+$", ""));
-                            if (ordinary) {
-                                throw new SQLException("statement failed (test)");
-                            }
-                            throw new OutOfMemoryError("Java heap space (test)");
-                        }
-                        try {
-                            return method.invoke(c, args);
-                        } catch (InvocationTargetException e) {
-                            throw e.getCause();
-                        }
-                    });
-        }
-
-        @Override
-        public Connection getConnection(String user, String password) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public PrintWriter getLogWriter() {
-            return null;
-        }
-
-        @Override
-        public void setLogWriter(PrintWriter out) {}
-
-        @Override
-        public void setLoginTimeout(int seconds) {}
-
-        @Override
-        public int getLoginTimeout() {
-            return 0;
-        }
-
-        @Override
-        public Logger getParentLogger() {
-            return Logger.getGlobal();
-        }
-
-        @Override
-        public <T> T unwrap(Class<T> iface) throws SQLException {
-            throw new SQLException("not a wrapper");
-        }
-
-        @Override
-        public boolean isWrapperFor(Class<?> iface) {
-            return false;
-        }
+        final DataSource source = intercepting(DIRECT, (c, call, args) -> {
+            var name = Thread.currentThread().getName();
+            if (on && call.getName().startsWith("prepare") && (name.startsWith("outbox-relay-")
+                    || name.startsWith("outbox-maintenance") || name.startsWith("outbox-dead-letters"))) {
+                thrown.incrementAndGet();
+                threads.add(name.replaceAll("-\\d+$", ""));
+                if (ordinary) {
+                    throw new SQLException("statement failed (test)");
+                }
+                throw new OutOfMemoryError("Java heap space (test)");
+            }
+        });
     }
 
     @Test
     void theRelaysThreadsOutliveAnOutOfMemoryError() throws Exception {
         var failing = new Failing();
-        var transactions = new JdbcTransactions(failing);
+        var transactions = new JdbcTransactions(failing.source);
         var config = new TestOutboxConfig().workers(2).maintenanceInterval(Duration.ofMillis(200))
                 .retry(Duration.ofMillis(50), Duration.ofMillis(400), 0);
         Set<UUID> delivered = ConcurrentHashMap.newKeySet();
@@ -194,7 +142,7 @@ class FatalErrorIT {
     void aFatalErrorReportingAnOrdinaryFailureEndsNoThread() throws Exception {
         var failing = new Failing();
         failing.ordinary = true;
-        var transactions = new JdbcTransactions(failing);
+        var transactions = new JdbcTransactions(failing.source);
         var config = new TestOutboxConfig().workers(2).retry(Duration.ofMillis(50), Duration.ofMillis(400), 0);
         var hookThrown = new AtomicInteger();
         var logThrown = new AtomicInteger();

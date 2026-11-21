@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox;
 
+import static io.github.dsudomoin.outbox.testing.Handlers.eachRecord;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -53,21 +54,13 @@ class ClockSkewIT {
     void aSkewedRelayLeavesNothingForTheOthersToWaitFor(long skew) throws Exception {
         config.shards(4).retry(Duration.ofMillis(100), Duration.ofMillis(200), 0);
         Set<UUID> delivered = ConcurrentHashMap.newKeySet();
-        var skewed = runtime(skew, new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {}
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) { // the target is down, but for its key "ok"
-                return records.stream().map(r -> {
-                    if ("ok".equals(key(r))) {
-                        delivered.add(r.messageId());
-                        return Outcome.delivered();
-                    }
-                    return Outcome.retry(new IOException("down"));
-                }).toList();
+        var skewed = runtime(skew, eachRecord(r -> { // the target is down, but for its key "ok"
+            if ("ok".equals(key(r))) {
+                delivered.add(r.messageId());
+                return Outcome.delivered();
             }
-        });
+            return Outcome.retry(new IOException("down"));
+        }));
         var sent = new HashSet<UUID>();
         for (var key : List.of("ok", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p")) {
             sent.add(send(skewed, key));
@@ -89,16 +82,8 @@ class ClockSkewIT {
     @ValueSource(longs = {7200, -7200})
     void aDivertedKeyWaitsOutItsBackoffOnEveryInstance(long skew) throws Exception {
         config.shards(1).retry(LONG, LONG, 0);
-        var skewed = runtime(skew, new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {}
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                return records.stream().map(r -> "ok".equals(key(r)) ? Outcome.delivered()
-                        : Outcome.retry(new IOException("down"))).toList();
-            }
-        });
+        var skewed = runtime(skew, eachRecord(r -> "ok".equals(key(r)) ? Outcome.delivered()
+                : Outcome.retry(new IOException("down"))));
         var bad = transactions.inTx(c -> {
             skewed.outbox().send(OutboxMessage.of(TOPIC, "ok", "p".getBytes(UTF_8)));
             return skewed.outbox().send(OutboxMessage.of(TOPIC, "bad", "p".getBytes(UTF_8)));
@@ -149,24 +134,18 @@ class ClockSkewIT {
     void aHandlersOwnTimeMeansTheDelayItMeant(long skew) throws Exception {
         config.shards(1);
         var clock = clock(skew);
-        var skewed = runtime(skew, new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {}
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                var at = clock.instant().plus(LONG);
-                return records.stream().map(r -> switch (key(r)) {
-                    case "retry" -> Outcome.retry(new IOException("down"), at);
-                    case "skipped" -> Outcome.notAttempted(at);
-                    case "waits" -> Outcome.waitFor("not yet", at);
-                    case "requeued" -> Outcome.requeue(at);
-                    case "forever" -> Outcome.retry(new IOException("down"), Instant.MAX);
-                    case "past" -> Outcome.retry(new IOException("down"), Instant.MIN);
-                    default -> Outcome.delivered();
-                }).toList();
-            }
-        });
+        var skewed = runtime(skew, eachRecord(r -> {
+            var at = clock.instant().plus(LONG);
+            return switch (key(r)) {
+                case "retry" -> Outcome.retry(new IOException("down"), at);
+                case "skipped" -> Outcome.notAttempted(at);
+                case "waits" -> Outcome.waitFor("not yet", at);
+                case "requeued" -> Outcome.requeue(at);
+                case "forever" -> Outcome.retry(new IOException("down"), Instant.MAX);
+                case "past" -> Outcome.retry(new IOException("down"), Instant.MIN);
+                default -> Outcome.delivered();
+            };
+        }));
         transactions.inTx(c -> {
             for (var key : List.of("ok", "retry", "skipped", "waits", "requeued", "forever", "past")) {
                 skewed.outbox().send(OutboxMessage.of(TOPIC, key, "p".getBytes(UTF_8)));
@@ -191,15 +170,8 @@ class ClockSkewIT {
     void aHooksOwnTimeMeansTheDelayItMeant(long skew) throws Exception {
         config.shards(1);
         var clock = clock(skew);
-        var skewed = OutboxRuntime.builder(config, transactions, new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {}
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                return records.stream().map(r -> Outcome.permanent(new IOException("never"))).toList();
-            }
-        }).deadLetterHandler(letters -> letters.stream().map(letter -> {
+        var skewed = OutboxRuntime.builder(config, transactions,
+                eachRecord(r -> Outcome.permanent(new IOException("never")))).deadLetterHandler(letters -> letters.stream().map(letter -> {
             var key = new String(letter.key(), UTF_8);
             return key.equals("later") ? DeadLetterDecision.redriveAt(clock.instant().plus(LONG))
                     : DeadLetterDecision.redriveAt(Instant.MAX);

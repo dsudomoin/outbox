@@ -54,13 +54,17 @@ class DatabaseSettingsIT {
     }
 
     private static Connection superuser(String database) throws SQLException {
-        var url = Pg.INSTANCE.getJdbcUrl().replaceFirst("/[^/?]+(\\?|$)", "/" + database + "$1");
-        return DriverManager.getConnection(url, Pg.INSTANCE.getUsername(), Pg.INSTANCE.getPassword());
+        return DriverManager.getConnection(url(database), Pg.INSTANCE.getUsername(), Pg.INSTANCE.getPassword());
+    }
+
+    /** The test server's JDBC URL with {@code database} in place of its own. */
+    private static String url(String database) {
+        return Pg.INSTANCE.getJdbcUrl().replaceFirst("/[^/?]+(\\?|$)", "/" + database + "$1");
     }
 
     private HikariDataSource pool(String database, String user, String password, int size) {
         var hikari = new HikariConfig();
-        hikari.setJdbcUrl(Pg.INSTANCE.getJdbcUrl().replaceFirst("/[^/?]+(\\?|$)", "/" + database + "$1"));
+        hikari.setJdbcUrl(url(database));
         hikari.setUsername(user);
         hikari.setPassword(password);
         hikari.setMaximumPoolSize(size);
@@ -265,13 +269,11 @@ class DatabaseSettingsIT {
         writer.get(30, TimeUnit.SECONDS);
         await(Duration.ofSeconds(60), () -> delivered.containsAll(committed));
         assertThat(delivered).as("only what committed").containsExactlyInAnyOrderElementsOf(committed);
-        long beaten = System.currentTimeMillis();
         await(Duration.ofSeconds(30), () -> {
             var status = runtime.admin().status();
             return !status.halted() && status.maintenanceSinceSuccessSeconds() < 2
                     && status.instances().stream().anyMatch(OutboxStatus.Instance::live);
         });
-        assertThat(System.currentTimeMillis() - beaten).isLessThan(30_000);
         assertThat(runtime.relay().running()).isTrue();
     }
 
@@ -321,11 +323,9 @@ class DatabaseSettingsIT {
         var errors = new ArrayList<String>();
         await(Duration.ofSeconds(20), () -> {
             errors.clear();
-            try (var c = ds.getConnection(); var st = c.createStatement(); var rs = st.executeQuery(
-                    "select error || ' | ' || last_handler_error from " + dead + " where handler_attempts > 0")) {
-                while (rs.next()) {
-                    errors.add(rs.getString(1));
-                }
+            try (var c = ds.getConnection()) {
+                errors.addAll(TestSql.queryStrings(c,
+                        "select error || ' | ' || last_handler_error from " + dead + " where handler_attempts > 0"));
             }
             return !errors.isEmpty();
         });

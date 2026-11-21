@@ -49,7 +49,7 @@ class UnusualWritesIT {
 
     private OutboxRuntime start(OutboxConfig config, OutboxTransactions transactions) {
         var runtime = OutboxRuntime.builder(config, transactions, record -> {
-            if (delivered.put(record.messageId(), record.payload() == null ? new byte[0] : record.payload()) != null) {
+            if (delivered.put(record.messageId(), record.payload()) != null) {
                 duplicates.incrementAndGet();
             }
             order.add(record.keyAsString() + "/" + new String(record.payload(), UTF_8));
@@ -212,7 +212,7 @@ class UnusualWritesIT {
      * usable and commits the next send.
      */
     @Test
-    void aTopicPostgresCannotStoreFailsTheSend() {
+    void aTopicPostgresCannotStoreFailsTheSend() throws Exception {
         var transactions = new JdbcTransactions(TestDataSources.newDataSource());
         var runtime = start(new TestOutboxConfig(), transactions);
 
@@ -224,7 +224,7 @@ class UnusualWritesIT {
         });
 
         assertThat(order).isEmpty();
-        assertThatAwait(() -> delivered.containsKey(ok));
+        await(Duration.ofSeconds(10), () -> delivered.containsKey(ok));
     }
 
     /** 100 000 messages in one transaction: delivered, each once. */
@@ -243,14 +243,6 @@ class UnusualWritesIT {
                 (System.nanoTime() - t0) / 1_000_000);
         assertThat(delivered.keySet()).isEqualTo(new java.util.HashSet<>(ids)); // a set: 100 000 compared at once
         assertThat(duplicates).hasValue(0);
-    }
-
-    private static void assertThatAwait(Check check) {
-        try {
-            await(Duration.ofSeconds(10), check);
-        } catch (Exception e) {
-            throw new AssertionError(e);
-        }
     }
 
     private static byte[] bytes(String s) {
