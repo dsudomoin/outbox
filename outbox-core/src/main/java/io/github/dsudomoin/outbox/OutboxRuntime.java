@@ -332,7 +332,7 @@ public final class OutboxRuntime implements AutoCloseable {
                 }
             }
             return OutboxHandler.byTopic(table, handler != null ? new LocalOnly(handler) : record -> {
-                throw CannotHandle.waiting(Outcome.Waiting.Kind.NO_ROUTE,
+                throw new OutboxWaitException(Outcome.Waiting.Kind.NO_ROUTE,
                         "no handler for topic " + record.topic() + " on this instance");
             });
         }

@@ -28,7 +28,7 @@ final class LocalOnly implements OutboxHandler {
     @Override
     public void handle(OutboxRecord record) throws Exception {
         if (local(record)) {
-            throw CannotHandle.waiting(Outcome.Waiting.Kind.NO_ROUTE, reason(record));
+            throw new OutboxWaitException(Outcome.Waiting.Kind.NO_ROUTE, reason(record));
         }
         delegate.handle(record);
     }

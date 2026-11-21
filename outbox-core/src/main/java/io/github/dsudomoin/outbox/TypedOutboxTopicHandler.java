@@ -126,7 +126,7 @@ public abstract class TypedOutboxTopicHandler<T> implements OutboxTopicHandler {
     protected final T decode(OutboxRecord record) throws Exception {
         int version = record.contractVersion();
         if (version > contractVersion) {
-            throw CannotHandle.waiting(Outcome.Waiting.Kind.CONTRACT, "contract v" + version + " of topic "
+            throw new OutboxWaitException(Outcome.Waiting.Kind.CONTRACT, "contract v" + version + " of topic "
                     + record.topic() + ", this instance reads up to v" + contractVersion);
         }
         var payload = record.payload();

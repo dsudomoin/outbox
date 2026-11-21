@@ -57,16 +57,13 @@ public final class PgOutbox implements Outbox, Contracts.TypedSend {
     /** Takes every topic. */
     public PgOutbox(OutboxTransactions db, OutboxSchema schema, int shards, Runnable wakeUpRelay,
             OutboxTelemetry telemetry) {
-        this(db, schema, shards, wakeUpRelay, telemetry, null);
+        this(db, schema, shards, wakeUpRelay, telemetry, null, new DatabaseClock(InstantSource.system()));
     }
 
-    /** {@code claimedTopics}: the only topics it takes, or null for every topic. */
-    public PgOutbox(OutboxTransactions db, OutboxSchema schema, int shards, Runnable wakeUpRelay,
-            OutboxTelemetry telemetry, @Nullable Set<String> claimedTopics) {
-        this(db, schema, shards, wakeUpRelay, telemetry, claimedTopics, new DatabaseClock(InstantSource.system()));
-    }
-
-    /** {@code clock}: the time of its message ids. */
+    /**
+     * {@code claimedTopics}: the only topics it takes, or null for every topic; {@code clock}: the time of its message
+     * ids.
+     */
     public PgOutbox(OutboxTransactions db, OutboxSchema schema, int shards, Runnable wakeUpRelay,
             OutboxTelemetry telemetry, @Nullable Set<String> claimedTopics, DatabaseClock clock) {
         OutboxSchema.validateShards(shards);

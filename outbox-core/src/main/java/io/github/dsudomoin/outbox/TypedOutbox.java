@@ -87,9 +87,4 @@ public final class TypedOutbox<T> {
     String typeName() {
         return type.getName();
     }
-
-    /** The declared type's {@link OutboxContract} version, 1 without it. */
-    int contractVersion() {
-        return version;
-    }
 }

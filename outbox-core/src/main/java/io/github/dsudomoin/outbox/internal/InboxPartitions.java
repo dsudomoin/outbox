@@ -103,14 +103,13 @@ final class InboxPartitions {
 
     /**
      * Makes ranges from the highest upper bound, or from {@code now - retention} when there is none or it lies below,
-     * until one reaches past {@code now + premake}. Returns the number made.
+     * until one reaches past {@code now + premake}.
      */
-    int ensurePremade(Connection c, long now) throws SQLException {
+    void ensurePremade(Connection c, long now) throws SQLException {
         long from = floor(now - retention);
         for (var b : PartitionDdl.listRanges(c, table)) {
             from = Math.max(from, millis(b.to()));
         }
-        int made = 0;
         while (from < now + premake) {
             // a top off the whole minute, from a table made under a sub-minute interval: the range ends on the next
             // multiple of the interval, so every later lower bound is one its name holds
@@ -118,17 +117,15 @@ final class InboxPartitions {
             PartitionDdl.createAndAttach(c, table, table + "_t" + suffix(from),
                     bound(from), bound(to), PartitionDdl.CREATE_LOCK_TIMEOUT);
             from = to;
-            made++;
         }
-        return made;
     }
 
     /**
      * Detaches concurrently and drops, lowest first, every range whose upper bound is older than
      * {@code now - retention}. A lock timeout (SQLState 55P03) surfaces as {@link SQLException} and leaves the rest
-     * to the next run. Returns the number dropped.
+     * to the next run.
      */
-    int dropExpired(Connection c, long now, Duration lockTimeout) throws SQLException {
+    void dropExpired(Connection c, long now, Duration lockTimeout) throws SQLException {
         var expired = PartitionDdl.listRanges(c, table).stream()
                 .filter(b -> millis(b.to()) < now - retention)
                 .sorted(Comparator.comparingLong(b -> millis(b.from())))
@@ -136,7 +133,6 @@ final class InboxPartitions {
         for (var b : expired) {
             PartitionDdl.detachConcurrentlyAndDrop(c, table, b.name(), lockTimeout);
         }
-        return expired.size();
     }
 
     /**
