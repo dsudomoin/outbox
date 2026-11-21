@@ -331,10 +331,7 @@ class JdbcTransactionsIT {
                     if (call.equals("close")) {
                         c.close();
                     }
-                    if (thrown instanceof Error e) {
-                        throw e;
-                    }
-                    throw thrown != null ? (Exception) thrown : new SQLException("injected " + call);
+                    throw thrown != null ? thrown : new SQLException("injected " + call);
                 }
             });
         }

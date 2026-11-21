@@ -114,13 +114,11 @@ public final class AdminRows {
                 + " waiting_since) values (2, 0, gen_random_uuid(), 't', now(), now(), now())");
         execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, created_at,"
                 + " next_attempt_at) values (3, 0, gen_random_uuid(), 't', 'k', now(), now())");
-        execute("create table " + orphan() + " (like " + names.base() + " including defaults)");
+        foreignOrphan();
         execute("insert into " + orphan() + " (id, shard, xid, message_id, topic)"
                 + " values (1, 0, '10', gen_random_uuid(), 't')");
         execute("insert into " + names.base() + " (shard, message_id, topic) values (0, gen_random_uuid(), 't')");
-        execute("insert into " + names.tick() + " (snapshot, created_at) select (x || ':' || x || ':')::pg_snapshot,"
-                + " now() - interval '1 minute' from (select pg_snapshot_xmax(pg_current_snapshot())::text::bigint"
-                + " + 1000000000 x) s");
+        forgeRegression();
         // the cursors' tick gone, so the shards stranded; the forged tick above is the latest
         execute("delete from " + names.tick() + " where id = (select min(tick_id) from " + names.cursor() + ")");
     }
@@ -174,13 +172,16 @@ public final class AdminRows {
         return messageId;
     }
 
-    /** As after a dump/restore: a tick whose snapshot xmax lies 10⁹ xids past the counter, made a minute ago. */
-    public void forgeRegression() throws SQLException {
+    /**
+     * As after a dump/restore: a tick whose snapshot xmax lies 10⁹ xids past the counter, made a minute ago; returns
+     * that xmax.
+     */
+    public long forgeRegression() throws SQLException {
         try (var c = connections.newConnection()) {
-            long xmax = TestSql.queryLong(c, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint")
-                    + 1_000_000_000L;
+            long xmax = TestSql.currentXid(c) + 1_000_000_000L;
             TestSql.execute(c, "insert into " + names.tick() + " (snapshot, created_at) values ('" + xmax + ":" + xmax
                     + ":'::pg_snapshot, now() - interval '1 minute')");
+            return xmax;
         }
     }
 

@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox;
 
+import static io.github.dsudomoin.outbox.testing.Handlers.answering;
 import static io.github.dsudomoin.outbox.testing.Handlers.eachRecord;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -173,21 +174,13 @@ class CoolingTargetIT {
     /** As {@link #start(Function)}, with {@code retry.maxDelay}; {@code retry.initialDelay} is 1 s. */
     private OutboxRuntime start(Function<Integer, Outcome> outcome, Duration maxDelay) {
         var config = new TestOutboxConfig().shards(1).batchSize(RECORDS).retry(Duration.ofSeconds(1), maxDelay, 0);
-        var runtime = OutboxRuntime.builder(config, transactions, new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {
-                throw new UnsupportedOperationException();
-            }
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                calls.add(new long[] {System.nanoTime(), records.size()});
-                failuresAtCall.add(transactions.inTx(c -> TestSql.queryLong(c, "select failures from " + cursorTable
-                        + " order by seq desc limit 1")));
-                var answer = outcome.apply(calls.size());
-                return records.stream().map(r -> answer).toList();
-            }
-        }).build();
+        var runtime = OutboxRuntime.builder(config, transactions, answering(records -> {
+            calls.add(new long[] {System.nanoTime(), records.size()});
+            failuresAtCall.add(transactions.inTx(c -> TestSql.queryLong(c, "select failures from " + cursorTable
+                    + " order by seq desc limit 1")));
+            var answer = outcome.apply(calls.size());
+            return records.stream().map(r -> answer).toList();
+        })).build();
         runtimes.add(runtime);
         runtime.start();
         cursorTable = runtime.schema().names().cursor(); // before the first row is sent, so before the first call

@@ -14,7 +14,6 @@ import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.OutboxTelemetry.ShardQueue;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
-import io.github.dsudomoin.outbox.internal.Cursors.Position;
 import io.github.dsudomoin.outbox.internal.Ticks.Tick;
 import io.github.dsudomoin.outbox.testing.ShardKeys;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
@@ -23,7 +22,6 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -279,13 +277,8 @@ class QueueStateIT {
     }
 
     private java.util.UUID send(int shard) {
-        var key = keyOfShard(shard);
+        var key = keys.next(shard);
         return transactions.inTx(c -> writer.outbox().send(OutboxMessage.of(TOPIC, key, "p".getBytes(UTF_8))));
-    }
-
-    /** A new key hashing to {@code shard}. */
-    private String keyOfShard(int shard) {
-        return keys.next(shard);
     }
 
     private static final class Recording implements OutboxTelemetry {

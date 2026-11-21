@@ -1,6 +1,7 @@
 package io.github.dsudomoin.outbox;
 
 import static io.github.dsudomoin.outbox.testing.Handlers.answering;
+import static io.github.dsudomoin.outbox.testing.Handlers.eachRecord;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -528,10 +529,8 @@ class RelayTelemetryIT {
         var config = new TestOutboxConfig().relayEnabled(false).requeueDelay(Duration.ofMillis(50));
         var events = new Events(transactions, config.table() + "_cursor");
         var requeues = new AtomicInteger();
-        OutboxHandler handler = answering(records -> {
-            return records.stream().map(r -> new String(r.payload(), UTF_8).equals("p")
-                    && requeues.getAndIncrement() < 2 ? Outcome.requeue() : Outcome.delivered()).toList();
-        });
+        OutboxHandler handler = eachRecord(r -> new String(r.payload(), UTF_8).equals("p")
+                && requeues.getAndIncrement() < 2 ? Outcome.requeue() : Outcome.delivered());
         var outbox = start(config, handler, events);
 
         transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", "k", bytes("p"))));

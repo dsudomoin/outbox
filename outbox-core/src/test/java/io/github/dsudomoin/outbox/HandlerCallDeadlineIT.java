@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox;
 
+import static io.github.dsudomoin.outbox.testing.Handlers.answering;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -7,7 +8,6 @@ import io.github.dsudomoin.outbox.internal.ShardProcessor;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import java.time.Duration;
-import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
@@ -23,18 +23,12 @@ class HandlerCallDeadlineIT {
     void aHandlerCallStartsWithItsWholeBatchTimeoutAhead() throws Exception {
         var seen = new CompletableFuture<long[]>();
         var config = new TestOutboxConfig().shards(1).batchTimeout(BATCH_TIMEOUT);
-        try (var runtime = OutboxRuntime.builder(config, transactions, new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {}
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                long now = System.nanoTime();
-                seen.complete(new long[] {ShardProcessor.callDeadline().orElseThrow() - now,
-                        now - ShardProcessor.callStarted().orElseThrow(), ShardProcessor.callCancelled() ? 1 : 0});
-                return records.stream().map(r -> Outcome.delivered()).toList();
-            }
-        }).build()) {
+        try (var runtime = OutboxRuntime.builder(config, transactions, answering(records -> {
+            long now = System.nanoTime();
+            seen.complete(new long[] {ShardProcessor.callDeadline().orElseThrow() - now,
+                    now - ShardProcessor.callStarted().orElseThrow(), ShardProcessor.callCancelled() ? 1 : 0});
+            return records.stream().map(r -> Outcome.delivered()).toList();
+        })).build()) {
             runtime.start();
             transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("orders", "k", "m".getBytes(UTF_8))));
 

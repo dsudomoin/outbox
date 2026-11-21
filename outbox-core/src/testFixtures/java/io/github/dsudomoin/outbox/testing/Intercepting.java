@@ -14,7 +14,7 @@ public final class Intercepting {
     /** What runs ahead of a connection's {@code call}; it may throw in its place. */
     @FunctionalInterface
     public interface ConnectionCall {
-        void run(Connection real, Method call, Object[] args) throws Exception;
+        void run(Connection real, Method call, Object[] args) throws Throwable;
     }
 
     /** {@code source}, a plain wrapper restoring nothing, with {@code before} run ahead of each connection's call. */

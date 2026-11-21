@@ -13,6 +13,7 @@ import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
+import io.github.dsudomoin.outbox.testing.AdminRows;
 import io.github.dsudomoin.outbox.testing.ByteReads;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.ShardKeys;
@@ -21,7 +22,6 @@ import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -759,15 +759,11 @@ class StrandedShardsIT {
         var once = new AtomicBoolean();
         admin().afterChunk = c -> {
             if (once.compareAndSet(false, true)) {
-                try (var other = direct.getConnection()) {
-                    long xmax = queryLong(other, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint")
-                            + 1_000_000_000L;
-                    execute(other, "insert into " + names.tick() + " (snapshot, created_at) values ('" + xmax + ":"
-                            + xmax + ":'::pg_snapshot, now() - interval '1 minute')");
-                    try (var ps = other.prepareStatement(XidRecovery.haltInsert(names))) {
-                        ps.setLong(1, xmax);
-                        ps.executeUpdate();
-                    }
+                long xmax = new AdminRows(direct::getConnection, names).forgeRegression();
+                try (var other = direct.getConnection();
+                        var ps = other.prepareStatement(XidRecovery.haltInsert(names))) {
+                    ps.setLong(1, xmax);
+                    ps.executeUpdate();
                 }
             }
         };
