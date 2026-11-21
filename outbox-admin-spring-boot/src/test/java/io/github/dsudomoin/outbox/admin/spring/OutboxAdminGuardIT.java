@@ -378,7 +378,7 @@ class OutboxAdminGuardIT {
 
     /** Clients other than browsers send no such header; a GET changes nothing, so a link from another site works. */
     @ParameterizedTest
-    @CsvSource({"POST,", "POST,same-origin", "POST,none", "GET,cross-site", "GET,same-site", "HEAD,cross-site"})
+    @CsvSource({"POST,", "POST,same-origin", "POST,none", "GET,cross-site", "HEAD,cross-site"})
     void aCallOfTheSameSiteOrNoBrowserOrAReadReachesTheAuthorizer(String method, String site) throws Exception {
         try (var server = AdminServer.start(WithKeys.class, WithSpy.class)) {
             var path = method.equals("POST") ? API + "/recovery/xid-regression" : STATUS;
@@ -469,12 +469,13 @@ class OutboxAdminGuardIT {
             server.bean(Keys.class).answer = request -> OutboxAdminAuthorizer.allow("x\": 200\nINFO forged \\\u2029");
 
             var response = server.post(API + "/waiting/abandon",
-                "{\"topic\":\"t\",\"reason\":\"v2\\\", dryRun \\\"true\\r\\nINFO forged\\u2028\\u2029\\u0007\"}");
+                "{\"topic\":\"t\",\"key\":\"ключ\",\"reason\":\"v2\\\", dryRun \\\"true\\r\\nINFO forged\\u2028\\u2029"
+                    + "\\u0007\"}");
 
             assertThat(response.statusCode()).isEqualTo(200);
             assertThat(server.settledAudit(stderr, 1)).containsExactly("outbox admin POST \"" + API
-                + "/waiting/abandon\" by \"x\\\": 200\\nINFO forged \\\\\\u2029\" with topic \"t\", key null, reason"
-                + " \"v2\\\", dryRun \\\"true\\r\\nINFO forged\\u2028\\u2029\\u0007\", dryRun \"false\": 200");
+                + "/waiting/abandon\" by \"x\\\": 200\\nINFO forged \\\\\\u2029\" with topic \"t\", key \"ключ\","
+                + " reason \"v2\\\", dryRun \\\"true\\r\\nINFO forged\\u2028\\u2029\\u0007\", dryRun \"false\": 200");
             assertThat(stderr.text()).doesNotContain("\nINFO forged").doesNotContain("\u2028").doesNotContain("\u2029");
         }
     }
@@ -875,11 +876,6 @@ class OutboxAdminGuardIT {
 
     // ------------------------------------------------------------------------------------------------ at the start
 
-    private static WebApplicationContextRunner runner(Class<?>... configurations) {
-        return new WebApplicationContextRunner().withUserConfiguration(AdminServer.Base.class)
-            .withUserConfiguration(configurations).withPropertyValues(AdminHttpIT.properties());
-    }
-
     /** What the operator reads: Boot's failure analyzer would put its own text in place of this one, given a cause. */
     @Test
     void aRealStartWithoutAnAuthorizerReportsTheAdvice() {
@@ -909,12 +905,13 @@ class OutboxAdminGuardIT {
 
     @Test
     void severalAuthorizersWithoutAPrimaryFailTheStartNamingThem() {
-        runner(TwoAuthorizers.class).run(context -> {
-            assertThat(context).hasFailed();
-            assertThat(context.getStartupFailure()).isExactlyInstanceOf(IllegalStateException.class).hasNoCause()
-                .hasMessageStartingWith("several OutboxAdminAuthorizer beans: ").hasMessageContaining("first")
-                .hasMessageContaining("second");
-        });
+        new WebApplicationContextRunner().withUserConfiguration(AdminServer.Base.class, TwoAuthorizers.class)
+            .withPropertyValues(AdminHttpIT.properties()).run(context -> {
+                assertThat(context).hasFailed();
+                assertThat(context.getStartupFailure()).isExactlyInstanceOf(IllegalStateException.class).hasNoCause()
+                    .hasMessageStartingWith("several OutboxAdminAuthorizer beans: ").hasMessageContaining("first")
+                    .hasMessageContaining("second");
+            });
     }
 
     @Configuration(proxyBeanMethods = false)

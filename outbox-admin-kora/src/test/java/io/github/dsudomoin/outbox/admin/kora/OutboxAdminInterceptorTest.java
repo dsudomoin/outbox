@@ -49,7 +49,7 @@ class OutboxAdminInterceptorTest {
         var authorization = new AtomicReference<Runnable>();
         var interceptor = interceptor(request -> {
             throw new IllegalStateException("key store down");
-        }, authorization);
+        }, authorization, true);
 
         try (var stderr = new CapturedStderr()) {
             var logAtResponse = new AtomicReference<String>();
@@ -66,16 +66,11 @@ class OutboxAdminInterceptorTest {
     /** As the authorizer's javadoc promises: a thrown 401 is no refusal, it is a failure. */
     @Test
     void anAuthorizerThrowing401GetsTheFixed500() {
-        var authorization = new AtomicReference<Runnable>();
-        var interceptor = interceptor(request -> {
-            throw HttpServerResponseException.of(401, "token expired");
-        }, authorization);
-
         try (var stderr = new CapturedStderr()) {
-            var response = interceptor.intercept(Context.current(), request("/kora-outbox/admin/v1/status"), NO_ROUTE);
-            authorization.get().run();
+            var answered = answered(request -> {
+                throw HttpServerResponseException.of(401, "token expired");
+            }, request("/kora-outbox/admin/v1/status"), NO_ROUTE, true);
 
-            var answered = response.toCompletableFuture().join();
             assertThat(answered.code()).isEqualTo(500);
             assertThat(body(answered)).isEqualTo("{\"message\":\"authorization failed\"}");
             assertThat(stderr.text()).contains("WARN").contains("OutboxAdminAuthorizer failed")
@@ -88,15 +83,11 @@ class OutboxAdminInterceptorTest {
     /** A failure without a message is named by its class; the WARN has the route and the identity, escaped. */
     @Test
     void aRouteFailureIsA500Error() {
-        var authorization = new AtomicReference<Runnable>();
-        var interceptor = interceptor(request -> OutboxAdminAuthorizer.allow("ops\n"), authorization);
-
         try (var stderr = new CapturedStderr()) {
-            var response = interceptor.intercept(Context.current(), request("/kora-outbox/admin/v1/status"),
-                    (context, request) -> CompletableFuture.failedFuture(new IllegalMonitorStateException()));
-            authorization.get().run();
+            var answered = answered(request -> OutboxAdminAuthorizer.allow("ops\n"),
+                    request("/kora-outbox/admin/v1/status"),
+                    (context, request) -> CompletableFuture.failedFuture(new IllegalMonitorStateException()), true);
 
-            var answered = response.toCompletableFuture().join();
             assertThat(answered.code()).isEqualTo(500);
             assertThat(body(answered)).isEqualTo("{\"message\":\"java.lang.IllegalMonitorStateException\"}");
             var call = "outbox admin GET \"/kora-outbox/admin/v1/status\" by \"ops\\n\"";
@@ -109,16 +100,11 @@ class OutboxAdminInterceptorTest {
     /** The server's own response exceptions keep their status, 5xx included; only other failures become 500. */
     @Test
     void aServerResponseExceptionKeepsItsStatus() {
-        var authorization = new AtomicReference<Runnable>();
-        var interceptor = interceptor(request -> OutboxAdminAuthorizer.allow("ops"), authorization);
-
         try (var stderr = new CapturedStderr()) {
-            var response = interceptor.intercept(Context.current(), request("/kora-outbox/admin/v1/status"),
-                    (context, request) -> CompletableFuture.failedFuture(HttpServerResponseException.of(503,
-                            "draining")));
-            authorization.get().run();
+            var answered = answered(request -> OutboxAdminAuthorizer.allow("ops"),
+                    request("/kora-outbox/admin/v1/status"), (context, request) -> CompletableFuture.failedFuture(
+                            HttpServerResponseException.of(503, "draining")), true);
 
-            var answered = response.toCompletableFuture().join();
             assertThat(answered.code()).isEqualTo(503);
             assertThat(body(answered)).isEqualTo("{\"message\":\"draining\"}");
             var call = "outbox admin GET \"/kora-outbox/admin/v1/status\" by \"ops\"";
@@ -130,14 +116,11 @@ class OutboxAdminInterceptorTest {
     /** Undertow leaves {@code %5C} encoded, so a backslash in a path is tested here. */
     @Test
     void auditLinePathIsOneQuotedToken() {
-        var authorization = new AtomicReference<Runnable>();
-        var interceptor = interceptor(request -> OutboxAdminAuthorizer.unauthorized("who?"), authorization);
-
         try (var stderr = new CapturedStderr()) {
-            var response = interceptor.intercept(Context.current(), request("/a\\\" by root: 200 \""), NO_ROUTE);
-            authorization.get().run();
+            var answered = answered(request -> OutboxAdminAuthorizer.unauthorized("who?"),
+                    request("/a\\\" by root: 200 \""), NO_ROUTE, true);
 
-            assertThat(response.toCompletableFuture().join().code()).isEqualTo(401);
+            assertThat(answered.code()).isEqualTo(401);
             assertThat(stderr.text()).contains("outbox admin GET \"/a\\\\\\\" by root: 200 \\\"\" denied: 401");
         }
     }
@@ -145,16 +128,11 @@ class OutboxAdminInterceptorTest {
     /** A bidi override or a zero-width character in the path would reorder or hide part of the line on screen. */
     @Test
     void auditLineEscapesFormatCharacters() {
-        var authorization = new AtomicReference<Runnable>();
-        var interceptor = interceptor(request -> OutboxAdminAuthorizer.unauthorized("who?"), authorization);
-
         try (var stderr = new CapturedStderr()) {
-            var response = interceptor.intercept(Context.current(),
-                    request("/kora-outbox/admin/v1/orphans/x\u202ey\u200bz\uDB40\uDC01/restore"),
-                    NO_ROUTE);
-            authorization.get().run();
+            var answered = answered(request -> OutboxAdminAuthorizer.unauthorized("who?"),
+                    request("/kora-outbox/admin/v1/orphans/x\u202ey\u200bz\uDB40\uDC01/restore"), NO_ROUTE, true);
 
-            assertThat(response.toCompletableFuture().join().code()).isEqualTo(401);
+            assertThat(answered.code()).isEqualTo(401);
             assertThat(stderr.text())
                     .contains("orphans/x\\u202ey\\u200bz\\udb40\\udc01/restore\" denied: 401")
                     .doesNotContain("\u202e").doesNotContain("\u200b");
@@ -164,15 +142,12 @@ class OutboxAdminInterceptorTest {
     /** The identity may be caller text (a token's subject): quoted, it cannot pass for the status that follows. */
     @Test
     void auditLineQuotesTheIdentity() {
-        var authorization = new AtomicReference<Runnable>();
-        var interceptor = interceptor(request -> OutboxAdminAuthorizer.allow("x\": 200 \\"), authorization);
-
         try (var stderr = new CapturedStderr()) {
-            var response = interceptor.intercept(Context.current(), request("/kora-outbox/admin/v1/status"),
-                    (context, request) -> CompletableFuture.completedFuture(HttpServerResponse.of(409)));
-            authorization.get().run();
+            var answered = answered(request -> OutboxAdminAuthorizer.allow("x\": 200 \\"),
+                    request("/kora-outbox/admin/v1/status"),
+                    (context, request) -> CompletableFuture.completedFuture(HttpServerResponse.of(409)), true);
 
-            assertThat(response.toCompletableFuture().join().code()).isEqualTo(409);
+            assertThat(answered.code()).isEqualTo(409);
             assertThat(stderr.text().lines().filter(l -> l.contains("outbox admin ")))
                     .singleElement(InstanceOfAssertFactories.STRING)
                     .endsWith("outbox admin GET \"/kora-outbox/admin/v1/status\" by \"x\\\": 200 \\\\\": 409");
@@ -270,19 +245,14 @@ class OutboxAdminInterceptorTest {
     @CsvSource({"text/plain,415", "application/x-www-form-urlencoded,415", "multipart/form-data; boundary=x,415",
             "application/jsonx,415", ",400"})
     void aBodyRouteRefusesAnotherContentTypeBeforeTheRoute(String type, int status) {
-        var authorization = new AtomicReference<Runnable>();
-        var interceptor = interceptor(request -> OutboxAdminAuthorizer.allow("ops"), authorization);
-
         try (var stderr = new CapturedStderr()) {
             for (var path : List.of("dead-letters/discard", "dead-letters/redrive", "keys/abandon",
                     "waiting/abandon", "dead-letters/discard/", "dead-letters/redrive/", "keys/abandon/",
                     "waiting/abandon/")) {
-                var response = interceptor.intercept(Context.current(), request("POST",
+                var answered = answered(request -> OutboxAdminAuthorizer.allow("ops"), request("POST",
                         "/kora-outbox/admin/v1/" + path, type == null ? HttpHeaders.of()
-                                : HttpHeaders.of("content-type", type)), NO_ROUTE);
-                authorization.get().run();
+                                : HttpHeaders.of("content-type", type)), NO_ROUTE, true);
 
-                var answered = response.toCompletableFuture().join();
                 assertThat(answered.code()).as(path).isEqualTo(status);
                 assertThat(body(answered)).isEqualTo(type == null
                         ? "{\"message\":\"a JSON body is required, with Content-Type application/json\"}"
@@ -311,12 +281,18 @@ class OutboxAdminInterceptorTest {
 
     /** The code of a call the {@code ops} authorizer allows to a route answering 200, once the authorization ran. */
     private static int allowedCode(HttpServerRequest request, boolean checkOrigin) {
+        return answered(r -> OutboxAdminAuthorizer.allow("ops"), request,
+                (context, r) -> CompletableFuture.completedFuture(HttpServerResponse.of(200)), checkOrigin).code();
+    }
+
+    /** The response of an interceptor whose authorizer, and so the route, ran once the call left it waiting. */
+    private static HttpServerResponse answered(OutboxAdminAuthorizer authorizer, HttpServerRequest request,
+            HttpServerInterceptor.InterceptChain chain, boolean checkOrigin) {
         var authorization = new AtomicReference<Runnable>();
-        var response = interceptor(r -> OutboxAdminAuthorizer.allow("ops"), authorization, checkOrigin)
-                .intercept(Context.current(), request,
-                        (context, r) -> CompletableFuture.completedFuture(HttpServerResponse.of(200)));
+        var response = interceptor(authorizer, authorization, checkOrigin).intercept(Context.current(), request,
+                chain);
         authorization.get().run();
-        return response.toCompletableFuture().join().code();
+        return response.toCompletableFuture().join();
     }
 
     /** The response to a call refused before an authorizer that fails the test if it runs, and before the route. */
@@ -339,10 +315,6 @@ class OutboxAdminInterceptorTest {
     }
 
     /** An interceptor whose authorizer runs when the test runs what it leaves in {@code run}. */
-    private static OutboxAdminInterceptor interceptor(OutboxAdminAuthorizer authorizer, AtomicReference<Runnable> run) {
-        return interceptor(authorizer, run, true);
-    }
-
     private static OutboxAdminInterceptor interceptor(OutboxAdminAuthorizer authorizer, AtomicReference<Runnable> run,
             boolean checkOrigin) {
         return new OutboxAdminInterceptor(authorizer, deferred(run), new $ModelError_JsonWriter(), checkOrigin);

@@ -47,10 +47,11 @@ class RequestReaders extends RequestBodyAdviceAdapter {
     /** Far above the largest body the contract needs: 1000 ids take about 21 kB. */
     private static final int MAX_BODY = 1024 * 1024;
 
-    private static final Set<String> SELECTION = Set.of("ids", "filter");
-    private static final Set<String> FILTER = Set.of("topic", "key", "error", "failedFrom", "failedTo", "status");
-    private static final Set<String> ABANDON = Set.of("topic", "key", "reason", "dryRun");
-    private static final Set<String> ABANDON_KEY = Set.of("topic", "key", "messageId", "reason", "dryRun");
+    /** Each body type's fields, in the order its 400 lists them. */
+    private static final List<String> SELECTION = List.of("ids", "filter");
+    private static final List<String> FILTER = List.of("topic", "key", "error", "failedFrom", "failedTo", "status");
+    private static final List<String> ABANDON = List.of("topic", "key", "reason", "dryRun");
+    private static final List<String> ABANDON_KEY = List.of("topic", "key", "messageId", "reason", "dryRun");
 
     private static final Logger log = LoggerFactory.getLogger(RequestReaders.class);
     private static final String BOUND = RequestReaders.class.getName() + ".bound";
@@ -125,7 +126,7 @@ class RequestReaders extends RequestBodyAdviceAdapter {
     }
 
     private static Selection selection(Map<?, ?> body) {
-        known(body, "Selection", SELECTION, "ids, filter");
+        known(body, "Selection", SELECTION);
         var selection = new Selection();
         var ids = body.get("ids");
         if (ids != null) {
@@ -152,7 +153,7 @@ class RequestReaders extends RequestBodyAdviceAdapter {
     }
 
     private static Filter filter(Map<?, ?> body) {
-        known(body, "Filter", FILTER, "topic, key, error, failedFrom, failedTo, status");
+        known(body, "Filter", FILTER);
         var status = string(body, "status");
         return new Filter().topic(AdminHttp.notBlank("topic", string(body, "topic"))).key(string(body, "key"))
             .error(AdminHttp.notBlank("error", string(body, "error")))
@@ -161,27 +162,21 @@ class RequestReaders extends RequestBodyAdviceAdapter {
     }
 
     private static AbandonWaiting abandonWaiting(Map<?, ?> body) {
-        known(body, "AbandonWaiting", ABANDON, "topic, key, reason, dryRun");
+        known(body, "AbandonWaiting", ABANDON);
         var topic = string(body, "topic");
         var key = string(body, "key");
         var reason = string(body, "reason");
-        if (topic == null || reason == null) {
-            throw new IllegalArgumentException("missing field '" + (topic == null ? "topic" : "reason")
-                + "' in AbandonWaiting");
-        }
+        requireTopicAndReason(topic, reason, "AbandonWaiting");
         return new AbandonWaiting(topic, reason).key(key).dryRun(dryRun(body));
     }
 
     private static AbandonKey abandonKey(Map<?, ?> body) {
-        known(body, "AbandonKey", ABANDON_KEY, "topic, key, messageId, reason, dryRun");
+        known(body, "AbandonKey", ABANDON_KEY);
         var topic = string(body, "topic");
         var key = string(body, "key");
         var messageId = string(body, "messageId");
         var reason = string(body, "reason");
-        if (topic == null || reason == null) {
-            throw new IllegalArgumentException("missing field '" + (topic == null ? "topic" : "reason")
-                + "' in AbandonKey");
-        }
+        requireTopicAndReason(topic, reason, "AbandonKey");
         if ((key == null) == (messageId == null)) {
             throw new IllegalArgumentException("AbandonKey needs exactly one of 'key' and 'messageId'");
         }
@@ -203,12 +198,19 @@ class RequestReaders extends RequestBodyAdviceAdapter {
         return (Boolean) dryRun;
     }
 
-    private static void known(Map<?, ?> body, String type, Set<String> fields, String listed) {
+    private static void known(Map<?, ?> body, String type, List<String> fields) {
         for (var field : body.keySet()) {
             if (!fields.contains(field)) {
                 throw new IllegalArgumentException("unknown field '" + field + "' in " + type + "; its fields: "
-                    + listed);
+                    + String.join(", ", fields));
             }
+        }
+    }
+
+    private static void requireTopicAndReason(@Nullable String topic, @Nullable String reason, String type) {
+        if (topic == null || reason == null) {
+            throw new IllegalArgumentException("missing field '" + (topic == null ? "topic" : "reason") + "' in "
+                + type);
         }
     }
 

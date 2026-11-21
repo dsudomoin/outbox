@@ -47,22 +47,17 @@ import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.test.context.runner.WebApplicationContextRunner;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.core.Ordered;
-import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpMethod;
-import org.springframework.http.ResponseEntity;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
-import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
-import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.context.WebApplicationContext;
 import org.springframework.web.servlet.HandlerInterceptor;
 import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
@@ -76,6 +71,7 @@ import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandl
 class AdminHttpIT {
 
     private static final Instant T0 = Instant.parse("2026-01-15T10:00:00Z");
+    private static final boolean BOOT_41 = "4.1".equals(System.getProperty("outbox.test.boot"));
 
     private WebApplicationContext context;
     private MockMvc mvc;
@@ -202,15 +198,6 @@ class AdminHttpIT {
             assertThat(ids(last.body)).containsExactly(c);
             assertThat(last.body).as("a short page is the last").doesNotContain("nextAfterId");
         });
-    }
-
-    private static String letterJson(long id, UUID messageId) {
-        return "{\"items\":[{\"id\":" + id + ",\"messageId\":\"" + messageId + "\","
-            + "\"topic\":\"t\",\"key\":\"" + base64("k") + "\",\"payload\":\"" + base64("p") + "\","
-            + "\"headers\":[{\"name\":\"h1\",\"value\":\"" + base64("v") + "\"},{\"name\":\"h2\"}],"
-            + "\"createdAt\":\"2026-01-15T09:00:00.000Z\",\"attempts\":3,"
-            + "\"failedAt\":\"2026-01-15T10:00:00.000Z\",\"error\":\"timeout\",\"status\":\"pending\","
-            + "\"redrives\":2,\"handlerAttempts\":1,\"dueAt\":\"2026-01-15T11:00:00.000Z\"}]}";
     }
 
     /** Milliseconds, always three digits, as the Kora adapter writes them, whatever Postgres keeps. */
@@ -476,7 +463,7 @@ class AdminHttpIT {
     /** Read as absent, a misspelt status would widen the call to every letter of the topic. */
     @Test
     void misspeltStatusIsRefusedWhenTheMapperReadsUnknownEnumsAsNull() {
-        var unknownAsNull = "4.1".equals(System.getProperty("outbox.test.boot"))
+        var unknownAsNull = BOOT_41
             ? "spring.jackson.datatype.enum.read-unknown-enum-values-as-null=true"
             : "spring.jackson.deserialization.read-unknown-enum-values-as-null=true";
         app(() -> {
@@ -765,26 +752,6 @@ class AdminHttpIT {
         });
     }
 
-    /** What the audit line of the call will carry, by name in order: the reason, unescaped; the line escapes it. */
-    @Test
-    void abandonLeavesItsDetailForTheAuditLine() {
-        app(() -> {
-            rows().seedWaiting();
-            var reason = "v2 rolled back\", dryRun \"true\r\nINFO forged";
-
-            var result = perform("POST", API + "/waiting/abandon", "application/json",
-                "{\"topic\":\"t\",\"key\":\"ключ\",\"reason\":\"v2 rolled back\\\", dryRun \\\"true\\r\\nINFO forged\"}");
-
-            assertThat(result.getResponse().getStatus()).isEqualTo(200);
-            var detail = (Map<?, ?>) result.getRequest().getAttribute(OutboxAdminController.DETAIL);
-            assertThat(detail.keySet().stream().map(Object::toString))
-                .containsExactly("topic", "key", "reason", "dryRun");
-            assertThat(detail.get("key")).isEqualTo("ключ");
-            assertThat(detail.get("reason")).isEqualTo(reason);
-            assertThat(detail.get("dryRun")).isEqualTo("false");
-        });
-    }
-
     /** A call that destroys or moves letters or rows names what it selected: the filter, the ids (the first ten). */
     @Test
     void destructiveAuditLinesNameTheirSelection() {
@@ -939,7 +906,12 @@ class AdminHttpIT {
             var response = call("GET", "/dead-letters?topic=t", null);
 
             assertJson(response, 200);
-            assertSameJson(response.body, letterJson(id, rows().messageId(id)));
+            assertSameJson(response.body, "{\"items\":[{\"id\":" + id + ",\"messageId\":\"" + rows().messageId(id)
+                + "\",\"topic\":\"t\",\"key\":\"" + base64("k") + "\",\"payload\":\"" + base64("p") + "\","
+                + "\"headers\":[{\"name\":\"h1\",\"value\":\"" + base64("v") + "\"},{\"name\":\"h2\"}],"
+                + "\"createdAt\":\"2026-01-15T09:00:00.000Z\",\"attempts\":3,"
+                + "\"failedAt\":\"2026-01-15T10:00:00.000Z\",\"error\":\"timeout\",\"status\":\"pending\","
+                + "\"redrives\":2,\"handlerAttempts\":1,\"dueAt\":\"2026-01-15T11:00:00.000Z\"}]}");
             assertThat(call("POST", "/dead-letters/discard", "{\"filter\":{\"topic\":\"t\",\"failedTo\":"
                 + "\"2026-01-15T10:00:00.001Z\"}}").body).isEqualTo("{\"count\":1}");
         }, "spring.jackson.property-naming-strategy=SNAKE_CASE", "spring.jackson.default-property-inclusion=always",
@@ -1100,7 +1072,7 @@ class AdminHttpIT {
     /** Boot 4.1 can keep MVC on Jackson 2, as an app in the middle of its migration does. */
     @Test
     void jackson2OnBoot41() {
-        assumeTrue("4.1".equals(System.getProperty("outbox.test.boot")));
+        assumeTrue(BOOT_41);
         app(() -> {
             assertThat(context.getBean(RequestMappingHandlerAdapter.class).getMessageConverters())
                 .anyMatch(c -> c.getClass().getName().endsWith("MappingJackson2HttpMessageConverter"));
@@ -1127,17 +1099,6 @@ class AdminHttpIT {
         }
     }
 
-    /** What many apps have: first in order, answering every exception in the app's own way. */
-    @RestControllerAdvice
-    @Order(Ordered.HIGHEST_PRECEDENCE)
-    static class FirstAppAdvice {
-
-        @ExceptionHandler(Exception.class)
-        ResponseEntity<String> any(Exception e) {
-            return ResponseEntity.status(418).body("the app's first handler: " + e.getClass().getSimpleName());
-        }
-    }
-
     @Configuration(proxyBeanMethods = false)
     static class FirstApp {
 
@@ -1147,8 +1108,8 @@ class AdminHttpIT {
         }
 
         @Bean
-        FirstAppAdvice firstAppAdvice() {
-            return new FirstAppAdvice();
+        AdminCoexistenceIT.AppAdvice appAdvice() {
+            return new AdminCoexistenceIT.AppAdvice();
         }
     }
 
@@ -1272,7 +1233,7 @@ class AdminHttpIT {
     /** The body on an app per Jackson its Boot line's MVC can read with, its String deserializer {@code shape}. */
     private void appWithStrings(String shape, OnServer body) throws Exception {
         var strings = "app.strings=" + shape;
-        if ("4.1".equals(System.getProperty("outbox.test.boot"))) {
+        if (BOOT_41) {
             onServer(body, List.of(strings), Jackson3Strings.class);
             onServer(body, List.of(strings, "spring.http.converters.preferred-json-mapper=jackson2"),
                 Jackson2Strings.class);

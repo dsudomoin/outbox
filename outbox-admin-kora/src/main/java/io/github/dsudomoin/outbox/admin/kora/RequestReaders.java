@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.time.OffsetDateTime;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import ru.tinkoff.kora.json.common.JsonReader;
 
@@ -34,9 +35,7 @@ final class RequestReaders {
             Filter where = null;
             var seen = new HashSet<String>();
             for (var field = parser.nextFieldName(); field != null; field = parser.nextFieldName()) {
-                if (!seen.add(field)) {
-                    throw new JsonParseException(parser, "duplicate field '" + field + "' in Selection");
-                }
+                once(parser, seen, field, "Selection");
                 var isNull = parser.nextToken() == JsonToken.VALUE_NULL;
                 switch (field) {
                     case "ids" -> idList = isNull ? null : ids.read(parser);
@@ -61,9 +60,7 @@ final class RequestReaders {
             DeadLetterStatus status = null;
             var seen = new HashSet<String>();
             for (var field = parser.nextFieldName(); field != null; field = parser.nextFieldName()) {
-                if (!seen.add(field)) {
-                    throw new JsonParseException(parser, "duplicate field '" + field + "' in Filter");
-                }
+                once(parser, seen, field, "Filter");
                 var isNull = parser.nextToken() == JsonToken.VALUE_NULL;
                 switch (field) {
                     case "topic" -> topic = string(parser, field);
@@ -92,9 +89,7 @@ final class RequestReaders {
             Boolean dryRun = null;
             var seen = new HashSet<String>();
             for (var field = parser.nextFieldName(); field != null; field = parser.nextFieldName()) {
-                if (!seen.add(field)) {
-                    throw new JsonParseException(parser, "duplicate field '" + field + "' in AbandonKey");
-                }
+                once(parser, seen, field, "AbandonKey");
                 parser.nextToken();
                 switch (field) {
                     case "topic" -> topic = string(parser, field);
@@ -105,10 +100,7 @@ final class RequestReaders {
                     default -> throw unknown(parser, field, "AbandonKey", "topic, key, messageId, reason, dryRun");
                 }
             }
-            if (topic == null || reason == null) {
-                throw new JsonParseException(parser, "missing field '" + (topic == null ? "topic" : "reason")
-                        + "' in AbandonKey");
-            }
+            requireTopicAndReason(parser, topic, reason, "AbandonKey");
             if ((key == null) == (messageId == null)) {
                 throw new JsonParseException(parser, "AbandonKey needs exactly one of 'key' and 'messageId'");
             }
@@ -136,9 +128,7 @@ final class RequestReaders {
             Boolean dryRun = null;
             var seen = new HashSet<String>();
             for (var field = parser.nextFieldName(); field != null; field = parser.nextFieldName()) {
-                if (!seen.add(field)) {
-                    throw new JsonParseException(parser, "duplicate field '" + field + "' in AbandonWaiting");
-                }
+                once(parser, seen, field, "AbandonWaiting");
                 parser.nextToken();
                 switch (field) {
                     case "topic" -> topic = string(parser, field);
@@ -148,12 +138,25 @@ final class RequestReaders {
                     default -> throw unknown(parser, field, "AbandonWaiting", "topic, key, reason, dryRun");
                 }
             }
-            if (topic == null || reason == null) {
-                throw new JsonParseException(parser, "missing field '" + (topic == null ? "topic" : "reason")
-                        + "' in AbandonWaiting");
-            }
+            requireTopicAndReason(parser, topic, reason, "AbandonWaiting");
             return new AbandonWaiting(topic, key, reason, dryRun);
         };
+    }
+
+    /** Refuses {@code field} when {@code seen} has it: a repeated field would let its last value win unseen. */
+    private static void once(JsonParser parser, Set<String> seen, String field, String type)
+            throws JsonParseException {
+        if (!seen.add(field)) {
+            throw new JsonParseException(parser, "duplicate field '" + field + "' in " + type);
+        }
+    }
+
+    private static void requireTopicAndReason(JsonParser parser, @Nullable String topic, @Nullable String reason,
+            String type) throws JsonParseException {
+        if (topic == null || reason == null) {
+            throw new JsonParseException(parser, "missing field '" + (topic == null ? "topic" : "reason") + "' in "
+                    + type);
+        }
     }
 
     /** False for {@code null}; true at the start of an object. */
