@@ -23,8 +23,7 @@ id=$(mark max "max single: $WRITERS writers unthrottled, 1 message per transacti
 load 0 "$WRITERS"
 measure
 load_stop
-reconcile_timed "$table" 900 "$(metric bench_messages_sent_total)"; single_rc=$RC single_drain=$DRAIN
-single_recon=$RECON
+reconcile_timed "$table" 900 "$(metric bench_messages_sent_total)"
 mark_end "$id"
 window "$T0" "$T1"
 single="| 1 сообщение на транзакцию, писателей $WRITERS, kafka + консьюмер | $(f0 "$COMMITTED") | $(f0 "$DELIVERED") \
@@ -33,7 +32,7 @@ single="| 1 сообщение на транзакцию, писателей $WR
 single_totals=$(totals)
 f0 "$CONSUMED" > "$LOGS/max-single.consumed"
 app_stop
-if [ "$single_rc" != 0 ]; then # before the bulk runs reset the topic and the consumer group: keep the evidence
+if [ "$RC" != 0 ]; then # before the bulk runs reset the topic and the consumer group: keep the evidence
   out << EOF
 
 ## max (без ограничения скорости)
@@ -45,9 +44,9 @@ consumer group сохранены.
 |---|---|---|---|---|---|---|---|---|---|
 $single
 
-Консьюмер всё выбрал $single_drain после остановки писателей; $single_totals. Сверка: $single_recon.
+Консьюмер всё выбрал $DRAIN после остановки писателей; $single_totals. Сверка: $RECON.
 EOF
-  verdict "$table" "$single_rc"
+  verdict "$table" "$RC"
 fi
 drop_outbox "$table"
 
@@ -99,8 +98,8 @@ ${WARMUP} с прогрева, затем окно ${DURATION} с. Два раз
 |---|---|---|---|---|---|---|---|---|---|
 $single
 $bulk
-Одиночные сообщения: консьюмер всё выбрал $single_drain после остановки писателей; $single_totals. Сверка (SQL, после
-выборки): закоммиченных строк, не потреблённых и не dead: $single_recon. Bulk, очередь при остановке
+Одиночные сообщения: консьюмер всё выбрал $DRAIN после остановки писателей; $single_totals. Сверка (SQL, после
+выборки): закоммиченных строк, не потреблённых и не dead: $RECON. Bulk, очередь при остановке
 писателей:$drains очередь в пределах нескольких транзакций означает, что relay успевал за писателями.
 
 $(consumer_note)

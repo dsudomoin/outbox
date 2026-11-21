@@ -34,9 +34,9 @@ c0=$(metric bench_consumer_received_total); t0=$(now); cpu_start
 sleep "$DRAIN"
 c1=$(metric bench_consumer_received_total); t1=$(now); cpu_stop
 lag=$(group_lag)
-statements=$(psql_q "select calls, round(total_exec_time)::bigint, round(mean_exec_time::numeric, 3)
+statements=$(psql_q "select calls, round(mean_exec_time::numeric, 3)
   from pg_stat_statements where query like 'insert into inbox %'" | tr '|' ' ')
-read -r calls total mean <<< "$statements"
+read -r calls mean <<< "$statements"
 rate=$(((c1 - c0) / (t1 - t0)))
 [ "${lag:-0}" -gt 0 ] || log "the backlog ran out inside the window: the rate is a lower bound"
 echo "$rate" > "$LOGS/consumer.rate"
