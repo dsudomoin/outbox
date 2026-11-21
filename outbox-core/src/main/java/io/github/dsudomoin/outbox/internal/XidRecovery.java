@@ -164,24 +164,14 @@ public final class XidRecovery {
 
     private long countRowsToSave(Connection autocommit) throws SQLException {
         var c = autocommit;
-        c.setAutoCommit(false);
-        try (var st = c.createStatement()) {
-            st.execute("set local statement_timeout = " + timeout.toMillis()
-                    + "; set local idle_in_transaction_session_timeout = " + LOCK_TIMEOUT.toMillis()
-                    + Ticks.noTransactionTimeout(c));
-            long rows = queryLong(st, "select count(*) from (" + saved + ") s");
-            c.commit();
-            return rows;
-        } catch (Throwable e) {
-            try {
-                c.rollback();
-            } catch (SQLException cleanup) {
-                e.addSuppressed(cleanup);
+        return Sql.inTransaction(c, () -> {
+            try (var st = c.createStatement()) {
+                st.execute("set local statement_timeout = " + timeout.toMillis()
+                        + "; set local idle_in_transaction_session_timeout = " + LOCK_TIMEOUT.toMillis()
+                        + Ticks.noTransactionTimeout(c));
+                return queryLong(st, "select count(*) from (" + saved + ") s");
             }
-            throw e;
-        } finally {
-            c.setAutoCommit(true);
-        }
+        });
     }
 
     /**
@@ -528,14 +518,13 @@ public final class XidRecovery {
      * tick after the commit. No {@code dirty} (null): the relay steps every shard behind it.
      */
     private long insertTick(Connection c) throws SQLException {
-        try (var st = c.createStatement(); var rs = st.executeQuery("insert into " + names.tick() + " (snapshot,"
-                + " max_id) select case when pg_snapshot_xmax(s) <= x then s else (least(pg_snapshot_xmin(s), x)"
-                + " || ':' || pg_snapshot_xmax(s) || ':' || array_to_string(array(select i from (select"
-                + " pg_snapshot_xip(s) i union all select x) u order by i), ','))::pg_snapshot end, "
-                + Ticks.maxIdQuery(c, names) + " from (select pg_current_snapshot() s, pg_current_xact_id() x) q"
-                + " returning id")) {
-            rs.next();
-            return rs.getLong(1);
+        try (var st = c.createStatement()) {
+            return queryLong(st, "insert into " + names.tick() + " (snapshot, max_id) select case when"
+                    + " pg_snapshot_xmax(s) <= x then s else (least(pg_snapshot_xmin(s), x) || ':'"
+                    + " || pg_snapshot_xmax(s) || ':' || array_to_string(array(select i from (select"
+                    + " pg_snapshot_xip(s) i union all select x) u order by i), ','))::pg_snapshot end, "
+                    + Ticks.maxIdQuery(c, names) + " from (select pg_current_snapshot() s, pg_current_xact_id() x) q"
+                    + " returning id");
         }
     }
 

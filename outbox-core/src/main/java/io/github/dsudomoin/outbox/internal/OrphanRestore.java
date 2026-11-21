@@ -2,6 +2,7 @@ package io.github.dsudomoin.outbox.internal;
 
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
@@ -187,6 +188,7 @@ public final class OrphanRestore {
         var c = autocommit;
         while (!last) {
             var rows = new ArrayList<Resender.Source>(CHUNK);
+            var moving = new ArrayList<Resender.Source>(CHUNK); // the rows no busy key holds, in id order
             int read;
             c.setAutoCommit(false);
             try (var st = c.createStatement()) {
@@ -196,9 +198,7 @@ public final class OrphanRestore {
                     ps.setLong(2, after);
                     scanning(scan, () -> {
                         try (var rs = ps.executeQuery()) {
-                            while (rs.next()) {
-                                rows.add(new Resender.Source(rs.getLong(1), rs.getString(2), rs.getBytes(3)));
-                            }
+                            readSources(rs, rows);
                         }
                     });
                 }
@@ -223,16 +223,13 @@ public final class OrphanRestore {
                         if (kept != null && kept.size() < CHUNK) {
                             kept.add(rows.get(i).id());
                         }
-                    }
-                }
-                for (int i = rows.size() - 1; i >= 0; i--) {
-                    if (hashes.get(i) != null && busy.contains(hashes.get(i))) {
-                        rows.remove(i);
                         left++;
+                    } else {
+                        moving.add(rows.get(i));
                     }
                 }
-                resender.insertFrom(c, table, rows);
-                deleteIds(c, table, rows.stream().map(Resender.Source::id).toList());
+                resender.insertFrom(c, table, moving);
+                deleteIds(c, table, moving.stream().map(Resender.Source::id).toList());
                 last = read < CHUNK;
                 // under the lock still: no row can reach the table between this read and the drop
                 if (last && left == 0) {
@@ -249,7 +246,7 @@ public final class OrphanRestore {
                 throw e;
             }
             c.setAutoCommit(true);
-            moved += rows.size();
+            moved += moving.size();
             if (afterChunk != null) {
                 afterChunk.accept(c);
             }
@@ -302,9 +299,7 @@ public final class OrphanRestore {
                     + " where id = any(?) order by id")) {
                 ps.setArray(1, c.createArrayOf("int8", ids.toArray()));
                 try (var rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        rows.add(new Resender.Source(rs.getLong(1), rs.getString(2), rs.getBytes(3)));
-                    }
+                    readSources(rs, rows);
                 }
             }
             resender.insertFrom(c, table, rows); // the key's lock is ours: taken again without waiting
@@ -326,6 +321,13 @@ public final class OrphanRestore {
                 e.addSuppressed(cleanup);
             }
             throw e;
+        }
+    }
+
+    /** The rows of {@code rs}, read as {@code select id, topic, key}, into {@code into}. */
+    private static void readSources(ResultSet rs, List<Resender.Source> into) throws SQLException {
+        while (rs.next()) {
+            into.add(new Resender.Source(rs.getLong(1), rs.getString(2), rs.getBytes(3)));
         }
     }
 

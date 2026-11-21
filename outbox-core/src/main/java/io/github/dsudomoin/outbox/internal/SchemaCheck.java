@@ -178,7 +178,7 @@ final class SchemaCheck {
      */
     static void warnIfAppCanCreateWhereOwnerResolves(Connection app, Connection owner, String table)
             throws SQLException {
-        String role = string(app, "select current_user", null);
+        String role = PartitionDdl.role(app);
         var schemas = new ArrayList<String>();
         var revokes = new ArrayList<String>();
         String ownerRole = null;
@@ -405,7 +405,7 @@ final class SchemaCheck {
     }
 
     private static String role(Connection c) throws SQLException {
-        return "role " + string(c, "select current_user", null);
+        return "role " + PartitionDdl.role(c);
     }
 
     private static Long oid(Connection c, String name) throws SQLException {
@@ -429,11 +429,9 @@ final class SchemaCheck {
         }
     }
 
-    private static String string(Connection c, String sql, Long oid) throws SQLException {
+    private static String string(Connection c, String sql, long oid) throws SQLException {
         try (var ps = c.prepareStatement(sql)) {
-            if (oid != null) {
-                ps.setLong(1, oid);
-            }
+            ps.setLong(1, oid);
             try (var rs = ps.executeQuery()) {
                 rs.next();
                 return rs.getString(1);

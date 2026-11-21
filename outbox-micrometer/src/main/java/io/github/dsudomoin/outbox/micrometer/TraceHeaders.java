@@ -66,7 +66,7 @@ final class TraceHeaders {
         if (v == null) {
             return false;
         }
-        int dash = indexOf(v, 0);
+        int dash = indexOf(v);
         if (dash != 16 && dash != 32 || !hexNotZero(v, 0, dash) || v.length < dash + 17
                 || !hexNotZero(v, dash + 1, dash + 17) || v.length > dash + 17 && v[dash + 17] != '-') {
             return false;
@@ -86,8 +86,9 @@ final class TraceHeaders {
                 && hexNotZero(traceId, 0, traceId.length) && spanId.length == 16 && hexNotZero(spanId, 0, 16);
     }
 
-    private static int indexOf(byte[] v, int from) {
-        for (int i = from; i < v.length; i++) {
+    /** The first {@code '-'} of {@code v}, or -1. */
+    private static int indexOf(byte[] v) {
+        for (int i = 0; i < v.length; i++) {
             if (v[i] == '-') {
                 return i;
             }

@@ -114,20 +114,7 @@ public final class ShardProcessor implements AutoCloseable {
     }
 
     /** A step's results, one per shard, and the end of its telemetry, which waits for its transaction's. */
-    private record Stepped(List<ShardResult> results, StepEnd end) {}
-
-    /**
-     * Ends a step's telemetry once its transaction has ended, on the step's thread: its settle, then its
-     * {@link OutboxTelemetry.RelayStep}. Call one of them, once.
-     */
-    private interface StepEnd {
-
-        /** The step's COMMIT returned. */
-        void committed();
-
-        /** The step's transaction rolled back after {@code error}, a COMMIT that failed included. */
-        void rolledBack(Throwable error);
-    }
+    private record Stepped(List<ShardResult> results, Observed end) {}
 
     private static final Logger log = LoggerFactory.getLogger(ShardProcessor.class);
     private static final AtomicInteger THREADS = new AtomicInteger();
@@ -365,7 +352,7 @@ public final class ShardProcessor implements AutoCloseable {
      */
     public List<ShardResult> tryProcessCommitted(Connection c, List<Integer> shards, long latestTickId, Instant now,
             Instant parkedUntil) throws SQLException, InterruptedException {
-        StepEnd end = null; // the step's telemetry while its transaction may still roll back
+        Observed end = null; // the step's telemetry while its transaction may still roll back
         try {
             var stepped = tryStep(c, shards, latestTickId, now, parkedUntil, deferredSettings(c), true);
             end = stepped.end();
@@ -503,16 +490,20 @@ public final class ShardProcessor implements AutoCloseable {
 
     /**
      * A step's telemetry: its {@link OutboxTelemetry.RelayStep} from the first shard with work, its settle from its
-     * last handler call, and the records the settle counts ({@link OutboxTelemetry.Settle}).
+     * last handler call, and the records the settle counts ({@link OutboxTelemetry.Settle}). Ended once the step's
+     * transaction has ended, on the step's thread: its settle, then its {@link OutboxTelemetry.RelayStep}. Call one of
+     * {@link #committed} and {@link #rolledBack}, once.
      */
-    private static final class Observed implements StepEnd {
+    private static final class Observed {
 
         OutboxTelemetry.RelayStep step = OutboxTelemetry.RelayStep.NONE;
         OutboxTelemetry.Settle settle = OutboxTelemetry.Settle.NONE;
         int settled;
 
-        /** An Error the guard lets through from the settle still ends the step: nothing else would. */
-        @Override
+        /**
+         * The step's COMMIT returned; an Error the guard lets through from the settle still ends the step: nothing
+         * else would.
+         */
         public void committed() {
             try {
                 settle.committed(settled);
@@ -521,7 +512,7 @@ public final class ShardProcessor implements AutoCloseable {
             }
         }
 
-        @Override
+        /** The step's transaction rolled back after {@code error}, a COMMIT that failed included. */
         public void rolledBack(Throwable error) {
             try {
                 settle.failed(settled, error);

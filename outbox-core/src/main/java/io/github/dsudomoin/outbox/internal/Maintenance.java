@@ -399,9 +399,8 @@ public final class Maintenance {
     @Nullable
     private Integer checkShards(Connection c) throws SQLException {
         var present = briefly(c, () -> {
-            try (var st = c.createStatement(); var rs = st.executeQuery(cursorShards)) {
-                rs.next();
-                return rs.getInt(1);
+            try (var st = c.createStatement()) {
+                return (int) Sql.queryLong(st, cursorShards);
             }
         });
         if (present == null) {
@@ -864,8 +863,7 @@ public final class Maintenance {
     /** One transaction of {@link #anchor}: {@code rows}, given the shards it locked, read after the lock. */
     private int anchorChunk(Connection c, List<Integer> shards, SqlFunction1<List<Integer>, List<Cursor>> rowsOf)
             throws SQLException {
-        c.setAutoCommit(false);
-        try {
+        return Sql.inTransaction(c, () -> {
             execute(c, "set transaction isolation level read committed");
             execute(c, "set local idle_in_transaction_session_timeout = " + ABANDONED_AFTER.toMillis());
             List<Integer> locked;
@@ -882,18 +880,8 @@ public final class Maintenance {
             anchorLocked.run();
             var rows = rowsOf.apply(locked); // a statement after the lock
             cursors.appendAll(c, rows);
-            c.commit();
             return rows.size();
-        } catch (SQLException | RuntimeException e) {
-            try {
-                c.rollback();
-            } catch (SQLException cleanup) {
-                e.addSuppressed(cleanup);
-            }
-            throw e;
-        } finally {
-            c.setAutoCommit(true);
-        }
+        });
     }
 
     /**
@@ -997,16 +985,12 @@ public final class Maintenance {
         var left = partitions.xidsLeft(c);
         xidsLeft = left == null ? Double.NaN : left;
         var cut = partitions.attachBackCut();
-        if (left != null && cut != null) {
+        if (left != null) {
             log.error("outbox partition tail {} is not attached, so no partition takes rows above the last range:"
-                    + " inserts into {} fail once {} more xids are used. Each maintenance run tries to attach it back;"
-                    + " {}", names.tail(), names.base(), left, cut);
-        } else if (left != null) {
-            log.error("outbox partition tail {} is not attached, so no partition takes rows above the last range:"
-                    + " inserts into {} fail once {} more xids are used. Each maintenance run tries to attach it back"
-                    + " or make a new one; a long transaction or snapshot (pg_dump, a repeatable-read report) blocks"
-                    + " that until it ends: see pg_stat_activity, oldest xact_start with backend_xmin set",
-                    names.tail(), names.base(), left);
+                    + " inserts into {} fail once {} more xids are used. Each maintenance run tries to attach it"
+                    + " back{}", names.tail(), names.base(), left, cut != null ? "; " + cut : " or make a new one; a"
+                            + " long transaction or snapshot (pg_dump, a repeatable-read report) blocks that until it"
+                            + " ends: see pg_stat_activity, oldest xact_start with backend_xmin set");
         } else if (ahead < 2 && due(premadeLogged)) { // a tail takes the rows, so nothing fails: not an ERROR
             log.warn("only {} premade xid partitions of {} left; inserts reach the tail soon, see README \"tail"
                     + " overflow\"; this WARN repeats at most once a minute", ahead, names.base());

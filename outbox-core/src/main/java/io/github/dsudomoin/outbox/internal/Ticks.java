@@ -520,12 +520,10 @@ public final class Ticks {
     @Nullable
     public Long skipReferencedIds(Connection autocommit) throws SQLException {
         var c = autocommit;
-        c.setAutoCommit(false);
-        try {
+        return Sql.inTransaction(c, () -> {
             if (!lock(c)) {
                 throw new SQLException("the tick lock stayed taken for 1 s", LOCK_NOT_AVAILABLE);
             }
-            Long moved;
             try (var ps = c.prepareStatement("with q as materialized (select s, coalesce(pg_sequence_last_value(s), 0)"
                     + " last, greatest((select max(greatest(tick_id, coalesce(target_tick_id, 0))) from "
                     + names.cursor() + "), (select max(greatest(tick_id, busy_tick_id)) from " + names.checkpoint()
@@ -533,21 +531,10 @@ public final class Ticks {
                     + " select last, setval(s, referenced) from q where referenced > last")) {
                 ps.setString(1, names.tick());
                 try (var rs = ps.executeQuery()) {
-                    moved = rs.next() ? rs.getLong(1) : null;
+                    return rs.next() ? rs.getLong(1) : null;
                 }
             }
-            c.commit();
-            return moved;
-        } catch (SQLException e) {
-            try {
-                c.rollback();
-            } catch (SQLException cleanup) {
-                e.addSuppressed(cleanup);
-            }
-            throw e;
-        } finally {
-            c.setAutoCommit(true);
-        }
+        });
     }
 
     /** The first two statements of {@link #make}, for tests that hold the tick lock as a frozen instance would. */

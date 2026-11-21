@@ -212,8 +212,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
      */
     public KafkaOutboxSender(KafkaOutboxConfig config,
             Function<Map<String, Object>, Producer<byte[], byte[]>> producers) {
-        this(producerConfig(config.driverProperties()), config.clientIdSuffix(), producers, Clock.systemUTC(),
-                System::nanoTime);
+        this(config, producers, Clock.systemUTC(), System::nanoTime);
     }
 
     /** For tests: the four pools of the public constructors, on {@code clock} and {@code nanos}. */
@@ -531,21 +530,21 @@ public final class KafkaOutboxSender implements AutoCloseable {
                 try {
                     if (!refused.isEmpty()
                             && (refused.contains(topic) || refused.contains(BatchClassifier.orderingKey(record)))) {
-                        call.complete(i, Outcome.notAttempted(), false);
+                        call.complete(i, Outcome.notAttempted());
                         continue;
                     }
                     if (call.metadataTimedOut && !partitionInfos.containsKey(topic)
                             && !pooled.resolved(topic, nanos.getAsLong())) {
                         // one metadata wait per call; before the cooldown lookup, which would lease the topic to us
                         var until = notBefore(topicCooldown.peek(topic, nanos.getAsLong()));
-                        call.complete(i, until.isPresent() ? Outcome.notAttempted(until.get()) : Outcome.notAttempted(),
-                                false);
+                        call.complete(i,
+                                until.isPresent() ? Outcome.notAttempted(until.get()) : Outcome.notAttempted());
                         continue;
                     }
                     var topicUntil = coolingUntil.computeIfAbsent(topic,
                             t -> leaseOrWait(topicCooldown, topic, leases));
                     if (topicUntil.isPresent()) {
-                        call.complete(i, Outcome.notAttempted(topicUntil.get()), false);
+                        call.complete(i, Outcome.notAttempted(topicUntil.get()));
                         continue;
                     }
                     var infos = partitionInfos.get(topic);
@@ -562,7 +561,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
                         partitionInfos.put(topic, infos);
                         pooled.used(topic, nanos.getAsLong());
                         if (System.nanoTime() - handOverUntil >= 0) { // a slow lookup: past the hand-over cutoff
-                            call.complete(i, Outcome.notAttempted(), false);
+                            call.complete(i, Outcome.notAttempted());
                             break;
                         }
                     }
@@ -576,7 +575,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
                         var until = coolingUntil.computeIfAbsent(partition,
                                 p -> leaseOrWait(cooldown, partition, leases));
                         if (until.isPresent()) {
-                            call.complete(i, Outcome.notAttempted(until.get()), false);
+                            call.complete(i, Outcome.notAttempted(until.get()));
                             continue;
                         }
                     }
@@ -593,7 +592,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
                         }
                     }
                 } catch (InterruptException e) { // waiting for metadata or buffer space: the record joined no batch
-                    call.complete(i, Outcome.notAttempted(), false);
+                    call.complete(i, Outcome.notAttempted());
                 } catch (RuntimeException e) {
                     call.failed(i, e, null);
                 }
@@ -708,7 +707,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
      */
     private void refuse(Call call, int i, OutboxRecord record, Exception e, boolean metadata,
             Map<Object, Optional<Instant>> coolingUntil, Set<Object> refused) {
-        call.complete(i, outcome(e), false);
+        call.complete(i, outcome(e));
         var topic = record.topic();
         boolean metadataTimeout = e instanceof TimeoutException && !(e instanceof BufferExhaustedException);
         call.metadataTimedOut |= metadataTimeout;
@@ -970,8 +969,8 @@ public final class KafkaOutboxSender implements AutoCloseable {
             started++;
         }
 
-        synchronized void complete(int i, Outcome outcome, boolean own) {
-            record(i, outcome, own, null);
+        synchronized void complete(int i, Outcome outcome) {
+            record(i, outcome, false, null);
         }
 
         /** Holds this. The first completion of a record wins. */

@@ -81,15 +81,13 @@ public final class PgInbox implements Inbox, AutoCloseable {
     private volatile ScheduledExecutorService scheduler;
 
     public PgInbox(OutboxTransactions db, OutboxConfig config, OutboxTelemetry telemetry) {
-        this(db, db, config, telemetry);
+        this(db, db, config, telemetry, InstantSource.system());
     }
 
-    /** {@code ddl}: the transactions whose new connections run the startup and maintenance. */
-    public PgInbox(OutboxTransactions db, OutboxTransactions ddl, OutboxConfig config, OutboxTelemetry telemetry) {
-        this(db, ddl, config, telemetry, InstantSource.system());
-    }
-
-    /** {@code jvmClock}: until the clock's first reading, and only that; another one only in tests. */
+    /**
+     * {@code ddl}: the transactions whose new connections run the startup and maintenance; {@code jvmClock}: until the
+     * clock's first reading, and only that; another one only in tests.
+     */
     public PgInbox(OutboxTransactions db, OutboxTransactions ddl, OutboxConfig config, OutboxTelemetry telemetry,
             InstantSource jvmClock) {
         this.clock = new DatabaseClock(jvmClock);

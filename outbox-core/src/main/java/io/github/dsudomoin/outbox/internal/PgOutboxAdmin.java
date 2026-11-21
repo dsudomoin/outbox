@@ -22,7 +22,6 @@ import java.sql.Types;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
-import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
@@ -418,8 +417,8 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     private boolean recoveredAfterAll(Exception failure) {
         try (var c = ddl.newConnection(); var bound = socket.on(c)) {
             c.setAutoCommit(false);
-            try (var st = c.createStatement()) {
-                st.execute("set local lock_timeout = 5000");
+            try {
+                execute(c, "set local lock_timeout = 5000");
                 var check = recovery.check(c);
                 return check.current() >= check.tickXmax() && check.recorded() == null;
             } finally {
@@ -1243,8 +1242,8 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             add(sql, params, "key = ?", f.key());
             // a substring: no pattern, no escapes
             add(sql, params, "position(? in error) > 0", absentIfBlank(f.errorContains()));
-            add(sql, params, "failed_at >= ?", f.failedFrom() == null ? null : f.failedFrom().atOffset(ZoneOffset.UTC));
-            add(sql, params, "failed_at < ?", f.failedTo() == null ? null : f.failedTo().atOffset(ZoneOffset.UTC));
+            add(sql, params, "failed_at >= ?", f.failedFrom() == null ? null : RetryStore.timestamp(f.failedFrom()));
+            add(sql, params, "failed_at < ?", f.failedTo() == null ? null : RetryStore.timestamp(f.failedTo()));
             add(sql, params, "status = ?", f.status() == null ? null : f.status().name().toLowerCase(Locale.ROOT));
             return new Where(sql.isEmpty() ? "true" : String.join(" and ", sql), params);
         }

@@ -17,7 +17,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.TreeSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -66,7 +65,7 @@ public final class OutboxRuntime implements AutoCloseable {
     private final Set<String> claimedTopics;
     /** The version each {@link TypedOutboxTopicHandler} route reads, by topic: what this instance's row reports. */
     private final Map<String, Integer> contracts;
-    /** Every topic a route claims, typed or plain, sorted: what this instance's row reports. */
+    /** Every topic a route claims, typed or plain: what this instance's row reports. */
     private final Set<String> routes;
     private final OutboxDeadLetterHandler deadLetterHandler;
     private final OutboxTelemetry telemetry;
@@ -78,12 +77,11 @@ public final class OutboxRuntime implements AutoCloseable {
     @Nullable
     private volatile Parts parts;
 
-    private OutboxRuntime(Builder builder, OutboxHandler handler, @Nullable Set<String> claimedTopics,
-            Map<String, Integer> contracts, Set<String> routes) {
+    private OutboxRuntime(Builder builder, OutboxHandler handler, Map<String, Integer> contracts, Set<String> routes) {
         this.config = builder.config;
         this.transactions = builder.transactions;
         this.handler = handler;
-        this.claimedTopics = claimedTopics;
+        this.claimedTopics = builder.handler != null ? null : routes;
         this.contracts = contracts;
         this.routes = routes;
         this.deadLetterHandler = builder.deadLetterHandler;
@@ -303,8 +301,7 @@ public final class OutboxRuntime implements AutoCloseable {
                     contracts.put(topic, typed.contractVersion());
                 }
             });
-            return new OutboxRuntime(this, routed, handler != null ? null : claims.keySet(), contracts,
-                    new TreeSet<>(claims.keySet()));
+            return new OutboxRuntime(this, routed, contracts, claims.keySet());
         }
 
         /** Fills {@code claims} with each claimed topic's route. */

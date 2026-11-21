@@ -795,8 +795,7 @@ public final class XidPartitions {
         try {
             return SocketBound.atLeast(c, quiesceTimeout, () -> PartitionDdl.transaction(c, QUIESCE_IDLE, () -> {
                 try (var st = c.createStatement()) {
-                    st.execute("set local lock_timeout = " + quiesceTimeout.toMillis() + "; set local statement_timeout = "
-                            + quiesceTimeout.plus(PartitionDdl.DDL_MARGIN).toMillis());
+                    PartitionDdl.setLocalTimeouts(c, quiesceTimeout, quiesceTimeout.plus(PartitionDdl.DDL_MARGIN));
                     st.execute(quiesce);
                     st.execute("set local lock_timeout to default; set local statement_timeout to default");
                 }

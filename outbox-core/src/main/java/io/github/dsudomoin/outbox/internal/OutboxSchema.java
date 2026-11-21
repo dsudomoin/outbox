@@ -582,7 +582,7 @@ public final class OutboxSchema implements AutoCloseable {
         for (var table : objects.tables()) {
             for (var index : table.indexes()) {
                 if (!index.name().equals(deadDue)) {
-                    createIndex(c, index.name(), table.name() + " " + index.definition());
+                    createIndex(c, table, index);
                 } else if (!PartitionDdl.exists(c, deadDue)) {
                     // on a dead table with rows (kept forever by default) the build would hold dead inserts and
                     // outlast the statement_timeout: Maintenance builds it concurrently, and the pass claims by a
@@ -591,7 +591,7 @@ public final class OutboxSchema implements AutoCloseable {
                         log.info("outbox index {} is missing on {}, which holds rows: maintenance builds it"
                                 + " concurrently in its next run", deadDue, n.dead());
                     } else {
-                        createIndex(c, deadDue, table.name() + " " + index.definition());
+                        createIndex(c, table, index);
                     }
                 }
             }
@@ -654,8 +654,7 @@ public final class OutboxSchema implements AutoCloseable {
             try {
                 // each lock wait within the bootstrap's lock_timeout, the drain checks' scans within its
                 // statement_timeout
-                execute(c, "set local lock_timeout = " + LOCK_TIMEOUT.toMillis() + "; set local statement_timeout = "
-                        + STATEMENT_TIMEOUT.toMillis());
+                PartitionDdl.setLocalTimeouts(c, LOCK_TIMEOUT, STATEMENT_TIMEOUT);
                 try (var ps = c.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {
                     for (int lock : List.of(TableNames.LOCK_MAINTENANCE, TableNames.LOCK_SWAP, TableNames.LOCK_TICK)) {
                         ps.setInt(1, n.internalNamespace());
@@ -863,12 +862,13 @@ public final class OutboxSchema implements AutoCloseable {
         }
     }
 
-    private void createIndex(Connection c, String index, String definition) throws SQLException {
-        if (PartitionDdl.exists(c, index)) {
+    private static void createIndex(Connection c, SchemaObjects.Table table, SchemaObjects.Index index)
+            throws SQLException {
+        if (PartitionDdl.exists(c, index.name())) {
             return; // CREATE INDEX IF NOT EXISTS would still queue a SHARE lock behind running writers
         }
         try {
-            ddl(c, "create index " + spelled.unqualified(index) + " on " + definition);
+            ddl(c, table.indexSql(index));
         } catch (SQLException e) {
             if (!DUPLICATE_TABLE.equals(e.getSQLState())) { // made meanwhile, by a dead-index build
                 throw e;

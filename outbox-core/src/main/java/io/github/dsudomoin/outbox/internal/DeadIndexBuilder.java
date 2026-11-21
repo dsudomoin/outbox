@@ -43,11 +43,13 @@ final class DeadIndexBuilder {
         t.setDaemon(true);
         return t;
     });
+    /** Picks from {@code pg_locks l} the build's granted SHARE UPDATE EXCLUSIVE on the dead table. */
+    private static final String HOLDS_BUILD_LOCK = " where l.locktype = 'relation' and l.relation = to_regclass(?)"
+            + " and l.mode = 'ShareUpdateExclusiveLock' and l.granted";
     /** The longest wait for a lock of a backend holding the build's SHARE UPDATE EXCLUSIVE on the dead table, s. */
     private static final String BUILD_WAIT = "select coalesce(extract(epoch from clock_timestamp() - min(w.waitstart)),"
             + " 0)::float8 from pg_locks l join pg_locks w on w.pid = l.pid and not w.granted and w.waitstart is not null"
-            + " where l.locktype = 'relation' and l.relation = to_regclass(?) and l.mode = 'ShareUpdateExclusiveLock'"
-            + " and l.granted";
+            + HOLDS_BUILD_LOCK;
 
     /** The longest backoff after a failed build. */
     static final Duration MAX_BACKOFF = Duration.ofHours(24);
@@ -146,8 +148,7 @@ final class DeadIndexBuilder {
         String state;
         try (var ps = c.prepareStatement("select coalesce(min(case when a.state = 'active' then 'active'"
                 + " when a.state is null or a.state = 'disabled' then 'hidden' else 'idle' end), 'gone')"
-                + " from pg_locks l left join pg_stat_activity a on a.pid = l.pid where l.locktype = 'relation'"
-                + " and l.relation = to_regclass(?) and l.mode = 'ShareUpdateExclusiveLock' and l.granted")) {
+                + " from pg_locks l left join pg_stat_activity a on a.pid = l.pid" + HOLDS_BUILD_LOCK)) {
             ps.setString(1, names.dead());
             try (var rs = ps.executeQuery()) {
                 rs.next();
@@ -340,7 +341,7 @@ final class DeadIndexBuilder {
                 }
                 waitCut = true;
             }
-            st.cancel(); // a JDBC cancel: a transaction-pooling proxy forwards it to the server session that runs it
+            st.cancel();
         } catch (SQLException | RuntimeException e) {
             log.debug("outbox could not watch the build of {}", index, e);
         }

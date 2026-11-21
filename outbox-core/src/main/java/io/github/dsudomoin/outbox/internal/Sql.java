@@ -4,7 +4,10 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
 
-/** JDBC callbacks that may throw {@link SQLException}, the one-statement {@link #execute} and {@link #queryLong}. */
+/**
+ * JDBC callbacks that may throw {@link SQLException}, the one-statement {@link #execute} and {@link #queryLong}, and
+ * {@link #inTransaction}.
+ */
 public final class Sql {
 
     private Sql() {}
@@ -22,6 +25,29 @@ public final class Sql {
             rs.next();
             return rs.getLong(1);
         }
+    }
+
+    /**
+     * {@code body} in a transaction on the autocommit connection {@code c}, given back in autocommit: commits after
+     * {@code body}, rolls back when it throws.
+     */
+    static <T> T inTransaction(Connection c, SqlFunction0<T> body) throws SQLException {
+        c.setAutoCommit(false);
+        T result;
+        try {
+            result = body.apply();
+            c.commit();
+        } catch (Throwable e) { // an Error too: setAutoCommit(true) would commit the work so far
+            try {
+                c.rollback();
+                c.setAutoCommit(true);
+            } catch (SQLException | RuntimeException cleanup) {
+                e.addSuppressed(cleanup);
+            }
+            throw e;
+        }
+        c.setAutoCommit(true);
+        return result;
     }
 
     @FunctionalInterface

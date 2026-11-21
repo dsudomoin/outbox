@@ -181,11 +181,6 @@ public final class RetryStore {
         }
     }
 
-    /** {@link #dueHeads(Connection, int, Instant, int, long, boolean)} without a byte limit. */
-    public List<DueHead> dueHeads(Connection c, int shard, Instant now, int limit) throws SQLException {
-        return dueHeads(c, shard, now, limit, RowBytes.NO_LIMIT, true);
-    }
-
     /**
      * Heads of {@code shard} due at {@code now}: those that do not wait in id order, then the waiting ones in id
      * order; {@code attempts} as stored. At most {@code limit} and as many as fit in {@code bytes}, the first however
@@ -208,12 +203,6 @@ public final class RetryStore {
                 return heads;
             }
         }
-    }
-
-    /** {@link #followers(Connection, List, int, long)} without a byte limit. */
-    public Map<Long, List<OutboxRecord>> followers(Connection c, List<DueHead> heads, int perKey)
-            throws SQLException {
-        return followers(c, heads, perKey, RowBytes.NO_LIMIT);
     }
 
     /**

@@ -194,7 +194,7 @@ public final class PartitionDdl {
                     + " owner to " + owner + "; perform set_config('" + REOWN_RESULT + "', 'given', true);",
                     XidPartitions.DAY_HOLD, REOWN_RESULT);
             try {
-                var result = transaction(c, Maintenance.ABANDONED_AFTER, () -> XidPartitions.pipeline(c, sql, null));
+                var result = XidPartitions.pipelined(c, sql, null);
                 if (!result.equals("given")) {
                     log.warn("outbox could not give table {} to {}, the owner of {}: a transaction held a lock on it at"
                             + " every try for {} ms; the next maintenance run retries", table, owner, parent,
@@ -254,7 +254,7 @@ public final class PartitionDdl {
         return "^" + parent.substring(parent.indexOf('.') + 1) + suffix + "$";
     }
 
-    private static String role(Connection c) throws SQLException {
+    static String role(Connection c) throws SQLException {
         try (var st = c.createStatement(); var rs = st.executeQuery("select current_user")) {
             rs.next();
             return rs.getString(1);
@@ -417,8 +417,7 @@ public final class PartitionDdl {
             @Nullable String to, Duration lockTimeout, Duration statementTimeout) throws SQLException {
         boolean empty = transaction(c, workIdle(lockTimeout), () -> {
             try (var st = c.createStatement()) {
-                st.execute("set local lock_timeout = " + lockTimeout.toMillis() + "; set local statement_timeout = "
-                        + statementTimeout.toMillis());
+                setLocalTimeouts(c, lockTimeout, statementTimeout);
                 st.execute("lock table " + name(table) + " in access exclusive mode");
                 boolean none;
                 try (var rs = st.executeQuery("select 1 from " + name(table) + " limit 1")) {
@@ -503,8 +502,7 @@ public final class PartitionDdl {
         // second would miss rows
         boolean found = transaction(c, workIdle(lockTimeout), () -> {
             try (var st = c.createStatement()) {
-                st.execute("set local lock_timeout = " + lockTimeout.toMillis() + "; set local statement_timeout = "
-                        + lockTimeout.plus(DDL_MARGIN).toMillis());
+                setLocalTimeouts(c, lockTimeout, lockTimeout.plus(DDL_MARGIN));
                 if (finds(c, table, find, bound)) {
                     return true;
                 }
@@ -608,8 +606,7 @@ public final class PartitionDdl {
             Sql.SqlFunction0<T> body) throws SQLException {
         return SocketBound.atLeast(c, statementTimeout, () -> c.getAutoCommit()
                 ? transaction(c, Maintenance.ABANDONED_AFTER, () -> {
-                    Sql.execute(c, "set local lock_timeout = " + lockTimeout.toMillis() + "; set local"
-                            + " statement_timeout = " + statementTimeout.toMillis());
+                    setLocalTimeouts(c, lockTimeout, statementTimeout);
                     return body.apply();
                 })
                 : withLocalTimeouts(c, lockTimeout, statementTimeout, body));
@@ -626,26 +623,13 @@ public final class PartitionDdl {
      * it throws.
      */
     static <T> T transaction(Connection c, Duration idle, Sql.SqlFunction0<T> body) throws SQLException {
-        c.setAutoCommit(false);
-        T result;
-        try {
+        return Sql.inTransaction(c, () -> {
             // first: isolation must precede every query of the transaction
             Sql.execute(c, "set transaction isolation level read committed; set local"
                     + " idle_in_transaction_session_timeout = " + idle.toMillis() + Ticks.noTransactionTimeout(c));
             LockHolder.fenceCurrent(c);
-            result = body.apply();
-            c.commit();
-        } catch (Throwable e) { // an Error too: setAutoCommit(true) would commit the work so far
-            try {
-                c.rollback();
-                c.setAutoCommit(true);
-            } catch (SQLException | RuntimeException cleanup) {
-                e.addSuppressed(cleanup);
-            }
-            throw e;
-        }
-        c.setAutoCommit(true);
-        return result;
+            return body.apply();
+        });
     }
 
     /**
@@ -687,6 +671,12 @@ public final class PartitionDdl {
             }
             return null;
         });
+    }
+
+    /** {@code SET LOCAL} of both timeouts, in one statement. */
+    static void setLocalTimeouts(Connection c, Duration lock, Duration statement) throws SQLException {
+        Sql.execute(c, "set local lock_timeout = " + lock.toMillis() + "; set local statement_timeout = "
+                + statement.toMillis());
     }
 
     private static <T> T withLocalTimeouts(Connection c, Duration lockTimeout, Duration statementTimeout,

@@ -87,12 +87,7 @@ public final class ParkedStore {
 
     /** For reads and moves of rows: nothing here that answers a handler. */
     public ParkedStore(TableNames names, RetryStore retries) {
-        this(names, retries, Duration.ZERO, Integer.MAX_VALUE);
-    }
-
-    /** {@link #ParkedStore(TableNames, RetryStore, Duration, int, long)} without a byte limit. */
-    public ParkedStore(TableNames names, RetryStore retries, Duration delay, int batch) {
-        this(names, retries, delay, batch, RowBytes.NO_LIMIT);
+        this(names, retries, Duration.ZERO, Integer.MAX_VALUE, RowBytes.NO_LIMIT);
     }
 
     /**
@@ -444,12 +439,6 @@ public final class ParkedStore {
             }
         }
         return List.copyOf(handed.values());
-    }
-
-    /** {@link #dueWithOlder(Connection, int, Instant, int, long, long, long, boolean)} without a byte limit. */
-    public List<OutboxRecord> dueWithOlder(Connection c, int shard, Instant now, int limit, long most)
-            throws SQLException {
-        return dueWithOlder(c, shard, now, limit, most, RowBytes.NO_LIMIT, RowBytes.NO_LIMIT, true);
     }
 
     /**
