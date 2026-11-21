@@ -1016,10 +1016,8 @@ class KafkaOutboxSenderTest {
     @Test
     void authorizationErrorIsRetryAndCoolsTheTopic() throws Exception {
         var sender = sender(DELIVERY_TIMEOUT);
-        var result = sendAsync(sender, List.of(record(1, keyOnPartition(0))));
-        awaitSent(0, 1).errorNext(new TopicAuthorizationException(Set.of(TOPIC)));
-
-        assertThat(result.get(5, SECONDS).get(0)).isInstanceOfSatisfying(Outcome.Retry.class,
+        assertThat(failed(sendAsync(sender, List.of(record(1, keyOnPartition(0)))), 0,
+                new TopicAuthorizationException(Set.of(TOPIC))).get(0)).isInstanceOfSatisfying(Outcome.Retry.class,
                 r -> assertThat(r.error()).isInstanceOf(TopicAuthorizationException.class));
 
         var next = sendAsync(sender, List.of(record(2, keyOnPartition(1)), recordTo(OTHER, 3, "a")));

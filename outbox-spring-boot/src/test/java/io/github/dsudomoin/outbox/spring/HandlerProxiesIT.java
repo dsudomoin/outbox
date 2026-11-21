@@ -408,20 +408,6 @@ class HandlerProxiesIT {
     }
 
     @Configuration(proxyBeanMethods = false)
-    static class TypedAspectApp {
-
-        @Bean
-        OutboxTopicHandler typedHandler(Calls calls) {
-            return new Typed(calls);
-        }
-
-        @Bean
-        RecordingAspect recordingAspect(Calls calls) {
-            return new RecordingAspect(calls);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
     static class ScopedApp {
 
         @Bean
@@ -471,20 +457,6 @@ class HandlerProxiesIT {
         }
     }
 
-    @Configuration(proxyBeanMethods = false)
-    static class TombstoneAspectApp {
-
-        @Bean
-        OutboxTopicHandler typedHandler(Calls calls) {
-            return new Typed(calls);
-        }
-
-        @Bean
-        TombstoneAspect tombstoneAspect(Calls calls) {
-            return new TombstoneAspect(calls);
-        }
-    }
-
     /** An interface-based proxy over a class-based one: its final handle(OutboxRecord) runs on the inner proxy. */
     @Configuration(proxyBeanMethods = false)
     static class NestedProxiesApp {
@@ -520,6 +492,11 @@ class HandlerProxiesIT {
     /** {@code handler} as the one bean {@code name}, built over the {@link Calls}. */
     private static ApplicationContextRunner app(String name, Class<?> handler, String... properties) {
         return runner(properties).withBean(Calls.class).withBean(name, handler);
+    }
+
+    /** {@link Typed} as the bean {@code typedHandler}, advised by {@code aspect}. */
+    private static ApplicationContextRunner typed(Class<?> aspect, String... properties) {
+        return app("typedHandler", Typed.class, properties).withBean(aspect);
     }
 
     /** {@code handler} as the bean {@code batched}, which {@link BatchAspect} advises. */
@@ -577,7 +554,7 @@ class HandlerProxiesIT {
 
     @Test
     void aspectOnFinalTypedHandleFailsStart() {
-        app(TypedAspectApp.class).run(context -> assertThat(failure(context)).contains("typedHandler")
+        typed(RecordingAspect.class).run(context -> assertThat(failure(context)).contains("typedHandler")
             .contains("handle(OutboxRecord)").contains(RecordingAspect.class.getName()).contains("advise the hook"));
     }
 
@@ -589,7 +566,7 @@ class HandlerProxiesIT {
 
     @Test
     void jdkTypedAspectOnInterfaceHandleRuns() {
-        app(TypedAspectApp.class, JDK_PROXIES).run(context -> assertThat(seenAfter(context, "audit", 4))
+        typed(RecordingAspect.class, JDK_PROXIES).run(context -> assertThat(seenAfter(context, "audit", 4))
             .containsExactly("aspect no tx", "typed v no tx", "aspect no tx", "typed v no tx"));
     }
 
@@ -692,9 +669,9 @@ class HandlerProxiesIT {
 
     @Test
     void tombstoneReachesTheAdvice() {
-        app(TombstoneAspectApp.class).run(context -> assertThat(seenAfterTombstone(context))
+        typed(TombstoneAspect.class).run(context -> assertThat(seenAfterTombstone(context))
             .containsExactly("tombstone aspect no tx", "tombstone no tx"));
-        app(TypedAspectApp.class, JDK_PROXIES).run(context -> assertThat(seenAfterTombstone(context))
+        typed(RecordingAspect.class, JDK_PROXIES).run(context -> assertThat(seenAfterTombstone(context))
             .containsExactly("aspect no tx", "tombstone no tx"));
     }
 
@@ -709,7 +686,7 @@ class HandlerProxiesIT {
     @Test
     void typedContractVersionFromTarget() {
         app("typedHandler", TypedTx.class).run(context -> assertContractV2(context, "typed v2 in tx"));
-        app(TypedAspectApp.class, JDK_PROXIES).run(context -> assertContractV2(context, "typed v2 no tx"));
+        typed(RecordingAspect.class, JDK_PROXIES).run(context -> assertContractV2(context, "typed v2 no tx"));
     }
 
     private static void assertContractV2(ApplicationContext context, String delivered) throws Exception {

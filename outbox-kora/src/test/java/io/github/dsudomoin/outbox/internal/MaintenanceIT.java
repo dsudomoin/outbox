@@ -2633,7 +2633,7 @@ class MaintenanceIT {
     }
 
     /** Opens a repeatable-read transaction on {@code c} and takes its snapshot with a read of {@code table}. */
-    private static void holdSnapshot(Connection c, String table) throws SQLException {
+    static void holdSnapshot(Connection c, String table) throws SQLException {
         c.setAutoCommit(false);
         execute(c, "set transaction isolation level repeatable read");
         queryLong(c, "select count(*) from " + table);

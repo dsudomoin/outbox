@@ -688,7 +688,7 @@ class OutboxRelayIT {
             } catch (InterruptedException e) {
                 throw new IllegalStateException(e);
             }
-            records.forEach(r -> offers.merge(new String(r.payload(), UTF_8), 1, Integer::sum));
+            records.forEach(r -> offers.merge(payload(r), 1, Integer::sum));
             return records.stream().map(r -> Outcome.requeue()).toList();
         }));
         send(outbox(relay::wake), IntStream.range(0, 5).mapToObj(i -> msg("t", "k", "k#" + i)).toArray(OutboxMessage[]::new));

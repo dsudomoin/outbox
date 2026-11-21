@@ -434,8 +434,8 @@ class KafkaGuaranteesIT {
     }
 
     /**
-     * A fresh table; the sender bounds a call by delivery.timeout.ms (20 s here, {@link TestKafka#shortTimeouts}) + 5 s
-     * + max.block.ms, so the relay gives it that.
+     * A fresh table; 30 s covers a sender on {@link TestKafka#shortTimeouts}, as this class's and KafkaTelemetryIT's
+     * are, which bounds a call by delivery.timeout.ms (20 s) + 5 s + max.block.ms.
      */
     static TestOutboxConfig config() {
         return new TestOutboxConfig().batchTimeout(Duration.ofSeconds(30)).deadLettersTimeout(Duration.ofSeconds(30));

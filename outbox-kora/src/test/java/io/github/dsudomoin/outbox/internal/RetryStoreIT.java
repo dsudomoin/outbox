@@ -27,6 +27,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import org.junit.jupiter.api.AfterEach;
@@ -129,14 +130,13 @@ class RetryStoreIT {
                 new Follower(a3)), NOW);
         store.apply(c, 1, List.of(new Follower(otherShard)), NOW);
 
-        var followers = store.followers(c, notWaiting(a, b, unkeyed), 2, RowBytes.NO_LIMIT);
+        var followers = followers(notWaiting(a, b, unkeyed), 2);
 
         assertThat(followers).containsOnlyKeys(a.id(), b.id());
         assertThat(followers.get(a.id())).extracting(OutboxRecord::id).containsExactly(a1.id(), a2.id());
         assertThat(followers.get(b.id())).extracting(OutboxRecord::id).containsExactly(b1.id());
         ParkedStoreIT.assertSameRecord(followers.get(b.id()).get(0), b1, 0, 0);
-        assertThat(store.followers(c, notWaiting(b1), 5, RowBytes.NO_LIMIT)).as("only rows after the given one")
-                .isEmpty();
+        assertThat(followers(notWaiting(b1), 5)).as("only rows after the given one").isEmpty();
     }
 
     @Test
@@ -238,7 +238,7 @@ class RetryStoreIT {
         assertThat(waitingSince(failed.id())).isNull();
         assertThat(waitingSince(skipped.id())).isNull();
         assertThat(retryRow(waiting.id())).isEqualTo("2|" + NOW + "|waiting (contract): v2");
-        assertThat(store.dueHeads(c, 0, NOW, 10, RowBytes.NO_LIMIT, true))
+        assertThat(due(0, NOW, 10))
                 .as("those that do not wait first, each part in id order")
                 .extracting(head -> head.r().id(), DueHead::waitingSince)
                 .containsExactly(tuple(failed.id(), null), tuple(skipped.id(), null), tuple(waiting.id(), since));
@@ -255,13 +255,13 @@ class RetryStoreIT {
         store.apply(c, 0, List.of(new Head(waiting, 0, NOW, "w", Kind.HANDLER), new Head(other, 1, NOW, "e"),
                 new Follower(w1), new Follower(o1)), NOW);
 
-        var due = store.dueHeads(c, 0, NOW, 10, RowBytes.NO_LIMIT, true);
+        var due = due(0, NOW, 10);
 
         assertThat(due).extracting(head -> head.r().id(), DueHead::takesFollowers)
                 .containsExactly(tuple(other.id(), true), tuple(waiting.id(), false));
-        assertThat(store.followers(c, due, 10, RowBytes.NO_LIMIT)).containsOnlyKeys(other.id());
-        assertThat(store.followers(c, due, 10, RowBytes.NO_LIMIT).get(other.id())).extracting(OutboxRecord::id)
-                .containsExactly(o1.id());
+        var followers = followers(due, 10);
+        assertThat(followers).containsOnlyKeys(other.id());
+        assertThat(followers.get(other.id())).extracting(OutboxRecord::id).containsExactly(o1.id());
         assertThat(new DueHead(record("t", null), null).takesFollowers()).as("unkeyed").isFalse();
     }
 
@@ -309,7 +309,7 @@ class RetryStoreIT {
         assertThat(store.promote(c, 0, delivered, NOW)).isTrue();
         assertThat(store.promote(c, 0, dead, NOW)).isTrue();
 
-        assertThat(store.dueHeads(c, 0, NOW, 10, RowBytes.NO_LIMIT, true))
+        assertThat(due(0, NOW, 10))
                 .extracting(head -> head.r().id(), DueHead::waitingSince)
                 .containsExactly(tuple(a1.id(), null), tuple(b1.id(), null));
         assertThat(store.size(c)).isEqualTo(2);
@@ -366,11 +366,10 @@ class RetryStoreIT {
         var follower = requeued(record("t", "k"), 3);
         store.apply(c, 0, List.of(new Head(head, 1, NOW, "e"), new Follower(follower)), NOW);
 
-        var due = store.dueHeads(c, 0, NOW, 10, RowBytes.NO_LIMIT, true);
+        var due = due(0, NOW, 10);
 
         assertThat(due).extracting(d -> d.r().requeues()).containsExactly(2);
-        assertThat(store.followers(c, due, 10, RowBytes.NO_LIMIT).get(head.id())).extracting(OutboxRecord::requeues)
-                .containsExactly(3);
+        assertThat(followers(due, 10).get(head.id())).extracting(OutboxRecord::requeues).containsExactly(3);
         store.deadFromRetry(c, due.get(0).r(), 2, null); // the dead table does not keep it
         assertThat(deadRow(c, names, head.id())).isEqualTo("0|2|e|k");
     }
@@ -445,9 +444,19 @@ class RetryStoreIT {
         }
     }
 
+    /** {@link RetryStore#dueHeads} without a byte limit, the waiting ones included. */
+    private List<DueHead> due(int shard, Instant now, int limit) throws SQLException {
+        return store.dueHeads(c, shard, now, limit, RowBytes.NO_LIMIT, true);
+    }
+
     /** {@link RetryStore#dueHeads}' records. */
     private List<OutboxRecord> dueHeads(int shard, Instant now, int limit) throws SQLException {
-        return store.dueHeads(c, shard, now, limit, RowBytes.NO_LIMIT, true).stream().map(DueHead::r).toList();
+        return due(shard, now, limit).stream().map(DueHead::r).toList();
+    }
+
+    /** {@link RetryStore#followers} without a byte limit. */
+    private Map<Long, List<OutboxRecord>> followers(List<DueHead> heads, int perKey) throws SQLException {
+        return store.followers(c, heads, perKey, RowBytes.NO_LIMIT);
     }
 
     private static List<DueHead> notWaiting(OutboxRecord... heads) {

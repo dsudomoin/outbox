@@ -247,9 +247,7 @@ class XidPartitionsIT {
                 try {
                     Thread.sleep(500);
                     holder.commit();
-                    pgDump.setAutoCommit(false);
-                    execute(pgDump, "set transaction isolation level repeatable read");
-                    queryLong(pgDump, "select count(*) from " + names.base());
+                    MaintenanceIT.holdSnapshot(pgDump, names.base());
                 } catch (Throwable e) {
                     errors.add(e);
                 }
@@ -815,9 +813,8 @@ class XidPartitionsIT {
         var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1)); // 20 s in production
 
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
-            holder.setAutoCommit(false); // a report on other tables: a snapshot, no lock on the outbox
-            execute(holder, "set transaction isolation level repeatable read");
-            queryLong(holder, "select count(*) from pg_class");
+            // a report on other tables: a snapshot, no lock on the outbox
+            MaintenanceIT.holdSnapshot(holder, "pg_class");
             Thread.sleep(1100); // older than the threshold
             long lower = tail(c, names);
             TestDb.burnXids(2500);
@@ -878,9 +875,7 @@ class XidPartitionsIT {
         dump.setProperty("ApplicationName", "pg_dump");
 
         try (var holder = TestDb.connect(dump); var c = TestDb.connect()) {
-            holder.setAutoCommit(false); // a dump that started a moment ago
-            execute(holder, "set transaction isolation level repeatable read");
-            queryLong(holder, "select count(*) from " + names.base());
+            MaintenanceIT.holdSnapshot(holder, names.base()); // a dump that started a moment ago
             long lower = tail(c, names);
             TestDb.burnXids(2500);
 
@@ -1610,9 +1605,8 @@ class XidPartitionsIT {
             var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1));
 
             try (var holder = TestDb.connect(); var c = TestDb.connect(TestDb.login(role))) {
-                holder.setAutoCommit(false); // a pg_dump by a backup role, under another application name
-                execute(holder, "set transaction isolation level repeatable read");
-                queryLong(holder, "select count(*) from " + names.base());
+                // a pg_dump by a backup role, under another application name
+                MaintenanceIT.holdSnapshot(holder, names.base());
                 long lower = tail(c, names);
                 TestDb.burnXids(2500);
 

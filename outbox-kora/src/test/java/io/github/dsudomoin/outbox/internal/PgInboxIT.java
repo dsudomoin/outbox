@@ -524,9 +524,7 @@ class PgInboxIT {
             assertThat(PartitionDdl.pendingDetach(c, table())).isEqualTo(expired.get(1));
             // a report on another table, its snapshot older than a FINALIZE would be
             execute(c, "create table " + unrelated + " (a int)");
-            report.setAutoCommit(false);
-            execute(report, "set transaction isolation level repeatable read");
-            queryLong(report, "select count(*) from " + unrelated);
+            MaintenanceIT.holdSnapshot(report, unrelated);
 
             inbox.runMaintenance();
 
