@@ -1,6 +1,6 @@
 package io.github.dsudomoin.outbox.kafka;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.JdbcTransactions;
@@ -13,6 +13,7 @@ import io.github.dsudomoin.outbox.internal.Hashing;
 import io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry;
 import io.github.dsudomoin.outbox.micrometer.OutboxDeliveryTracingObservationHandler;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.micrometer.core.instrument.observation.DefaultMeterObservationHandler;
@@ -49,7 +50,6 @@ import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -164,7 +164,7 @@ class KafkaTelemetryIT {
                 "requeued").map(k -> OutboxMessage.of(topic, k, bytes(k))).toList()));
         var dead = ids.get(4);
 
-        await(TIMEOUT, () -> counter("outbox.messages.delivered", "topic", topic) == 5
+        Await.until(TIMEOUT, () -> counter("outbox.messages.delivered", "topic", topic) == 5
                 && counter("outbox.messages.failed", "topic", topic, "outcome", "dead") == 1);
         assertThat(counter("outbox.messages.enqueued", "topic", topic)).isEqualTo(6);
         assertThat(counter("outbox.messages.failed", "topic", topic, "outcome", "retry")).isEqualTo(1);
@@ -188,10 +188,10 @@ class KafkaTelemetryIT {
         var runtime = start(KafkaGuaranteesIT.config().headFailuresBeforeDivert(1_000), handler);
         transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of(topic, "k", bytes("late"))));
 
-        await(TIMEOUT, () -> runtime.maintenance().runOnce() && lag() > 0);
+        Await.until(TIMEOUT, () -> runtime.maintenance().runOnce() && lag() > 0);
         down.set(false);
-        await(TIMEOUT, () -> counter("outbox.messages.delivered", "topic", topic) == 1);
-        await(TIMEOUT, () -> runtime.maintenance().runOnce() && lag() == 0);
+        Await.until(TIMEOUT, () -> counter("outbox.messages.delivered", "topic", topic) == 1);
+        Await.until(TIMEOUT, () -> runtime.maintenance().runOnce() && lag() == 0);
     }
 
     /**
@@ -227,7 +227,7 @@ class KafkaTelemetryIT {
         };
         transactions.inTx(c -> running.outbox().send(OutboxMessage.of(topic, "k", bytes("crashed"))));
 
-        await(TIMEOUT, () -> counter("outbox.relay.failures") >= 1
+        Await.until(TIMEOUT, () -> counter("outbox.relay.failures") >= 1
                 && spans(STEP).stream().anyMatch(s -> s.getStatus().getStatusCode() == StatusCode.ERROR));
         assertThat(terminated).as("the step's backend").hasValue(1);
     }
@@ -478,19 +478,5 @@ class KafkaTelemetryIT {
     private double counter(String name, String... tags) {
         var counter = meters.find(name).tags(tags).counter();
         return counter == null ? 0 : counter.count();
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
-    }
-
-    private static void await(Duration timeout, BooleanSupplier condition) throws InterruptedException {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!condition.getAsBoolean()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within " + timeout);
-            }
-            Thread.sleep(10);
-        }
     }
 }

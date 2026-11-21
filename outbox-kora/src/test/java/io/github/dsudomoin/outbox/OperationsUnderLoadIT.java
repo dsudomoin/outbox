@@ -22,6 +22,7 @@ import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.internal.Ticks;
 import io.github.dsudomoin.outbox.internal.UuidV7;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
@@ -177,21 +178,21 @@ class OperationsUnderLoadIT {
             // a run moves every row but those of keys an open send holds, the holder's and maybe a writer's, and
             // gives up; the next runs move the writers' ones, so only the holder's stay
             var failed = failedRuns(orphan);
-            await(FIRST_FAILURE_CAP, "a maintenance run giving up on " + HELD,
+            Await.until(FIRST_FAILURE_CAP, "a maintenance run giving up on " + HELD,
                     () -> failed.matcher(log.text()).results().findAny().isPresent());
             firstFailure = System.nanoTime() - restoreStarted;
-            await(BOUND, "only the rows of " + HELD + " left", () -> remaining(orphan) == heldRows(orphan));
+            Await.until(BOUND, "only the rows of " + HELD + " left", () -> remaining(orphan) == heldRows(orphan));
             release.countDown();
             holder.join(BOUND.toMillis());
             skipHeld = false;
-            await(BOUND, "the orphan restored", () -> !exists(orphan.table()));
+            Await.until(BOUND, "the orphan restored", () -> !exists(orphan.table()));
             assertEachOnceInTheOutbox(orphan);
         }
         var failed = failedRuns(orphan).matcher(log.text()).results().map(m -> m.group(1)).toList();
         assertThat(failed).as("the runs that gave up").isNotEmpty().containsOnly(LOCK_NOT_AVAILABLE);
         assertThat(occurrences(log.text(), "could not move the rows of " + orphan.table())).as("every failed run")
                 .isEqualTo(failed.size());
-        await(BOUND, "the orphan gauge back to 0", () -> gauge("outbox.partitions.orphaned") == 0);
+        Await.until(BOUND, "the orphan gauge back to 0", () -> gauge("outbox.partitions.orphaned") == 0);
         try (var c = TestDb.connect()) {
             assertThat(queryLong(c, "select count(*) from " + names.dropping() + " where table_name = '"
                     + names.unqualified(orphan.table()) + "'")).as("its <base>_dropping marker").isZero();
@@ -225,7 +226,7 @@ class OperationsUnderLoadIT {
             // exactly them; an operator with a real foreign orphan finds the cut by comparing with what was delivered
             orphan = fill(c, range, Long.parseLong(range.to()));
             maintenanceLock(pause, "pg_advisory_unlock");
-            await(BOUND, "maintenance keeping it", () -> gauge("outbox.partitions.orphaned") == 1);
+            Await.until(BOUND, "maintenance keeping it", () -> gauge("outbox.partitions.orphaned") == 1);
 
             var holder = holdKey();
             restoreStarted = System.nanoTime();
@@ -273,7 +274,7 @@ class OperationsUnderLoadIT {
             }
             assertEachOnceInTheOutbox(orphan);
         }
-        await(BOUND, "the orphan gauge back to 0", () -> gauge("outbox.partitions.orphaned") == 0);
+        Await.until(BOUND, "the orphan gauge back to 0", () -> gauge("outbox.partitions.orphaned") == 0);
 
         var delivered = finish("foreignOrphanIsRestoredByTheAdminUnderLoad", calls + " restoreOrphan calls, "
                 + failedCalls + " gave up (the first " + TimeUnit.NANOSECONDS.toMillis(firstFailure)
@@ -344,7 +345,7 @@ class OperationsUnderLoadIT {
                 }
             });
         }
-        await(BOUND, "inbox load", () -> commits.get() >= 1000);
+        Await.until(BOUND, "inbox load", () -> commits.get() >= 1000);
 
         try (var pause = TestDb.connect(); var c = TestDb.connect()) {
             var lock = "(" + TableNames.of(table).resolve(c).internalNamespace() + ", "
@@ -354,13 +355,13 @@ class OperationsUnderLoadIT {
             execute(c, "alter table " + table + " detach partition " + detached.name() + " concurrently");
             assertThat(PartitionDdl.listRanges(c, table)).doesNotContain(detached);
             long during = commits.get();
-            await(BOUND, "ids recorded while it is detached", () -> commits.get() >= during + 1000);
+            Await.until(BOUND, "ids recorded while it is detached", () -> commits.get() >= during + 1000);
             execute(pause, "select pg_advisory_unlock" + lock);
         }
-        await(BOUND, "the range attached back", () -> inboxRanges(table).contains(detached));
+        Await.until(BOUND, "the range attached back", () -> inboxRanges(table).contains(detached));
         attachedSeen.set(System.nanoTime());
         long attached = commits.get();
-        await(BOUND, "load after the attach", () -> commits.get() >= attached + 1000);
+        Await.until(BOUND, "load after the attach", () -> commits.get() >= attached + 1000);
         stopLoad();
         System.out.printf("OperationsUnderLoadIT inboxOrphanIsAttachedBackUnderLoad: %d writer commits, %d ids"
                 + " recorded, %d inserts into the detached range failed (23514) until the attach, the slowest %.1f"
@@ -382,7 +383,7 @@ class OperationsUnderLoadIT {
             c.rollback();
         }
         // a read during a maintenance run in progress is NaN, unknown until its orphan step completes
-        await(BOUND, "the inbox orphan gauge at 0", () -> gauge("outbox.inbox.partitions.orphaned") == 0);
+        Await.until(BOUND, "the inbox orphan gauge at 0", () -> gauge("outbox.inbox.partitions.orphaned") == 0);
     }
 
     @Test
@@ -488,7 +489,7 @@ class OperationsUnderLoadIT {
                 }
             });
         }
-        await(BOUND, "outbox load", () -> commits.get() >= 1000);
+        Await.until(BOUND, "outbox load", () -> commits.get() >= 1000);
     }
 
     /**
@@ -498,7 +499,7 @@ class OperationsUnderLoadIT {
      */
     private Thread holdKey() throws Exception {
         skipHeld = true;
-        await(BOUND, "writers done with their sends of " + HELD, () -> heldSends.get() == 0);
+        Await.until(BOUND, "writers done with their sends of " + HELD, () -> heldSends.get() == 0);
         var holding = new CountDownLatch(1);
         var holder = run("key-holder", () -> {
             var id = db.inTx((SqlFunction0<UUID>) () -> {
@@ -758,19 +759,5 @@ class OperationsUnderLoadIT {
 
     private static int occurrences(String text, String part) {
         return text.split(Pattern.quote(part), -1).length - 1;
-    }
-
-    private interface Condition {
-        boolean holds() throws Exception;
-    }
-
-    private static void await(Duration timeout, String what, Condition condition) throws Exception {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!condition.holds()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError(what + ": not within " + timeout);
-            }
-            Thread.sleep(5);
-        }
     }
 }

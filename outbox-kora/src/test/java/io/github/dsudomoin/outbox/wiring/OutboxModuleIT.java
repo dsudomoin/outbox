@@ -12,6 +12,7 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRelay;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestDb;
@@ -20,7 +21,6 @@ import java.sql.SQLException;
 import java.time.Duration;
 import java.util.List;
 import java.util.UUID;
-import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
@@ -33,6 +33,8 @@ import ru.tinkoff.kora.test.extension.junit5.TestComponent;
 /** One graph per test method, with fresh tables: each test instance makes its own config. */
 @KoraAppTest(CoreTestApp.class)
 class OutboxModuleIT implements KoraAppTestConfigModifier {
+
+    private static final Duration TIMEOUT = Duration.ofSeconds(10);
 
     private final String table = TestSql.uniqueTable();
     private final String inboxTable = TestSql.uniqueTable();
@@ -73,11 +75,11 @@ class OutboxModuleIT implements KoraAppTestConfigModifier {
     @Test
     void sendInsideInTxIsDeliveredThroughGraph() throws Exception {
         var first = send();
-        await(() -> handler.delivered().size() == 1); // maybe by the relay's start-up pass
+        Await.until(TIMEOUT, () -> handler.delivered().size() == 1); // maybe by the relay's start-up pass
         var second = send();
 
-        await(() -> handler.delivered().size() == 2); // workers idle now: within 10 s only the wake-up delivers, not
-        // the 30 s idle poll
+        // workers idle now: within 10 s only the wake-up delivers, not the 30 s idle poll
+        Await.until(TIMEOUT, () -> handler.delivered().size() == 2);
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactly(first, second);
         assertThat(exists(inboxTable)).as("the outbox and its relay do not build the inbox").isFalse();
     }
@@ -94,7 +96,7 @@ class OutboxModuleIT implements KoraAppTestConfigModifier {
     @Test
     void adminRedriveWakesTheRelay(@TestComponent OutboxAdmin admin) throws Exception {
         send();
-        await(() -> handler.delivered().size() == 1);
+        Await.until(TIMEOUT, () -> handler.delivered().size() == 1);
         try (var c = TestDb.connect()) { // a dead letter as the relay writes one
             execute(c, "insert into " + table + "_dead (id, shard, message_id, topic, key, payload, created_at,"
                     + " attempts) values (1, 0, gen_random_uuid(), 'orders', 'k', 'p', now(), 3)");
@@ -102,7 +104,7 @@ class OutboxModuleIT implements KoraAppTestConfigModifier {
 
         assertThat(admin.redriveDeadLetters(List.of(1L))).isOne();
 
-        await(() -> handler.delivered().size() == 2); // the idle poll is 30 s: the wake-up delivers
+        Await.until(TIMEOUT, () -> handler.delivered().size() == 2); // the idle poll is 30 s: the wake-up delivers
     }
 
     @Test
@@ -113,7 +115,7 @@ class OutboxModuleIT implements KoraAppTestConfigModifier {
         var id = db.inTx((SqlFunction0<UUID>) () -> outbox.send(
                 OutboxMessage.of("orders", "poison", "p".getBytes(UTF_8))));
 
-        await(() -> hook.handed.size() == 1); // maintenanceInterval is 30 s: the step's wake-up hands it
+        Await.until(TIMEOUT, () -> hook.handed.size() == 1); // maintenanceInterval is 30 s: the step's wake-up hands it
         assertThat(hook.handed.get(0).messageId()).isEqualTo(id);
     }
 
@@ -142,15 +144,5 @@ class OutboxModuleIT implements KoraAppTestConfigModifier {
 
     private UUID send() throws SQLException {
         return db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("orders", "k", "p".getBytes(UTF_8))));
-    }
-
-    private static void await(BooleanSupplier condition) throws InterruptedException {
-        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
-        while (!condition.getAsBoolean()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within 10 s");
-            }
-            Thread.sleep(5);
-        }
     }
 }

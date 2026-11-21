@@ -1,6 +1,6 @@
 package io.github.dsudomoin.outbox;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -243,10 +243,6 @@ class EnqueueTelemetryIT {
     private long countOf(UUID id) throws SQLException {
         return TestSql.queryLong(transactions.currentConnection(), "select count(*) from " + config.table()
                 + " where message_id = '" + id + "'");
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
     }
 
     /** One message handle, as the telemetry saw it. */

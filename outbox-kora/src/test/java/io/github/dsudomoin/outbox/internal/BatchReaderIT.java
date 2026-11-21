@@ -2,6 +2,7 @@ package io.github.dsudomoin.outbox.internal;
 
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.within;
@@ -724,9 +725,5 @@ class BatchReaderIT {
 
     private static List<UUID> messageIds(List<BatchRow> rows) {
         return rows.stream().map(BatchRow::record).map(OutboxRecord::messageId).toList();
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
     }
 }

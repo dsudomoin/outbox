@@ -23,6 +23,7 @@ import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.internal.Ticks;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.Intercepting;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
@@ -110,7 +111,7 @@ class OutboxRelayIT {
 
         long committed = System.nanoTime();
         var ids = send(outbox, msg("t", "k", "p"));
-        await(Duration.ofMillis(500), () -> handler.delivered().size() == 1);
+        Await.until(Duration.ofMillis(500), () -> handler.delivered().size() == 1);
 
         assertThat(Duration.ofNanos(System.nanoTime() - committed)).isLessThan(Duration.ofMillis(500));
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyElementsOf(ids);
@@ -138,13 +139,13 @@ class OutboxRelayIT {
         var outbox = outbox(relay::wake);
         awaitParked();
         send(outbox, msg("t", "k", "warm-up")); // the shard's first step checks its retry and parked rows in full
-        await(Duration.ofSeconds(5), () -> handler.delivered().size() == 1);
+        Await.until(Duration.ofSeconds(5), () -> handler.delivered().size() == 1);
         awaitParked();
 
         try (var roundTrips = RoundTrips.onThreads("outbox-relay-")) {
             counting.set(roundTrips);
             send(outbox, msg("t", "k", "p"));
-            await(Duration.ofSeconds(5), () -> handler.delivered().size() == 2);
+            Await.until(Duration.ofSeconds(5), () -> handler.delivered().size() == 2);
         }
 
         assertThat(atCall.get()).as("round trips of the relay from the commit to the handler").isEqualTo(5);
@@ -165,7 +166,7 @@ class OutboxRelayIT {
         send(outbox, msg("t", "k", "p")); // the wake-up's tick is skipped: that tick is younger than 1 s
 
         // a further attempt within 2 × minTickInterval covers it, not the 30 s idle poll
-        await(Duration.ofSeconds(5), () -> handler.delivered().size() == 1);
+        Await.until(Duration.ofSeconds(5), () -> handler.delivered().size() == 1);
     }
 
     @Test
@@ -200,7 +201,7 @@ class OutboxRelayIT {
         for (int i = 0; i < 25; i++) {
             send(outbox, msg("t", "k" + i, "m" + i));
             int n = i + 1;
-            await(Duration.ofSeconds(5), () -> delivered.get() == n);
+            Await.until(Duration.ofSeconds(5), () -> delivered.get() == n);
         }
         double readsPerTick = (double) (cursorReads.get() - readsBefore) / (ticksMade() - ticksBefore);
         // another instance's commits: no wake-up; the idle poll's (slow) tick must wake the workers that polled before
@@ -215,7 +216,7 @@ class OutboxRelayIT {
             send(silent, IntStream.range(0, 16).mapToObj(shard -> msg("t", keyOnShard(2 * shard, "r" + round + "-"),
                     "r" + round)).toArray(OutboxMessage[]::new));
             int n = 25 + 16 * (i + 1);
-            await(Duration.ofSeconds(5), () -> delivered.get() == n);
+            Await.until(Duration.ofSeconds(5), () -> delivered.get() == n);
             workersPerTick += lockingWorkers.size();
         }
 
@@ -246,12 +247,12 @@ class OutboxRelayIT {
                 .toList();
         // the first batch of each shard: the relay learns a hundred rows a shard
         send(outbox, keys.stream().map(k -> msg("t", k, "a")).toArray(OutboxMessage[]::new));
-        await(Duration.ofSeconds(10), () -> handler.delivered().size() == keys.size());
+        Await.until(Duration.ofSeconds(10), () -> handler.delivered().size() == keys.size());
         awaitParked();
         handler.reset();
 
         send(outbox, keys.stream().map(k -> msg("t", k, "b")).toArray(OutboxMessage[]::new));
-        await(Duration.ofSeconds(10), () -> handler.delivered().size() == keys.size());
+        Await.until(Duration.ofSeconds(10), () -> handler.delivered().size() == keys.size());
 
         assertThat(handler.batches()).as("handler calls for 16 shards of 100 rows at batchSize 1000").hasSizeLessThan(5);
     }
@@ -288,7 +289,7 @@ class OutboxRelayIT {
         assertThat(made).as("ticks in %d ms at minTickInterval 50 ms", elapsedMillis)
                 .isGreaterThanOrEqualTo((long) (elapsedMillis / 50 * 0.7));
         int total = sent;
-        await(Duration.ofSeconds(5), () -> handler.delivered().size() == total);
+        Await.until(Duration.ofSeconds(5), () -> handler.delivered().size() == total);
     }
 
     /**
@@ -320,7 +321,7 @@ class OutboxRelayIT {
         }), handler);
         relay.start();
 
-        await(Duration.ofSeconds(30), () -> handler.delivered().size() == 400);
+        Await.until(Duration.ofSeconds(30), () -> handler.delivered().size() == 400);
         relay.close();
 
         assertThat(borrows.get()).as("a pass per bound").isGreaterThan(5);
@@ -340,7 +341,7 @@ class OutboxRelayIT {
                     }
                 })), deadLetters(db, null)));
         relays.get(0).start();
-        await(Duration.ofSeconds(5), () -> runs.get() == 1);
+        Await.until(Duration.ofSeconds(5), () -> runs.get() == 1);
 
         config.relayEnabled(false);
         var disabled = new AtomicInteger();
@@ -386,9 +387,9 @@ class OutboxRelayIT {
             relays.get(0).start();
 
             // a run that throws would cancel all later runs without a word: the run logs it and the next one comes
-            await(Duration.ofSeconds(5), () -> err.text().contains("maintenance out of memory (test)"));
+            Await.until(Duration.ofSeconds(5), () -> err.text().contains("maintenance out of memory (test)"));
             assertThat(err.text()).contains("ERROR " + OutboxRelay.class.getName());
-            await(Duration.ofSeconds(5), () -> connections.get() >= 3);
+            Await.until(Duration.ofSeconds(5), () -> connections.get() >= 3);
         }
     }
 
@@ -429,7 +430,7 @@ class OutboxRelayIT {
         assertThat(read).as("cursor reads for %d tick attempts, %d commits", tickAttempts, sent)
                 .isLessThanOrEqualTo((tickAttempts + 2) * config.workers() * 4);
         int total = sent;
-        await(Duration.ofSeconds(5), () -> handler.delivered().size() == total);
+        Await.until(Duration.ofSeconds(5), () -> handler.delivered().size() == total);
     }
 
     @Test
@@ -469,7 +470,7 @@ class OutboxRelayIT {
 
         var id = send(outbox(relay::wake), msg("t", "k", "p")).get(0);
 
-        await(Duration.ofSeconds(10), () -> tickSees(id, before));
+        Await.until(Duration.ofSeconds(10), () -> tickSees(id, before));
         assertThat(relay.running()).isFalse();
         assertThat(relayThreads()).isEmpty();
     }
@@ -525,7 +526,7 @@ class OutboxRelayIT {
         try (var c = TestDb.connect()) {
             execute(c, "delete from " + schema.names().halt());
         }
-        await(Duration.ofSeconds(10), () -> tickSees(id, before));
+        Await.until(Duration.ofSeconds(10), () -> tickSees(id, before));
     }
 
     /**
@@ -600,7 +601,7 @@ class OutboxRelayIT {
 
         var id = send(outbox(relay::wake), msg("t", "k", "p")).get(0);
 
-        await(Duration.ofSeconds(10), () -> tickSees(id, before));
+        Await.until(Duration.ofSeconds(10), () -> tickSees(id, before));
         assertThat(failed.get()).isGreaterThan(1);
         assertThat(tickerThreads()).hasSize(1);
     }
@@ -615,7 +616,7 @@ class OutboxRelayIT {
 
         relay.close();
 
-        await(Duration.ofSeconds(5), () -> tickerThreads().isEmpty());
+        Await.until(Duration.ofSeconds(5), () -> tickerThreads().isEmpty());
     }
 
     @Test
@@ -876,10 +877,10 @@ class OutboxRelayIT {
                 }
                 return records.stream().map(r -> Outcome.delivered()).toList();
             }));
-            await(Duration.ofSeconds(10), () -> checkpointTick() >= d);
+            Await.until(Duration.ofSeconds(10), () -> checkpointTick() >= d);
             send(outbox(other::wake), IntStream.range(0, 6).mapToObj(i -> msg("t", late, "l" + i))
                     .toArray(OutboxMessage[]::new));
-            await(Duration.ofSeconds(10), () -> calls.get() > 1);
+            Await.until(Duration.ofSeconds(10), () -> calls.get() > 1);
             assertThat(cursor(1).targetTickId()).as("a batch in progress").isNotNull();
 
             releaseDrain.countDown();
@@ -920,10 +921,10 @@ class OutboxRelayIT {
 
         var ids = send(outbox(relay::wake), msg("t", "poison", "p"));
 
-        await(Duration.ofSeconds(2), () -> handed.size() == 1);
+        Await.until(Duration.ofSeconds(2), () -> handed.size() == 1);
         assertThat(handed.get(0).messageId()).isEqualTo(ids.get(0));
         assertThat(handed.get(0).error()).contains("bad payload");
-        await(Duration.ofSeconds(2), () -> "kept".equals(deadStatus(ids.get(0))));
+        Await.until(Duration.ofSeconds(2), () -> "kept".equals(deadStatus(ids.get(0))));
     }
 
     @Test
@@ -947,7 +948,7 @@ class OutboxRelayIT {
 
         var ids = send(outbox(relay::wake), msg("t", "poison", "p"));
 
-        await(Duration.ofSeconds(2), () -> {
+        Await.until(Duration.ofSeconds(2), () -> {
             assertThat(handed).as("no hook call while the letter is written").isEmpty();
             return deadStatus(ids.get(0)) != null;
         });
@@ -1038,7 +1039,7 @@ class OutboxRelayIT {
         try (var c = TestDb.connect()) {
             execute(c, "alter table " + dead + " disable trigger fail");
         }
-        await(Duration.ofSeconds(10), () -> rows(dead + " where status = 'kept'") == 1); // the next run, by 5 s
+        Await.until(Duration.ofSeconds(10), () -> rows(dead + " where status = 'kept'") == 1); // the next run, by 5 s
         try (var c = TestDb.connect()) {
             execute(c, "alter table " + dead + " enable trigger fail");
         }
@@ -1047,7 +1048,7 @@ class OutboxRelayIT {
         send(outbox(relay::wake), msg("t", "poison", "p")); // its step wakes the thread
 
         // the success reset the backoff: the failure of that call is retried after initialDelay, not 5 s
-        await(Duration.ofSeconds(2), () -> calls.get() >= before + 2);
+        Await.until(Duration.ofSeconds(2), () -> calls.get() >= before + 2);
     }
 
     @Test
@@ -1384,7 +1385,7 @@ class OutboxRelayIT {
         send(outbox, msg("t", "k", "k#1")); // parked at once, due 100 ms later; nothing else is written
 
         // well before the shard's idle append (5 s), which would step it as well
-        await(Duration.ofSeconds(2), () -> delivered.size() == 1 && parked() == null);
+        Await.until(Duration.ofSeconds(2), () -> delivered.size() == 1 && parked() == null);
         assertThat(delivered.get(0).requeues()).isEqualTo(1);
     }
 
@@ -1398,21 +1399,21 @@ class OutboxRelayIT {
         handler.blocked = whileRunning("SYNCHRONIZE");
 
         send(outbox, msg("t", "acc42", "SYNCHRONIZE#2"));
-        await(Duration.ofSeconds(1), () -> "SYNCHRONIZE#2".equals(parked()));
+        Await.until(Duration.ofSeconds(1), () -> "SYNCHRONIZE#2".equals(parked()));
         Thread.sleep(3000);
         assertThat(handler.calls).as("handed again at each due time (about 1 s and 2 s later)")
                 .filteredOn(List.of("SYNCHRONIZE#2")::equals).hasSizeGreaterThanOrEqualTo(3);
         assertThat(handler.delivered()).isEmpty();
         assertThat(parked()).isEqualTo("SYNCHRONIZE#2");
         send(outbox, msg("t", "acc42", "FEE_RELEASE"));
-        await(Duration.ofSeconds(1), () -> handler.delivered().size() == 1); // FEE_RELEASE did not wait
+        Await.until(Duration.ofSeconds(1), () -> handler.delivered().size() == 1); // FEE_RELEASE did not wait
 
         assertThat(handler.calls)
                 .anyMatch(call -> Collections.indexOfSubList(call, List.of("SYNCHRONIZE#2", "FEE_RELEASE")) >= 0);
         assertThat(parked()).isEqualTo("SYNCHRONIZE#2");
 
         handler.blocked = r -> false; // the running SYNCHRONIZE ends
-        await(Duration.ofSeconds(2), () -> handler.delivered().size() == 2); // its due time at the latest
+        Await.until(Duration.ofSeconds(2), () -> handler.delivered().size() == 2); // its due time at the latest
 
         assertThat(handler.delivered()).extracting(OutboxRelayIT::payload)
                 .containsExactly("FEE_RELEASE", "SYNCHRONIZE#2");
@@ -1431,10 +1432,10 @@ class OutboxRelayIT {
         handler.blocked = whileRunning("FEE_RELEASE");
 
         send(outbox, msg("t", "acc42", "FEE_RELEASE#1"));
-        await(Duration.ofSeconds(1), () -> "FEE_RELEASE#1".equals(parked()));
+        Await.until(Duration.ofSeconds(1), () -> "FEE_RELEASE#1".equals(parked()));
         handler.blocked = r -> false; // the running FEE_RELEASE ends
         send(outbox, msg("t", "acc42", "FEE_RELEASE#2"));
-        await(Duration.ofSeconds(1), () -> handler.delivered().size() == 2 && parked() == null);
+        Await.until(Duration.ofSeconds(1), () -> handler.delivered().size() == 2 && parked() == null);
 
         assertThat(handler.calls)
                 .containsExactly(List.of("FEE_RELEASE#1"), List.of("FEE_RELEASE#1", "FEE_RELEASE#2"));
@@ -1450,7 +1451,7 @@ class OutboxRelayIT {
         var started = List.of(start(handler), start(handler), start(handler));
         var ids = sendConcurrently(started);
 
-        await(Duration.ofSeconds(60), () -> handler.delivered().size() >= 5000);
+        Await.until(Duration.ofSeconds(60), () -> handler.delivered().size() >= 5000);
         assertThat(started.get(0).drain()).isZero(); // everything is committed, nothing left
 
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyInAnyOrderElementsOf(ids);
@@ -1466,9 +1467,10 @@ class OutboxRelayIT {
         var started = List.of(start(handler), start(handler), start(handler));
         var ids = sendConcurrently(started);
 
-        await(Duration.ofSeconds(60), () -> handler.delivered().size() >= 5000);
+        Await.until(Duration.ofSeconds(60), () -> handler.delivered().size() >= 5000);
         assertThat(started.get(0).drain()).isZero(); // everything is committed, nothing left
-        await(Duration.ofSeconds(5), () -> rows(schema.names().parked()) == 0 && rows(schema.names().retry()) == 0);
+        Await.until(Duration.ofSeconds(5),
+                () -> rows(schema.names().parked()) == 0 && rows(schema.names().retry()) == 0);
 
         var delivered = handler.delivered();
         assertThat(delivered).extracting(OutboxRecord::messageId).containsExactlyInAnyOrderElementsOf(ids);
@@ -1508,9 +1510,9 @@ class OutboxRelayIT {
         var ids = new ArrayList<>(send(outbox, IntStream.range(0, 20)
                 .mapToObj(i -> msg("t", "k" + i % 4, "m" + i))
                 .toArray(OutboxMessage[]::new)));
-        await(Duration.ofSeconds(10), () -> handler.delivered().size() >= 20);
+        Await.until(Duration.ofSeconds(10), () -> handler.delivered().size() >= 20);
         ids.addAll(send(outbox, msg("t", "k0", "after"))); // the workers still deliver
-        await(Duration.ofSeconds(10), () -> handler.delivered().size() >= 21);
+        Await.until(Duration.ofSeconds(10), () -> handler.delivered().size() >= 21);
 
         assertThat(calls.get() - handler.batches().size()).as("calls that threw").isEqualTo(2);
         assertThat(relay.running()).isTrue();
@@ -1538,7 +1540,7 @@ class OutboxRelayIT {
 
         var ids = new ArrayList<>(send(outbox(relay::wake), messages.toArray(OutboxMessage[]::new)));
         ids.remove(0);
-        await(Duration.ofSeconds(10), () -> handler.delivered().size() >= 400 && retryRows(poison) == 1);
+        Await.until(Duration.ofSeconds(10), () -> handler.delivered().size() >= 400 && retryRows(poison) == 1);
 
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyInAnyOrderElementsOf(ids);
         assertIdOrderPerKey(handler.delivered());
@@ -1564,7 +1566,7 @@ class OutboxRelayIT {
 
             var ids = new ArrayList<>(send(outbox(relay::wake), messages.toArray(OutboxMessage[]::new)));
             ids.remove(0);
-            await(Duration.ofSeconds(10), () -> handler.delivered().size() >= 100 && retryRows(deep) == 1);
+            Await.until(Duration.ofSeconds(10), () -> handler.delivered().size() >= 100 && retryRows(deep) == 1);
 
             assertThat(relayThreads()).hasSize(config.workers());
             assertThat(handler.delivered()).extracting(OutboxRecord::messageId)
@@ -1590,12 +1592,12 @@ class OutboxRelayIT {
             var relay = start(handler);
 
             var ids = send(outbox(relay::wake), messagesOnShards(100, 1, 3).toArray(OutboxMessage[]::new));
-            await(Duration.ofSeconds(10), () -> handler.delivered().size() >= 100);
+            Await.until(Duration.ofSeconds(10), () -> handler.delivered().size() >= 100);
 
             assertThat(handler.delivered()).extracting(OutboxRecord::messageId)
                     .containsExactlyInAnyOrderElementsOf(ids);
             // its pass may step shard 0 after the others: the failure may come just after the last delivery
-            await(Duration.ofSeconds(5), () -> err.text().contains("outbox shard 0 step failed"));
+            Await.until(Duration.ofSeconds(5), () -> err.text().contains("outbox shard 0 step failed"));
         }
     }
 
@@ -1620,12 +1622,13 @@ class OutboxRelayIT {
             relay.start();
 
             var ids = send(outbox(relay::wake), messagesOnShards(100, 1, 3).toArray(OutboxMessage[]::new));
-            await(Duration.ofSeconds(10), () -> handler.delivered().size() >= 100);
+            Await.until(Duration.ofSeconds(10), () -> handler.delivered().size() >= 100);
 
             assertThat(handler.delivered()).extracting(OutboxRecord::messageId)
                     .containsExactlyInAnyOrderElementsOf(ids);
-            await(Duration.ofSeconds(5), () -> err.text().contains("outbox shard 0 step failed")); // see above
-            await(Duration.ofSeconds(5), () -> err.text().contains("tracer assertion (test)")); // in the trace, see above
+            Await.until(Duration.ofSeconds(5), () -> err.text().contains("outbox shard 0 step failed")); // see above
+            // in the trace, see above
+            Await.until(Duration.ofSeconds(5), () -> err.text().contains("tracer assertion (test)"));
             assertThat(relayThreads()).hasSize(config.workers());
         }
     }
@@ -1644,7 +1647,7 @@ class OutboxRelayIT {
                 .mapToObj(i -> msg("t", "k" + i % 100, "m" + i))
                 .toArray(OutboxMessage[]::new));
         // the handler alone needs 1000 × ~25 ms (sleep overshoot included); before the fix 50 distinct records in 30 s
-        await(Duration.ofSeconds(45), () -> handler.delivered().size() >= 1000);
+        Await.until(Duration.ofSeconds(45), () -> handler.delivered().size() >= 1000);
 
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyInAnyOrderElementsOf(ids);
         assertIdOrderPerKey(handler.delivered());
@@ -1668,7 +1671,7 @@ class OutboxRelayIT {
                 .mapToObj(i -> msg("t", "k" + i % 100, "m" + i))
                 .toArray(OutboxMessage[]::new));
         // the handler alone needs 500 × ~45 ms
-        await(Duration.ofSeconds(45), () -> handler.delivered().size() >= 500);
+        Await.until(Duration.ofSeconds(45), () -> handler.delivered().size() >= 500);
 
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyInAnyOrderElementsOf(ids);
         assertIdOrderPerKey(handler.delivered());
@@ -1688,7 +1691,7 @@ class OutboxRelayIT {
 
         var ids = new ArrayList<>(send(outbox(relay::wake), messages.toArray(OutboxMessage[]::new)));
         ids.remove(10);
-        await(Duration.ofSeconds(10), () -> healthy.delivered().size() >= 20 && retryRows("s") == 1);
+        Await.until(Duration.ofSeconds(10), () -> healthy.delivered().size() >= 20 && retryRows("s") == 1);
 
         assertThat(healthy.delivered()).extracting(OutboxRecord::messageId).containsExactlyInAnyOrderElementsOf(ids);
         assertIdOrderPerKey(healthy.delivered());
@@ -1701,7 +1704,7 @@ class OutboxRelayIT {
         var relay = start(OutboxHandler.byTopic(Map.of("audit", throwingOnPoison(audit)), new RecordingHandler()));
 
         var id = send(outbox(relay::wake), msg("audit", "k1", "poison")).get(0);
-        await(Duration.ofSeconds(10), () -> deadStatus(id) != null);
+        Await.until(Duration.ofSeconds(10), () -> deadStatus(id) != null);
 
         assertThat(retryRows("k1")).isZero();
     }
@@ -1717,7 +1720,7 @@ class OutboxRelayIT {
         var ids = send(outbox(relay::wake),
                 msg("audit", "k1", "poison"), msg("audit", "k2", "ok"), msg("t", "k3", "other"));
         // both audit keys go to the retry table together; the retry pass then calls them together
-        await(Duration.ofSeconds(10), () -> audit.delivered().size() == 1 && deadStatus(ids.get(0)) != null);
+        Await.until(Duration.ofSeconds(10), () -> audit.delivered().size() == 1 && deadStatus(ids.get(0)) != null);
 
         assertThat(audit.delivered()).extracting(OutboxRecord::messageId).containsExactly(ids.get(1));
         assertThat(fallback.delivered()).extracting(OutboxRecord::messageId).containsExactly(ids.get(2));
@@ -1740,7 +1743,7 @@ class OutboxRelayIT {
             // beside k3 the route's two records get Retry and go to the retry table together; the retry pass then
             // calls them as its whole call, a failed call as with a plain handler: each key is called alone, not
             // both together for ever
-            await(Duration.ofSeconds(10), () -> audit.delivered().size() == 2);
+            Await.until(Duration.ofSeconds(10), () -> audit.delivered().size() == 2);
 
             assertThat(audit.delivered()).extracting(OutboxRecord::messageId)
                     .containsExactlyInAnyOrder(ids.get(0), ids.get(1));
@@ -1765,7 +1768,7 @@ class OutboxRelayIT {
         config.idlePollInterval(Duration.ofMillis(200)); // the default; a spin would still burn ~2 s of CPU
         bootstrap();
         start(new RecordingHandler());
-        await(Duration.ofSeconds(5), () -> ticksMade() >= 2);
+        Await.until(Duration.ofSeconds(5), () -> ticksMade() >= 2);
         var threads = relayThreads();
         assertThat(threads).hasSize(config.workers());
         var mx = ManagementFactory.getThreadMXBean();
@@ -1786,7 +1789,7 @@ class OutboxRelayIT {
         var handler = new RecordingHandler();
         start(handler);
         long first = ticksMade();
-        await(Duration.ofSeconds(5), () -> ticksMade() > first);
+        Await.until(Duration.ofSeconds(5), () -> ticksMade() > first);
         start(handler); // a few ms out of phase with the first
         long ticks = ticksMade();
         long started = System.nanoTime();
@@ -1804,7 +1807,7 @@ class OutboxRelayIT {
             long sent = System.nanoTime();
             send(silent, msg("t", "k" + i, "m" + i));
             int n = i + 1;
-            await(Duration.ofSeconds(2), () -> handler.delivered().size() == n);
+            Await.until(Duration.ofSeconds(2), () -> handler.delivered().size() == n);
             slowest = Math.max(slowest, System.nanoTime() - sent);
         }
         System.out.printf("slowest delivery without a wake-up: %d ms%n", TimeUnit.NANOSECONDS.toMillis(slowest));
@@ -1834,7 +1837,7 @@ class OutboxRelayIT {
             Thread.sleep(20);
         }
         int total = sent;
-        await(Duration.ofSeconds(5), () -> handler.delivered().size() == total);
+        Await.until(Duration.ofSeconds(5), () -> handler.delivered().size() == total);
 
         double seconds = (System.nanoTime() - started) / 1e9;
         long made = ticksMade() - ticks;
@@ -1887,7 +1890,7 @@ class OutboxRelayIT {
         } finally {
             writers.shutdown();
         }
-        await(Duration.ofSeconds(10), () -> handler.delivered().size() == sent.size());
+        Await.until(Duration.ofSeconds(10), () -> handler.delivered().size() == sent.size());
 
         long made = ticksMade() - ticks;
         int read = reads.get() - readsBefore;
@@ -1909,13 +1912,13 @@ class OutboxRelayIT {
         // shard 0's cursor past the checkpoint's tick, which then stays valid for the other shards (deleting the
         // checkpoint's own tick would strand every shard); once its start run is over, maintenance does not run again
         // for an hour
-        await(Duration.ofSeconds(5), () -> !lastSuccess().equals(bootstrapped));
+        Await.until(Duration.ofSeconds(5), () -> !lastSuccess().equals(bootstrapped));
         long stuckAt = 0;
         for (int a = 1; stuckAt <= checkpointTick(); a++) {
             assertThat(a).as("rows sent to shard 0").isLessThanOrEqualTo(10);
             send(outbox(first::wake), msg("t", keyOnShard(0, "a"), "a#" + a));
             int sent = a;
-            await(Duration.ofSeconds(5), () -> handler.delivered().size() == sent);
+            Await.until(Duration.ofSeconds(5), () -> handler.delivered().size() == sent);
             try (var c = TestDb.connect()) {
                 stuckAt = queryLong(c, "select tick_id from " + schema.names().cursor()
                         + " where shard = 0 order by seq desc limit 1");
@@ -1934,18 +1937,18 @@ class OutboxRelayIT {
                     .toArray(OutboxMessage[]::new));
             relay.start();
 
-            await(Duration.ofSeconds(10), () -> handler.delivered().size() == before + 3);
+            Await.until(Duration.ofSeconds(10), () -> handler.delivered().size() == before + 3);
             assertThat(handler.delivered().subList(before, before + 3)).extracting(OutboxRelayIT::payload)
                     .containsExactlyInAnyOrder("b1", "b2", "b3");
-            await(Duration.ofSeconds(5), () -> err.text().contains("outbox shard 0 step failed"));
+            Await.until(Duration.ofSeconds(5), () -> err.text().contains("outbox shard 0 step failed"));
             long tick = stuckAt; // the stack trace comes after the line, in a write of its own
-            await(Duration.ofSeconds(5), () -> err.text().contains("no tick " + tick + " for shard 0"));
+            Await.until(Duration.ofSeconds(5), () -> err.text().contains("no tick " + tick + " for shard 0"));
             // keeps failing, alone: one shared step at most found it out
             send(outbox, IntStream.range(1, 4).mapToObj(shard -> msg("t", keyOnShard(shard, "c"), "c" + shard))
                     .toArray(OutboxMessage[]::new));
-            await(Duration.ofSeconds(10), () -> handler.delivered().size() == before + 6);
+            Await.until(Duration.ofSeconds(10), () -> handler.delivered().size() == before + 6);
             int seen = groups.size();
-            await(Duration.ofSeconds(5), () -> groups.size() > seen + 2);
+            Await.until(Duration.ofSeconds(5), () -> groups.size() > seen + 2);
             assertThat(groups.stream().filter(g -> g.contains(0) && g.size() > 1)).as("shared steps of shard 0")
                     .hasSizeLessThanOrEqualTo(1);
             assertThat(groups.stream().filter(g -> g.equals(List.of(0)))).as("steps of shard 0 alone")
@@ -1966,7 +1969,7 @@ class OutboxRelayIT {
         var outbox = outbox(relay::wake);
         awaitParked();
         send(outbox, messagesOnShards(2000, 0, 3).toArray(OutboxMessage[]::new));
-        await(Duration.ofSeconds(5), () -> delivered.get() > 0);
+        Await.until(Duration.ofSeconds(5), () -> delivered.get() > 0);
         long ticks = ticksMade();
 
         long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
@@ -1999,7 +2002,7 @@ class OutboxRelayIT {
                     .mapToObj(i -> msg("t", keyOnShard(shard, "k"), "m"))).toArray(OutboxMessage[]::new));
             sent += 32 * rows;
             int total = sent;
-            await(Duration.ofSeconds(20), () -> handler.delivered().size() == total);
+            Await.until(Duration.ofSeconds(20), () -> handler.delivered().size() == total);
             awaitParked();
             waves.add(List.copyOf(groups.subList(from, groups.size())));
         }
@@ -2043,7 +2046,7 @@ class OutboxRelayIT {
         send(outbox, msg("t", key, "r#2"));
 
         // the newer round found the shard in flight; the step, caught up only to its own tick, puts it back
-        await(Duration.ofSeconds(3), () -> handler.delivered().size() == 2);
+        Await.until(Duration.ofSeconds(3), () -> handler.delivered().size() == 2);
         assertThat(handler.delivered()).extracting(OutboxRelayIT::payload).containsExactly("r#1", "r#2");
     }
 
@@ -2060,7 +2063,7 @@ class OutboxRelayIT {
         steps.clear();
 
         send(outbox, msg("t", keyOnShard(5, "k"), "m"));
-        await(Duration.ofSeconds(5), () -> handler.delivered().size() == 1);
+        Await.until(Duration.ofSeconds(5), () -> handler.delivered().size() == 1);
         awaitParked();
 
         assertThat(steps).containsOnlyKeys(5);
@@ -2104,7 +2107,7 @@ class OutboxRelayIT {
             Thread.sleep(200);
         }
         int total = sent;
-        await(Duration.ofSeconds(20), () -> delays.size() == total);
+        Await.until(Duration.ofSeconds(20), () -> delays.size() == total);
 
         long max = delays.stream().mapToLong(Long::longValue).max().orElse(0);
         System.out.printf("neighbours: %d records, max delay %d ms; slow records done %d%n", total, max,
@@ -2135,7 +2138,7 @@ class OutboxRelayIT {
             Thread.sleep(20);
         }
 
-        await(Duration.ofSeconds(5), () -> handler.delivered().size() >= ids.size());
+        Await.until(Duration.ofSeconds(5), () -> handler.delivered().size() >= ids.size());
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyInAnyOrderElementsOf(ids);
         assertIdOrderPerKey(handler.delivered());
         assertThat(ticksMade() - before - otherTicks).as("ticks this relay made").isLessThanOrEqualTo(2);
@@ -2156,11 +2159,11 @@ class OutboxRelayIT {
             execute(other, "lock table " + schema.names().tail() + " in access exclusive mode");
             var ids = send(outbox, messagesOnShards(40, 0, config.shards() - 1).toArray(OutboxMessage[]::new));
 
-            await(Duration.ofSeconds(2), () -> ticksMade() > before
+            Await.until(Duration.ofSeconds(2), () -> ticksMade() > before
                     && err.text().contains("outbox tick made without its shard set"));
             other.rollback();
 
-            await(Duration.ofSeconds(10), () -> handler.delivered().size() >= ids.size());
+            Await.until(Duration.ofSeconds(10), () -> handler.delivered().size() >= ids.size());
             assertThat(handler.delivered()).extracting(OutboxRecord::messageId)
                     .containsExactlyInAnyOrderElementsOf(ids);
         }
@@ -2205,7 +2208,7 @@ class OutboxRelayIT {
         relay.start();
         awaitParked();
         // its start run is over: one starting after the tick below would find the regression itself and recover it
-        await(Duration.ofSeconds(5), () -> !lastSuccess().equals(bootstrapped));
+        Await.until(Duration.ofSeconds(5), () -> !lastSuccess().equals(bootstrapped));
         assertThat(maintenance.halted()).isFalse();
         try (var c = TestDb.connect()) {
             // under the tick lock, as every tick is: a tick of the running relay in flight would otherwise take its
@@ -2218,7 +2221,7 @@ class OutboxRelayIT {
 
         send(outbox(relay::wake), msg("t", "k", "m"));
 
-        await(Duration.ofSeconds(5), maintenance::halted);
+        Await.until(Duration.ofSeconds(5), maintenance::halted);
         try (var c = TestDb.connect()) {
             assertThat(queryLong(c, "select count(*) from " + schema.names().halt())).isOne();
         }
@@ -2253,7 +2256,7 @@ class OutboxRelayIT {
         relays.add(relay);
         relay.start();
         // then maintenance's checkpoint moves every idle shard on, past the ids the restore goes back to
-        await(Duration.ofSeconds(10), () -> checkpointTick() > dumped + 900);
+        Await.until(Duration.ofSeconds(10), () -> checkpointTick() > dumped + 900);
         awaitParked();
 
         // the restore: its xid regression halts the relay; the operator restores and lifts the halt
@@ -2277,7 +2280,7 @@ class OutboxRelayIT {
         // tick ids now run below those the shards were found idle at
         var ids = send(outbox(relay::wake), IntStream.range(0, config.shards())
                 .mapToObj(shard -> msg("t", keyOnShard(shard, "k"), "m" + shard)).toArray(OutboxMessage[]::new));
-        await(Duration.ofSeconds(3), () -> handler.delivered().size() == ids.size());
+        Await.until(Duration.ofSeconds(3), () -> handler.delivered().size() == ids.size());
         assertThat(ticksMade()).as("tick ids still below the old ones").isLessThan(dumped + 900);
     }
 
@@ -2292,7 +2295,7 @@ class OutboxRelayIT {
         awaitParked();
         var names = schema.names();
         // the start's maintenance run is past its checkpoint step, so it cannot replace the one written below
-        await(Duration.ofSeconds(5), () -> checkpointTick() > 0);
+        Await.until(Duration.ofSeconds(5), () -> checkpointTick() > 0);
         long ahead = ticksMade() + 1000;
         try (var c = TestDb.connect()) { // as a partial restore leaves it: above every tick, every shard idle
             execute(c, "delete from " + names.checkpoint());
@@ -2301,7 +2304,7 @@ class OutboxRelayIT {
         }
 
         var ids = send(outbox(relay::wake), msg("t", keyOnShard(2, "k"), "m"));
-        await(Duration.ofSeconds(5), () -> handler.delivered().size() == ids.size()); // the relay alone delivers
+        Await.until(Duration.ofSeconds(5), () -> handler.delivered().size() == ids.size()); // the relay alone delivers
         assertThat(checkpointTick()).as("no maintenance ran meanwhile").isEqualTo(ahead);
 
         assertThat(maintenance(db).runOnce()).isTrue();
@@ -2319,7 +2322,7 @@ class OutboxRelayIT {
         awaitParked();
         var names = schema.names();
         // the start's maintenance run is past its checkpoint step, so it cannot replace the one written below
-        await(Duration.ofSeconds(5), () -> checkpointTick() > 0);
+        Await.until(Duration.ofSeconds(5), () -> checkpointTick() > 0);
         long next = ticksMade() + 1;
         try (var c = TestDb.connect()) { // as a partial restore leaves it once new ticks pass its id: every shard idle
             execute(c, "delete from " + names.checkpoint());
@@ -2333,7 +2336,7 @@ class OutboxRelayIT {
         assertThat(ticksMade()).as("the tick the checkpoint names").isEqualTo(next);
 
         relay.wake();
-        await(Duration.ofSeconds(5), () -> handler.delivered().size() == ids.size()); // the relay alone delivers
+        Await.until(Duration.ofSeconds(5), () -> handler.delivered().size() == ids.size()); // the relay alone delivers
         assertThat(checkpointTick()).as("no maintenance ran meanwhile").isEqualTo(next);
 
         assertThat(maintenance(db).runOnce()).isTrue();
@@ -2416,7 +2419,7 @@ class OutboxRelayIT {
                     + " max_id from " + schema.names().tick() + " order by id desc limit 1");
             relay.wake();
 
-            await(Duration.ofSeconds(5), () -> maxCursorSeq() >= seq + config.shards());
+            Await.until(Duration.ofSeconds(5), () -> maxCursorSeq() >= seq + config.shards());
             execute(tickLock, "select pg_advisory_unlock" + lock);
         }
         awaitParked();
@@ -2454,7 +2457,7 @@ class OutboxRelayIT {
         var ids = new ArrayList<>(send(outbox, IntStream.range(0, 10)
                 .mapToObj(i -> msg("t", a.get(i % 2), "a" + i))
                 .toArray(OutboxMessage[]::new)));
-        await(Duration.ofSeconds(10), () -> cursor(0).failures() >= 1);
+        Await.until(Duration.ofSeconds(10), () -> cursor(0).failures() >= 1);
         first.close();
         assertThat(cursor(0).failures()).isPositive();
         assertThat(cursor(0).targetTickId()).isNull();
@@ -2475,7 +2478,7 @@ class OutboxRelayIT {
             }
             throw new IllegalStateException("instance stops after one chunk");
         }));
-        await(Duration.ofSeconds(10), () -> cursor(1).targetTickId() != null);
+        Await.until(Duration.ofSeconds(10), () -> cursor(1).targetTickId() != null);
         second.close();
         assertThat(chunk.delivered()).hasSize(5);
         assertThat(cursor(1).lastId()).isEqualTo(chunk.delivered().get(4).id());
@@ -2486,7 +2489,7 @@ class OutboxRelayIT {
         // 3: a new instance with a working target resumes both shards from their cursors
         var fresh = new RecordingHandler();
         var third = start(fresh);
-        await(Duration.ofSeconds(15), () -> fresh.delivered().size() >= 25);
+        Await.until(Duration.ofSeconds(15), () -> fresh.delivered().size() >= 25);
         assertThat(third.drain()).isZero();
 
         var all = new ArrayList<>(chunk.delivered());
@@ -2677,7 +2680,7 @@ class OutboxRelayIT {
             Thread.sleep(5);
         }
         committed.remove(run + "/poison");
-        await(Duration.ofSeconds(30), () -> arrived.size() == 1000);
+        Await.until(Duration.ofSeconds(30), () -> arrived.size() == 1000);
         return committed.entrySet().stream()
                 .map(e -> Duration.ofNanos(Math.max(0, arrived.get(e.getKey()) - e.getValue())))
                 .toList();
@@ -2910,7 +2913,7 @@ class OutboxRelayIT {
 
     /** Every worker parked: the relay is idle. */
     private void awaitParked() throws Exception {
-        await(Duration.ofSeconds(5), () -> relayThreads().size() == config.workers()
+        Await.until(Duration.ofSeconds(5), () -> relayThreads().size() == config.workers()
                 && relayThreads().stream().allMatch(t -> t.getState() == Thread.State.TIMED_WAITING));
     }
 
@@ -2947,19 +2950,5 @@ class OutboxRelayIT {
             }
         }
         perKey.forEach((key, ids) -> assertThat(ids).as("ids of key %s", key).isSorted());
-    }
-
-    private interface Condition {
-        boolean holds() throws Exception;
-    }
-
-    private static void await(Duration timeout, Condition condition) throws Exception {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!condition.holds()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within " + timeout);
-            }
-            Thread.sleep(5);
-        }
     }
 }

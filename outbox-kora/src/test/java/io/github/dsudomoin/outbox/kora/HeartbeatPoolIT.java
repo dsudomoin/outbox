@@ -8,6 +8,7 @@ import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.OutboxTopicHandler;
 import io.github.dsudomoin.outbox.internal.TableNames;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
@@ -40,6 +41,7 @@ import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
  */
 class HeartbeatPoolIT {
 
+    private static final Duration TIMEOUT = Duration.ofSeconds(10);
     private static final Duration INTERVAL = Duration.ofSeconds(1);
     /** 3 intervals: older than that, the row has expired. */
     private static final long STALE_MILLIS = 3 * INTERVAL.toMillis();
@@ -118,7 +120,7 @@ class HeartbeatPoolIT {
         try (var c = TestDb.connect()) {
             assertThat(TestSql.queryLong(c, "select count(*) from " + names.instance())).isZero();
         }
-        await(() -> !poolRuns());
+        Await.until(TIMEOUT, () -> !poolRuns());
     }
 
     @Test
@@ -144,7 +146,7 @@ class HeartbeatPoolIT {
             releasing.get(60, TimeUnit.SECONDS);
             holder.rollback();
         }
-        await(() -> !poolRuns());
+        Await.until(TIMEOUT, () -> !poolRuns());
     }
 
     @Test
@@ -152,13 +154,13 @@ class HeartbeatPoolIT {
         assertThatThrownBy(() -> new OutboxModule() {}.outboxRuntime(config, new KoraOutboxTransactions(database), null,
                 All.of(), null, new OutboxTelemetry() {}, null, null, flag(true)))
                 .as("no handler, no route").isInstanceOf(IllegalArgumentException.class);
-        await(() -> !poolRuns());
+        Await.until(TIMEOUT, () -> !poolRuns());
 
         config.table("s" + TestSql.uniqueTable() + ".outbox"); // in a schema that does not exist
         var wrapper = runtime(null, true);
         assertThat(poolRuns()).isTrue();
         assertThatThrownBy(wrapper::init).hasStackTraceContaining("does not exist");
-        await(() -> !poolRuns());
+        Await.until(TIMEOUT, () -> !poolRuns());
     }
 
     @Test
@@ -249,7 +251,7 @@ class HeartbeatPoolIT {
     /** Waits until {@code last_seen} moves past its value now. */
     private static void awaitBeat(TableNames names) throws Exception {
         long seen = millis("last_seen", names);
-        await(() -> millis("last_seen", names) > seen);
+        Await.until(TIMEOUT, () -> millis("last_seen", names) > seen);
     }
 
     /** {@code expression} of the instance's row, in milliseconds since the epoch or as a duration. */
@@ -258,20 +260,5 @@ class HeartbeatPoolIT {
             return TestSql.queryLong(c, "select (extract(epoch from " + expression + ") * 1000)::bigint from "
                     + names.instance());
         }
-    }
-
-    private static void await(Check condition) throws Exception {
-        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
-        while (!condition.met()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within 10 s");
-            }
-            Thread.sleep(20);
-        }
-    }
-
-    @FunctionalInterface
-    private interface Check {
-        boolean met() throws Exception;
     }
 }

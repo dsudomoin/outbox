@@ -9,10 +9,10 @@ import io.github.dsudomoin.outbox.kafka.KafkaOutboxHeaders;
 import io.github.dsudomoin.outbox.kafka.TestKafka;
 import io.github.dsudomoin.outbox.kafka.wiring.RoutedAuditHandler.AuditEvent;
 import io.github.dsudomoin.outbox.kafka.wiring.RoutedTestApp.AppCode;
+import io.github.dsudomoin.outbox.testing.Await;
 import java.time.Duration;
 import java.util.List;
 import java.util.UUID;
-import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
@@ -54,18 +54,10 @@ class RoutedIT implements KoraAppTestConfigModifier {
         var records = TestKafka.consumeUntil(orders, Duration.ofSeconds(30), r -> !r.isEmpty());
 
         assertThat(records).extracting(KafkaOutboxHeaders::messageId).containsExactly(ids.get(2));
-        await(() -> !audit.events.isEmpty() && billing.handled.size() == 2);
+        Await.until(Duration.ofSeconds(10), () -> !audit.events.isEmpty() && billing.handled.size() == 2);
         assertThat(audit.events).as("decoded by the JsonReader-derived deserializer")
                 .containsExactly(new AuditEvent("login"));
         assertThat(billing.handled).extracting(OutboxRecord::messageId) // two topics: two shards, no order
                 .containsExactlyInAnyOrder(ids.get(1), ids.get(3));
-    }
-
-    static void await(BooleanSupplier condition) throws InterruptedException {
-        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
-        while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
-            Thread.sleep(10);
-        }
-        assertThat(condition.getAsBoolean()).as("within 10 s").isTrue();
     }
 }

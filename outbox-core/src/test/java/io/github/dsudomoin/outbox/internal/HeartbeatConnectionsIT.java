@@ -7,6 +7,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import io.github.dsudomoin.outbox.ConnectionSource;
 import io.github.dsudomoin.outbox.JdbcTransactions;
 import io.github.dsudomoin.outbox.OutboxRuntime;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.Intercepting;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
@@ -75,7 +76,7 @@ class HeartbeatConnectionsIT {
                 long seen = TestSql.queryLong(holder, lastSeen);
                 holder.commit();
 
-                await("a beat gets through once the lock is gone", Duration.ofSeconds(10), () -> {
+                Await.until(Duration.ofSeconds(10), "a beat gets through once the lock is gone", () -> {
                     boolean moved = TestSql.queryLong(holder, lastSeen) > seen;
                     holder.commit();
                     return moved;
@@ -130,7 +131,7 @@ class HeartbeatConnectionsIT {
                 try {
                     var lastSeen = "select (extract(epoch from last_seen) * 1000000)::bigint from " + row;
                     long seen = TestSql.queryLong(holder, lastSeen);
-                    await("a beat refreshes the row", Duration.ofSeconds(5),
+                    Await.until(Duration.ofSeconds(5), "a beat refreshes the row",
                             () -> TestSql.queryLong(holder, lastSeen) > seen);
                 } finally {
                     runtime.close();
@@ -180,31 +181,15 @@ class HeartbeatConnectionsIT {
             runtime.start();
             try {
                 readOnly.set(true);
-                await("logged: " + logged, Duration.ofSeconds(5), () -> log.text().contains(logged));
+                Await.until(Duration.ofSeconds(5), "logged: " + logged, () -> log.text().contains(logged));
                 readOnly.set(false);
                 int at = own.get();
-                await("the beats are back on the lane", Duration.ofSeconds(5), () -> own.get() >= at + 2);
+                Await.until(Duration.ofSeconds(5), "the beats are back on the lane", () -> own.get() >= at + 2);
             } finally {
                 runtime.close();
             }
             return log.text();
         }
-    }
-
-    /** Polls {@code condition} every 20 ms until it is met; fails naming {@code as} once {@code within} is out. */
-    private static void await(String as, Duration within, Check condition) throws Exception {
-        long deadline = System.nanoTime() + within.toNanos();
-        while (!condition.met()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError(as + ": not met within " + within.toSeconds() + " s");
-            }
-            Thread.sleep(20);
-        }
-    }
-
-    @FunctionalInterface
-    private interface Check {
-        boolean met() throws Exception;
     }
 
     /** Connections of the main database whose transactions default to read-only while {@code readOnly} is set. */

@@ -14,6 +14,7 @@ import static io.github.dsudomoin.outbox.kafka.MessagingConventionsTelemetry.PAR
 import static io.github.dsudomoin.outbox.kafka.MessagingConventionsTelemetry.RECORD_ID;
 import static io.github.dsudomoin.outbox.kafka.MessagingConventionsTelemetry.RESEND_COUNT;
 import static io.github.dsudomoin.outbox.kafka.MessagingConventionsTelemetry.SYSTEM;
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -25,6 +26,7 @@ import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.OutboxSqlException;
 import io.github.dsudomoin.outbox.Outcome;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
@@ -50,7 +52,6 @@ import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Future;
-import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
@@ -123,7 +124,7 @@ class MessagingConventionsIT {
             writer.end();
         }
         var meters = telemetry.meters();
-        await(() -> runtime.maintenance().runOnce() && meters.pending(0) == 2);
+        Await.until(TIMEOUT, () -> runtime.maintenance().runOnce() && meters.pending(0) == 2);
         assertThat(meters.oldestSeconds(0)).as("oldest age with two pending").isGreaterThanOrEqualTo(0);
 
         runtime.relay().drain();
@@ -172,7 +173,7 @@ class MessagingConventionsIT {
         assertThat(meters.histogram(FETCH_BATCH_SIZE)).as("the steps with records").contains(2L)
                 .allMatch(n -> n == 2 || n == 0);
         assertFetchSpansHaveRecords();
-        await(() -> runtime.maintenance().runOnce() && meters.pending(0) == 0);
+        Await.until(TIMEOUT, () -> runtime.maintenance().runOnce() && meters.pending(0) == 0);
         assertThat(meters.oldestSeconds(0)).as("oldest age with none pending").isZero();
     }
 
@@ -294,7 +295,7 @@ class MessagingConventionsIT {
         var dest = DESTINATION.getKey();
 
         // a step whose link target has not ended yet is still committing
-        await(() -> telemetry.meters().count(DELIVERED, dest, topic) == 3 && delivers().size() == 4
+        Await.until(TIMEOUT, () -> telemetry.meters().count(DELIVERED, dest, topic) == 3 && delivers().size() == 4
                 && delivers().stream().flatMap(d -> d.getLinks().stream()).allMatch(l -> !spans(
                         s -> s.getSpanId().equals(l.getSpanContext().getSpanId())).isEmpty()));
 
@@ -381,7 +382,7 @@ class MessagingConventionsIT {
 
         Predicate<SpanData> failedFetch = s -> s.getName().equals("fetch " + config.table())
                 && s.getStatus().getStatusCode() == StatusCode.ERROR;
-        await(() -> !spans(failedFetch).isEmpty());
+        Await.until(TIMEOUT, () -> !spans(failedFetch).isEmpty());
 
         var fetch = spans(failedFetch).get(0);
         assertThat(fetch.getKind()).isEqualTo(SpanKind.CLIENT);
@@ -602,19 +603,5 @@ class MessagingConventionsIT {
             }
         }
         return last;
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
-    }
-
-    private static void await(BooleanSupplier condition) throws InterruptedException {
-        long deadline = System.nanoTime() + TIMEOUT.toNanos();
-        while (!condition.getAsBoolean()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within " + TIMEOUT);
-            }
-            Thread.sleep(10);
-        }
     }
 }

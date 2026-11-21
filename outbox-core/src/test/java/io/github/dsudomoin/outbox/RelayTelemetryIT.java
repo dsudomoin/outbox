@@ -2,11 +2,13 @@ package io.github.dsudomoin.outbox;
 
 import static io.github.dsudomoin.outbox.testing.Handlers.answering;
 import static io.github.dsudomoin.outbox.testing.Handlers.eachRecord;
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.internal.Hashing;
 import io.github.dsudomoin.outbox.internal.RecordScope;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.Intercepting;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.ShardKeys;
@@ -30,7 +32,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.BooleanSupplier;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -61,7 +62,7 @@ class RelayTelemetryIT {
         }
 
         transactions.inTx(c -> outbox.sendAll(messages));
-        await(Duration.ofSeconds(10), () -> handler.delivered().size() >= 20);
+        Await.until(Duration.ofSeconds(10), () -> handler.delivered().size() >= 20);
         runtime.close(); // no step in flight from here
 
         assertThat(telemetry.steps).isNotEmpty().allSatisfy(step -> {
@@ -90,9 +91,9 @@ class RelayTelemetryIT {
             messages.add(OutboxMessage.of("orders", bad, bytes("b" + i)));
         }
         var ids = transactions.inTx(c -> outbox.sendAll(messages));
-        await(Duration.ofSeconds(30), () -> telemetry.failedAlone(badShard) >= 2);
+        Await.until(Duration.ofSeconds(30), () -> telemetry.failedAlone(badShard) >= 2);
         restoreCursorAppends(config);
-        await(Duration.ofSeconds(30), () -> delivered(handler).containsAll(ids));
+        Await.until(Duration.ofSeconds(30), () -> delivered(handler).containsAll(ids));
         runtime.close(); // no step in flight from here
 
         var badKey = bytes(bad);
@@ -124,7 +125,8 @@ class RelayTelemetryIT {
             badMessages.add(OutboxMessage.of("orders", bad, bytes("b" + i)));
         }
         var badIds = transactions.inTx(c -> outbox.sendAll(badMessages));
-        await(Duration.ofSeconds(30), () -> telemetry.failedAlone(badShard) >= 1); // isolated: stepped alone from here
+        // isolated: stepped alone from here
+        Await.until(Duration.ofSeconds(30), () -> telemetry.failedAlone(badShard) >= 1);
 
         var goodIds = new ArrayList<UUID>();
         long until = System.nanoTime() + Duration.ofSeconds(6).toNanos();
@@ -140,9 +142,9 @@ class RelayTelemetryIT {
         assertThat(telemetry.failedAlone(badShard)).isLessThanOrEqualTo(4);
 
         restoreCursorAppends(config);
-        await(Duration.ofSeconds(30), () -> delivered(handler).containsAll(badIds) && telemetry.steps.stream()
+        Await.until(Duration.ofSeconds(30), () -> delivered(handler).containsAll(badIds) && telemetry.steps.stream()
                 .anyMatch(s -> s.shards.equals(List.of(badShard)) && s.finished.get() > 0));
-        await(Duration.ofSeconds(10), () -> delivered(handler).containsAll(goodIds));
+        Await.until(Duration.ofSeconds(10), () -> delivered(handler).containsAll(goodIds));
         runtime.close(); // no step in flight from here
 
         assertThat(delivered(handler)).filteredOn(goodIds::contains).as("the other shard, delivered once each")
@@ -162,7 +164,7 @@ class RelayTelemetryIT {
         assertThat(called.await(10, TimeUnit.SECONDS)).isTrue();
         runtime.close(); // interrupts the step after shutdownTimeout
 
-        await(Duration.ofSeconds(5), () -> telemetry.steps.stream().allMatch(s -> s.ends() > 0));
+        Await.until(Duration.ofSeconds(5), () -> telemetry.steps.stream().allMatch(s -> s.ends() > 0));
         assertThat(telemetry.steps).isNotEmpty().allSatisfy(step -> assertThat(step.ends()).isOne());
         assertThat(telemetry.relayFailures).hasValue(0);
     }
@@ -175,7 +177,7 @@ class RelayTelemetryIT {
         var outbox = start(config, handler, events);
 
         var id = transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", "k", bytes("m"))));
-        await(Duration.ofSeconds(10), () -> events.ended().stream().anyMatch(Events.Observed::delivered));
+        Await.until(Duration.ofSeconds(10), () -> events.ended().stream().anyMatch(Events.Observed::delivered));
         runtime.close();
 
         var step = events.single();
@@ -204,7 +206,7 @@ class RelayTelemetryIT {
         }
 
         transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", "k", bytes("m"))));
-        await(Duration.ofSeconds(10), () -> events.ended().stream().anyMatch(s -> s.log.contains("failed")));
+        Await.until(Duration.ofSeconds(10), () -> events.ended().stream().anyMatch(s -> s.log.contains("failed")));
         runtime.close(); // no step left to contend for the table with the drop
         try (var c = transactions.newConnection()) {
             TestSql.execute(c, "drop trigger refuse on " + cursor);
@@ -237,7 +239,7 @@ class RelayTelemetryIT {
         r.start();
 
         failingTransactions.inTx(c -> r.outbox().send(OutboxMessage.of("orders", "k", bytes("m"))));
-        await(Duration.ofSeconds(10), () -> rollbackErrors.get() > 0
+        Await.until(Duration.ofSeconds(10), () -> rollbackErrors.get() > 0
                 && events.ended().stream().anyMatch(s -> s.log.contains("failed")));
         runtime.close();
 
@@ -256,7 +258,7 @@ class RelayTelemetryIT {
         var outbox = start(config, handler, events);
 
         transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", "k", bytes("m"))));
-        await(Duration.ofSeconds(10), () -> events.steps.stream().anyMatch(s -> s.log.contains("committed(1)")));
+        Await.until(Duration.ofSeconds(10), () -> events.steps.stream().anyMatch(s -> s.log.contains("committed(1)")));
         Thread.sleep(200);
         runtime.close();
 
@@ -320,7 +322,7 @@ class RelayTelemetryIT {
         }
 
         transactions.inTx(c -> outbox.sendAll(messages));
-        await(Duration.ofSeconds(10), () -> handler.delivered().size() >= 5);
+        Await.until(Duration.ofSeconds(10), () -> handler.delivered().size() >= 5);
         runtime.close();
 
         assertThat(events.fetched(0)).isEqualTo(3);
@@ -364,7 +366,7 @@ class RelayTelemetryIT {
         var outbox = start(config, handler, events);
 
         transactions.inTx(c -> outbox.sendAll(messages));
-        await(Duration.ofSeconds(20), () -> calls.get() >= 4);
+        Await.until(Duration.ofSeconds(20), () -> calls.get() >= 4);
         runtime.close();
 
         assertThat(events.steps.get(0).handedTimes).as("both shards in one call").containsExactly(4);
@@ -394,7 +396,7 @@ class RelayTelemetryIT {
         var messages = sameShard.stream().map(k -> OutboxMessage.of("orders", k, bytes(k))).toList();
 
         transactions.inTx(c -> outbox.sendAll(messages));
-        await(Duration.ofSeconds(10), () -> !first.get() && events.ended().stream().anyMatch(s -> s.handed == 3));
+        Await.until(Duration.ofSeconds(10), () -> !first.get() && events.ended().stream().anyMatch(s -> s.handed == 3));
         runtime.close();
 
         var step = events.ended().stream().filter(s -> s.handed == 3).findFirst().orElseThrow();
@@ -415,7 +417,7 @@ class RelayTelemetryIT {
         var outbox = start(config, handler, events);
 
         var id = transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", "k", bytes("m"))));
-        await(Duration.ofSeconds(10), () -> events.ended().stream().anyMatch(Events.Observed::delivered));
+        Await.until(Duration.ofSeconds(10), () -> events.ended().stream().anyMatch(Events.Observed::delivered));
         runtime.close();
 
         var log = events.single().log;
@@ -444,7 +446,7 @@ class RelayTelemetryIT {
                 OutboxMessage.of("orders", sameShard.get(0), bytes("1")),
                 OutboxMessage.of("orders", sameShard.get(1), bytes("2")),
                 OutboxMessage.of("orders", sameShard.get(1), bytes("3")))));
-        await(Duration.ofSeconds(10), () -> events.ended().stream().anyMatch(s -> s.handed == 3));
+        Await.until(Duration.ofSeconds(10), () -> events.ended().stream().anyMatch(s -> s.handed == 3));
         runtime.close();
 
         var step = events.ended().stream().filter(s -> s.handed == 3).findFirst().orElseThrow();
@@ -466,7 +468,7 @@ class RelayTelemetryIT {
 
         var failing = transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", "failing", bytes("f"))));
         var permanent = transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", "permanent", bytes("p"))));
-        await(Duration.ofSeconds(15), () -> events.deadLettered.size() >= 2);
+        Await.until(Duration.ofSeconds(15), () -> events.deadLettered.size() >= 2);
         runtime.close();
 
         assertThat(events.deadLettered).containsExactlyInAnyOrder(failing + " max_attempts",
@@ -485,10 +487,10 @@ class RelayTelemetryIT {
         var outbox = start(config, handler, events);
 
         var failing = transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", sameShard.get(0), bytes("f"))));
-        await(Duration.ofSeconds(10), () -> handler.batches().stream().flatMap(List::stream)
+        Await.until(Duration.ofSeconds(10), () -> handler.batches().stream().flatMap(List::stream)
                 .anyMatch(Outcome.Retry.class::isInstance));
         var next = transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", sameShard.get(1), bytes("n"))));
-        await(Duration.ofSeconds(10), () -> delivered(handler).containsAll(List.of(failing, next)));
+        Await.until(Duration.ofSeconds(10), () -> delivered(handler).containsAll(List.of(failing, next)));
         runtime.close();
 
         assertThat(events.foreignSteps).as("every delivery got the handle its step's stepStarted returned").isZero();
@@ -512,7 +514,7 @@ class RelayTelemetryIT {
         }
 
         transactions.inTx(c -> outbox.sendAll(messages));
-        await(Duration.ofSeconds(10), () -> handler.delivered().size() >= 6);
+        Await.until(Duration.ofSeconds(10), () -> handler.delivered().size() >= 6);
         runtime.close();
 
         var handedSix = events.ended().stream().filter(step -> step.handedTimes.contains(6)).toList();
@@ -578,20 +580,6 @@ class RelayTelemetryIT {
 
     private static List<UUID> delivered(RecordingHandler handler) {
         return handler.delivered().stream().map(OutboxRecord::messageId).toList();
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
-    }
-
-    private static void await(Duration timeout, BooleanSupplier condition) throws InterruptedException {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!condition.getAsBoolean()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within " + timeout);
-            }
-            Thread.sleep(10);
-        }
     }
 
     /** The steps started, in order, and the relay failures. */

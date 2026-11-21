@@ -15,6 +15,7 @@ import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.testing.AdminRows;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.ByteReads;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.ShardKeys;
@@ -52,6 +53,7 @@ import org.junit.jupiter.api.Test;
  */
 class StrandedShardsIT {
 
+    private static final Duration TIMEOUT = Duration.ofSeconds(30);
     private static final int SHARDS = 8;
     private static final String TOPIC = "t";
     private static final List<Integer> STRANDED = List.of(1, 2);
@@ -95,7 +97,7 @@ class StrandedShardsIT {
         var others = sendMany(0, 10);
         deleteTheirTick();
         startRelay();
-        await(() -> delivered.containsAll(others));
+        Await.until(TIMEOUT, () -> delivered.containsAll(others));
         assertThat(delivered).as("stranded: nothing of them moves").doesNotContainAnyElementsOf(strandedRows);
 
         var stop = new AtomicBoolean();
@@ -109,18 +111,18 @@ class StrandedShardsIT {
             }
             return null;
         });
-        await(() -> sent.size() > 20);
+        Await.until(TIMEOUT, () -> sent.size() > 20);
         var flowing = sendMany(0, 1);
-        await(() -> delivered.containsAll(flowing));
+        Await.until(TIMEOUT, () -> delivered.containsAll(flowing));
 
         long resent = admin().recoverStrandedShards();
 
         assertThat(resent).as("every row of theirs from before the call").isGreaterThanOrEqualTo(strandedRows.size());
         var afterIt = sendMany(1, 1);
-        await(() -> delivered.containsAll(afterIt));
+        Await.until(TIMEOUT, () -> delivered.containsAll(afterIt));
         stop.set(true);
         writers.get(10, TimeUnit.SECONDS);
-        await(() -> delivered.containsAll(strandedRows) && delivered.containsAll(sent));
+        Await.until(TIMEOUT, () -> delivered.containsAll(strandedRows) && delivered.containsAll(sent));
         assertThatThrownBy(() -> admin().recoverStrandedShards()).isInstanceOf(IllegalStateException.class)
                 .hasMessageStartingWith("no stranded shards");
     }
@@ -156,7 +158,7 @@ class StrandedShardsIT {
         sent.add(openWhileTheCopyRuns.id());
         sent.add(openPastTheCall.id());
         sent.add(startedInTheCall.get(0).get());
-        await(() -> delivered.containsAll(sent));
+        Await.until(TIMEOUT, () -> delivered.containsAll(sent));
         Thread.sleep(300); // a second delivery would come now
         assertThat(times.get(openWhileTheCopyRuns.id())).as("committed after the tick: only the relay's").isEqualTo(1);
         assertThat(times.get(openPastTheCall.id())).isEqualTo(1);
@@ -177,7 +179,7 @@ class StrandedShardsIT {
                     + " returned 5, the rows re-sent, for shards [1, 2]");
         }
 
-        await(() -> delivered.containsAll(rows));
+        Await.until(TIMEOUT, () -> delivered.containsAll(rows));
         Thread.sleep(300);
         assertThat(rows).allSatisfy(id -> assertThat(times.get(id)).isEqualTo(1));
         try (var c = direct.getConnection()) {
@@ -229,7 +231,7 @@ class StrandedShardsIT {
 
         assertThat(admin().recoverStrandedShards()).as("the plain row alone").isEqualTo(1);
 
-        await(() -> delivered.contains(plain));
+        Await.until(TIMEOUT, () -> delivered.contains(plain));
         assertThat(delivered).as("each waits in its table").doesNotContain(inRetry, inParked, inDead);
         try (var c = direct.getConnection()) {
             var cursor = new Cursors(names, SHARDS).latest(c, 1).cursor();
@@ -266,7 +268,7 @@ class StrandedShardsIT {
         var sent = new ArrayList<>(free);
         sent.add(heldRow);
         sent.add(open.id());
-        await(() -> delivered.containsAll(sent));
+        Await.until(TIMEOUT, () -> delivered.containsAll(sent));
     }
 
     /**
@@ -289,7 +291,7 @@ class StrandedShardsIT {
                     + " move").isZero();
         }
 
-        await(() -> delivered.containsAll(sent));
+        Await.until(TIMEOUT, () -> delivered.containsAll(sent));
         var mine = new HashSet<>(sent);
         assertThat(order.stream().filter(mine::contains).distinct().toList()).as("the key in send order")
                 .isEqualTo(sent);
@@ -329,7 +331,7 @@ class StrandedShardsIT {
 
         assertThat(admin().recoverStrandedShards()).as("only the rows the first call left").isEqualTo(500);
 
-        await(() -> delivered.containsAll(sent));
+        Await.until(TIMEOUT, () -> delivered.containsAll(sent));
         var mine = new HashSet<>(sent);
         assertThat(order.stream().filter(mine::contains).distinct().toList()).as("the key in send order")
                 .isEqualTo(sent);
@@ -372,7 +374,7 @@ class StrandedShardsIT {
         assertThat(admin().recoverStrandedShards()).as("the rows its tick does not see, read or not").isEqualTo(6);
 
         rows.addAll(after);
-        await(() -> delivered.containsAll(rows));
+        Await.until(TIMEOUT, () -> delivered.containsAll(rows));
         Thread.sleep(300);
         assertThat(delivered).as("what its tick sees went through before").doesNotContainAnyElementsOf(relayed);
         assertThatThrownBy(() -> admin().recoverStrandedShards()).hasMessageStartingWith("no stranded shards");
@@ -419,7 +421,7 @@ class StrandedShardsIT {
                     .containsOnlyKeys(stranded);
         }
         startRelay();
-        await(() -> delivered.containsAll(row));
+        Await.until(TIMEOUT, () -> delivered.containsAll(row));
         Thread.sleep(300);
         assertThat(times.get(row.get(0))).as("once: the relay's, no repair's").isEqualTo(1);
     }
@@ -465,7 +467,7 @@ class StrandedShardsIT {
         }
         startRelay();
         admin().recoverStrandedShards();
-        await(() -> delivered.containsAll(row));
+        Await.until(TIMEOUT, () -> delivered.containsAll(row));
     }
 
     /**
@@ -496,7 +498,8 @@ class StrandedShardsIT {
             execute(c, "select setval(" + tickSequence + ", " + (restored + 1_000_000) + ")");
             makeATick();
             var before = sendMany(0, 1);
-            await(() -> delivered.containsAll(before)); // on a round of a tick above restored + 1 000 000
+            // on a round of a tick above restored + 1 000 000
+            Await.until(TIMEOUT, () -> delivered.containsAll(before));
 
             execute(c, lock);
             for (int i = 0; i < tables.size(); i++) {
@@ -512,7 +515,7 @@ class StrandedShardsIT {
             after.addAll(sendMany(shard, 1));
         }
 
-        await(() -> delivered.containsAll(after));
+        Await.until(TIMEOUT, () -> delivered.containsAll(after));
     }
 
     @Test
@@ -526,7 +529,7 @@ class StrandedShardsIT {
                 this::deliver).build();
         relay.start();
 
-        await(() -> atClose.size() > 10);
+        Await.until(TIMEOUT, () -> atClose.size() > 10);
 
         assertThat(atClose).as("as every pass closes it, a stranded shard's step failing in each").containsOnly(true);
     }
@@ -550,13 +553,13 @@ class StrandedShardsIT {
             }
         }).build();
         relay.start();
-        await(() -> failures.get() > 2);
+        Await.until(TIMEOUT, () -> failures.get() > 2);
 
         var sent = sendMany(0, 5);
 
-        await(() -> delivered.containsAll(sent));
+        Await.until(TIMEOUT, () -> delivered.containsAll(sent));
         int before = failures.get();
-        await(() -> failures.get() > before + 2); // and it is still tried: a repair is not left waiting
+        Await.until(TIMEOUT, () -> failures.get() > before + 2); // and it is still tried: a repair is not left waiting
     }
 
     @Test
@@ -583,7 +586,7 @@ class StrandedShardsIT {
             sent.addAll(sendMany(i % 2 == 0 ? 0 : 3, 1));
             Thread.sleep(5);
         }
-        await(() -> delivered.containsAll(sent));
+        Await.until(TIMEOUT, () -> delivered.containsAll(sent));
 
         assertThat(failures).as("the stranded shard's own failures, and only those").isNotEmpty()
                 .noneMatch(failure -> failure.contains("before any query"));
@@ -668,7 +671,7 @@ class StrandedShardsIT {
             assertThat(cursors.latest(c, idle).cursor().tickId()).as("anchored in its turn").isEqualTo(before);
         }
         startRelay();
-        await(() -> delivered.containsAll(idleRow) && delivered.containsAll(unread));
+        Await.until(TIMEOUT, () -> delivered.containsAll(idleRow) && delivered.containsAll(unread));
         Thread.sleep(300);
         assertThat(times.get(idleRow.get(0))).isEqualTo(1);
         assertThat(times.get(unread.get(0))).isEqualTo(1);
@@ -735,7 +738,7 @@ class StrandedShardsIT {
         }
 
         assertThat(first.get(10, TimeUnit.SECONDS)).isEqualTo(5);
-        await(() -> delivered.containsAll(rows));
+        Await.until(TIMEOUT, () -> delivered.containsAll(rows));
     }
 
     @Test
@@ -762,7 +765,7 @@ class StrandedShardsIT {
         admin().afterChunk = null;
         admin().recoverXidRegression();
 
-        await(() -> delivered.containsAll(rows));
+        Await.until(TIMEOUT, () -> delivered.containsAll(rows));
     }
 
     /** The message id, topic, key and the md5 of the payload and headers of each row of {@code messageIds}. */
@@ -890,20 +893,5 @@ class StrandedShardsIT {
                 throw new AssertionError(e);
             }
         }
-    }
-
-    private static void await(Check condition) throws Exception {
-        long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
-        while (!condition.met()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within 30 s");
-            }
-            Thread.sleep(20);
-        }
-    }
-
-    @FunctionalInterface
-    private interface Check {
-        boolean met() throws Exception;
     }
 }

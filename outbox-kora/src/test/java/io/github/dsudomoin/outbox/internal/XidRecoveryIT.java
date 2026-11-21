@@ -16,6 +16,7 @@ import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.Intercepting;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
@@ -70,11 +71,11 @@ class XidRecoveryIT {
         relay.start();
         var outbox = outbox(relay);
         var sent = new ArrayList<>(send(outbox, messages("before", 20)));
-        await(Duration.ofSeconds(5), () -> handler.delivered().size() >= 20);
+        Await.until(Duration.ofSeconds(5), () -> handler.delivered().size() >= 20);
         long forged = forgeRegression();
         sent.addAll(send(outbox, messages("after", 20))); // xids the forged tick takes for relayed
         // the workers' next tick is refused: they record the halt and stop, ahead of maintenance
-        await(Duration.ofSeconds(5), maintenance::halted);
+        Await.until(Duration.ofSeconds(5), maintenance::halted);
         assertThat(haltRows()).isOne();
         assertThat(latestTickId()).as("no tick after the forged one").isEqualTo(forged);
 
@@ -94,7 +95,7 @@ class XidRecoveryIT {
         assertThat(maintenance.halted()).isFalse();
         assertThat(haltRows()).isZero();
         assertThat(tickExists(forged)).isFalse();
-        await(Duration.ofSeconds(10), () -> delivered(handler).containsAll(sent));
+        Await.until(Duration.ofSeconds(10), () -> delivered(handler).containsAll(sent));
     }
 
     @Test
@@ -114,7 +115,7 @@ class XidRecoveryIT {
         var maintenance = maintenance();
         relay(handler, maintenance).start();
         assertThat(maintenance.halted()).isFalse();
-        await(Duration.ofSeconds(10), () -> handler.delivered().size() >= 20);
+        Await.until(Duration.ofSeconds(10), () -> handler.delivered().size() >= 20);
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyInAnyOrderElementsOf(sent);
     }
 
@@ -128,7 +129,7 @@ class XidRecoveryIT {
         var relay = relay(handler, maintenance());
         relay.start();
         var before = send(outbox(relay), messages("before", 20));
-        await(Duration.ofSeconds(5), () -> delivered(handler).containsAll(before));
+        Await.until(Duration.ofSeconds(5), () -> delivered(handler).containsAll(before));
         relay.close();
         // logical replication or DMS: the rows are copied, the sequences stay at their start, and the target's xid
         // counter is not behind, so no regression shows
@@ -143,7 +144,7 @@ class XidRecoveryIT {
         var relayAfter = relay(handler, maintenance());
         relayAfter.start();
         var after = send(outbox(relayAfter), messages("after", 20));
-        await(Duration.ofSeconds(10), () -> delivered(handler).containsAll(after));
+        Await.until(Duration.ofSeconds(10), () -> delivered(handler).containsAll(after));
     }
 
     @Test
@@ -153,7 +154,7 @@ class XidRecoveryIT {
         var relay = relay(handler, maintenance());
         relay.start();
         var before = send(outbox(relay), messages("before", 10));
-        await(Duration.ofSeconds(5), () -> delivered(handler).containsAll(before));
+        Await.until(Duration.ofSeconds(5), () -> delivered(handler).containsAll(before));
         relay.close();
         // the source's last rows: written after its newest tick, so above every max_id and last_id
         var copied = send(outbox(null), messages("copied", 10));
@@ -167,7 +168,7 @@ class XidRecoveryIT {
             assertThat(queryLong(c, "select count(*) from (select id from " + names.base()
                     + " group by id having count(*) > 1) d")).as("ids shared by a copied and a new row").isZero();
         }
-        await(Duration.ofSeconds(10), () -> delivered(handler).containsAll(copied) && delivered(handler)
+        Await.until(Duration.ofSeconds(10), () -> delivered(handler).containsAll(copied) && delivered(handler)
                 .containsAll(after));
         var order = handler.delivered().stream().map(r -> new String(r.payload(), UTF_8))
                 .filter(p -> !p.startsWith("before")).toList();
@@ -188,22 +189,22 @@ class XidRecoveryIT {
         relay.start();
         var outbox = outbox(relay);
         send(outbox, msg("x", "first"));
-        await(Duration.ofSeconds(5), () -> OutboxAdminIT.count(names.dead()) == 1);
+        Await.until(Duration.ofSeconds(5), () -> OutboxAdminIT.count(names.dead()) == 1);
         // the run the relay started with holds the maintenance lock until it ends: a run of ours completes only after
         // it, and the run below then is the one that meets the rewound sequence
-        await(Duration.ofSeconds(10), maintenance::runOnce);
+        Await.until(Duration.ofSeconds(10), maintenance::runOnce);
         try (var c = TestDb.connect()) { // a live repoint onto a copy whose outbox id sequence was not carried
             execute(c, "alter table " + names.base() + " alter column id restart with 1");
         }
 
         try (var err = new CapturedStderr()) {
             // the relay's own runs take the lock too: a run of this call's may find it held
-            await(Duration.ofSeconds(10), maintenance::runOnce);
+            Await.until(Duration.ofSeconds(10), maintenance::runOnce);
 
             assertThat(err.text()).contains("ERROR").contains(names.base());
         }
         send(outbox, msg("x", "second")); // without the raise, its id is the dead letter's: 23505 on every step
-        await(Duration.ofSeconds(10), () -> OutboxAdminIT.count(names.dead()) == 2);
+        Await.until(Duration.ofSeconds(10), () -> OutboxAdminIT.count(names.dead()) == 2);
     }
 
     @Test
@@ -460,7 +461,7 @@ class XidRecoveryIT {
             assertThat(maintenance.halted()).as("no answer yet: no worker takes a shard").isTrue();
             locker.rollback();
             send(outbox(relay), messages("m", 3));
-            await(Duration.ofSeconds(5), () -> handler.delivered().size() == 3);
+            Await.until(Duration.ofSeconds(5), () -> handler.delivered().size() == 3);
             assertThat(maintenance.halted()).isFalse();
             assertThat(err.text()).doesNotContain("xid regression").doesNotContain("resumed");
         }
@@ -651,7 +652,7 @@ class XidRecoveryIT {
         var outbox = outbox(relay);
         var held = send(outbox, msg("r", "head"), msg("r", "follower"));
         var parked = send(outbox, msg("p", "parked"));
-        await(Duration.ofSeconds(5), // the head diverted with its follower, p requeued
+        Await.until(Duration.ofSeconds(5), // the head diverted with its follower, p requeued
                 () -> OutboxAdminIT.count(names.retry()) == 2 && MaintenanceIT.count(names.parked(), parked) == 1);
         try (var c = TestDb.connect()) { // a parked row whose outbox range is gone: its id above every outbox id
             execute(c, "insert into " + names.parked() + " (id, shard, message_id, topic, key, created_at, due_at)"
@@ -672,13 +673,13 @@ class XidRecoveryIT {
                     .isGreaterThan(1_000_000_000L);
         }
         down.set(false);
-        await(Duration.ofSeconds(10), () -> delivered(recording).containsAll(held)
+        Await.until(Duration.ofSeconds(10), () -> delivered(recording).containsAll(held)
                 && delivered(recording).containsAll(other) && delivered(recording).containsAll(parked));
         assertThat(recording.delivered()).extracting(r -> new String(r.payload(), UTF_8))
                 .filteredOn(p -> p.equals("head") || p.equals("follower"))
                 .containsExactly("head", "follower");
         assertThat(recording.delivered()).filteredOn(r -> parked.contains(r.messageId())).as("once").hasSize(1);
-        await(Duration.ofSeconds(5), () -> OutboxAdminIT.count(names.retry()) == 0);
+        Await.until(Duration.ofSeconds(5), () -> OutboxAdminIT.count(names.retry()) == 0);
     }
 
     @Test
@@ -720,7 +721,7 @@ class XidRecoveryIT {
                     }
                 }
             }));
-            await(Duration.ofSeconds(5), () -> written.size() >= 40);
+            Await.until(Duration.ofSeconds(5), () -> written.size() >= 40);
 
             try (var err = new CapturedStderr()) {
                 assertThat(maintenance().runOnce()).isTrue();
@@ -728,7 +729,7 @@ class XidRecoveryIT {
                 assertThat(err.text()).contains("recovered: ");
             }
             long after = written.size();
-            await(Duration.ofSeconds(5), () -> written.size() >= after + 40);
+            Await.until(Duration.ofSeconds(5), () -> written.size() >= after + 40);
         } finally {
             stop.set(true);
             for (var task : tasks) {
@@ -1163,20 +1164,6 @@ class XidRecoveryIT {
     private List<Bound> ranges() throws SQLException {
         try (var c = TestDb.connect()) {
             return PartitionDdl.listRanges(c, names.base());
-        }
-    }
-
-    private interface Condition {
-        boolean holds() throws Exception;
-    }
-
-    private static void await(Duration timeout, Condition condition) throws Exception {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!condition.holds()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within " + timeout);
-            }
-            Thread.sleep(5);
         }
     }
 }

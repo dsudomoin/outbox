@@ -11,6 +11,7 @@ import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.XidRecovery;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
@@ -95,7 +96,7 @@ class XidRegressionDumpRestoreIT {
         relayA.start();
         var outboxA = new PgOutbox(dbA, schemaA, config.shards(), relayA::wake, TestTelemetry.kora());
         var first = send(dbA, outboxA, "first", 1000);
-        await(Duration.ofSeconds(10), () -> deliveries(handlerA).keySet().containsAll(first));
+        Await.until(Duration.ofSeconds(10), () -> deliveries(handlerA).keySet().containsAll(first));
         relayA.close();
         var undelivered = send(dbA, outboxA, "undelivered", 500);
 
@@ -106,7 +107,7 @@ class XidRegressionDumpRestoreIT {
         OutboxSchema schemaB;
         var writers = new Writers(b, config.table(), config.shards(), 2); // a service writing before the library starts
         try {
-            await(Duration.ofSeconds(10), () -> writers.written.size() >= 50);
+            Await.until(Duration.ofSeconds(10), () -> writers.written.size() >= 50);
             var dbB = database(b);
             try (var err = new CapturedStderr()) {
                 schemaB = bootstrap(dbB);
@@ -117,7 +118,7 @@ class XidRegressionDumpRestoreIT {
             assertThat(haltRows(b, schemaB)).isZero();
             relay(dbB, schemaB, handlerB).start();
             int before = writers.written.size();
-            await(Duration.ofSeconds(10), () -> writers.written.size() >= before + 50);
+            Await.until(Duration.ofSeconds(10), () -> writers.written.size() >= before + 50);
         } finally {
             writers.stop();
         }
@@ -125,7 +126,7 @@ class XidRegressionDumpRestoreIT {
         assertThat(writers.errors).isEmpty();
         var expected = new HashSet<>(undelivered);
         expected.addAll(writers.written);
-        await(Duration.ofSeconds(30), () -> deliveries(handlerB).keySet().containsAll(expected));
+        Await.until(Duration.ofSeconds(30), () -> deliveries(handlerB).keySet().containsAll(expected));
         assertThat(haltRows(b, schemaB)).isZero();
         var all = new HashSet<>(expected);
         all.addAll(first);
@@ -165,7 +166,7 @@ class XidRegressionDumpRestoreIT {
         long took;
         var writer = new Writers(b, config.table(), config.shards(), 1);
         try (var c = connect(b)) {
-            await(Duration.ofSeconds(10), () -> writer.written.size() >= 100);
+            Await.until(Duration.ofSeconds(10), () -> writer.written.size() >= 100);
             long start = System.nanoTime();
             rows = recovery.rowsToSave(c); // as the automatic recovery does first, under no lock
             counted = System.nanoTime() - start;
@@ -173,7 +174,7 @@ class XidRegressionDumpRestoreIT {
             sent = recovery.recover(c);
             took = System.nanoTime() - start;
             int before = writer.written.size();
-            await(Duration.ofSeconds(10), () -> writer.written.size() >= before + 100);
+            Await.until(Duration.ofSeconds(10), () -> writer.written.size() >= before + 100);
         } finally {
             writer.stop();
         }
@@ -308,20 +309,6 @@ class XidRegressionDumpRestoreIT {
             for (var t : threads) {
                 t.join(TimeUnit.SECONDS.toMillis(30));
             }
-        }
-    }
-
-    private interface Condition {
-        boolean holds() throws Exception;
-    }
-
-    private static void await(Duration timeout, Condition condition) throws Exception {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!condition.holds()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within " + timeout);
-            }
-            Thread.sleep(5);
         }
     }
 }

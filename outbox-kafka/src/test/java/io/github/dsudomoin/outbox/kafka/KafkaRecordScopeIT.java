@@ -1,6 +1,6 @@
 package io.github.dsudomoin.outbox.kafka;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.JdbcTransactions;
@@ -10,6 +10,7 @@ import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.Outcome;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import jakarta.annotation.Nullable;
 import java.time.Duration;
@@ -24,7 +25,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.BooleanSupplier;
 import java.util.stream.Stream;
 import org.apache.kafka.clients.producer.Callback;
 import org.apache.kafka.clients.producer.KafkaProducer;
@@ -77,7 +77,7 @@ class KafkaRecordScopeIT {
         var ids = sendAll(runtime, topic, "a", "b", "c");
 
         runtime.relay().drain();
-        await(() -> telemetry.finished().size() == handler.calls.get());
+        Await.until(TIMEOUT, () -> telemetry.finished().size() == handler.calls.get());
 
         var reports = telemetry.reports();
         assertThat(reports).extracting(r -> r.record().messageId()).containsExactlyInAnyOrderElementsOf(ids);
@@ -102,7 +102,7 @@ class KafkaRecordScopeIT {
         var bad = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of(invalid, "k", bytes("bad"))));
 
         runtime.relay().drain();
-        await(() -> telemetry.finished().stream().anyMatch(f -> f.indexOf(bad) >= 0));
+        Await.until(TIMEOUT, () -> telemetry.finished().stream().anyMatch(f -> f.indexOf(bad) >= 0));
 
         assertThat(telemetry.reports()).extracting(r -> r.record().messageId()).containsExactly(good);
         var finished = telemetry.finished().stream().filter(f -> f.indexOf(bad) >= 0).findFirst().orElseThrow();
@@ -226,20 +226,6 @@ class KafkaRecordScopeIT {
 
         List<Finished> finished() {
             return events.stream().filter(Finished.class::isInstance).map(Finished.class::cast).toList();
-        }
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
-    }
-
-    private static void await(BooleanSupplier condition) throws InterruptedException {
-        long deadline = System.nanoTime() + TIMEOUT.toNanos();
-        while (!condition.getAsBoolean()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within " + TIMEOUT);
-            }
-            Thread.sleep(10);
         }
     }
 }

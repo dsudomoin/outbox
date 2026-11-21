@@ -9,6 +9,7 @@ import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.OutboxTopicHandler;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -92,7 +93,7 @@ class HeartbeatLaneIT {
         long readAge;
         try {
             long bootstrapped = millis("last_seen", names);
-            await(() -> millis("last_seen", names) > bootstrapped);
+            Await.until(Duration.ofSeconds(10), () -> millis("last_seen", names) > bootstrapped);
             var id = transactions.inTx(c -> {
                 gate.closed = true;
                 sleep(1000);
@@ -147,21 +148,6 @@ class HeartbeatLaneIT {
             Thread.currentThread().interrupt();
             throw new SQLException(e);
         }
-    }
-
-    private static void await(Check condition) throws Exception {
-        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
-        while (!condition.met()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within 10 s");
-            }
-            Thread.sleep(20);
-        }
-    }
-
-    @FunctionalInterface
-    private interface Check {
-        boolean met() throws Exception;
     }
 
     /** The application's pool, exhausted while closed: a connection is then refused after a 200 ms wait. */

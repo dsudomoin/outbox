@@ -6,6 +6,7 @@ import static io.github.dsudomoin.outbox.DeadLetter.Status.SCHEDULED;
 import static io.github.dsudomoin.outbox.testing.AdminRows.API;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -742,10 +743,6 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
 
     private static String base64(String s) {
         return Base64.getEncoder().encodeToString(bytes(s));
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
     }
 
 }

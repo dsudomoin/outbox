@@ -1,10 +1,12 @@
 package io.github.dsudomoin.outbox;
 
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.internal.Hashing;
 import io.github.dsudomoin.outbox.internal.UuidV7;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
@@ -21,7 +23,6 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -49,7 +50,7 @@ class FrameworkFreeIT {
         var two = transactions.inTx(c -> runtime.outbox().sendAll(List.of(
                 OutboxMessage.of("orders", "k2", bytes("b")), OutboxMessage.of("orders", "k3", bytes("c")))));
 
-        await(Duration.ofSeconds(1), () -> handler.delivered().size() == 3);
+        Await.until(Duration.ofSeconds(1), () -> handler.delivered().size() == 3);
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId)
                 .containsExactlyInAnyOrder(one, two.get(0), two.get(1));
     }
@@ -137,7 +138,7 @@ class FrameworkFreeIT {
 
         // the retry pass formats the error again
         long attempts = attempts(retry);
-        await(Duration.ofSeconds(10), () -> {
+        Await.until(Duration.ofSeconds(10), () -> {
             runtime.relay().drain();
             return attempts(retry) > attempts;
         });
@@ -206,11 +207,12 @@ class FrameworkFreeIT {
             var id = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", "k", bytes("p"))));
             assertThat(runtime.admin().status().tailOverflow()).as("the message went to the tail").isTrue();
 
-            await(Duration.ofSeconds(30), () -> {
+            Await.until(Duration.ofSeconds(30), () -> {
                 var status = runtime.admin().status();
                 return !status.tailOverflow() && status.premade() >= 2;
             });
-            await(Duration.ofSeconds(10), () -> handler.delivered().stream().anyMatch(r -> r.messageId().equals(id)));
+            Await.until(Duration.ofSeconds(10),
+                    () -> handler.delivered().stream().anyMatch(r -> r.messageId().equals(id)));
             assertThat(err.text()).doesNotContain("ERROR");
         }
     }
@@ -226,8 +228,8 @@ class FrameworkFreeIT {
     }
 
     /** Waits for a maintenance run to complete after {@code since} ({@link System#nanoTime()}). */
-    private static void awaitMaintenanceRun(OutboxRuntime runtime, long since) throws InterruptedException {
-        await(Duration.ofSeconds(10), () -> {
+    private static void awaitMaintenanceRun(OutboxRuntime runtime, long since) throws Exception {
+        Await.until(Duration.ofSeconds(10), () -> {
             long before = System.nanoTime(); // the status reads the age after this: a success it shows is no older
             var age = runtime.admin().status().maintenanceSinceSuccessSeconds();
             return age != null && age < (before - since) / 1e9;
@@ -238,20 +240,6 @@ class FrameworkFreeIT {
         try (var c = transactions.newConnection(); var st = c.createStatement()) {
             st.execute("set synchronous_commit = off");
             st.execute("do $$ begin for i in 1.." + n + " loop perform pg_current_xact_id(); commit; end loop; end $$");
-        }
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
-    }
-
-    private static void await(Duration timeout, BooleanSupplier condition) throws InterruptedException {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!condition.getAsBoolean()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within " + timeout);
-            }
-            Thread.sleep(10);
         }
     }
 

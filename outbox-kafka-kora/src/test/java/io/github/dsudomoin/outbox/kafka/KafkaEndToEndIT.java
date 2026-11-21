@@ -2,6 +2,7 @@ package io.github.dsudomoin.outbox.kafka;
 
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -287,9 +288,5 @@ class KafkaEndToEndIT {
         var sender = new KafkaOutboxSender(() -> properties);
         senders.add(sender);
         return sender;
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
     }
 }

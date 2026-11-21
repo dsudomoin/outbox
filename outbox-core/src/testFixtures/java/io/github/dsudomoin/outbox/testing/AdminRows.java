@@ -1,6 +1,6 @@
 package io.github.dsudomoin.outbox.testing;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 
 import io.github.dsudomoin.outbox.ConnectionSource;
 import io.github.dsudomoin.outbox.DeadLetter;
@@ -207,9 +207,5 @@ public final class AdminRows {
         try (var c = connections.newConnection()) {
             TestSql.execute(c, sql);
         }
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
     }
 }

@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox;
 
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -8,6 +9,7 @@ import static org.assertj.core.api.Assertions.tuple;
 import io.github.dsudomoin.outbox.internal.Hashing;
 import io.github.dsudomoin.outbox.internal.HeaderCodec;
 import io.github.dsudomoin.outbox.internal.UuidV7;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
@@ -23,7 +25,6 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -112,7 +113,7 @@ class ContractReleasesIT {
 
         var v1 = send(transition, "a", "a1");
         var v2 = send(next, "a", "a2");
-        await(() -> delivered().size() == 2);
+        Await.until(TIMEOUT, () -> delivered().size() == 2);
         assertThat(delivered()).extracting(Delivery::messageId, Delivery::version, Delivery::event)
                 .containsExactly(tuple(v1, 1, new Event("a1", null)), tuple(v2, 2, new Event("a2", "v2")));
 
@@ -122,7 +123,7 @@ class ContractReleasesIT {
             stop(next);
             return ids;
         });
-        await(() -> delivered().size() == 4);
+        Await.until(TIMEOUT, () -> delivered().size() == 4);
         assertThat(delivered().subList(2, 4)).extracting(Delivery::by, Delivery::messageId, Delivery::event)
                 .containsExactlyInAnyOrder(tuple(Release.TRANSITION, rolledBack.get(0), new Event("a3", "v2")),
                         tuple(Release.TRANSITION, rolledBack.get(1), new Event("b1", "v2")));
@@ -150,12 +151,13 @@ class ContractReleasesIT {
 
         var old = start(Release.OLD);
         var v1 = send(old, "d", "d1");
-        await(() -> old.runtime().admin().status().waitingSize() == keys.size() && delivered().size() == 1);
+        Await.until(TIMEOUT,
+                () -> old.runtime().admin().status().waitingSize() == keys.size() && delivered().size() == 1);
         assertThat(delivered()).extracting(Delivery::messageId).containsExactly(v1);
         assertThat(deadLetters(old)).isZero();
 
         start(Release.TRANSITION); // beside N-1, which keeps taking the heads it cannot read
-        await(() -> delivered().size() == keys.size() * 3 + 1);
+        Await.until(TIMEOUT, () -> delivered().size() == keys.size() * 3 + 1);
         for (var key : keys) {
             assertThat(ids(key)).as(key).containsExactly(key + 1, key + 2, key + 3);
         }
@@ -200,7 +202,7 @@ class ContractReleasesIT {
                     stop(fleet.get(i));
                     fleet.set(i, replacement);
                     int before = delivered().size();
-                    await(() -> delivered().size() >= before + 20 || failure.get() != null);
+                    Await.until(TIMEOUT, () -> delivered().size() >= before + 20 || failure.get() != null);
                 }
             }
         } finally {
@@ -209,7 +211,7 @@ class ContractReleasesIT {
         }
 
         assertThat(failure.get()).isNull();
-        await(() -> delivered().stream().map(Delivery::id).distinct().count() == sent.size());
+        Await.until(TIMEOUT, () -> delivered().stream().map(Delivery::id).distinct().count() == sent.size());
         for (int k = 0; k < keys; k++) {
             var key = "k" + k;
             // at least once: a redelivery may repeat a record, never reorder the first deliveries
@@ -246,7 +248,7 @@ class ContractReleasesIT {
             return ids;
         });
 
-        await(() -> delivered().size() == sent.size());
+        Await.until(TIMEOUT, () -> delivered().size() == sent.size());
         var report = new ArrayList<String>();
         long slowest = 0;
         for (var d : delivered()) {
@@ -323,20 +325,6 @@ class ContractReleasesIT {
     private static String key(String id) {
         int slash = id.indexOf('/');
         return slash < 0 ? id : id.substring(0, slash);
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
-    }
-
-    private static void await(BooleanSupplier condition) throws InterruptedException {
-        long deadline = System.nanoTime() + TIMEOUT.toNanos();
-        while (!condition.getAsBoolean()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within " + TIMEOUT);
-            }
-            Thread.sleep(10);
-        }
     }
 
     /** A release's handler of {@link #TOPIC}: reads up to {@code type}'s contract, and notes deliveries and waits. */

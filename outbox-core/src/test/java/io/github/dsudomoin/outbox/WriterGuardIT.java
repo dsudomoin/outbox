@@ -1,6 +1,6 @@
 package io.github.dsudomoin.outbox;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -329,10 +329,6 @@ class WriterGuardIT {
 
     private static OutboxMessage raw(String topic) {
         return new OutboxMessage(topic, bytes("k"), bytes("1"), List.of());
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
     }
 
     private static final class Reads<T> extends TypedOutboxTopicHandler<T> {

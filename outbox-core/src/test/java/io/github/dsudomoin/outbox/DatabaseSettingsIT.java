@@ -7,6 +7,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import io.github.dsudomoin.outbox.internal.TableNames;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
@@ -120,7 +121,7 @@ class DatabaseSettingsIT {
                     .mapToObj(i -> OutboxMessage.of("fast", "k" + (n * 10 + i) % 7, new byte[] {(byte) i})).toList())));
         }
 
-        await(Duration.ofSeconds(60), () -> effects.containsAll(sent) && hooked.contains(poison));
+        Await.until(Duration.ofSeconds(60), () -> effects.containsAll(sent) && hooked.contains(poison));
         Thread.sleep(2000); // maintenance runs meanwhile, and anything delivered twice would show
         runtime.relay().drain();
 
@@ -249,12 +250,12 @@ class DatabaseSettingsIT {
         assertThat(refused).as("writers are refused").hasPositiveValue();
         readOnly(database, false);
 
-        await(Duration.ofSeconds(30), () -> committed.size() > before + 50);
+        Await.until(Duration.ofSeconds(30), () -> committed.size() > before + 50);
         stop.set(true);
         writer.get(30, TimeUnit.SECONDS);
-        await(Duration.ofSeconds(60), () -> delivered.containsAll(committed));
+        Await.until(Duration.ofSeconds(60), () -> delivered.containsAll(committed));
         assertThat(delivered).as("only what committed").containsExactlyInAnyOrderElementsOf(committed);
-        await(Duration.ofSeconds(30), () -> {
+        Await.until(Duration.ofSeconds(30), () -> {
             var status = runtime.admin().status();
             return !status.halted() && status.maintenanceSinceSuccessSeconds() < 2
                     && status.instances().stream().anyMatch(OutboxStatus.Instance::live);
@@ -306,7 +307,7 @@ class DatabaseSettingsIT {
 
         var dead = TableNames.of(config.table()).dead();
         var errors = new ArrayList<String>();
-        await(Duration.ofSeconds(20), () -> {
+        Await.until(Duration.ofSeconds(20), () -> {
             errors.clear();
             try (var c = ds.getConnection()) {
                 errors.addAll(TestSql.queryStrings(c,
@@ -326,20 +327,5 @@ class DatabaseSettingsIT {
             TestSql.execute(c, "select pg_terminate_backend(pid) from pg_stat_activity where datname = '" + database
                     + "' and pid <> pg_backend_pid()");
         }
-    }
-
-    private static void await(Duration timeout, Check check) throws Exception {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!check.met()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("not met within " + timeout);
-            }
-            Thread.sleep(50);
-        }
-    }
-
-    @FunctionalInterface
-    private interface Check {
-        boolean met() throws Exception;
     }
 }

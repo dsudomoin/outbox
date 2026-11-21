@@ -1,6 +1,7 @@
 package io.github.dsudomoin.outbox;
 
 import static io.github.dsudomoin.outbox.testing.Intercepting.intercepting;
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -338,10 +339,6 @@ class OutboxRuntimeIT {
 
     private static long rows(JdbcTransactions transactions, TestOutboxConfig config) {
         return transactions.inTx(c -> TestSql.queryLong(c, "select count(*) from " + config.table()));
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
     }
 
     private record Claiming(Set<String> topics) implements OutboxTopicHandler {

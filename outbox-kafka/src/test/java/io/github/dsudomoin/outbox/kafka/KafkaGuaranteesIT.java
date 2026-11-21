@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.kafka;
 
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -11,6 +12,7 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.Outcome;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
@@ -30,7 +32,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -140,7 +141,7 @@ class KafkaGuaranteesIT {
                 OutboxMessage.of(topic, "b", bytes("b#1")),
                 OutboxMessage.of(topic, "a", bytes("a#2"))));
         var bad = committed.remove("bad"); // checked on its own topic
-        await(CONSUME_TIMEOUT, () -> count(retryRows) == bad.size()); // its head and two followers
+        Await.until(CONSUME_TIMEOUT, () -> count(retryRows) == bad.size()); // its head and two followers
         sendAll(runtime, List.of(
                 OutboxMessage.of(topic, "c", bytes("c#1")),
                 OutboxMessage.of(topic, "a", bytes("a#3"))));
@@ -153,7 +154,7 @@ class KafkaGuaranteesIT {
         var arrived = TestKafka.consumeUntil(missing, CONSUME_TIMEOUT,
                 r -> TestKafka.byMessageId(r).keySet().containsAll(bad));
         assertThat(firstOccurrenceOrderPerKey(arrived)).isEqualTo(Map.of("bad", bad));
-        await(Duration.ofSeconds(10), () -> count(retryRows) == 0);
+        Await.until(Duration.ofSeconds(10), () -> count(retryRows) == 0);
     }
 
     @Test
@@ -214,7 +215,7 @@ class KafkaGuaranteesIT {
         var dead = TestKafka.consumeUntil(dlq, CONSUME_TIMEOUT, r -> !r.isEmpty());
         assertThat(dead).extracting(KafkaOutboxHeaders::messageId).containsOnly(poison);
         // the discard commits after the publish
-        await(Duration.ofSeconds(10), () -> runtime.admin().countDeadLetters(DeadLetterFilter.any()) == 0);
+        Await.until(Duration.ofSeconds(10), () -> runtime.admin().countDeadLetters(DeadLetterFilter.any()) == 0);
     }
 
     /**
@@ -267,7 +268,7 @@ class KafkaGuaranteesIT {
         assertThat(dead).extracting(KafkaOutboxHeaders::messageId).containsOnly(poison);
         var main = consumeCommitted(topic, r -> true);
         assertThat(main).extracting(KafkaOutboxHeaders::messageId).doesNotContain(poison);
-        await(Duration.ofSeconds(10), () -> runtime.admin().countDeadLetters(DeadLetterFilter.any()) == 0);
+        Await.until(Duration.ofSeconds(10), () -> runtime.admin().countDeadLetters(DeadLetterFilter.any()) == 0);
         assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThanOrEqualTo(within);
     }
 
@@ -296,7 +297,7 @@ class KafkaGuaranteesIT {
 
         alterTopic(topic, "max.message.bytes", "1048588"); // Kafka's default
         consumeCommitted(topic, r -> true); // all four, per key in send order
-        await(CONSUME_TIMEOUT, () -> count("select count(*) from " + runtime.schema().names().retry()) == 0);
+        Await.until(CONSUME_TIMEOUT, () -> count("select count(*) from " + runtime.schema().names().retry()) == 0);
         assertNothingIn(dlq);
     }
 
@@ -328,7 +329,7 @@ class KafkaGuaranteesIT {
         var next = start(OutboxRuntime.builder(config().sameTablesAs(config).holdPermanent(true), transactions,
                 new Handler(sender)).deadLetterHandler(new KafkaDeadLetterHandler(sender, "{topic}.dlq")));
         consumeCommitted(topic, r -> true);
-        await(CONSUME_TIMEOUT, () -> count("select count(*) from " + next.schema().names().retry()) == 0);
+        Await.until(CONSUME_TIMEOUT, () -> count("select count(*) from " + next.schema().names().retry()) == 0);
         assertNothingIn(dlq);
     }
 
@@ -340,8 +341,8 @@ class KafkaGuaranteesIT {
     private void assertHeld(OutboxRuntime runtime, String topic, String dlq, List<UUID> ids) throws Exception {
         var names = runtime.schema().names();
         var poison = ids.get(1);
-        await(CONSUME_TIMEOUT, () -> count("select count(*) from " + names.retry() + " where message_id = '" + poison
-                + "' and next_attempt_at is not null and attempts >= 2") == 1);
+        Await.until(CONSUME_TIMEOUT, () -> count("select count(*) from " + names.retry() + " where message_id = '"
+                + poison + "' and next_attempt_at is not null and attempts >= 2") == 1);
         assertThat(count("select count(*) from " + names.retry() + " where message_id = '" + ids.get(2)
                 + "' and next_attempt_at is null")).as("after, a follower").isEqualTo(1);
         var main = TestKafka.consumeUntil(topic, CONSUME_TIMEOUT,
@@ -384,7 +385,8 @@ class KafkaGuaranteesIT {
         sendAll(a, IntStream.range(0, 500)
                 .mapToObj(i -> OutboxMessage.of(topic, "k" + i % 10, bytes("m" + i))).toList());
 
-        await(Duration.ofSeconds(30), () -> slow.delivered.get() >= 50); // acknowledged with acks=all: in the topic
+        // acknowledged with acks=all: in the topic
+        Await.until(Duration.ofSeconds(30), () -> slow.delivered.get() >= 50);
         a.close();
         var next = new Handler();
         start(config().sameTablesAs(config), next);
@@ -518,19 +520,5 @@ class KafkaGuaranteesIT {
                     .add(KafkaOutboxHeaders.messageId(r));
         }
         return result.entrySet().stream().collect(Collectors.toMap(Map.Entry::getKey, e -> List.copyOf(e.getValue())));
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
-    }
-
-    private static void await(Duration timeout, BooleanSupplier condition) throws InterruptedException {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!condition.getAsBoolean()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within " + timeout);
-            }
-            Thread.sleep(10);
-        }
     }
 }

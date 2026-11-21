@@ -12,6 +12,7 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
@@ -28,7 +29,6 @@ import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -42,6 +42,7 @@ import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
  */
 class ReshardIT {
 
+    private static final Duration TIMEOUT = Duration.ofSeconds(10);
     private static final OutboxDeadLetterHandler HOOK = letters -> List.of();
 
     private final TestDatabase db = TestDb.newDatabase(20);
@@ -259,7 +260,7 @@ class ReshardIT {
         send(node.outbox(), "k", "before");
 
         reshardBehindItsBack(8);
-        await(() -> {
+        Await.until(TIMEOUT, () -> {
             try {
                 send(node.outbox(), "k", "after");
                 return false;
@@ -274,7 +275,7 @@ class ReshardIT {
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("8 shards");
 
         reshardBehindItsBack(4);
-        await(() -> {
+        Await.until(TIMEOUT, () -> {
             try {
                 send(node.outbox(), "k", "again");
                 return true;
@@ -291,9 +292,9 @@ class ReshardIT {
         var relaying = start(config(4), HOOK);
         relaying.relay().start();
 
-        await(() -> queryLong("select count(*) from " + names.instance() + " where last_seen > now() - interval"
-                + " '10 seconds' and hook_active is not null") == 2);
-        await(() -> queryString("select string_agg(hook_active::text, ',' order by hook_active) from "
+        Await.until(TIMEOUT, () -> queryLong("select count(*) from " + names.instance()
+                + " where last_seen > now() - interval '10 seconds' and hook_active is not null") == 2);
+        Await.until(TIMEOUT, () -> queryString("select string_agg(hook_active::text, ',' order by hook_active) from "
                 + names.instance()).equals("false,true"));
         assertThat(queryString("select hook_active::text from " + names.instance() + " where instance_id = '"
                 + writer.schema().instanceId() + "'")).as("a writer-only pod runs no dead-letter pass")
@@ -305,7 +306,7 @@ class ReshardIT {
         var node = start(config(4).relayEnabled(false));
         node.relay().start();
 
-        await(() -> queryLong("select count(*) from " + names.instance()) == 1);
+        Await.until(TIMEOUT, () -> queryLong("select count(*) from " + names.instance()) == 1);
         assertThat(queryString("select instance_id from " + names.instance()))
                 .isEqualTo(node.schema().instanceId())
                 .matches("[^/]+/" + ProcessHandle.current().pid() + "/[0-9a-f]{8}");
@@ -342,7 +343,7 @@ class ReshardIT {
                 new KoraOutboxTransactions(failingOnce), node.schema(), node.schema().config(), false);
         try {
             heartbeat.start();
-            await(() -> queryLong("select count(*) from " + names.instance()) == 1);
+            Await.until(TIMEOUT, () -> queryLong("select count(*) from " + names.instance()) == 1);
             assertThat(failed).isTrue();
         } finally {
             heartbeat.stop();
@@ -363,14 +364,14 @@ class ReshardIT {
                 schema(config(8)).start();
                 return null;
             });
-            await(() -> queryLong("select count(*) from pg_locks where locktype = 'advisory' and objid = "
-                    + TableNames.LOCK_TICK + " and not granted") == 1);
+            Await.until(TIMEOUT, () -> queryLong("select count(*) from pg_locks where locktype = 'advisory'"
+                    + " and objid = " + TableNames.LOCK_TICK + " and not granted") == 1);
             holder.setAutoCommit(false);
             // holds the retry check, which runs under SHARE on the outbox
             TestSql.execute(holder, "lock table " + names.retry() + " in access exclusive mode");
             TestSql.execute(gate, "select pg_advisory_unlock(" + tickLock + ")");
-            await(() -> queryLong("select count(*) from pg_locks where relation = '" + table + "'::regclass"
-                    + " and mode = 'ShareLock' and granted") == 1);
+            Await.until(TIMEOUT, () -> queryLong("select count(*) from pg_locks where relation = '" + table
+                    + "'::regclass and mode = 'ShareLock' and granted") == 1);
             var writing = pool.submit(() -> send(writer, "k", "during"));
             Thread.sleep(300);
             assertThat(writing.isDone()).as("the writer waits for the checks").isFalse();
@@ -401,8 +402,8 @@ class ReshardIT {
                 new OutboxSchema(repeatableRead, config(8)).start();
                 return null;
             });
-            await(() -> queryLong("select count(*) from pg_locks where relation = '" + table + "'::regclass"
-                    + " and mode = 'ShareLock' and not granted") == 1);
+            Await.until(TIMEOUT, () -> queryLong("select count(*) from pg_locks where relation = '" + table
+                    + "'::regclass and mode = 'ShareLock' and not granted") == 1);
             writer.commit();
 
             assertThatThrownBy(() -> resharding.get(10, SECONDS)).hasCauseInstanceOf(IllegalStateException.class)
@@ -488,18 +489,6 @@ class ReshardIT {
 
     private long cursorShards() throws SQLException {
         return queryLong("select count(distinct shard) from " + names.cursor());
-    }
-
-    private interface Condition {
-        boolean holds() throws Exception;
-    }
-
-    private static void await(Condition condition) throws Exception {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-        while (!condition.holds()) {
-            assertThat(System.nanoTime()).as("awaited condition").isLessThan(deadline);
-            Thread.sleep(20);
-        }
     }
 
     private static void execute(String sql) throws SQLException {

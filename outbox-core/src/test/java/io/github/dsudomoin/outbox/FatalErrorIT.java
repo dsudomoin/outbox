@@ -1,9 +1,11 @@
 package io.github.dsudomoin.outbox;
 
 import static io.github.dsudomoin.outbox.testing.Intercepting.intercepting;
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.ShardKeys;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
@@ -29,6 +31,7 @@ import org.junit.jupiter.api.Test;
  */
 class FatalErrorIT {
 
+    private static final Duration TIMEOUT = Duration.ofSeconds(30);
     private static final DataSource DIRECT = TestDataSources.newDataSource();
 
     /**
@@ -66,20 +69,21 @@ class FatalErrorIT {
                 .deadLetterHandler(FatalErrorIT::keepAll).build(); var err = new CapturedStderr()) {
             runtime.start();
             var before = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", "k", bytes("before"))));
-            await(() -> delivered.contains(before));
+            Await.until(TIMEOUT, () -> delivered.contains(before));
 
             failing.on = true;
             var during = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", "k", bytes("during"))));
-            await(() -> failing.threads.containsAll(Set.of("outbox-relay", "outbox-maintenance", "outbox-dead-letters"))
-                    && failing.thrown.get() > 10);
+            Await.until(TIMEOUT, () -> failing.threads.containsAll(
+                    Set.of("outbox-relay", "outbox-maintenance", "outbox-dead-letters")) && failing.thrown.get() > 10);
             Thread.sleep(1000); // several fatal errors in a row on each thread
             assertThat(delivered).doesNotContain(during);
             failing.on = false;
 
             var after = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", "k", bytes("after"))));
-            await(() -> delivered.containsAll(Set.of(during, after)));
+            Await.until(TIMEOUT, () -> delivered.containsAll(Set.of(during, after)));
             assertThat(workersAlive()).as("both workers alive").isEqualTo(2);
-            await(() -> runtime.admin().status().maintenanceSinceSuccessSeconds() < 1); // maintenance runs again
+            // maintenance runs again
+            Await.until(TIMEOUT, () -> runtime.admin().status().maintenanceSinceSuccessSeconds() < 1);
             assertThat(err.text()).contains("hit a fatal error, going on in", "outbox maintenance failed; next run in",
                             "outbox dead-letter pass hit a fatal error, retrying in")
                     .doesNotContain("stopped by a fatal error");
@@ -123,14 +127,15 @@ class FatalErrorIT {
                 return ids;
             });
             var neighbours = sent.subList(1, sent.size());
-            await("the neighbours delivered", () -> thrown.get() >= 5 && calls.keySet().containsAll(neighbours));
-            await(() -> thrown.get() >= 8); // more ticks, each one more step of the failing shard
+            Await.until(TIMEOUT, "the neighbours delivered",
+                    () -> thrown.get() >= 5 && calls.keySet().containsAll(neighbours));
+            Await.until(TIMEOUT, () -> thrown.get() >= 8); // more ticks, each one more step of the failing shard
             for (var id : neighbours) {
                 // once, or twice when the group's failed step had handed it the record before the poison's error
                 assertThat(calls.get(id).get()).as("calls of a neighbour's record").isBetween(1, 2);
             }
             thrown.set(Integer.MIN_VALUE);
-            await(() -> calls.containsKey(sent.get(0)));
+            Await.until(TIMEOUT, () -> calls.containsKey(sent.get(0)));
         }
     }
 
@@ -176,12 +181,12 @@ class FatalErrorIT {
                 .deadLetterHandler(FatalErrorIT::keepAll).telemetry(telemetry).build()) {
             runtime.start();
             failing.on = true;
-            await("the workers going on after relayFailed threw", () -> hookThrown.get() >= 4);
-            await("the dead-letter pass going on after its log threw", () -> logThrown.get() >= 2);
+            Await.until(TIMEOUT, "the workers going on after relayFailed threw", () -> hookThrown.get() >= 4);
+            Await.until(TIMEOUT, "the dead-letter pass going on after its log threw", () -> logThrown.get() >= 2);
             failing.on = false;
 
             var after = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", "k", bytes("after"))));
-            await(() -> delivered.contains(after));
+            Await.until(TIMEOUT, () -> delivered.contains(after));
             assertThat(workersAlive()).as("both workers alive").isEqualTo(2);
             assertThat(threadAlive("outbox-dead-letters")).as("the dead-letter thread alive").isTrue();
         } finally {
@@ -200,28 +205,5 @@ class FatalErrorIT {
 
     private static boolean threadAlive(String name) {
         return Thread.getAllStackTraces().keySet().stream().anyMatch(t -> t.getName().equals(name));
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
-    }
-
-    private static void await(Check check) throws Exception {
-        await("condition", check);
-    }
-
-    private static void await(String what, Check check) throws Exception {
-        long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
-        while (!check.met()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError(what + " not met within 30 s");
-            }
-            Thread.sleep(20);
-        }
-    }
-
-    @FunctionalInterface
-    private interface Check {
-        boolean met() throws Exception;
     }
 }

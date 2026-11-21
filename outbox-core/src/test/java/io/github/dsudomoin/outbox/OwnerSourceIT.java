@@ -10,6 +10,7 @@ import io.github.dsudomoin.outbox.internal.PgInbox;
 import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.internal.UuidV7;
 import io.github.dsudomoin.outbox.testing.AdminRows;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -149,7 +150,7 @@ class OwnerSourceIT {
 
         transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", "k", "p".getBytes(UTF_8))));
 
-        await(Duration.ofSeconds(10), () -> {
+        Await.until(Duration.ofSeconds(10), () -> {
             try (var c = as(app).getConnection()) {
                 return TestSql.queryLong(c, "select count(*) from " + names.tick() + " where id > " + before) > 0;
             }
@@ -466,11 +467,11 @@ class OwnerSourceIT {
 
             assertThat(writerErrors).as("writers' failures").isEmpty();
             try {
-                await(Duration.ofSeconds(60), () -> undecided(sent, handler).isEmpty());
+                Await.until(Duration.ofSeconds(60), () -> undecided(sent, handler).isEmpty());
             } catch (AssertionError e) {
                 throw new AssertionError(where(undecided(sent, handler)), e);
             }
-            await(Duration.ofSeconds(10), () -> {
+            Await.until(Duration.ofSeconds(10), () -> {
                 var since = outbox.admin().status().maintenanceSinceSuccessSeconds();
                 return since != null && since < 2 * interval.toMillis() / 1000.0;
             });
@@ -603,21 +604,6 @@ class OwnerSourceIT {
         try (var c = TestDataSources.newDataSource().getConnection()) {
             TestSql.execute(c, sql);
         }
-    }
-
-    private static void await(Duration timeout, Check condition) throws Exception {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!condition.met()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within " + timeout);
-            }
-            Thread.sleep(50);
-        }
-    }
-
-    @FunctionalInterface
-    private interface Check {
-        boolean met() throws Exception;
     }
 
     /**

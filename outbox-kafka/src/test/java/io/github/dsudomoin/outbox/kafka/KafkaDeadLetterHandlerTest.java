@@ -2,6 +2,7 @@ package io.github.dsudomoin.outbox.kafka;
 
 import static io.github.dsudomoin.outbox.kafka.KafkaOutboxSenderTest.DLQ;
 import static io.github.dsudomoin.outbox.kafka.KafkaOutboxSenderTest.TOPIC;
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -334,9 +335,5 @@ class KafkaDeadLetterHandlerTest {
             OutboxHeader... headers) {
         return new DeadLetter(id, UUID.randomUUID(), TOPIC, bytes(key), bytes(payload),
                 List.of(headers), Instant.now(), 3, FAILED_AT, error, DeadLetter.Status.PENDING, 0, 0, Instant.now());
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
     }
 }

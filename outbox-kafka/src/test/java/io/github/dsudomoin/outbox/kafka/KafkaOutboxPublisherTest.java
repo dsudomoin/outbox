@@ -1,7 +1,7 @@
 package io.github.dsudomoin.outbox.kafka;
 
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static java.nio.charset.StandardCharsets.US_ASCII;
-import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -149,9 +149,5 @@ class KafkaOutboxPublisherTest {
 
     private static OutboxHeader contract(String version) {
         return new OutboxHeader("outbox-contract", version.getBytes(US_ASCII));
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
     }
 }

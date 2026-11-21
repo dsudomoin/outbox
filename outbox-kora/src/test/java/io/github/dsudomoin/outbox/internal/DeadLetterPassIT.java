@@ -6,6 +6,7 @@ import static io.github.dsudomoin.outbox.DeadLetterDecision.redrive;
 import static io.github.dsudomoin.outbox.DeadLetterDecision.redriveAt;
 import static io.github.dsudomoin.outbox.DeadLetterDecision.retryLater;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -20,6 +21,7 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.ByteReads;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.Intercepting;
@@ -181,7 +183,7 @@ class DeadLetterPassIT {
         assertThat(pass.untilNextDue()).as("by the database clock")
                 .isPositive().isLessThanOrEqualTo(Duration.ofSeconds(3));
 
-        await(Duration.ofSeconds(10), () -> pass.runOnce() == 1);
+        Await.until(Duration.ofSeconds(10), () -> pass.runOnce() == 1);
 
         assertThat(status(soon)).isNull();
         assertThat(status(later)).isEqualTo("scheduled");
@@ -340,7 +342,7 @@ class DeadLetterPassIT {
                 .as("once").hasSize(1);
         assertThat(status(id)).isEqualTo("pending");
         release.countDown();
-        await(Duration.ofSeconds(5), () -> {
+        Await.until(Duration.ofSeconds(5), () -> {
             execute("update " + names.dead() + " set due_at = now() where id = " + id);
             pass.runOnce();
             return "kept".equals(status(id));
@@ -415,7 +417,7 @@ class DeadLetterPassIT {
 
         commit.countDown();
         var live = sender.get(10, SECONDS);
-        await(Duration.ofSeconds(5), () -> pass.runOnce() == 1);
+        Await.until(Duration.ofSeconds(5), () -> pass.runOnce() == 1);
 
         assertThat(calls).as("decided once").hasValue(1);
         assertThat(OutboxAdminIT.messageIds(names.base())).as("behind the send").containsExactly(live, messageId);
@@ -440,7 +442,7 @@ class DeadLetterPassIT {
 
         commit.countDown();
         sender.get(10, SECONDS);
-        await(Duration.ofSeconds(5), () -> pass.runOnce() == 1);
+        Await.until(Duration.ofSeconds(5), () -> pass.runOnce() == 1);
         assertThat(status(held)).isNull();
     }
 
@@ -461,7 +463,7 @@ class DeadLetterPassIT {
             locker.rollback();
         }
 
-        await(Duration.ofSeconds(5), () -> pass.runOnce() == 1);
+        Await.until(Duration.ofSeconds(5), () -> pass.runOnce() == 1);
         assertThat(status(id)).isNull();
     }
 
@@ -558,7 +560,7 @@ class DeadLetterPassIT {
         sender.get(10, SECONDS);
 
         var redriven = new AtomicInteger();
-        await(Duration.ofSeconds(5), () -> redriven.addAndGet(pass.runOnce()) == 2);
+        Await.until(Duration.ofSeconds(5), () -> redriven.addAndGet(pass.runOnce()) == 2);
     }
 
     @Test
@@ -576,9 +578,9 @@ class DeadLetterPassIT {
             // the claim passes it; the deferral of the held key's letter waits for it, holding the lock of key j
             TestSql.execute(locker, "lock table " + names.dead() + " in share mode");
             var run = pool.submit(pass::runOnce);
-            await(Duration.ofSeconds(5), () -> keyLockGranted("j"));
+            Await.until(Duration.ofSeconds(5), () -> keyLockGranted("j"));
             long taken = System.nanoTime();
-            await(Duration.ofSeconds(10), () -> !keyLockGranted("j"));
+            Await.until(Duration.ofSeconds(10), () -> !keyLockGranted("j"));
             heldFor = System.nanoTime() - taken;
             locker.rollback();
             assertThat(run.get(10, SECONDS)).isZero();
@@ -940,7 +942,7 @@ class DeadLetterPassIT {
         assertThat(triedBetween).isTrue();
         assertThat(status(scheduled)).as("waits for its key").isEqualTo("scheduled");
         var redriven = new AtomicInteger();
-        await(Duration.ofSeconds(5), () -> redriven.addAndGet(pass.runOnce()) == 1);
+        Await.until(Duration.ofSeconds(5), () -> redriven.addAndGet(pass.runOnce()) == 1);
     }
 
     /** A transaction that has sent {@code payload} with {@code key} on topic t and stays open until {@code commit}. */
@@ -987,7 +989,7 @@ class DeadLetterPassIT {
 
     /** Until {@code thread} parks, waiting for the pass's run lock. */
     private static void awaitWaiting(Thread thread) throws Exception {
-        await(Duration.ofSeconds(5), () -> thread.getState() == Thread.State.WAITING);
+        Await.until(Duration.ofSeconds(5), () -> thread.getState() == Thread.State.WAITING);
     }
 
     /** Some transaction holds the key lock of {@code key} on topic t. */
@@ -1097,18 +1099,6 @@ class DeadLetterPassIT {
         }
     }
 
-    private interface Condition {
-        boolean met() throws Exception;
-    }
-
-    private static void await(Duration timeout, Condition condition) throws Exception {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!condition.met()) {
-            assertThat(System.nanoTime()).as("condition met within " + timeout).isLessThan(deadline);
-            Thread.sleep(20);
-        }
-    }
-
     private static void awaitLatch(CountDownLatch latch) {
         try {
             assertThat(latch.await(10, SECONDS)).isTrue();
@@ -1116,9 +1106,5 @@ class DeadLetterPassIT {
             Thread.currentThread().interrupt();
             throw new IllegalStateException(e);
         }
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
     }
 }

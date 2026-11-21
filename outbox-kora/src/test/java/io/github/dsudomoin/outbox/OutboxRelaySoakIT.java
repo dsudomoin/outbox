@@ -10,6 +10,7 @@ import io.github.dsudomoin.outbox.internal.Maintenance;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.ShardKeys;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
@@ -57,7 +58,7 @@ class OutboxRelaySoakIT {
                 .maintenanceInterval(Duration.ofSeconds(30));
         bootstrap(); // the defaults, 1024 shards
         start(new RecordingHandler());
-        await(Duration.ofSeconds(5), () -> ticksMade() >= 3);
+        Await.until(Duration.ofSeconds(5), () -> ticksMade() >= 3);
         awaitParked();
         long seq = maxCursorSeq();
         long ticks = ticksMade();
@@ -160,7 +161,7 @@ class OutboxRelaySoakIT {
             writers.shutdown();
         }
         System.out.printf("%d messages sent in 60 s%n", sent.size());
-        await(Duration.ofSeconds(60), () -> delivered.size() >= sent.size());
+        Await.until(Duration.ofSeconds(60), () -> delivered.size() >= sent.size());
 
         assertThat(delivered).hasSameSizeAs(sent);
         assertThat(delivered.containsAll(sent)).as("every message delivered").isTrue(); // a hash lookup each
@@ -232,7 +233,7 @@ class OutboxRelaySoakIT {
 
     /** Every worker parked: the relay is idle. */
     private void awaitParked() throws Exception {
-        await(Duration.ofSeconds(5), () -> relayThreads().size() == config.workers()
+        Await.until(Duration.ofSeconds(5), () -> relayThreads().size() == config.workers()
                 && relayThreads().stream().allMatch(t -> t.getState() == Thread.State.TIMED_WAITING));
     }
 
@@ -240,19 +241,5 @@ class OutboxRelaySoakIT {
         return Thread.getAllStackTraces().keySet().stream()
                 .filter(t -> t.getName().startsWith("outbox-relay-") && t.isAlive())
                 .toList();
-    }
-
-    private interface Condition {
-        boolean holds() throws Exception;
-    }
-
-    private static void await(Duration timeout, Condition condition) throws Exception {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!condition.holds()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within " + timeout);
-            }
-            Thread.sleep(5);
-        }
     }
 }

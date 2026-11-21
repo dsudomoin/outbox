@@ -1,6 +1,5 @@
 package io.github.dsudomoin.outbox.kafka.wiring;
 
-import static io.github.dsudomoin.outbox.kafka.wiring.RoutedIT.await;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -9,6 +8,7 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.kafka.KafkaOutboxHeaders;
 import io.github.dsudomoin.outbox.kafka.TestKafka;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import java.time.Duration;
 import java.util.List;
@@ -51,7 +51,7 @@ class KafkaOverrideIT implements KoraAppTestConfigModifier {
         var records = TestKafka.consumeUntil(orders, Duration.ofSeconds(30), r -> !r.isEmpty());
 
         assertThat(records).extracting(KafkaOutboxHeaders::messageId).containsExactly(ids.get(1));
-        await(() -> !audit.delivered().isEmpty());
+        Await.until(Duration.ofSeconds(10), () -> !audit.delivered().isEmpty());
         assertThat(audit.delivered()).extracting(OutboxRecord::messageId).containsExactly(ids.get(0));
     }
 }

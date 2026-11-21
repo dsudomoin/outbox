@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.micrometer;
 
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -1086,10 +1087,6 @@ class ObservationOutboxTelemetryTest {
         var found = spans.getFinishedSpanItems().stream().filter(filter).toList();
         assertThat(found).hasSize(1);
         return found.get(0);
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
     }
 
     private static String attribute(SpanData span, String key) {

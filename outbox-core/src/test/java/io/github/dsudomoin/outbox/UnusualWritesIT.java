@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox;
 
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -9,6 +10,7 @@ import com.github.dockerjava.api.model.PortBinding;
 import com.github.dockerjava.api.model.Ports;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
@@ -89,7 +91,7 @@ class UnusualWritesIT {
             return outbox.send(OutboxMessage.of("t", "p", bytes("blocked")));
         })).hasStackTraceContaining("lock timeout");
         var before = transactions.inTx(c -> outbox.send(OutboxMessage.of("t", "f", bytes("before"))));
-        await(Duration.ofSeconds(10), () -> delivered.containsKey(before));
+        Await.until(Duration.ofSeconds(10), () -> delivered.containsKey(before));
 
         String started;
         try (var c = DriverManager.getConnection(pg.getJdbcUrl(), pg.getUsername(), pg.getPassword())) {
@@ -107,7 +109,7 @@ class UnusualWritesIT {
             }
         }
         UUID back = after;
-        await(Duration.ofSeconds(30), () -> delivered.containsKey(back));
+        Await.until(Duration.ofSeconds(30), () -> delivered.containsKey(back));
         try (var c = DriverManager.getConnection(pg.getJdbcUrl(), pg.getUsername(), pg.getPassword())) {
             assertThat(TestSql.queryString(c, "select pg_postmaster_start_time()::text")).as("restarted")
                     .isNotEqualTo(started);
@@ -118,9 +120,9 @@ class UnusualWritesIT {
             TestSql.execute(c, "rollback prepared 'gx-rollback'");
         }
 
-        await(Duration.ofSeconds(30), () -> delivered.containsKey(commit));
+        Await.until(Duration.ofSeconds(30), () -> delivered.containsKey(commit));
         var last = transactions.inTx(c -> outbox.send(OutboxMessage.of("t", "p", bytes("last"))));
-        await(Duration.ofSeconds(10), () -> delivered.containsKey(last));
+        Await.until(Duration.ofSeconds(10), () -> delivered.containsKey(last));
         runtime.relay().drain();
         assertThat(delivered).doesNotContainKey(rollback);
         assertThat(order).containsSubsequence("p/commit", "p/last");
@@ -180,7 +182,7 @@ class UnusualWritesIT {
             assertThat(order).as("nothing before the commit").isEmpty();
             return null;
         });
-        await(Duration.ofSeconds(15), () -> order.size() >= kept.size());
+        Await.until(Duration.ofSeconds(15), () -> order.size() >= kept.size());
         runtime.relay().drain();
         assertThat(order).containsExactlyElementsOf(kept);
         assertThat(duplicates).hasValue(0);
@@ -202,7 +204,7 @@ class UnusualWritesIT {
                 OutboxMessage.of("t", odd, odd).withHeader("h\u0000", new byte[] {0, (byte) 0xFF})));
         var bigId = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", "big", big)));
 
-        await(Duration.ofSeconds(30), () -> received.containsKey(oddId) && received.containsKey(bigId));
+        Await.until(Duration.ofSeconds(30), () -> received.containsKey(oddId) && received.containsKey(bigId));
         assertThat(received.get(oddId).key()).isEqualTo(odd);
         assertThat(received.get(oddId).payload()).isEqualTo(odd);
         assertThat(received.get(oddId).headers()).singleElement().satisfies(h -> {
@@ -229,7 +231,7 @@ class UnusualWritesIT {
         });
 
         assertThat(order).isEmpty();
-        await(Duration.ofSeconds(10), () -> delivered.containsKey(ok));
+        Await.until(Duration.ofSeconds(10), () -> delivered.containsKey(ok));
     }
 
     /** 100 000 messages in one transaction: delivered, each once. */
@@ -243,29 +245,10 @@ class UnusualWritesIT {
         var ids = transactions.inTx(c -> runtime.outbox().sendAll(messages));
         long wrote = System.nanoTime() - t0;
 
-        await(Duration.ofSeconds(120), () -> delivered.size() >= ids.size());
+        Await.until(Duration.ofSeconds(120), () -> delivered.size() >= ids.size());
         System.out.printf("100 000 in one transaction: written in %d ms, delivered after %d ms%n", wrote / 1_000_000,
                 (System.nanoTime() - t0) / 1_000_000);
         assertThat(delivered.keySet()).isEqualTo(new java.util.HashSet<>(ids)); // a set: 100 000 compared at once
         assertThat(duplicates).hasValue(0);
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
-    }
-
-    private static void await(Duration timeout, Check check) throws Exception {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!check.met()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("not met within " + timeout);
-            }
-            Thread.sleep(50);
-        }
-    }
-
-    @FunctionalInterface
-    private interface Check {
-        boolean met() throws Exception;
     }
 }

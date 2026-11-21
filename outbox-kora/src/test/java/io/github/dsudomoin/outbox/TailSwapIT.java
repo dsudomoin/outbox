@@ -14,6 +14,7 @@ import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.internal.XidPartitions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
@@ -122,7 +123,7 @@ class TailSwapIT {
         bootstrap();
         start();
         burning = true;
-        await(Duration.ofSeconds(60), () -> swaps().size() >= 3);
+        Await.until(Duration.ofSeconds(60), () -> swaps().size() >= 3);
         burning = false;
 
         var swaps = finish("emptyTailSwapsUnderLoad");
@@ -141,10 +142,10 @@ class TailSwapIT {
             burnUntil(() -> queryLong(c, "select count(*) from (select from " + names.tail() + " limit 1) t") == 1);
             maintenanceLock(pause, "pg_advisory_unlock");
         }
-        await(Duration.ofSeconds(30), () -> !swaps().isEmpty());
+        Await.until(Duration.ofSeconds(30), () -> !swaps().isEmpty());
         assertThat(swaps().get(0).group(2)).as("the tail became a range with its rows").isNotNull();
         burning = true;
-        await(Duration.ofSeconds(60), () -> swaps().size() >= 3);
+        Await.until(Duration.ofSeconds(60), () -> swaps().size() >= 3);
         burning = false;
 
         var swaps = finish("overflowedTailSwapsUnderLoad");
@@ -188,11 +189,11 @@ class TailSwapIT {
             maintenanceLock(pause, "pg_advisory_unlock"); // the extension starts while that step runs
 
             // the budget runs from the slow call's start, not from the unpause: the wait must be seen within the call
-            await(Duration.ofNanos(began.get() + SLOW_CALL.toNanos() - System.nanoTime()), () -> quiesceWaits(c));
+            Await.until(Duration.ofNanos(began.get() + SLOW_CALL.toNanos() - System.nanoTime()), () -> quiesceWaits(c));
             long waitSeen = System.nanoTime();
             long waiting = commits.get();
             assertThat(returned).as("the step still runs").hasValue(0);
-            await(Duration.ofSeconds(10), () -> swaps().size() > before);
+            Await.until(Duration.ofSeconds(10), () -> swaps().size() > before);
             long swapped = System.nanoTime();
             System.out.printf("TailSwapIT: the swap waited for the slow step at least %d ms%n",
                     TimeUnit.NANOSECONDS.toMillis(swapped - waitSeen));
@@ -244,7 +245,7 @@ class TailSwapIT {
                 Thread.sleep(150);
             }
         });
-        await(Duration.ofSeconds(90), () -> swaps().size() >= 3);
+        Await.until(Duration.ofSeconds(90), () -> swaps().size() >= 3);
 
         finish("writersWithAShortLockTimeoutNeverFailDuringSwaps (xidsPerPartition " + config.xidsPerPartition()
                 + ", premake " + config.premake() + ")");
@@ -296,7 +297,7 @@ class TailSwapIT {
                     + " has not run on (\\d+) due runs in a row, (\\d+) ranges ahead of the current xid: .*?(\\d+)"
                     + " transactions hold a lock on (\\S+) right after, the oldest: (pid \\d+ \\(.*?\\) in a"
                     + " transaction open [\\d.]+ s)");
-            await(Duration.ofSeconds(60), () -> stuck.matcher(log.text()).find());
+            Await.until(Duration.ofSeconds(60), () -> stuck.matcher(log.text()).find());
 
             var text = log.text();
             assertThat(text).contains("failed (SQLState 55P03)").contains("transactions hold a lock on "
@@ -336,11 +337,11 @@ class TailSwapIT {
             maintenanceLock(pause, "pg_advisory_lock");
             useUpHalfOfPremake(c);
             start();
-            await(Duration.ofSeconds(10), () -> commits.get() > 1000);
+            Await.until(Duration.ofSeconds(10), () -> commits.get() > 1000);
             maintenanceLock(pause, "pg_advisory_unlock");
         }
         int expected = config.premake() / 2 / 4; // premake / 2 ranges used up, four a swap
-        await(Duration.ofSeconds(60), () -> swaps().size() >= expected);
+        Await.until(Duration.ofSeconds(60), () -> swaps().size() >= expected);
 
         var swaps = finish("swapAtTheDefaultPartitionSizes (xidsPerPartition " + config.xidsPerPartition()
                 + ", premake " + config.premake() + ")");
@@ -541,15 +542,5 @@ class TailSwapIT {
 
     private interface Condition {
         boolean holds() throws Exception;
-    }
-
-    private static void await(Duration timeout, Condition condition) throws Exception {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!condition.holds()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within " + timeout);
-            }
-            Thread.sleep(5);
-        }
     }
 }

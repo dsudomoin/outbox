@@ -1,6 +1,6 @@
 package io.github.dsudomoin.outbox.kafka;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.JdbcTransactions;
@@ -186,9 +186,5 @@ class KafkaOutboxSenderInRelayIT {
             broker.schedule(() -> completeNext(), ackAfter.toMillis(), TimeUnit.MILLISECONDS);
             return sent;
         }
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
     }
 }

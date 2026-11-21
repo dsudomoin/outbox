@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox;
 
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -7,6 +8,7 @@ import static org.assertj.core.api.Assertions.fail;
 
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -19,7 +21,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -123,10 +124,10 @@ class RouteReleasesIT {
         writeAsTheRouteGoes(keys);
         var old = start(Release.OLD);
         start(Release.OLD);
-        await(() -> waiting(old) == keys.size());
+        Await.until(TIMEOUT, () -> waiting(old) == keys.size());
 
         start(Release.NEW);
-        await(() -> delivered().size() == keys.size() * 3);
+        Await.until(TIMEOUT, () -> delivered().size() == keys.size() * 3);
         for (var key : keys) {
             assertThat(ids(key)).as(key).containsExactly(key + 1, key + 2, key + 3);
         }
@@ -143,11 +144,11 @@ class RouteReleasesIT {
     void theFallbackStillGetsItsRecordsBatchedInTheCallsWhereTheRouteWaits() throws Exception {
         writeMixed();
         var old = start(Release.OLD);
-        await(() -> kafka.delivered().size() == 3 && waiting(old) == 2);
+        Await.until(TIMEOUT, () -> kafka.delivered().size() == 3 && waiting(old) == 2);
 
         assertThat(calls).first().isEqualTo(List.of("orders a1 waits", "kafka k1 delivered", "orders b1 waits",
                 "kafka k2 delivered", "orders a2 waits", "kafka k3 delivered", "audit x1 delivered"));
-        await(() -> calls.size() >= 2);
+        Await.until(TIMEOUT, () -> calls.size() >= 2);
         assertThat(kafka.batches()).as("one call, and none without a record for it").extracting(List::size)
                 .containsExactly(3);
         assertThat(kafka.delivered()).extracting(r -> text(r.payload())).containsExactly("k1", "k2", "k3");
@@ -161,7 +162,7 @@ class RouteReleasesIT {
     void aRedrivenRecordOfTheRouteKeepsItsMarker() throws Exception {
         writeAsTheRouteGoes(List.of("a"));
         var old = start(Release.OLD);
-        await(() -> waiting(old) == 1);
+        Await.until(TIMEOUT, () -> waiting(old) == 1);
         var admin = old.runtime().admin();
 
         assertThat(admin.abandonWaiting(TOPIC, null, "rolled back", false)).isEqualTo(new OutboxAdmin.Abandoned(1, 3));
@@ -169,11 +170,11 @@ class RouteReleasesIT {
         assertThat(letters).hasSize(3).allSatisfy(l -> assertThat(l.headers()).contains(LOCAL));
         int waited = waits.size();
         assertThat(admin.redriveDeadLetters(letters.stream().map(DeadLetter::id).toList())).isEqualTo(3);
-        await(() -> waiting(old) == 1 && waits.size() > waited);
+        Await.until(TIMEOUT, () -> waiting(old) == 1 && waits.size() > waited);
         assertThat(kafka.delivered()).isEmpty();
 
         start(Release.NEW);
-        await(() -> delivered().size() == 3);
+        Await.until(TIMEOUT, () -> delivered().size() == 3);
         assertThat(ids("a")).containsExactly("a1", "a2", "a3");
         assertThat(delivered()).allSatisfy(d -> assertThat(d.headers()).contains(LOCAL));
     }
@@ -188,7 +189,7 @@ class RouteReleasesIT {
         kafka.throwFromBatch(() -> new IllegalStateException("broker down"));
         writeMixed();
         var old = start(Release.OLD);
-        await(() -> deadLetters(old) == 3 && waiting(old) == 2);
+        Await.until(TIMEOUT, () -> deadLetters(old) == 3 && waiting(old) == 2);
 
         assertThat(calls).first().isEqualTo(List.of("orders a1 waits", "kafka k1 Retry", "orders b1 waits",
                 "kafka k2 Retry", "orders a2 waits", "kafka k3 Retry", "audit x1 delivered"));
@@ -222,7 +223,7 @@ class RouteReleasesIT {
             var refused = writer(unreported, unchecked);
 
             var refusal = new AtomicReference<OutboxMissingRouteException>();
-            await(() -> { // a fresh refusal names the instance
+            Await.until(TIMEOUT, () -> { // a fresh refusal names the instance
                 refusal.set(refusal(refused));
                 return refusal.get().instances().isEmpty();
             });
@@ -242,13 +243,13 @@ class RouteReleasesIT {
         writeAsTheRouteGoes(keys);
         var old = start(older);
         var forwarded = transactions.inTx(c -> old.runtime().outbox().send(raw(KAFKA, "k")));
-        await(() -> waiting(old) == keys.size() && kafka.delivered().size() == 1);
+        Await.until(TIMEOUT, () -> waiting(old) == keys.size() && kafka.delivered().size() == 1);
         assertThat(kafka.delivered()).extracting(OutboxRecord::messageId).containsExactly(forwarded);
         assertThat(delivered()).isEmpty();
 
         stop(old);
         var next = start(Release.NEW);
-        await(() -> delivered().size() == keys.size() * 3);
+        Await.until(TIMEOUT, () -> delivered().size() == keys.size() * 3);
         for (var key : keys) {
             assertThat(ids(key)).as(key).containsExactly(key + 1, key + 2, key + 3);
         }
@@ -402,22 +403,8 @@ class RouteReleasesIT {
         return new OutboxMessage(topic, bytes(id), bytes(id), List.of());
     }
 
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
-    }
-
     private static String text(byte[] bytes) {
         return new String(bytes, UTF_8);
-    }
-
-    private static void await(BooleanSupplier condition) throws InterruptedException {
-        long deadline = System.nanoTime() + TIMEOUT.toNanos();
-        while (!condition.getAsBoolean()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within " + TIMEOUT);
-            }
-            Thread.sleep(10);
-        }
     }
 
     /** NEW's route of {@link #TOPIC}: notes what it takes. */

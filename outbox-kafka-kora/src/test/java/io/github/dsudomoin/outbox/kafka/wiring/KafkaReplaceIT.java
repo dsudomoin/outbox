@@ -1,6 +1,5 @@
 package io.github.dsudomoin.outbox.kafka.wiring;
 
-import static io.github.dsudomoin.outbox.kafka.wiring.RoutedIT.await;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -9,8 +8,10 @@ import io.github.dsudomoin.outbox.Outbox;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestSql;
+import java.time.Duration;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
@@ -41,7 +42,7 @@ class KafkaReplaceIT implements KoraAppTestConfigModifier {
     void subtypeComponentReplacesTheDefault() throws Exception {
         var id = db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("t", "k", "v".getBytes(UTF_8))));
 
-        await(() -> !handler.delivered().isEmpty());
+        Await.until(Duration.ofSeconds(10), () -> !handler.delivered().isEmpty());
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactly(id);
     }
 
@@ -52,7 +53,7 @@ class KafkaReplaceIT implements KoraAppTestConfigModifier {
 
         var id = db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("t", "poison", "p".getBytes(UTF_8))));
 
-        await(() -> !hook.handed.isEmpty());
+        Await.until(Duration.ofSeconds(10), () -> !hook.handed.isEmpty());
         assertThat(hook.handed).extracting(DeadLetter::messageId).containsExactly(id);
     }
 }

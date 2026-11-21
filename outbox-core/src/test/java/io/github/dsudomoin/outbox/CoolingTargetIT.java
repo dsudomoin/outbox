@@ -5,6 +5,7 @@ import static io.github.dsudomoin.outbox.testing.Handlers.eachRecord;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
@@ -15,7 +16,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
@@ -56,7 +56,7 @@ class CoolingTargetIT {
                 : Outcome.delivered());
         sendDistinctKeys(runtime);
 
-        await(Duration.ofSeconds(30), () -> failuresAtCall.size() > COOLING_CALLS);
+        Await.until(Duration.ofSeconds(30), () -> failuresAtCall.size() > COOLING_CALLS);
 
         for (int i = 1; i <= COOLING_CALLS; i++) {
             assertThat(gap(i)).as("pause after cooling call %d", i)
@@ -73,7 +73,7 @@ class CoolingTargetIT {
         var runtime = start(n -> n <= 3 ? Outcome.retry(new IOException("down")) : Outcome.delivered());
         sendDistinctKeys(runtime);
 
-        await(Duration.ofSeconds(30), () -> calls.size() > 3);
+        Await.until(Duration.ofSeconds(30), () -> calls.size() > 3);
 
         assertThat(gap(2)).as("second pause").isGreaterThanOrEqualTo(Duration.ofMillis(1950));
         assertThat(gap(3)).as("third pause").isGreaterThanOrEqualTo(Duration.ofMillis(3950));
@@ -89,7 +89,7 @@ class CoolingTargetIT {
         var runtime = start(n -> n <= 2 ? Outcome.notAttempted(Instant.now().minusSeconds(1)) : Outcome.delivered());
         sendDistinctKeys(runtime);
 
-        await(Duration.ofSeconds(30), () -> calls.size() > 2);
+        Await.until(Duration.ofSeconds(30), () -> calls.size() > 2);
 
         assertThat(gap(2)).as("second pause").isGreaterThanOrEqualTo(Duration.ofMillis(1950));
     }
@@ -100,7 +100,7 @@ class CoolingTargetIT {
         var runtime = start(n -> n <= 2 ? Outcome.notAttempted(Instant.now().plusMillis(50)) : Outcome.delivered());
         sendDistinctKeys(runtime);
 
-        await(Duration.ofSeconds(30), () -> calls.size() > 2);
+        Await.until(Duration.ofSeconds(30), () -> calls.size() > 2);
 
         for (int i = 1; i <= 2; i++) {
             assertThat(gap(i)).as("pause after call %d", i).isGreaterThanOrEqualTo(Duration.ofMillis(950));
@@ -114,7 +114,7 @@ class CoolingTargetIT {
                 : Outcome.delivered(), Duration.ofSeconds(2));
         sendDistinctKeys(runtime);
 
-        await(Duration.ofSeconds(10), () -> calls.size() > 1);
+        Await.until(Duration.ofSeconds(10), () -> calls.size() > 1);
 
         assertThat(gap(1)).as("pause after the call")
                 .isGreaterThanOrEqualTo(Duration.ofMillis(1950)).isLessThan(Duration.ofSeconds(4));
@@ -152,11 +152,11 @@ class CoolingTargetIT {
             return runtime.outbox().sendAll(messages);
         });
 
-        await(Duration.ofSeconds(8), () -> delivered.contains("healthy:0"));
+        Await.until(Duration.ofSeconds(8), () -> delivered.contains("healthy:0"));
         assertThat(delivered).as("while the hot key cools").containsExactly("healthy:0");
 
         cooling.set(false);
-        await(Duration.ofSeconds(30), () -> delivered.size() == hotRows + 1);
+        Await.until(Duration.ofSeconds(30), () -> delivered.size() == hotRows + 1);
         assertThat(delivered.stream().filter(d -> d.startsWith("hot:")).toList()).as("the hot key, in order")
                 .containsExactlyElementsOf(IntStream.range(0, hotRows).mapToObj(i -> "hot:" + i).toList());
     }
@@ -196,13 +196,5 @@ class CoolingTargetIT {
             }
             return runtime.outbox().sendAll(messages);
         });
-    }
-
-    private static void await(Duration timeout, BooleanSupplier condition) throws InterruptedException {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!condition.getAsBoolean()) {
-            assertThat(System.nanoTime() < deadline).as("condition within %s", timeout).isTrue();
-            Thread.sleep(20);
-        }
     }
 }

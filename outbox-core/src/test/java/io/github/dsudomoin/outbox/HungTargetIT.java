@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import java.time.Duration;
@@ -25,6 +26,8 @@ import org.junit.jupiter.api.Test;
  */
 class HungTargetIT {
 
+    private static final Duration TIMEOUT = Duration.ofSeconds(30);
+
     private final JdbcTransactions transactions = new JdbcTransactions(TestDataSources.newDataSource());
     private final CountDownLatch recovered = new CountDownLatch(1);
     private final List<OutboxRuntime> runtimes = new ArrayList<>();
@@ -41,7 +44,7 @@ class HungTargetIT {
         var free = new ConcurrentHashMap<OutboxGauge, DoubleSupplier>();
         var hung = runtime(hanging(delivered), free);
         var sent = send(hung, "a", 8);
-        await(() -> free.get(OutboxGauge.HANDLER_THREADS_FREE).getAsDouble() == 0);
+        Await.until(TIMEOUT, () -> free.get(OutboxGauge.HANDLER_THREADS_FREE).getAsDouble() == 0);
         assertThat(hung.relay().running()).isTrue();
         assertThat(hung.admin().status().instances()).singleElement()
                 .satisfies(i -> assertThat(i.live()).as("the heartbeat says the process runs, no more").isTrue());
@@ -49,11 +52,11 @@ class HungTargetIT {
         Set<UUID> healthy = ConcurrentHashMap.newKeySet();
         var other = runtime(record -> healthy.add(record.messageId()), new ConcurrentHashMap<>());
         var sentThere = send(other, "b", 8);
-        await(() -> healthy.containsAll(sentThere));
+        Await.until(TIMEOUT, () -> healthy.containsAll(sentThere));
 
         assertThat(free.get(OutboxGauge.HANDLER_THREADS_FREE).getAsDouble()).as("still hung, and bounded").isZero();
         recovered.countDown();
-        await(() -> delivered.containsAll(sent));
+        Await.until(TIMEOUT, () -> delivered.containsAll(sent));
     }
 
     private OutboxRuntime runtime(OutboxHandler handler, Map<OutboxGauge, DoubleSupplier> gauges) {
@@ -95,20 +98,5 @@ class HungTargetIT {
             ids.add(transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of(topic, key, "p".getBytes(UTF_8)))));
         }
         return ids;
-    }
-
-    private static void await(Check condition) throws Exception {
-        long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
-        while (!condition.met()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within 30 s");
-            }
-            Thread.sleep(20);
-        }
-    }
-
-    @FunctionalInterface
-    private interface Check {
-        boolean met() throws Exception;
     }
 }

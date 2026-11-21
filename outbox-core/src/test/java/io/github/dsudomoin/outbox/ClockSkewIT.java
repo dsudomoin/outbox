@@ -5,6 +5,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.internal.UuidV7;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
@@ -30,6 +31,7 @@ import org.junit.jupiter.params.provider.ValueSource;
  */
 class ClockSkewIT {
 
+    private static final Duration TIMEOUT = Duration.ofSeconds(15);
     private static final String TOPIC = "t";
     /** A delay long enough to outlast the test; what was scheduled is read from the database, not waited out. */
     private static final Duration LONG = Duration.ofSeconds(60);
@@ -66,7 +68,7 @@ class ClockSkewIT {
             sent.add(send(skewed, key));
         }
         var names = skewed.schema().names();
-        await(() -> count("select count(*) from " + names.retry()) > 0
+        Await.until(TIMEOUT, () -> count("select count(*) from " + names.retry()) > 0
                 && count("select count(*) from (select distinct on (shard) paused_until from " + names.cursor()
                         + " order by shard, seq desc) c where paused_until is not null") > 0);
         skewed.close();
@@ -74,7 +76,7 @@ class ClockSkewIT {
 
         runtime(0, record -> delivered.add(record.messageId()));
 
-        await(() -> delivered.containsAll(sent));
+        Await.until(TIMEOUT, () -> delivered.containsAll(sent));
         assertThat(count("select count(*) from " + names.retry())).isZero();
     }
 
@@ -89,7 +91,7 @@ class ClockSkewIT {
             return skewed.outbox().send(OutboxMessage.of(TOPIC, "bad", "p".getBytes(UTF_8)));
         });
         var names = skewed.schema().names();
-        await(() -> count("select count(*) from " + names.retry()) == 1);
+        Await.until(TIMEOUT, () -> count("select count(*) from " + names.retry()) == 1);
 
         assertThat(count(remaining("next_attempt_at", names.retry()))).as("the backoff, by the database's clock")
                 .isBetween(LONG_LOW, LONG_HIGH);
@@ -116,7 +118,8 @@ class ClockSkewIT {
             return List.of(first, skewed.outbox().send(OutboxMessage.of(TOPIC, "b", "p".getBytes(UTF_8))));
         });
         var pausedUntil = "select paused_until from " + names.cursor() + " order by seq desc limit 1";
-        await(() -> count("select count(*) from (" + pausedUntil + ") c where paused_until is not null") == 1);
+        Await.until(TIMEOUT,
+                () -> count("select count(*) from (" + pausedUntil + ") c where paused_until is not null") == 1);
 
         assertThat(count("select (extract(epoch from (" + pausedUntil + ") - clock_timestamp()))::bigint"))
                 .as("the pause, by the database's clock").isBetween(LONG_LOW, LONG_HIGH);
@@ -153,7 +156,7 @@ class ClockSkewIT {
             return null;
         });
         var names = skewed.schema().names();
-        await(() -> count("select count(*) from " + names.parked()) == 1
+        Await.until(TIMEOUT, () -> count("select count(*) from " + names.parked()) == 1
                 && count("select count(*) from " + names.retry() + " where key <> 'past'::bytea") == 4);
 
         for (var key : List.of("retry", "skipped", "waits")) {
@@ -183,7 +186,7 @@ class ClockSkewIT {
             return skewed.outbox().send(OutboxMessage.of(TOPIC, "forever", "p".getBytes(UTF_8)));
         });
         var dead = skewed.schema().names().dead();
-        await(() -> count("select count(*) from " + dead + " where status = 'scheduled'") == 2);
+        Await.until(TIMEOUT, () -> count("select count(*) from " + dead + " where status = 'scheduled'") == 2);
 
         assertThat(count(remaining("due_at", dead) + " where key = 'later'::bytea"))
                 .isBetween(LONG_LOW, LONG_HIGH);
@@ -281,20 +284,5 @@ class ClockSkewIT {
         try (var c = direct.getConnection()) {
             return TestSql.queryLong(c, sql);
         }
-    }
-
-    private static void await(Check condition) throws Exception {
-        long deadline = System.nanoTime() + Duration.ofSeconds(15).toNanos();
-        while (!condition.met()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within 15 s");
-            }
-            Thread.sleep(20);
-        }
-    }
-
-    @FunctionalInterface
-    private interface Check {
-        boolean met() throws Exception;
     }
 }

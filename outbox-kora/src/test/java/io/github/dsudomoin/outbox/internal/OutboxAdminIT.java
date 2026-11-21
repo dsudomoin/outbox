@@ -5,6 +5,7 @@ import static io.github.dsudomoin.outbox.DeadLetter.Status.PENDING;
 import static io.github.dsudomoin.outbox.DeadLetter.Status.SCHEDULED;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -1579,9 +1580,5 @@ class OutboxAdminIT {
         try (var c = TestDb.connect()) {
             TestSql.execute(c, sql);
         }
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
     }
 }

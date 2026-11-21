@@ -23,6 +23,7 @@ import io.github.dsudomoin.outbox.internal.PartitionDdl.Attachment;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.ByteReads;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
@@ -221,7 +222,7 @@ class MaintenanceIT {
         relay.start();
         var outbox = new PgOutbox(db, schema, config.shards(), relay::wake, TestTelemetry.kora());
         send(outbox, msg("t", "k", "before"));
-        await(Duration.ofSeconds(5), () -> handler.delivered().size() == 1);
+        Await.until(Duration.ofSeconds(5), () -> handler.delivered().size() == 1);
 
         var err = new CapturedStderr(); // before the forge: the relay's own run at start may already see it
         String original;
@@ -1232,7 +1233,7 @@ class MaintenanceIT {
                     throw new IllegalStateException(e);
                 }
             });
-            await(Duration.ofSeconds(10), () -> queryLong(c, "select count(*) from pg_locks where relation ="
+            Await.until(Duration.ofSeconds(10), () -> queryLong(c, "select count(*) from pg_locks where relation ="
                     + " to_regclass('" + names.base() + "') and not granted") > 0);
             while (partitions.premadeAhead(c) >= 2) {
                 TestDb.burnXids(500);
@@ -1267,7 +1268,7 @@ class MaintenanceIT {
             execute(operator, "lock table " + range.name() + " in access exclusive mode");
             var run = CompletableFuture.supplyAsync(maintenance::runOnce);
             try (var c = TestDb.connect()) { // the step waits for the operator's lock on the orphan
-                await(Duration.ofSeconds(20), () -> queryLong(c, "select count(*) from pg_locks where relation ="
+                Await.until(Duration.ofSeconds(20), () -> queryLong(c, "select count(*) from pg_locks where relation ="
                         + " to_regclass('" + range.name() + "') and not granted") > 0);
             }
 
@@ -2045,7 +2046,7 @@ class MaintenanceIT {
             execute(c, "update " + names.dead() + " set status = 'pending', due_at = now() where id <= 1000003");
 
             assertThat(maintenance.runOnce()).as("the build runs on its own thread").isTrue();
-            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1); // for the open insert
+            Await.until(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1); // for the open insert
 
             // a plain CREATE INDEX waiting there would queue every new dead insert behind it
             long start = System.nanoTime();
@@ -2100,7 +2101,7 @@ class MaintenanceIT {
             }
 
             holder.rollback();
-            await(Duration.ofSeconds(10), () -> {
+            Await.until(Duration.ofSeconds(10), () -> {
                 maintenance.runOnce();
                 awaitBuildEnd(maintenance);
                 return indexState().endsWith(":true");
@@ -2117,7 +2118,7 @@ class MaintenanceIT {
         deadTableWithoutIndex(1);
         try (var c = TestDb.connect(); var holder = openDeadInsert(2); var err = new CapturedStderr()) {
             assertThat(maintenance.runOnce()).isTrue();
-            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
+            Await.until(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
             execute(c, "select pg_cancel_backend(pid) from pg_stat_activity where query like 'create index"
                     + " concurrently%'");
             awaitBuildEnd(maintenance);
@@ -2140,7 +2141,7 @@ class MaintenanceIT {
         deadTableWithoutIndex(1);
         try (var c = TestDb.connect(); var holder = openDeadInsert(2); var err = new CapturedStderr()) {
             assertThat(maintenance.runOnce()).isTrue();
-            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
+            Await.until(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
             execute(c, "select pg_terminate_backend(pid) from pg_stat_activity where query like 'create index"
                     + " concurrently%'");
             awaitBuildEnd(maintenance);
@@ -2158,7 +2159,7 @@ class MaintenanceIT {
         deadTableWithoutIndex(1);
         try (var c = TestDb.connect(); var holder = openDeadInsert(2)) {
             assertThat(first.runOnce()).isTrue();
-            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
+            Await.until(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
 
             assertThat(second.runOnce()).isTrue();
             awaitBuildEnd(second); // its thread did not get LOCK_DEAD_INDEX
@@ -2190,7 +2191,7 @@ class MaintenanceIT {
         deadTableWithoutIndex(1);
         try (var c = TestDb.connect(); var holder = openDeadInsert(2)) {
             assertThat(maintenance.runOnce()).isTrue();
-            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
+            Await.until(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
             hanging.set(true);
 
             CompletableFuture.runAsync(() -> maintenance.close(Duration.ofMillis(100))).get(60, TimeUnit.SECONDS);
@@ -2219,13 +2220,13 @@ class MaintenanceIT {
             var builder = new DeadIndexBuilder(new JdbcTransactions(pool), names, Duration.ofMinutes(1),
                     Duration.ofMinutes(1), new SocketBound(Duration.ZERO));
             builder.startIfDue(c);
-            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
+            Await.until(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
             long build = queryLong(c, "select pid from pg_stat_activity where query like 'create index concurrently%'");
 
             builder.close(Duration.ofSeconds(10));
 
             assertThat(builder.running()).isFalse();
-            await(Duration.ofSeconds(10), () -> queryLong(c, "select count(*) from pg_stat_activity where pid = "
+            Await.until(Duration.ofSeconds(10), () -> queryLong(c, "select count(*) from pg_stat_activity where pid = "
                     + build) == 0);
         }
     }
@@ -2244,7 +2245,7 @@ class MaintenanceIT {
         try (var c = TestDb.connect(); var other = TestDb.connect(TestDb.login(role)); var holder = openDeadInsert(2);
                 var err = new CapturedStderr()) {
             builder.startIfDue(c);
-            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
+            Await.until(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
             long pid = queryLong(c, "select pid from pg_stat_activity where query like 'create index concurrently%'");
             assertThat(queryString(other, "select coalesce(state, 'hidden') from pg_stat_activity where pid = " + pid))
                     .as("what the other role sees").isEqualTo("hidden");
@@ -2254,7 +2255,7 @@ class MaintenanceIT {
             }
             assertThat(err.text()).doesNotContain("no longer runs it").contains("pg_read_all_stats");
             holder.commit();
-            await(Duration.ofSeconds(30), () -> !builder.running());
+            Await.until(Duration.ofSeconds(30), () -> !builder.running());
             assertThat(indexState()).endsWith(":true");
         } finally {
             builder.close(Duration.ofSeconds(10));
@@ -2272,7 +2273,7 @@ class MaintenanceIT {
         deadTableWithoutIndex(1);
         try (var c = TestDb.connect(); var holder = openDeadInsert(2)) {
             assertThat(maintenance.runOnce()).isTrue();
-            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
+            Await.until(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
 
             long start = System.nanoTime();
             maintenance.close(Duration.ofSeconds(10));
@@ -2299,7 +2300,7 @@ class MaintenanceIT {
         try (var c = TestDb.connect(); var holder = openDeadInsert(2); var run = TestDb.connect();
                 var err = new CapturedStderr()) {
             assertThat(maintenance.runOnce()).isTrue();
-            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
+            Await.until(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
 
             // another maintenance run in progress; a startup waits for it, trying the lock again and again: no
             // statement of it waits holding a snapshot, which the build would wait for
@@ -2375,7 +2376,7 @@ class MaintenanceIT {
     }
 
     private static void awaitBuildEnd(Maintenance maintenance) throws Exception {
-        await(Duration.ofSeconds(30), () -> !maintenance.deadIndex.running());
+        Await.until(Duration.ofSeconds(30), () -> !maintenance.deadIndex.running());
     }
 
     /** A dead letter of {@code status} that failed {@code age} ago (an interval), due now unless kept. */
@@ -2683,19 +2684,5 @@ class MaintenanceIT {
 
     private static double gauge(SimpleMeterRegistry registry, String name) {
         return registry.get(name).gauge().value();
-    }
-
-    private interface Condition {
-        boolean holds() throws Exception;
-    }
-
-    private static void await(Duration timeout, Condition condition) throws Exception {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!condition.holds()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within " + timeout);
-            }
-            Thread.sleep(5);
-        }
     }
 }

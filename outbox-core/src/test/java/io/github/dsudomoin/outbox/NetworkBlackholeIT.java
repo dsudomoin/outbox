@@ -9,6 +9,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import io.github.dsudomoin.outbox.testing.AdminRows;
+import io.github.dsudomoin.outbox.testing.Await;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -51,6 +52,7 @@ import org.postgresql.ds.PGSimpleDataSource;
  */
 class NetworkBlackholeIT {
 
+    private static final Duration TIMEOUT = Duration.ofSeconds(30);
     private static final DataSource DIRECT = TestDataSources.newDataSource();
 
     private final Blackhole hole = new Blackhole();
@@ -88,17 +90,17 @@ class NetworkBlackholeIT {
         writer.start();
         var sent = new HashSet<UUID>();
         sent.add(send(writer, direct, "before"));
-        await(() -> delivered.containsAll(sent));
+        Await.until(TIMEOUT, () -> delivered.containsAll(sent));
 
         hole.shut();
         sent.add(send(writer, direct, "during"));
         int failed = failures.get();
-        await(() -> failures.get() > failed);
+        Await.until(TIMEOUT, () -> failures.get() > failed);
         assertThat(delivered.containsAll(sent)).as("what was sent during it waits").isFalse();
 
         hole.open();
         sent.add(send(writer, direct, "after"));
-        await(() -> delivered.containsAll(sent));
+        Await.until(TIMEOUT, () -> delivered.containsAll(sent));
         assertThat(relay.relay().running()).isTrue();
         awaitBeat(relay);
     }
@@ -113,7 +115,7 @@ class NetworkBlackholeIT {
         runtime.start();
         var sent = new HashSet<UUID>();
         sent.add(send(runtime, transactions, "before"));
-        await(() -> delivered.containsAll(sent));
+        Await.until(TIMEOUT, () -> delivered.containsAll(sent));
 
         try (var locker = DIRECT.getConnection()) {
             locker.setAutoCommit(false);
@@ -124,7 +126,7 @@ class NetworkBlackholeIT {
             locker.rollback();
         }
 
-        await(() -> delivered.containsAll(sent));
+        Await.until(TIMEOUT, () -> delivered.containsAll(sent));
         assertThat(runtime.relay().running()).isTrue();
     }
 
@@ -168,12 +170,12 @@ class NetworkBlackholeIT {
         var writer = writer(config.table());
         var sent = new HashSet<UUID>();
         sent.add(send(writer, direct, "before"));
-        await(() -> delivered.containsAll(sent));
+        Await.until(TIMEOUT, () -> delivered.containsAll(sent));
 
         hole.forget(); // each worker's next statement, on its pooled connection, waits on a silent socket
         sent.add(send(writer, direct, "after"));
 
-        await(() -> delivered.containsAll(sent));
+        Await.until(TIMEOUT, () -> delivered.containsAll(sent));
         assertThat(relay.relay().running()).isTrue();
     }
 
@@ -190,7 +192,8 @@ class NetworkBlackholeIT {
         hole.forget();
         var after = send(writer, direct, "after");
 
-        await(() -> delivered.contains(after)); // within the await, so by the 1 s of the DataSource, not by the hour
+        // within the await, so by the 1 s of the DataSource, not by the hour
+        Await.until(TIMEOUT, () -> delivered.contains(after));
     }
 
     @Test
@@ -208,7 +211,7 @@ class NetworkBlackholeIT {
         calls.removeIf(call -> call.startsWith("Test worker"));
 
         var sent = send(relay, transactions, "k");
-        await(() -> delivered.contains(sent));
+        Await.until(TIMEOUT, () -> delivered.contains(sent));
         Thread.sleep(500); // some maintenance runs, dead-letter passes and beats
 
         assertThat(calls).allMatch(call -> call.endsWith(":9000"));
@@ -227,7 +230,7 @@ class NetworkBlackholeIT {
         relay.start();
 
         var sent = send(relay, transactions, "k");
-        await(() -> delivered.contains(sent));
+        Await.until(TIMEOUT, () -> delivered.contains(sent));
 
         assertThat(calls).isEmpty();
     }
@@ -255,13 +258,13 @@ class NetworkBlackholeIT {
         closing.add(relay);
         relay.start();
         var names = relay.schema().names();
-        await(() -> lastSuccess(names.maintenance()) > 0);
+        Await.until(TIMEOUT, () -> lastSuccess(names.maintenance()) > 0);
 
         hole.forget();
 
         long seen = lastSuccess(names.maintenance());
         // a run cut off holds the maintenance lock till idle_in_transaction_session_timeout (60 s) ends its holder
-        await(Duration.ofSeconds(90), () -> lastSuccess(names.maintenance()) > seen);
+        Await.until(Duration.ofSeconds(90), () -> lastSuccess(names.maintenance()) > seen);
     }
 
     @Test
@@ -278,13 +281,13 @@ class NetworkBlackholeIT {
         closing.add(relay);
         relay.start();
         var names = relay.schema().names();
-        await(() -> lastSuccess(names.maintenance()) > 0);
+        Await.until(TIMEOUT, () -> lastSuccess(names.maintenance()) > 0);
 
         hole.forget();
 
         long seen = lastSuccess(names.maintenance());
         // a run cut off holds the maintenance lock till idle_in_transaction_session_timeout (60 s) ends its holder
-        await(Duration.ofSeconds(90), () -> lastSuccess(names.maintenance()) > seen);
+        Await.until(Duration.ofSeconds(90), () -> lastSuccess(names.maintenance()) > seen);
     }
 
     @Test
@@ -303,7 +306,7 @@ class NetworkBlackholeIT {
             TestSql.execute(c, "create table " + past + " (like " + config.inbox().table() + " including defaults)");
         }
         // a run cut off holds the maintenance lock till idle_in_transaction_session_timeout (60 s) ends its holder
-        await(Duration.ofSeconds(90), () -> {
+        Await.until(Duration.ofSeconds(90), () -> {
             try (var c = DIRECT.getConnection()) {
                 return TestSql.queryString(c, "select to_regclass(?)::text", past) == null;
             }
@@ -371,13 +374,13 @@ class NetworkBlackholeIT {
         relay.start();
         var writer = writer(config.table());
         var before = send(writer, direct, "before");
-        await(() -> handed.contains(before));
+        Await.until(TIMEOUT, () -> handed.contains(before));
 
         Thread.sleep(150); // past its run, so it waits on its next statement
         hole.forget();
         var after = send(writer, direct, "after");
 
-        await(() -> handed.contains(after));
+        Await.until(TIMEOUT, () -> handed.contains(after));
     }
 
     /** Cut off while the hook runs: the same letter comes back, once the server ends the abandoned claim. */
@@ -410,7 +413,7 @@ class NetworkBlackholeIT {
 
         var dead = relay.schema().names().dead();
         // the abandoned claim holds the letter for the hook's timeout + 30 s
-        await(Duration.ofSeconds(60), () -> {
+        Await.until(Duration.ofSeconds(60), () -> {
             try (var c = DIRECT.getConnection()) {
                 return "kept".equals(TestSql.queryString(c, "select status from " + dead));
             }
@@ -463,7 +466,7 @@ class NetworkBlackholeIT {
         closing.add(relay);
         relay.start();
         armed.set(true);
-        await(() -> !armed.get());
+        Await.until(TIMEOUT, () -> !armed.get());
 
         awaitBeat(Duration.ofSeconds(20), relay); // not the 60 s socketTimeout
     }
@@ -483,7 +486,7 @@ class NetworkBlackholeIT {
         closing.add(relay);
         relay.start();
         armed.set(true);
-        await(() -> !armed.get());
+        Await.until(TIMEOUT, () -> !armed.get());
 
         Thread.sleep(1500); // the client has given that beat up
         awaitBeat(relay);
@@ -511,14 +514,14 @@ class NetworkBlackholeIT {
         closing.add(relay);
         relay.start();
         var writer = writer(config.table());
-        await(cut::get);
+        Await.until(TIMEOUT, cut::get);
 
         var sent = new HashSet<UUID>();
         for (int i = 0; i < 64; i++) { // on every shard
             sent.add(send(writer, direct, "k" + i));
         }
 
-        await(() -> delivered.containsAll(sent));
+        Await.until(TIMEOUT, () -> delivered.containsAll(sent));
     }
 
     @Test
@@ -531,7 +534,7 @@ class NetworkBlackholeIT {
             closing.add(relay);
             relay.start();
             var sent = send(relay, transactions, "k");
-            await(() -> delivered.contains(sent));
+            Await.until(TIMEOUT, () -> delivered.contains(sent));
             Thread.sleep(300); // passes, runs and beats, each on a connection of that pool
 
             assertThat(err.text().lines().filter(line -> line.contains("WARN")
@@ -609,7 +612,7 @@ class NetworkBlackholeIT {
                     new JdbcTransactions(pool(throughTheHole(3, 0))), record -> {}).build();
             closing.add(relay);
             relay.start();
-            await(() -> TestSql.queryLong(c, "select count(*) from pg_stat_activity where query like"
+            Await.until(TIMEOUT, () -> TestSql.queryLong(c, "select count(*) from pg_stat_activity where query like"
                     + " 'create index concurrently%" + index.substring(index.lastIndexOf('.') + 1) + "%'"
                     + " and state = 'active'") == 1);
             Thread.sleep(1500); // past the bound: a long statement, which it must not cut
@@ -621,7 +624,7 @@ class NetworkBlackholeIT {
             holder.rollback(); // the backend ends the build and its answer goes nowhere
         }
 
-        await(() -> Thread.getAllStackTraces().keySet().stream()
+        Await.until(TIMEOUT, () -> Thread.getAllStackTraces().keySet().stream()
                 .noneMatch(thread -> thread.getName().equals("outbox-dead-index")));
         try (var c = DIRECT.getConnection()) {
             assertThat(TestSql.queryString(c, "select indisvalid::text from pg_index where indexrelid = to_regclass(?)",
@@ -663,7 +666,7 @@ class NetworkBlackholeIT {
             closing.add(relay);
             relay.start();
 
-            await(() -> atClose.size() >= 2); // the build's connection and its holder's
+            Await.until(TIMEOUT, () -> atClose.size() >= 2); // the build's connection and its holder's
             assertThat(TestSql.queryString(c, "select indisvalid::text from pg_index where indexrelid = to_regclass(?)",
                     index)).isEqualTo("true");
         }
@@ -691,13 +694,13 @@ class NetworkBlackholeIT {
                     record -> {}).build();
             closing.add(relay);
             relay.start();
-            await(() -> TestSql.queryLong(c, "select count(*) from pg_stat_activity where query like"
+            Await.until(TIMEOUT, () -> TestSql.queryLong(c, "select count(*) from pg_stat_activity where query like"
                     + " 'create index concurrently%' and state = 'active'") == 1);
             Thread.sleep(2000); // past the DataSource's 1 s
 
             holder.rollback();
 
-            await(() -> "true".equals(TestSql.queryString(c, "select indisvalid::text from pg_index"
+            Await.until(TIMEOUT, () -> "true".equals(TestSql.queryString(c, "select indisvalid::text from pg_index"
                     + " where indexrelid = to_regclass(?)", index)));
             assertThat(err.text()).doesNotContain("could not build");
         }
@@ -771,14 +774,14 @@ class NetworkBlackholeIT {
                 record -> delivered.add(record.messageId())).build();
         closing.add(relay);
         relay.start();
-        await(() -> {
+        Await.until(TIMEOUT, () -> {
             try (var c = DIRECT.getConnection()) {
                 return TestSql.queryLong(c, "select count(*) from pg_stat_activity where wait_event = 'ClientWrite'")
                         > 0;
             }
         });
 
-        await(Duration.ofSeconds(120), () -> delivered.containsAll(sent)); // batchTimeout + 30 s, then the rest
+        Await.until(Duration.ofSeconds(120), () -> delivered.containsAll(sent)); // batchTimeout + 30 s, then the rest
     }
 
     private static FutureTask<Integer> draining(OutboxRuntime relay) {
@@ -867,7 +870,7 @@ class NetworkBlackholeIT {
         var cut = OutboxRuntime.builder(config, new JdbcTransactions(forgottenAfter("advisory_xact_lock(?, ?)",
                 throughTheHole(3, 0))), record -> {}).build();
         CompletableFuture.runAsync(cut::start); // cut off, as it should be; the hole's close ends its wait
-        await(() -> {
+        Await.until(TIMEOUT, () -> {
             try (var c = DIRECT.getConnection()) {
                 return TestSql.queryLong(c, "select count(*) from pg_locks where locktype = 'advisory'"
                         + " and granted") > 0;
@@ -890,7 +893,7 @@ class NetworkBlackholeIT {
         var cut = InboxRuntime.builder(config, new JdbcTransactions(forgottenAfter("advisory_xact_lock(?, ?)",
                 throughTheHole(3, 0)))).build();
         CompletableFuture.runAsync(cut::start); // cut off, as it should be; the hole's close ends its wait
-        await(() -> {
+        Await.until(TIMEOUT, () -> {
             try (var c = DIRECT.getConnection()) {
                 return TestSql.queryLong(c, "select count(*) from pg_locks where locktype = 'advisory' and granted") > 0;
             }
@@ -905,7 +908,7 @@ class NetworkBlackholeIT {
             TestSql.execute(c, "create table " + past + " (like " + config.inbox().table() + " including defaults)");
         }
 
-        await(Duration.ofSeconds(60), () -> {
+        Await.until(Duration.ofSeconds(60), () -> {
             try (var c = DIRECT.getConnection()) {
                 return TestSql.queryString(c, "select to_regclass(?)::text", past) == null;
             }
@@ -982,8 +985,8 @@ class NetworkBlackholeIT {
         relay.start();
 
         var sent = send(relay, transactions, "k");
-        await(() -> delivered.contains(sent));
-        await(() -> !atClose.isEmpty());
+        Await.until(TIMEOUT, () -> delivered.contains(sent));
+        Await.until(TIMEOUT, () -> !atClose.isEmpty());
 
         assertThat(atClose).as("a pool that restores nothing passes on what it gets").containsOnly(0);
     }
@@ -1004,7 +1007,7 @@ class NetworkBlackholeIT {
             relay.start();
 
             var sent = send(relay, transactions, "k");
-            await(() -> delivered.contains(sent));
+            Await.until(TIMEOUT, () -> delivered.contains(sent));
             Thread.sleep(200); // more passes
 
             assertThat(err.text().lines().filter(line -> line.contains("could not be set")).count())
@@ -1034,7 +1037,7 @@ class NetworkBlackholeIT {
         relay.start();
         var sent = new HashSet<UUID>();
         sent.add(send(relay, transactions, "before"));
-        await(() -> delivered.containsAll(sent));
+        Await.until(TIMEOUT, () -> delivered.containsAll(sent));
 
         armed.set(true);
         assertThat(silent.await(10, TimeUnit.SECONDS)).isTrue();
@@ -1042,7 +1045,7 @@ class NetworkBlackholeIT {
             sent.add(send(relay, transactions, "k" + i));
         }
 
-        await(Duration.ofSeconds(3), () -> delivered.containsAll(sent));
+        Await.until(Duration.ofSeconds(3), () -> delivered.containsAll(sent));
     }
 
     private static UUID send(OutboxRuntime runtime, JdbcTransactions transactions, String key) {
@@ -1078,7 +1081,7 @@ class NetworkBlackholeIT {
     private static void awaitBeat(Duration bound, OutboxRuntime relay) throws Exception {
         var instances = relay.schema().names().instance();
         long seen = lastSeen(instances, relay);
-        await(bound, () -> lastSeen(instances, relay) > seen);
+        Await.until(bound, () -> lastSeen(instances, relay) > seen);
     }
 
     private static long lastSeen(String instances, OutboxRuntime runtime) throws Exception {
@@ -1125,25 +1128,6 @@ class NetworkBlackholeIT {
                 calls.add(Thread.currentThread().getName() + ":" + args[1]);
             }
         });
-    }
-
-    private static void await(Check condition) throws Exception {
-        await(Duration.ofSeconds(30), condition);
-    }
-
-    private static void await(Duration bound, Check condition) throws Exception {
-        long deadline = System.nanoTime() + bound.toNanos();
-        while (!condition.met()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within " + bound);
-            }
-            Thread.sleep(20);
-        }
-    }
-
-    @FunctionalInterface
-    private interface Check {
-        boolean met() throws Exception;
     }
 
     private static final URI TARGET = URI.create(TestDataSources.jdbcUrl().substring("jdbc:".length()));

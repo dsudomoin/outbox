@@ -3,7 +3,7 @@ package io.github.dsudomoin.outbox.internal;
 import static io.github.dsudomoin.outbox.internal.ShardProcessor.ShardStatus.NOT_LOCKED;
 import static io.github.dsudomoin.outbox.internal.ShardProcessor.ShardStatus.PROGRESS;
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
-import static java.nio.charset.StandardCharsets.UTF_8;
+import static io.github.dsudomoin.outbox.testing.Utf8.bytes;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -182,9 +182,5 @@ class TableSpellingIT {
             Thread.currentThread().interrupt();
             throw new IllegalStateException(e);
         }
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(UTF_8);
     }
 }
