@@ -40,7 +40,7 @@ row() { # row PHASE T0 T1
 ## poison
 
 Режим заказов (1 сообщение на транзакцию, писателей $WRITERS), $RATE msg/s, обработчик Kafka, консьюмер с inbox;
-шардов 32, relay workers 8. В $(utc "$t1") UTC \`POST /poison?count=$COUNT\` закоммитил $COUNT сообщений размером
+$APP_RELAY. В $(utc "$t1") UTC \`POST /poison?count=$COUNT\` закоммитил $COUNT сообщений размером
 \`max.request.size\` продюсера + 1 КБ (~1 МБ каждое, различные ключи, $((t2 - t1)) с на все). Kafka отвергает их на
 стороне клиента как постоянные сбои.
 

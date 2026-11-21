@@ -26,19 +26,20 @@ out << EOF
 таблицы попали в окно). Записано = закоммиченные сообщения; доставлено = переданные
 обработчику (noop: подсчитаны и выброшены; kafka: подтверждены брокером, acks=all); задержка = от вставки на стороне
 коммита до outcome обработчика. Δ очереди = изменение (закоммичено − доставлено) за окно; выбрано за = время от остановки
-писателей до момента, когда доставленные догнали закоммиченные. Последняя строка оставляет relay с настройками
-библиотеки по умолчанию (workers 4, \`batchSize = 1000\`, \`idlePollInterval = 200ms\`) и шардами 4, как в основном
-прогоне (по умолчанию в библиотеке 32): то, что получит пользователь без настройки relay.
+писателей до момента, когда доставленные догнали закоммиченные. Последняя строка запускает relay без настроек под bulk:
+как у бенч-приложения (workers 8, \`batchSize = 2000\`, \`idlePollInterval = 200ms\`), с шардами 4, как в основном
+прогоне.
 
 | шарды | обработчик | записано msg/s | доставлено msg/s | задержка p50 | задержка p99 | транзакция писателя p50 | CPU БД (из 200%) | Δ очереди | выбрано за | окно (UTC) |
 |---|---|---|---|---|---|---|---|---|---|---|
 EOF
 
-# run SHARDS HANDLER [defaults]: "defaults" leaves the relay at the library defaults (batchSize 1000, idle poll 200 ms).
+# run SHARDS HANDLER [defaults]: "defaults" leaves the relay as bench/application.conf has it (workers 8, batch 2000,
+# idle poll 200 ms).
 run() {
   local shards=$1 handler=$2 table=bench_bulk_s$1_$2${3:+_$3} name=bulk-s$1-$2${3:+-$3} label=$2
   local relay=(OUTBOX_RELAY_WORKERS=4 OUTBOX_RELAY_BATCH_SIZE=20000 OUTBOX_RELAY_IDLE_POLL=100ms)
-  if [ "${3:-}" = defaults ]; then relay=(); label="$2, relay по умолчанию"; fi
+  if [ "${3:-}" = defaults ]; then relay=(); label="$2, relay приложения"; fi
   log "$name"
   fresh_app "$name" "$table" CONSUMER_THREADS=0 BENCH_HANDLER="$handler" OUTBOX_SHARDS="$shards" ${relay[@]+"${relay[@]}"}
   local id; id=$(mark bulk "bulk shards=$shards handler=$label")

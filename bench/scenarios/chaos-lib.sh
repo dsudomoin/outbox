@@ -311,7 +311,7 @@ chaos_end() {
 
 ## chaos: $NAME
 
-$TEXT. Экземпляров: $N, на таблице outbox \`$TABLE\` (у каждого шардов 32, relay workers 8), один топик Kafka
+$TEXT. Экземпляров: $N, на таблице outbox \`$TABLE\` (у каждого $APP_RELAY), один топик Kafka
 \`orders\` (12 партиций) и одна consumer group (потоков консьюмера на экземпляр: $((12 / N))); $ROLLBACK % заказов
 откатываются после отправки. Прогон $(utc "$T0") – $(hms "$stopped") UTC, затем выборка. Замеры каждые 30 с:
 \`bench/build/scenarios/chaos-$NAME.csv\`.

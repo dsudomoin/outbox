@@ -49,7 +49,7 @@ out << EOF
 ## kafka-outage
 
 Режим заказов (1 сообщение на транзакцию, писателей $WRITERS), $RATE msg/s, обработчик Kafka, консьюмер с inbox;
-шардов 32, relay workers 8. Kafka остановили (\`docker stop $KAFKA\`) в $(utc "$down") UTC на $OUTAGE с и снова
+$APP_RELAY. Kafka остановили (\`docker stop $KAFKA\`) в $(utc "$down") UTC на $OUTAGE с и снова
 запустили в $(hms "$up"); писатели всё это время продолжали коммитить. $(rate_note "$RATE")
 
 | базовый p99 задержки | пик очереди | выбрано (очередь ≤ 1 с трафика) | p99 задержки от начала сбоя до выборки + 30 с | dead |

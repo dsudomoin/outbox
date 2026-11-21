@@ -12,7 +12,7 @@ DELAY=${HANDLER_DELAY_MS:-20}
 
 chaos_begin slow-handler bench_chaos_slow_handler 1 "Режим заказов, 1 экземпляр, $RATE msg/s в течение $DURATION с; \
 обработчик Kafka спит $DELAY мс на каждую запись перед каждым пакетом, \`batchSize = 1000\` \
-(прежнее значение по умолчанию), \`batchTimeout = 30 s\` (по умолчанию)" \
+(прежнее значение по умолчанию), \`batchTimeout = 130 s\` (по умолчанию)" \
   HANDLER_DELAY_MS="$DELAY" OUTBOX_RELAY_BATCH_SIZE=1000
 chaos_load 1 "$RATE" "$CHAOS_WRITERS"
 chaos_for "$DURATION"

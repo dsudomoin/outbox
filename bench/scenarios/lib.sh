@@ -8,6 +8,8 @@ LOGS=$ROOT/bench/build/scenarios
 APP=$ROOT/bench/build/install/bench/bin/bench
 PG=kora-outbox-bench-postgres-1
 KAFKA=kora-outbox-bench-kafka-1
+# what a scenario runs unless it sets these: a new outbox table's default shard count and bench/application.conf's relay
+APP_RELAY="шардов 256 (по умолчанию у новой таблицы), relay workers 8"
 GRAFANA=http://localhost:3000
 PROM=http://localhost:9090
 BENCH=http://localhost:8080

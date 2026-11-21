@@ -34,7 +34,7 @@ row() { # row PHASE T0 T1
 ## long-transaction
 
 Режим заказов (1 сообщение на транзакцию, писателей $WRITERS), $RATE msg/s, обработчик Kafka, консьюмер с inbox;
-шардов 32, relay workers 8. Сессия держала xid $LONG_TX_XID открытым $LONG_TX с (\`begin; select pg_current_xact_id(); select
+$APP_RELAY. Сессия держала xid $LONG_TX_XID открытым $LONG_TX с (\`begin; select pg_current_xact_id(); select
 pg_sleep($LONG_TX)\`); snapshot xmin самого нового тика был равен этому xid в $PINNED, снятых каждые 10 с, пока она
 была открыта. CPU БД, пока она была открыта: $CPU% из 200%. Дата $(utc "$t0" | cut -c1-10) (UTC). $(rate_note "$RATE")
 
