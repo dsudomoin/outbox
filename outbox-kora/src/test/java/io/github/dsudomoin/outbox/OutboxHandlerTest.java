@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox;
 
+import static io.github.dsudomoin.outbox.testing.Handlers.answering;
 import static io.github.dsudomoin.outbox.testing.TestTracing.TRACEPARENT;
 import static io.github.dsudomoin.outbox.testing.TestTracing.TRACE_ID;
 import static io.github.dsudomoin.outbox.testing.TestTracing.header;
@@ -314,15 +315,7 @@ class OutboxHandlerTest {
                 records -> null,
                 records -> Arrays.asList(new Outcome[records.size()]));
         for (var answer : answers) {
-            OutboxHandler broken = new OutboxHandler() {
-                @Override
-                public void handle(OutboxRecord record) {}
-
-                @Override
-                public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                    return answer.apply(records);
-                }
-            };
+            OutboxHandler broken = answering(records -> answer.apply(records));
             var handler = OutboxHandler.byTopic(Map.of("ok", new RecordingHandler()), broken);
             var records = List.of(record("t", "k"), record("ok", "k"), record("t", null));
 
@@ -342,15 +335,7 @@ class OutboxHandlerTest {
 
     @Test
     void byTopicRouteGivenTheWholeCallThrowsForAnInvalidList() {
-        OutboxHandler broken = new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {}
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                return List.of(Outcome.delivered());
-            }
-        };
+        OutboxHandler broken = answering(records -> List.of(Outcome.delivered()));
         var handler = OutboxHandler.byTopic(Map.of("a", broken), new RecordingHandler());
 
         try (var err = new CapturedStderr()) {
@@ -364,15 +349,7 @@ class OutboxHandlerTest {
 
     @Test
     void byTopicPassesRequeueThrough() {
-        OutboxHandler requeueing = new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {}
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                return records.stream().map(r -> Outcome.requeue()).toList();
-            }
-        };
+        OutboxHandler requeueing = answering(records -> records.stream().map(r -> Outcome.requeue()).toList());
         var handler = OutboxHandler.byTopic(Map.of("q", requeueing), new RecordingHandler());
 
         assertThat(handler.handleBatch(List.of(record("t", "k"), record("q", "k"), record("t", null))))

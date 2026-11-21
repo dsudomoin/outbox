@@ -24,6 +24,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.ParameterizedTest;
 import ru.tinkoff.kora.application.graph.All;
 import ru.tinkoff.kora.application.graph.LifecycleWrapper;
 import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
@@ -65,16 +67,6 @@ class HeartbeatPoolIT {
         var run = hold(runtime(null, false));
 
         assertThat(run.age()).isGreaterThan(STALE_MILLIS);
-    }
-
-    @Test
-    void aTaggedFactoryWinsOverTheFlagOff() throws Exception {
-        taggedFactoryServesTheBeats(false);
-    }
-
-    @Test
-    void aTaggedFactoryWinsOverTheFlagOn() throws Exception {
-        taggedFactoryServesTheBeats(true);
     }
 
     @Test
@@ -184,7 +176,9 @@ class HeartbeatPoolIT {
     }
 
     /** Beats on a tagged factory, with no pool derived whatever {@code dedicated} says. */
-    private void taggedFactoryServesTheBeats(boolean dedicated) throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void aTaggedFactoryWinsOverTheFlag(boolean dedicated) throws Exception {
         var other = TestDb.newDatabase(1);
         var taken = new AtomicInteger();
         var wrapper = runtime(counting(other, taken), dedicated);

@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox;
 
+import static io.github.dsudomoin.outbox.testing.Intercepting.intercepting;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -7,12 +8,9 @@ import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestSql;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.concurrent.atomic.AtomicBoolean;
-import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
 
 /** A connection whose rollback failed never goes back into a real pool, and the pool serves the next call. */
@@ -20,7 +18,7 @@ class JdbcTransactionsOnAPoolIT {
 
     @Test
     void aFailedRollbackCommitsNothingAndThePoolReplacesTheConnection() throws Exception {
-        var table = "jt_" + Long.toHexString(System.nanoTime());
+        var table = TestSql.uniqueTable();
         try (var c = TestDb.connect()) {
             TestSql.execute(c, "create table " + table + " (id int)");
         }
@@ -31,7 +29,11 @@ class JdbcTransactionsOnAPoolIT {
         config.setMaximumPoolSize(1);
         try (var pool = new HikariDataSource(config)) {
             var failing = new AtomicBoolean(true);
-            var db = new JdbcTransactions(failingRollback(pool, failing));
+            var db = new JdbcTransactions(intercepting(pool, (real, call, args) -> {
+                if (call.getName().equals("rollback") && failing.get()) {
+                    throw new SQLException("injected rollback");
+                }
+            }));
             int[] pid = new int[1];
 
             assertThatThrownBy(() -> db.inTx(c -> {
@@ -51,31 +53,5 @@ class JdbcTransactionsOnAPoolIT {
 
     private static int pid(Connection c) throws SQLException {
         return (int) TestSql.queryLong(c, "select pg_backend_pid()");
-    }
-
-    private static DataSource failingRollback(DataSource pool, AtomicBoolean failing) {
-        return (DataSource) Proxy.newProxyInstance(DataSource.class.getClassLoader(), new Class<?>[] {DataSource.class},
-                (proxy, method, args) -> {
-                    var result = invoke(method, pool, args);
-                    return result instanceof Connection c ? failingRollback(c, failing) : result;
-                });
-    }
-
-    private static Connection failingRollback(Connection c, AtomicBoolean failing) {
-        return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[] {Connection.class},
-                (proxy, method, args) -> {
-                    if (method.getName().equals("rollback") && failing.get()) {
-                        throw new SQLException("injected rollback");
-                    }
-                    return invoke(method, c, args);
-                });
-    }
-
-    private static Object invoke(java.lang.reflect.Method method, Object on, Object[] args) throws Throwable {
-        try {
-            return method.invoke(on, args);
-        } catch (InvocationTargetException e) {
-            throw e.getCause();
-        }
     }
 }

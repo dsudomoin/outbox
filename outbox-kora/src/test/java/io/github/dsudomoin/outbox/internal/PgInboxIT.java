@@ -54,6 +54,11 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
 class PgInboxIT {
 
+    /** The suffixes of hourly and of sub-hourly range names, after {@code <table>_t}. */
+    private static final DateTimeFormatter HOURS = DateTimeFormatter.ofPattern("yyyyMMddHH").withZone(ZoneOffset.UTC);
+    private static final DateTimeFormatter MINUTES =
+            DateTimeFormatter.ofPattern("yyyyMMddHHmm").withZone(ZoneOffset.UTC);
+
     private static final long HOUR = Duration.ofHours(1).toMillis();
     private static final String NOT_IN_TX = "inside JdbcConnectionFactory.inTx";
     private static final String OUTSIDE_WARN = "accepted without dedup";
@@ -473,7 +478,7 @@ class PgInboxIT {
         start();
         long after = System.currentTimeMillis();
         long hour = lowest() + 2 * HOUR; // the hour init saw, wherever the clock is now
-        var name = DateTimeFormatter.ofPattern("yyyyMMddHH").withZone(ZoneOffset.UTC);
+        var name = HOURS;
         var current = ranges();
         // fresh: hourly ranges from floor(now - retention) to past now + premake, named after their lower bound
         assertThat(hour).isIn(Math.floorDiv(before, HOUR) * HOUR, Math.floorDiv(after, HOUR) * HOUR);
@@ -589,9 +594,9 @@ class PgInboxIT {
     void rangeOrphanedBetweenDetachAndDropIsDroppedOnceExpired() throws Exception {
         start();
         long hour = lowest() + 2 * HOUR; // the hour init saw, wherever the clock is now
-        var expired = table() + "_t" + DateTimeFormatter.ofPattern("yyyyMMddHH").withZone(ZoneOffset.UTC)
+        var expired = table() + "_t" + HOURS
                 .format(Instant.ofEpochMilli(hour - 5 * HOUR));
-        var recent = table() + "_t" + DateTimeFormatter.ofPattern("yyyyMMddHH").withZone(ZoneOffset.UTC)
+        var recent = table() + "_t" + HOURS
                 .format(Instant.ofEpochMilli(hour + 240 * HOUR));
         try (var c = TestDb.connect()) {
             attach(c, expired, hour - 5 * HOUR);
@@ -602,7 +607,7 @@ class PgInboxIT {
             // a run killed after its DETACH went through, before its DROP
             execute(c, "alter table " + table() + " detach partition " + expired + " concurrently");
             // and a detached table whose ids are still in the window: its dedup records sit outside the inbox
-            execute(c, "create table " + recent + " (like " + table() + " including defaults)");
+            standalone(c, recent);
             try (var ps = c.prepareStatement("insert into " + recent + " (message_id) values (?)")) {
                 ps.setObject(1, UuidV7.next());
                 ps.executeUpdate();
@@ -620,7 +625,7 @@ class PgInboxIT {
             assertThat(queryLong(c, "select count(*) from pg_class where relname = '" + expired + "'")).isZero();
             assertThat(queryLong(c, "select count(*) from pg_class where relname = '" + recent + "'")).isOne();
         }
-        assertThat(orphanRegistry.get("outbox.inbox.partitions.orphaned").gauge().value()).isEqualTo(1);
+        assertThat(orphaned(orphanRegistry)).isEqualTo(1);
     }
 
     @Test
@@ -655,20 +660,19 @@ class PgInboxIT {
         }
         assertThat(ranges()).as("finished, then attached back").contains(range);
         assertThat(accept(id)).isFalse();
-        assertThat(orphanRegistry.get("outbox.inbox.partitions.orphaned").gauge().value()).isZero();
+        assertThat(orphaned(orphanRegistry)).isZero();
     }
 
     @Test
     void emptyInWindowOrphanIsReportedAndEveryUnparsableNameSkipped() throws Exception {
         start();
-        var hour = DateTimeFormatter.ofPattern("yyyyMMddHH").withZone(ZoneOffset.UTC);
-        var empty = table() + "_t" + hour.format(Instant.ofEpochMilli(highest() + 10 * HOUR));
+        var empty = table() + "_t" + HOURS.format(Instant.ofEpochMilli(highest() + 10 * HOUR));
         var feb30 = table() + "_t2026023012";
         var month13 = table() + "_t2026139912";
         try (var c = TestDb.connect()) {
-            execute(c, "create table " + empty + " (like " + table() + " including defaults)");
-            execute(c, "create table " + feb30 + " (like " + table() + " including defaults)");
-            execute(c, "create table " + month13 + " (like " + table() + " including defaults)");
+            standalone(c, empty);
+            standalone(c, feb30);
+            standalone(c, month13);
         }
         var orphanRegistry = new SimpleMeterRegistry();
         var maintaining = new PgInbox(db, config, new OutboxMetrics(orphanRegistry));
@@ -681,11 +685,11 @@ class PgInboxIT {
                     .as("not attached back: the ranges below it are missing").contains("do not attach it by hand")
                     .as("no statement that would open the gap").doesNotContain("attach partition " + empty);
         }
-        assertThat(orphanRegistry.get("outbox.inbox.partitions.orphaned").gauge().value())
+        assertThat(orphaned(orphanRegistry))
                 .as("the step completed: the empty one counted, the unparsable ones skipped").isEqualTo(1);
         var hour24 = table() + "_t2026010124";
         try (var c = TestDb.connect()) {
-            execute(c, "create table " + hour24 + " (like " + table() + " including defaults)");
+            standalone(c, hour24);
         }
 
         try (var err = new CapturedStderr()) {
@@ -712,21 +716,21 @@ class PgInboxIT {
             assertThat(err.text()).doesNotContain("that is not attached");
         }
         assertThat(ranges()).as("premake attached it back").contains(top);
-        assertThat(orphanRegistry.get("outbox.inbox.partitions.orphaned").gauge().value()).isZero();
+        assertThat(orphaned(orphanRegistry)).isZero();
     }
 
     @Test
     void theOrphanGaugeKeepsItsLastValueWhileTheStepRuns() throws Exception {
         start();
         long hour = lowest() + 2 * HOUR;
-        var expired = table() + "_t" + DateTimeFormatter.ofPattern("yyyyMMddHH").withZone(ZoneOffset.UTC)
+        var expired = table() + "_t" + HOURS
                 .format(Instant.ofEpochMilli(hour - 5 * HOUR));
         var registry = new SimpleMeterRegistry();
         var maintaining = new PgInbox(db, config, new OutboxMetrics(registry));
         maintaining.runMaintenance();
-        assertThat(registry.get("outbox.inbox.partitions.orphaned").gauge().value()).isZero();
+        assertThat(orphaned(registry)).isZero();
         try (var c = TestDb.connect()) {
-            execute(c, "create table " + expired + " (like " + table() + " including defaults)");
+            standalone(c, expired);
         }
 
         try (var operator = TestDb.connect()) {
@@ -742,12 +746,12 @@ class PgInboxIT {
                 }
             }
 
-            assertThat(registry.get("outbox.inbox.partitions.orphaned").gauge().value()).as("mid-run").isZero();
+            assertThat(orphaned(registry)).as("mid-run").isZero();
 
             operator.rollback();
             run.get(30, TimeUnit.SECONDS);
         }
-        assertThat(registry.get("outbox.inbox.partitions.orphaned").gauge().value()).isZero();
+        assertThat(orphaned(registry)).isZero();
     }
 
     @Test
@@ -769,7 +773,7 @@ class PgInboxIT {
         }
         assertThat(ranges()).contains(range);
         assertThat(accept(id)).as("its dedup record counts again").isFalse();
-        assertThat(registry.get("outbox.inbox.partitions.orphaned").gauge().value()).isZero();
+        assertThat(orphaned(registry)).isZero();
     }
 
     @Test
@@ -778,11 +782,10 @@ class PgInboxIT {
                 .inboxRetention(Duration.ofHours(1))
                 .inboxPremake(Duration.ofHours(1));
         start();
-        var minutes = DateTimeFormatter.ofPattern("yyyyMMddHHmm").withZone(ZoneOffset.UTC);
         if (highest() % HOUR == 0) { // the top on a half hour, so the 1h ranges after it start on one
             long from = highest();
             try (var c = TestDb.connect()) {
-                PartitionDdl.createAndAttach(c, table(), table() + "_t" + minutes.format(Instant.ofEpochMilli(from)),
+                PartitionDdl.createAndAttach(c, table(), table() + "_t" + MINUTES.format(Instant.ofEpochMilli(from)),
                         bound(from), bound(from + HOUR / 2), PartitionDdl.CREATE_LOCK_TIMEOUT);
             }
         }
@@ -797,7 +800,7 @@ class PgInboxIT {
         var old = rangeOf(top - 1); // a 30m range, under the 1h interval now
         var next = rangeOf(top); // a 1h range that starts on a half hour
         assertThat(millis(next.to()) - millis(next.from())).isEqualTo(HOUR);
-        assertThat(next.name()).isEqualTo(table() + "_t" + minutes.format(Instant.ofEpochMilli(top)));
+        assertThat(next.name()).isEqualTo(table() + "_t" + MINUTES.format(Instant.ofEpochMilli(top)));
         try (var c = TestDb.connect()) { // an operator's detach of both
             execute(c, "alter table " + table() + " detach partition " + old.name());
             execute(c, "alter table " + table() + " detach partition " + next.name());
@@ -809,7 +812,7 @@ class PgInboxIT {
             assertThat(err.text()).doesNotContain("that is not attached");
         }
         assertThat(ranges()).contains(old, next);
-        assertThat(restarted.get("outbox.inbox.partitions.orphaned").gauge().value()).isZero();
+        assertThat(orphaned(restarted)).isZero();
     }
 
     @Test
@@ -829,7 +832,7 @@ class PgInboxIT {
                     .contains("do not attach it by hand").doesNotContain("attach partition " + low.get(1).name());
         }
         assertThat(ranges()).doesNotContain(low.get(1));
-        assertThat(registry.get("outbox.inbox.partitions.orphaned").gauge().value()).isEqualTo(1);
+        assertThat(orphaned(registry)).isEqualTo(1);
     }
 
     @Test
@@ -837,11 +840,11 @@ class PgInboxIT {
         config.attachOrphans(false);
         start();
         var range = rangeOf(System.currentTimeMillis());
-        var far = table() + "_t" + DateTimeFormatter.ofPattern("yyyyMMddHH").withZone(ZoneOffset.UTC)
+        var far = table() + "_t" + HOURS
                 .format(Instant.ofEpochMilli(highest() + 10 * HOUR));
         try (var c = TestDb.connect()) {
             execute(c, "alter table " + table() + " detach partition " + range.name());
-            execute(c, "create table " + far + " (like " + table() + " including defaults)");
+            standalone(c, far);
         }
 
         try (var err = new CapturedStderr()) {
@@ -854,7 +857,7 @@ class PgInboxIT {
                     .doesNotContain("attach partition " + far);
         }
         assertThat(ranges()).doesNotContain(range);
-        assertThat(registry.get("outbox.inbox.partitions.orphaned").gauge().value()).isEqualTo(2);
+        assertThat(orphaned(registry)).isEqualTo(2);
     }
 
     @Test
@@ -876,17 +879,16 @@ class PgInboxIT {
                     .contains("alter table " + table() + " attach partition " + overlapping.name() + " for values");
         }
         assertThat(ranges()).doesNotContain(overlapping).as("the failed attach does not stop the next").contains(next);
-        assertThat(registry.get("outbox.inbox.partitions.orphaned").gauge().value()).isEqualTo(1);
+        assertThat(orphaned(registry)).isEqualTo(1);
     }
 
     @Test
     void inWindowOrphanIsReportedWithoutWaitingForItsLock() throws Exception {
         start();
-        var hour = DateTimeFormatter.ofPattern("yyyyMMddHH").withZone(ZoneOffset.UTC);
-        var orphan = table() + "_t" + hour.format(Instant.ofEpochMilli(highest() + 10 * HOUR));
+        var orphan = table() + "_t" + HOURS.format(Instant.ofEpochMilli(highest() + 10 * HOUR));
         var partitions = new InboxPartitions(table(), config);
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
-            execute(c, "create table " + orphan + " (like " + table() + " including defaults)");
+            standalone(c, orphan);
             holder.setAutoCommit(false); // e.g. an operator's ATTACH, or a VACUUM FULL, in an open transaction
             execute(holder, "lock table " + orphan + " in access exclusive mode");
 
@@ -1088,7 +1090,7 @@ class PgInboxIT {
                 .inboxPremake(Duration.ofHours(1));
         start();
 
-        var name = DateTimeFormatter.ofPattern("yyyyMMddHHmm").withZone(ZoneOffset.UTC);
+        var name = MINUTES;
         var current = ranges();
         assertThat(current).isNotEmpty().allSatisfy(b -> assertThat(b.name())
                 .isEqualTo(table() + "_t" + name.format(Instant.ofEpochMilli(millis(b.from())))));
@@ -1100,10 +1102,9 @@ class PgInboxIT {
     @Test
     void aTopOffTheWholeMinuteIsRealignedByTheNextRange() throws Exception {
         start();
-        var minutes = DateTimeFormatter.ofPattern("yyyyMMddHHmm").withZone(ZoneOffset.UTC);
         long top = highest();
         try (var c = TestDb.connect()) { // a 90s range on top, as a sub-minute interval of an earlier version made
-            PartitionDdl.createAndAttach(c, table(), table() + "_t" + minutes.format(Instant.ofEpochMilli(top)),
+            PartitionDdl.createAndAttach(c, table(), table() + "_t" + MINUTES.format(Instant.ofEpochMilli(top)),
                     bound(top), bound(top + 90_000), PartitionDdl.CREATE_LOCK_TIMEOUT);
         }
         inbox.close();
@@ -1122,7 +1123,7 @@ class PgInboxIT {
         inbox.runMaintenance();
 
         assertThat(ranges()).as("its name holds its bounds: attached back").contains(next);
-        assertThat(restarted.get("outbox.inbox.partitions.orphaned").gauge().value()).isZero();
+        assertThat(orphaned(restarted)).isZero();
     }
 
     private void rejected(TestOutboxConfig invalid, String message) {
@@ -1223,5 +1224,14 @@ class PgInboxIT {
         var r = ThreadLocalRandom.current();
         return new UUID((millis << 16) | 0x7000L | (r.nextLong() & 0x0FFFL),
                 (r.nextLong() & 0x3FFF_FFFF_FFFF_FFFFL) | 0x8000_0000_0000_0000L);
+    }
+
+    /** A standalone table {@code name} shaped like the inbox, as a range left detached would be. */
+    private void standalone(Connection c, String name) throws SQLException {
+        execute(c, "create table " + name + " (like " + table() + " including defaults)");
+    }
+
+    private static double orphaned(SimpleMeterRegistry registry) {
+        return registry.get("outbox.inbox.partitions.orphaned").gauge().value();
     }
 }

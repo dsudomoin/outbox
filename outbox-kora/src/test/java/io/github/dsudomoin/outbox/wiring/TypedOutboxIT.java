@@ -76,7 +76,7 @@ class TypedOutboxIT implements KoraAppTestConfigModifier {
     }
 
     @Test
-    void eachTypedOutboxUsesItsSerializer() throws Exception {
+    void eachTypedOutboxUsesItsSerializerAndStampsItsVersion() throws Exception {
         var header = new OutboxHeader("h", "v".getBytes(UTF_8));
         db.inTx((SqlRunnable) () -> {
             app.orders().send("orders", "u1", new OrderCreated(7, "u1"));
@@ -95,18 +95,6 @@ class TypedOutboxIT implements KoraAppTestConfigModifier {
         assertThat(StringValue.parseFrom(proto.payload()).getValue()).isEqualTo("hello");
         assertThat(proto.key()).isEqualTo("p".getBytes(UTF_8));
         assertThat(proto.headers()).contains(header);
-    }
-
-    @Test
-    void eachTypedOutboxStampsTheVersionOfItsOwnType() throws Exception {
-        db.inTx((SqlRunnable) () -> {
-            app.orders().send("orders", "u1", new OrderCreated(7, "u1"));
-            app.custom().send("custom", "k", new Custom("hi"));
-        });
-
-        assertThat(relay.drain()).isEqualTo(2);
-        Map<String, OutboxRecord> byTopic = handler.delivered().stream()
-                .collect(Collectors.toMap(OutboxRecord::topic, Function.identity()));
         assertThat(byTopic.get("orders").headers()).as("@OutboxContract(2) through the injected TypeRef")
                 .containsExactly(new OutboxHeader("outbox-contract", "2".getBytes(US_ASCII)));
         assertThat(byTopic.get("orders").contractVersion()).isEqualTo(2);

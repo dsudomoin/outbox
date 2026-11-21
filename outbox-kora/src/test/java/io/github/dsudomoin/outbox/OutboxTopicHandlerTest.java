@@ -44,7 +44,7 @@ class OutboxTopicHandlerTest {
         var fallback = new RecordingHandler();
         var audit = new Recorder(Set.of("audit"));
         var billing = new Recorder(Set.of("billing", "invoices"));
-        var handler = build(OutboxRuntime.builder(new TestOutboxConfig(), transactions, fallback)
+        var handler = BuiltHandler.of(OutboxRuntime.builder(new TestOutboxConfig(), transactions, fallback)
                 .route(audit).route(billing));
         var records = List.of(record("orders", "k"), record("invoices", "k"), record("audit", "k"),
                 record("billing", "k"), record("orders", null));
@@ -61,7 +61,8 @@ class OutboxTopicHandlerTest {
     @Test
     void routeOutcomesComeBackInTheirPositions() {
         var poison = new Recorder(Set.of("audit")).failing("poison", new OutboxPermanentException("bad"));
-        var handler = build(OutboxRuntime.builder(new TestOutboxConfig(), transactions, new RecordingHandler())
+        var handler = BuiltHandler.of(OutboxRuntime.builder(new TestOutboxConfig(), transactions,
+                new RecordingHandler())
                 .route(poison));
 
         var outcomes = handler.handleBatch(List.of(record("orders", "k"), record("audit", "poison"),
@@ -105,7 +106,8 @@ class OutboxTopicHandlerTest {
     void aLocalRecordReachesItsRouteButNeverTheHandler() {
         var fallback = new RecordingHandler();
         var audit = new Recorder(Set.of("audit"));
-        var handler = build(OutboxRuntime.builder(new TestOutboxConfig(), transactions, fallback).route(audit));
+        var handler = BuiltHandler.of(OutboxRuntime.builder(new TestOutboxConfig(), transactions, fallback)
+                .route(audit));
         var routed = record("audit", "k", List.of(LOCAL));
         var unrouted = record("billing", "k", List.of(LOCAL));
         var plain = record("billing", "j");
@@ -119,7 +121,7 @@ class OutboxTopicHandlerTest {
     @Test
     void withoutRoutesTheHandlerNeverTakesALocalRecord() {
         var fallback = new RecordingHandler();
-        var handler = build(OutboxRuntime.builder(new TestOutboxConfig(), transactions, fallback));
+        var handler = BuiltHandler.of(OutboxRuntime.builder(new TestOutboxConfig(), transactions, fallback));
         var plain = record("billing", "j");
 
         assertThat(handler.handleBatch(List.of(record("billing", "k", List.of(LOCAL)), plain)))
@@ -130,7 +132,7 @@ class OutboxTopicHandlerTest {
     @Test
     void withoutHandlerAnUnclaimedTopicWaits() {
         var audit = new Recorder(Set.of("audit"));
-        var handler = build(OutboxRuntime.builder(new TestOutboxConfig(), transactions, null).route(audit));
+        var handler = BuiltHandler.of(OutboxRuntime.builder(new TestOutboxConfig(), transactions, null).route(audit));
 
         var outcomes = handler.handleBatch(List.of(record("billing", "k"), record("audit", "k")));
 
@@ -321,9 +323,6 @@ class OutboxTopicHandlerTest {
                 .hasMessageContaining("OutboxHandler").hasMessageContaining("OutboxTopicHandler");
     }
 
-    private static OutboxHandler build(OutboxRuntime.Builder builder) {
-        return builder.build().handler;
-    }
 
     /** A record no instance reading its contract version can ever handle. */
     private static void assertPermanent(Outcome outcome, OutboxRecord record, String reason) {

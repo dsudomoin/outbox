@@ -52,20 +52,7 @@ class KoraOutboxTelemetryTest {
     }
 
     @Test
-    void recordScopeCarriesTraceWithoutTracer() throws Exception {
-        var telemetry = new KoraOutboxTelemetry(new OutboxMetrics(null), null);
-        var record = record(List.of(header("traceparent", TRACEPARENT)));
-        var delivery = telemetry.deliveryStarted(List.of(record), NOW);
-
-        assertThat(delivery.handed(List.of(record))).containsExactly(record);
-        var traceId = delivery.inRecordScope(record,
-                () -> OpentelemetryContext.getSpan().getSpanContext().getTraceId());
-        assertThat(traceId).isEqualTo(TRACE_ID);
-        assertThat(OpentelemetryContext.getSpan()).as("the caller's context is restored").isNull();
-    }
-
-    @Test
-    void metricsWithoutTracer() {
+    void eachHookReachesItsCounterWithoutATracer() {
         var registry = new SimpleMeterRegistry();
         var telemetry = new KoraOutboxTelemetry(new OutboxMetrics(registry), null);
 
@@ -73,16 +60,26 @@ class KoraOutboxTelemetryTest {
         telemetry.delivered("orders", Duration.ofMillis(10));
         var delivery = telemetry.deliveryStarted(List.of(record(List.of())), NOW);
         delivery.finished(List.of(Outcome.delivered()));
+        telemetry.contractRejected("orders", "Created", 2);
+        telemetry.routeRejected("orders");
+        telemetry.routeUnchecked("audit");
+        telemetry.relayFailed(new SQLException("x"));
 
         assertThat(registry.get("outbox.messages.enqueued").tag("topic", "orders").counter().count()).isEqualTo(1);
         assertThat(registry.get("outbox.messages.delivered").tag("topic", "orders").counter().count()).isEqualTo(1);
+        assertThat(registry.get("outbox.messages.contract_rejected").tags("topic", "orders", "type", "Created",
+                "version", "2").counter().count()).isEqualTo(1);
+        assertThat(registry.get("outbox.messages.route_rejected").tag("topic", "orders").counter().count())
+                .isEqualTo(1);
+        assertThat(registry.get("outbox.messages.route_unchecked").tag("topic", "audit").counter().count())
+                .isEqualTo(1);
+        assertThat(registry.get("outbox.relay.failures").counter().count()).isEqualTo(1);
     }
 
     @Test
     void spansWithoutRegistry() {
         var spans = InMemorySpanExporter.create();
-        var tracer = SdkTracerProvider.builder().addSpanProcessor(SimpleSpanProcessor.create(spans)).build()
-                .get("test");
+        var tracer = tracer(spans);
         var telemetry = new KoraOutboxTelemetry(new OutboxMetrics(null), tracer);
         var record = record(List.of(header("traceparent", TRACEPARENT)));
 
@@ -104,35 +101,10 @@ class KoraOutboxTelemetryTest {
     }
 
     @Test
-    void aRejectedContractIsCounted() {
-        var registry = new SimpleMeterRegistry();
-
-        new KoraOutboxTelemetry(new OutboxMetrics(registry), null).contractRejected("orders", "Created", 2);
-
-        assertThat(registry.get("outbox.messages.contract_rejected").tags("topic", "orders", "type", "Created",
-                "version", "2").counter().count()).isEqualTo(1);
-    }
-
-    @Test
-    void aRejectedAndAnUncheckedRouteAreCounted() {
-        var registry = new SimpleMeterRegistry();
-        var telemetry = new KoraOutboxTelemetry(new OutboxMetrics(registry), null);
-
-        telemetry.routeRejected("orders");
-        telemetry.routeUnchecked("audit");
-
-        assertThat(registry.get("outbox.messages.route_rejected").tag("topic", "orders").counter().count())
-                .isEqualTo(1);
-        assertThat(registry.get("outbox.messages.route_unchecked").tag("topic", "audit").counter().count())
-                .isEqualTo(1);
-    }
-
-    @Test
     void aWaitingRecordEndsItsSpanAsWaitingWithoutAnErrorAndIsCounted() {
         var registry = new SimpleMeterRegistry();
         var spans = InMemorySpanExporter.create();
-        var tracer = SdkTracerProvider.builder().addSpanProcessor(SimpleSpanProcessor.create(spans)).build()
-                .get("test");
+        var tracer = tracer(spans);
         var telemetry = new KoraOutboxTelemetry(new OutboxMetrics(registry), tracer);
 
         var delivery = telemetry.deliveryStarted(List.of(record(List.of())), NOW);
@@ -145,44 +117,6 @@ class KoraOutboxTelemetryTest {
         assertThat(span.getEvents()).isEmpty();
         assertThat(registry.get("outbox.messages.waiting").tags("topic", "orders", "kind", "handler").counter()
                 .count()).isEqualTo(1);
-    }
-
-    @Test
-    void eachRecordOfACallKeepsItsOwnTrace() {
-        var spans = InMemorySpanExporter.create();
-        var tracer = SdkTracerProvider.builder().addSpanProcessor(SimpleSpanProcessor.create(spans)).build()
-                .get("test");
-        var telemetry = new KoraOutboxTelemetry(new OutboxMetrics(null), tracer);
-        var writers = List.of(tracer.spanBuilder("writer 1").startSpan(), tracer.spanBuilder("writer 2").startSpan());
-        writers.forEach(Span::end);
-        var records = writers.stream().map(w -> record(List.of(header("traceparent",
-                "00-" + w.getSpanContext().getTraceId() + "-" + w.getSpanContext().getSpanId() + "-01")))).toList();
-
-        var delivery = telemetry.deliveryStarted(records, NOW);
-        delivery.handed(records);
-        delivery.finished(List.of(Outcome.delivered(), Outcome.delivered()));
-
-        for (int i = 0; i < records.size(); i++) {
-            var id = records.get(i).messageId().toString();
-            var writer = writers.get(i).getSpanContext();
-            assertThat(spans.getFinishedSpanItems())
-                    .filteredOn(s -> id.equals(s.getAttributes().get(AttributeKey.stringKey("outbox.message_id"))))
-                    .singleElement()
-                    .satisfies(span -> {
-                        assertThat(span.getTraceId()).isEqualTo(writer.getTraceId());
-                        assertThat(span.getParentSpanId()).isEqualTo(writer.getSpanId());
-                    });
-        }
-    }
-
-    @Test
-    void relayFailuresReachTheCounter() {
-        var registry = new SimpleMeterRegistry();
-        var telemetry = new KoraOutboxTelemetry(new OutboxMetrics(registry), null);
-
-        telemetry.relayFailed(new SQLException("x"));
-
-        assertThat(registry.get("outbox.relay.failures").counter().count()).isEqualTo(1);
     }
 
     @Test

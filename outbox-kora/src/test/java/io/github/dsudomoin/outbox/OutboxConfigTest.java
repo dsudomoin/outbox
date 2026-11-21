@@ -132,24 +132,11 @@ class OutboxConfigTest {
 
         OutboxSchema.validate(config);
         assertThat(config.partitions().swapLockTimeout()).isZero();
-    }
-
-    @Test
-    void negativeSwapLockTimeoutIsRejected() {
-        var config = parse("outbox.partitions.swapLockTimeout = -1ms");
-
-        assertThatThrownBy(() -> OutboxSchema.validate(config))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage("outbox.partitions.swapLockTimeout must be 0 or at least 1ms: PT-0.001S");
-    }
-
-    @Test
-    void subMillisecondSwapLockTimeoutIsRejected() { // sent as whole milliseconds, and lock_timeout = 0 is no limit
-        var config = parse("outbox.partitions.swapLockTimeout = 500us");
-
-        assertThatThrownBy(() -> OutboxSchema.validate(config))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage("outbox.partitions.swapLockTimeout must be 0 or at least 1ms: PT0.0005S");
+        assertRejected("outbox.partitions.swapLockTimeout = -1ms",
+                "outbox.partitions.swapLockTimeout must be 0 or at least 1ms: PT-0.001S");
+        // sent as whole milliseconds, and lock_timeout = 0 is no limit
+        assertRejected("outbox.partitions.swapLockTimeout = 500us",
+                "outbox.partitions.swapLockTimeout must be 0 or at least 1ms: PT0.0005S");
     }
 
     @Test
@@ -161,11 +148,7 @@ class OutboxConfigTest {
 
     @Test
     void negativeMaxTailScanIsRejected() {
-        var config = parse("outbox.partitions.maxTailScan = -1");
-
-        assertThatThrownBy(() -> OutboxSchema.validate(config))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage("outbox.partitions.maxTailScan must not be negative: -1");
+        assertRejected("outbox.partitions.maxTailScan = -1", "outbox.partitions.maxTailScan must not be negative: -1");
     }
 
     @Test
@@ -185,9 +168,8 @@ class OutboxConfigTest {
         assertThatThrownBy(() -> OutboxSchema.validate(parse("outbox.partitions.tailConversion.zone = Mars/Olympus")))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("outbox.partitions.tailConversion.zone").hasMessageContaining("Mars/Olympus");
-        assertThatThrownBy(() -> OutboxSchema.validate(parse("outbox.partitions.tailConversion.maxStall = 0s")))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage("outbox.partitions.tailConversion.maxStall must be at least 1ms: PT0S");
+        assertRejected("outbox.partitions.tailConversion.maxStall = 0s",
+                "outbox.partitions.tailConversion.maxStall must be at least 1ms: PT0S");
     }
 
     @Test
@@ -214,12 +196,9 @@ class OutboxConfigTest {
 
         assertThat(requeue.delay()).isEqualTo(Duration.ofMillis(250));
         assertThat(requeue.maxRequeues()).isEqualTo(5);
-        assertThatThrownBy(() -> OutboxSchema.validate(parse("outbox.relay.requeue.delay = 0s")))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage("outbox.relay.requeue.delay must be positive: PT0S");
-        assertThatThrownBy(() -> OutboxSchema.validate(parse("outbox.relay.requeue.maxRequeues = -1")))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage("outbox.relay.requeue.maxRequeues must not be negative: -1");
+        assertRejected("outbox.relay.requeue.delay = 0s", "outbox.relay.requeue.delay must be positive: PT0S");
+        assertRejected("outbox.relay.requeue.maxRequeues = -1",
+                "outbox.relay.requeue.maxRequeues must not be negative: -1");
     }
 
     @Test

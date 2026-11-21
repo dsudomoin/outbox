@@ -13,6 +13,7 @@ import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.RoundTrips;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.github.dsudomoin.outbox.testing.TestTracing;
 import java.sql.Connection;
@@ -471,27 +472,17 @@ class PgOutboxIT {
     }
 
     private List<String> payloadsInIdOrder() throws SQLException {
-        var payloads = new ArrayList<String>();
-        try (var c = TestDb.connect();
-                var st = c.createStatement();
-                var rs = st.executeQuery("select payload from " + names.base() + " order by id")) {
-            while (rs.next()) {
-                payloads.add(new String(rs.getBytes(1), UTF_8));
-            }
+        try (var c = TestDb.connect()) {
+            return TestSql.queryStrings(c, "select convert_from(payload, 'UTF8') from " + names.base()
+                    + " order by id");
         }
-        return payloads;
     }
 
     private List<UUID> messageIdsInIdOrder() throws SQLException {
-        var ids = new ArrayList<UUID>();
-        try (var c = TestDb.connect();
-                var st = c.createStatement();
-                var rs = st.executeQuery("select message_id from " + names.base() + " order by id")) {
-            while (rs.next()) {
-                ids.add(rs.getObject(1, UUID.class));
-            }
+        try (var c = TestDb.connect()) {
+            return TestSql.queryStrings(c, "select message_id::text from " + names.base() + " order by id").stream()
+                    .map(UUID::fromString).toList();
         }
-        return ids;
     }
 
     /** Until another session waits for the key lock of {@code topic}/{@code key}, failing after 10 s. */
