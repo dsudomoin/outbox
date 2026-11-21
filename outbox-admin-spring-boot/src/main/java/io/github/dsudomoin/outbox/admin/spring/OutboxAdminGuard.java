@@ -1,14 +1,11 @@
 package io.github.dsudomoin.outbox.admin.spring;
 
+import io.github.dsudomoin.outbox.internal.AdminHttp;
 import jakarta.annotation.Nullable;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
-import java.net.URI;
-import java.net.URISyntaxException;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
-import java.util.StringJoiner;
 import java.util.function.Supplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -144,12 +141,12 @@ final class OutboxAdminGuard implements HandlerInterceptor {
     /** {@code <method> "<path>"}, with {@code by "<identity>"} once allowed: how a line about this call names it. */
     static String caller(HttpServletRequest request) {
         return call(request) + (request.getAttribute(IDENTITY) instanceof Allowed allowed
-            ? " by \"" + printable(allowed.identity()) + "\"" : "");
+            ? " by \"" + AdminHttp.printable(allowed.identity()) + "\"" : "");
     }
 
     private static String call(HttpServletRequest request) {
         var path = request.getServletPath() + Objects.requireNonNullElse(request.getPathInfo(), "");
-        return request.getMethod() + " \"" + printable(path) + "\"";
+        return request.getMethod() + " \"" + AdminHttp.printable(path) + "\"";
     }
 
     /**
@@ -168,7 +165,7 @@ final class OutboxAdminGuard implements HandlerInterceptor {
             return false;
         }
         var origin = request.getHeader("Origin");
-        return origin != null && !sameHost(origin, request.getServerName(), port(request));
+        return origin != null && !AdminHttp.sameHost(origin, request.getServerName(), port(request));
     }
 
     /**
@@ -183,59 +180,10 @@ final class OutboxAdminGuard implements HandlerInterceptor {
         return !named && port == (request.isSecure() ? 443 : 80) ? -1 : port;
     }
 
-    /**
-     * Whether {@code origin} names {@code host} and {@code port} (below 0: the default of the browser's scheme). Not
-     * the scheme: behind a proxy ending TLS the page had https, the server http.
-     */
-    private static boolean sameHost(String origin, String host, int port) {
-        try {
-            var page = new URI(origin);
-            var defaultPort = "https".equalsIgnoreCase(page.getScheme()) ? 443 : 80;
-            return page.getHost() != null
-                && page.getHost().toLowerCase(Locale.ROOT).equals(host.toLowerCase(Locale.ROOT))
-                && (page.getPort() < 0 ? defaultPort : page.getPort()) == (port < 0 ? defaultPort : port);
-        } catch (URISyntaxException e) {
-            return false;
-        }
-    }
-
-    /** {@code  with <name> "<value>", ...} of the operation's detail, each value {@link #printable}; else empty. */
+    /** {@code  with <name> "<value>", ...} of the operation's detail; else empty. */
     private static String detail(HttpServletRequest request) {
-        if (!(request.getAttribute(OutboxAdminController.DETAIL) instanceof Map<?, ?> detail)) {
-            return "";
-        }
-        var out = new StringJoiner(", ", " with ", "");
-        detail.forEach((name, value) -> out.add(name + " "
-            + (value == null ? "null" : "\"" + printable(value.toString()) + "\"")));
-        return out.toString();
-    }
-
-    /**
-     * {@code text} with quotes and backslashes escaped and each control or format character (a bidi override reorders
-     * a line on screen) as its Java escape, so it stays one quoted token on one log line.
-     */
-    private static String printable(String text) {
-        var out = new StringBuilder(text.length());
-        text.codePoints().forEach(ch -> {
-            switch (ch) {
-                case '"' -> out.append("\\\"");
-                case '\\' -> out.append("\\\\");
-                case '\n' -> out.append("\\n");
-                case '\r' -> out.append("\\r");
-                case '\t' -> out.append("\\t");
-                default -> {
-                    if (Character.isISOControl(ch) || ch == '\u2028' || ch == '\u2029'
-                        || Character.getType(ch) == Character.FORMAT) {
-                        for (var unit : Character.toChars(ch)) { // beyond U+FFFF, Java's escape is two of them
-                            out.append(String.format("\\u%04x", (int) unit));
-                        }
-                    } else {
-                        out.appendCodePoint(ch);
-                    }
-                }
-            }
-        });
-        return out.toString();
+        return AdminHttp.detail(request.getAttribute(OutboxAdminController.DETAIL) instanceof Map<?, ?> detail
+            ? detail : null);
     }
 
     /** What the guard answers instead of the route; its line is written, so its handler only answers. */

@@ -22,6 +22,7 @@ import io.github.dsudomoin.outbox.admin.spring.model.Orphan;
 import io.github.dsudomoin.outbox.admin.spring.model.OrphanKind;
 import io.github.dsudomoin.outbox.admin.spring.model.Selection;
 import io.github.dsudomoin.outbox.admin.spring.model.Status;
+import io.github.dsudomoin.outbox.internal.AdminHttp;
 import jakarta.annotation.Nullable;
 import jakarta.servlet.http.HttpServletRequest;
 import java.beans.PropertyEditorSupport;
@@ -34,7 +35,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Objects;
 import java.util.TreeMap;
-import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.NestedRuntimeException;
@@ -82,10 +82,6 @@ class OutboxAdminController implements OutboxAdminApi {
      */
     static final String DETAIL = OutboxAdminController.class.getName() + ".detail";
 
-    /** As the contract's {@code maxItems}: the library binds every id in each chunk's query. */
-    private static final int MAX_IDS = 1000;
-    /** The ids of a call its audit line shows, after their count: the line stays short for a thousand of them. */
-    private static final int AUDIT_IDS = 10;
     /** As the Kora adapter writes them: always UTC, always three fraction digits. */
     private static final DateTimeFormatter DATE_TIME =
         DateTimeFormatter.ofPattern("uuuu-MM-dd'T'HH:mm:ss.SSSXXX").withZone(ZoneOffset.UTC);
@@ -273,41 +269,22 @@ class OutboxAdminController implements OutboxAdminApi {
     /** The ids, or null for the filter: exactly one of them. */
     @Nullable
     private static List<Long> ids(Selection selection) {
-        if ((selection.getIds() == null) == (selection.getFilter() == null)) {
-            throw new IllegalArgumentException("give exactly one of ids and filter");
-        }
-        var ids = selection.getIds();
-        if (ids != null && ids.size() > MAX_IDS) {
-            throw new IllegalArgumentException("at most " + MAX_IDS + " ids, not " + ids.size()
-                + ": select more with a filter");
-        }
-        if (ids != null && ids.stream().anyMatch(Objects::isNull)) {
-            throw new IllegalArgumentException("ids must be numbers, not null");
-        }
-        return ids;
+        return AdminHttp.ids(selection.getIds(), selection.getFilter() != null);
     }
 
-    /** {@code ids}, their count and the first {@value #AUDIT_IDS} of them put into the audit line. */
+    /** {@code ids}, their count and the first {@value AdminHttp#AUDIT_IDS} of them put into the audit line. */
     private static List<Long> audited(List<Long> ids) {
-        var detail = new LinkedHashMap<String, String>();
-        detail.put("count", String.valueOf(ids.size()));
-        detail.put("ids", ids.stream().limit(AUDIT_IDS).map(String::valueOf)
-            .collect(Collectors.joining(", ", "[", ids.size() > AUDIT_IDS ? ", ...]" : "]")));
-        RequestContextHolder.currentRequestAttributes().setAttribute(DETAIL, detail, RequestAttributes.SCOPE_REQUEST);
+        RequestContextHolder.currentRequestAttributes().setAttribute(DETAIL, AdminHttp.idsDetail(ids),
+            RequestAttributes.SCOPE_REQUEST);
         return ids;
     }
 
     /** {@link #filter(Filter)}, its fields put into the audit line. */
     private static DeadLetterFilter audited(Filter f) {
         var filter = filter(f);
-        var detail = new LinkedHashMap<String, String>();
-        detail.put("topic", filter.topic());
-        detail.put("key", f.getKey());
-        detail.put("error", filter.errorContains());
-        detail.put("failedFrom", filter.failedFrom() == null ? null : filter.failedFrom().toString());
-        detail.put("failedTo", filter.failedTo() == null ? null : filter.failedTo().toString());
-        detail.put("status", f.getStatus() == null ? null : f.getStatus().toString());
-        RequestContextHolder.currentRequestAttributes().setAttribute(DETAIL, detail, RequestAttributes.SCOPE_REQUEST);
+        RequestContextHolder.currentRequestAttributes().setAttribute(DETAIL,
+            AdminHttp.filterDetail(filter, f.getKey(), f.getStatus() == null ? null : f.getStatus().toString()),
+            RequestAttributes.SCOPE_REQUEST);
         return filter;
     }
 

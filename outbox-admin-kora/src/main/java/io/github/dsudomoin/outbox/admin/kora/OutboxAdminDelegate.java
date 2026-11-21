@@ -63,6 +63,7 @@ import io.github.dsudomoin.outbox.admin.kora.model.Orphan;
 import io.github.dsudomoin.outbox.admin.kora.model.OrphanKind;
 import io.github.dsudomoin.outbox.admin.kora.model.Selection;
 import io.github.dsudomoin.outbox.admin.kora.model.Status;
+import io.github.dsudomoin.outbox.internal.AdminHttp;
 import jakarta.annotation.Nullable;
 import java.time.Instant;
 import java.time.OffsetDateTime;
@@ -73,7 +74,6 @@ import java.util.Objects;
 import java.util.TreeMap;
 import java.util.function.Function;
 import java.util.function.Supplier;
-import java.util.stream.Collectors;
 import ru.tinkoff.kora.common.Context;
 
 /**
@@ -88,10 +88,6 @@ import ru.tinkoff.kora.common.Context;
 public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
 
     private static final int DEFAULT_LIMIT = 100;
-    /** As the contract's {@code maxItems}: the library binds every id in each chunk's query. */
-    private static final int MAX_IDS = 1000;
-    /** The ids of a call its audit line shows, after their count: the line stays short for a thousand of them. */
-    private static final int AUDIT_IDS = 10;
 
     private final OutboxAdmin admin;
 
@@ -226,41 +222,23 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
     /** The ids, or null for the filter: exactly one of them. */
     @Nullable
     private static List<Long> ids(@Nullable Selection selection) {
-        if (selection == null || (selection.ids() == null) == (selection.filter() == null)) {
+        if (selection == null) {
             throw new IllegalArgumentException("give exactly one of ids and filter");
         }
-        var ids = selection.ids();
-        if (ids != null && ids.size() > MAX_IDS) {
-            throw new IllegalArgumentException("at most " + MAX_IDS + " ids, not " + ids.size()
-                    + ": select more with a filter");
-        }
-        if (ids != null && ids.stream().anyMatch(Objects::isNull)) {
-            throw new IllegalArgumentException("ids must be numbers, not null");
-        }
-        return ids;
+        return AdminHttp.ids(selection.ids(), selection.filter() != null);
     }
 
-    /** {@code ids}, their count and the first {@value #AUDIT_IDS} of them put into the audit line. */
+    /** {@code ids}, their count and the first {@value AdminHttp#AUDIT_IDS} of them put into the audit line. */
     private static List<Long> audited(List<Long> ids) {
-        var detail = new LinkedHashMap<String, String>();
-        detail.put("count", String.valueOf(ids.size()));
-        detail.put("ids", ids.stream().limit(AUDIT_IDS).map(String::valueOf)
-                .collect(Collectors.joining(", ", "[", ids.size() > AUDIT_IDS ? ", ...]" : "]")));
-        Context.current().set(OutboxAdminInterceptor.DETAIL, detail);
+        Context.current().set(OutboxAdminInterceptor.DETAIL, AdminHttp.idsDetail(ids));
         return ids;
     }
 
     /** {@link #filter(Filter)}, its fields put into the audit line. */
     private static DeadLetterFilter audited(Filter f) {
         var filter = filter(f);
-        var detail = new LinkedHashMap<String, String>();
-        detail.put("topic", filter.topic());
-        detail.put("key", f.key());
-        detail.put("error", filter.errorContains());
-        detail.put("failedFrom", filter.failedFrom() == null ? null : filter.failedFrom().toString());
-        detail.put("failedTo", filter.failedTo() == null ? null : filter.failedTo().toString());
-        detail.put("status", f.status() == null ? null : f.status().toString());
-        Context.current().set(OutboxAdminInterceptor.DETAIL, detail);
+        Context.current().set(OutboxAdminInterceptor.DETAIL,
+                AdminHttp.filterDetail(filter, f.key(), f.status() == null ? null : f.status().toString()));
         return filter;
     }
 

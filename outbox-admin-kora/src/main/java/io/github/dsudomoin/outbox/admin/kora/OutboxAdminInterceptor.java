@@ -2,14 +2,13 @@ package io.github.dsudomoin.outbox.admin.kora;
 
 import io.github.dsudomoin.outbox.InternalApi;
 import io.github.dsudomoin.outbox.admin.kora.model.ModelError;
+import io.github.dsudomoin.outbox.internal.AdminHttp;
 import jakarta.annotation.Nullable;
 import java.net.URI;
 import java.net.URISyntaxException;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.StringJoiner;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
@@ -87,7 +86,7 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
 
     @Override
     public CompletionStage<HttpServerResponse> intercept(Context context, HttpServerRequest request, InterceptChain chain) {
-        var call = request.method() + " \"" + printable(request.path()) + "\"";
+        var call = request.method() + " \"" + AdminHttp.printable(request.path()) + "\"";
         if (!request.method().equals("GET") && !request.method().equals("HEAD") && sentByAnotherSite(request)) {
             log.info("outbox admin {} denied: 403", call);
             return CompletableFuture.completedFuture(error(context, 403, null, "cross-site request refused"));
@@ -108,11 +107,11 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
             return CompletableFuture.completedFuture(error(context, 500, null, "authorization failed"));
         }
         if (decision instanceof OutboxAdminAuthorizer.Allow allow) {
-            var caller = call + " by \"" + printable(allow.identity()) + "\"";
+            var caller = call + " by \"" + AdminHttp.printable(allow.identity()) + "\"";
             return process(context, request, chain)
                     .exceptionallyCompose(e -> CompletableFuture.completedFuture(failure(context, caller, e)))
-                    .whenComplete((response, e) -> log.info("outbox admin {}{}: {}", caller, detail(context),
-                            response != null ? response.code() : status(e)));
+                    .whenComplete((response, e) -> log.info("outbox admin {}{}: {}", caller,
+                            AdminHttp.detail(context.get(DETAIL)), response != null ? response.code() : status(e)));
         }
         var deny = (OutboxAdminAuthorizer.Deny) decision;
         log.info("outbox admin {} denied: {}", call, deny.status());
@@ -157,20 +156,15 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
 
     /**
      * Whether {@code origin} names the host and port of {@code host} (a {@code Host} header, its port omitted for the
-     * default of the browser's scheme). Not the scheme: behind a proxy ending TLS the page had https, the server http.
+     * default of the browser's scheme).
      */
     private static boolean sameHost(String origin, @Nullable String host) {
         if (host == null) {
             return false;
         }
         try {
-            var page = new URI(origin);
             var server = new URI("http://" + host);
-            var defaultPort = "https".equalsIgnoreCase(page.getScheme()) ? 443 : 80;
-            return page.getHost() != null && server.getHost() != null
-                    && page.getHost().toLowerCase(Locale.ROOT).equals(server.getHost().toLowerCase(Locale.ROOT))
-                    && (page.getPort() < 0 ? defaultPort : page.getPort())
-                    == (server.getPort() < 0 ? defaultPort : server.getPort());
+            return server.getHost() != null && AdminHttp.sameHost(origin, server.getHost(), server.getPort());
         } catch (URISyntaxException e) {
             return false;
         }
@@ -205,46 +199,6 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
         } catch (Exception e) {
             return CompletableFuture.failedFuture(e);
         }
-    }
-
-    /** {@code  with <name> "<value>", ...} of {@link #DETAIL}, each value {@link #printable}; empty without it. */
-    private static String detail(Context context) {
-        var detail = context.get(DETAIL);
-        if (detail == null) {
-            return "";
-        }
-        var out = new StringJoiner(", ", " with ", "");
-        detail.forEach((name, value) -> out.add(name + " "
-                + (value == null ? "null" : "\"" + printable(value) + "\"")));
-        return out.toString();
-    }
-
-    /**
-     * {@code text} with quotes and backslashes escaped and each control or format character (a bidi override reorders
-     * a line on screen) as its Java escape, so it stays one quoted token on one log line.
-     */
-    private static String printable(String text) {
-        var out = new StringBuilder(text.length());
-        text.codePoints().forEach(ch -> {
-            switch (ch) {
-                case '"' -> out.append("\\\"");
-                case '\\' -> out.append("\\\\");
-                case '\n' -> out.append("\\n");
-                case '\r' -> out.append("\\r");
-                case '\t' -> out.append("\\t");
-                default -> {
-                    if (Character.isISOControl(ch) || ch == '\u2028' || ch == '\u2029'
-                            || Character.getType(ch) == Character.FORMAT) {
-                        for (var unit : Character.toChars(ch)) { // beyond U+FFFF, Java's escape is two of them
-                            out.append(String.format("\\u%04x", (int) unit));
-                        }
-                    } else {
-                        out.appendCodePoint(ch);
-                    }
-                }
-            }
-        });
-        return out.toString();
     }
 
     private static Throwable unwrap(Throwable error) {
