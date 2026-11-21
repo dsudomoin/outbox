@@ -5562,7 +5562,7 @@ retry и dead пусты. Прогон на более ранней версии
   этого репозитория: `OutboxRuntime.schema()`, `maintenance()` и `deadLetterPass()`, конструктор `OutboxRelay`,
   `TypedOutboxTopicHandler.contractVersion()` и `calledThrough`, конструкторы `OutboxIncompatibleContractException` и
   `OutboxMissingRouteException`,
-  `KafkaOutboxSender.warnIfLongerThan`, фабрики `OutboxModule` и `OutboxAdminHttpModule` для внутренних типов,
+  `KafkaOutboxSender.warnAboveBatchTimeout` и `warnAboveDeadLetterTimeout`, фабрики `OutboxModule` и `OutboxAdminHttpModule` для внутренних типов,
   классы `OutboxAdminDelegate`, `OutboxAdminInterceptor`, `KoraRecordScope` и `OutboxTracing`;
 - пакетов `io.github.dsudomoin.outbox.admin.kora.api`, `io.github.dsudomoin.outbox.admin.kora.model`,
   `io.github.dsudomoin.outbox.admin.spring.api` и `io.github.dsudomoin.outbox.admin.spring.model`, сгенерированных из

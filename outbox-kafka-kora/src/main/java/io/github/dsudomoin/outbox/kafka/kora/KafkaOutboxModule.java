@@ -68,9 +68,7 @@ public interface KafkaOutboxModule {
             @Nullable OutboxConfig outbox) {
         var sender = new KafkaOutboxSender(config);
         if (outbox != null) {
-            sender.warnIfLongerThan("outbox.relay.batchTimeout", outbox.relay().batchTimeout(), "The relay cancels a"
-                    + " call at batchTimeout; the sender ends it just before, keeps acked records as delivered and"
-                    + " retries the rest, so slow sends end as retries");
+            sender.warnAboveBatchTimeout(outbox);
         }
         return new LifecycleWrapper<>(sender, s -> {}, KafkaOutboxSender::close);
     }
@@ -92,10 +90,7 @@ public interface KafkaOutboxModule {
             @Nullable OutboxConfig outbox) {
         var hook = new KafkaDeadLetterHandler(sender, config.deadLetterTopic());
         if (hook.active() && outbox != null) {
-            sender.warnIfLongerThan("outbox.deadLetters.timeout", outbox.deadLetters().timeout(), "The dead-letter"
-                    + " pass abandons a hook call at its timeout and hands its letters again after a backoff, so slow"
-                    + " dead-letter sends end as retries and letters acked meanwhile repeat on their dead-letter"
-                    + " topic");
+            sender.warnAboveDeadLetterTimeout(outbox);
         }
         return hook;
     }

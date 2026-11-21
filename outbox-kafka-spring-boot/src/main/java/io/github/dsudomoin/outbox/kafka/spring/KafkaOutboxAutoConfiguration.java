@@ -58,9 +58,7 @@ public final class KafkaOutboxAutoConfiguration {
             }
         };
         var sender = new KafkaOutboxSender(config);
-        outbox.ifAvailable(o -> sender.warnIfLongerThan("outbox.relay.batchTimeout", o.relay().batchTimeout(),
-            "The relay cancels a call at batchTimeout; the sender ends it just before, keeps acked records as delivered"
-                + " and retries the rest, so slow sends end as retries"));
+        outbox.ifAvailable(sender::warnAboveBatchTimeout);
         return sender;
     }
 
@@ -94,10 +92,7 @@ public final class KafkaOutboxAutoConfiguration {
     KafkaDeadLetterHandler kafkaDeadLetterHandler(KafkaOutboxProperties properties, KafkaOutboxSender sender,
             ObjectProvider<OutboxConfig> outbox) {
         var hook = new KafkaDeadLetterHandler(sender, properties.deadLetterTopic());
-        outbox.ifAvailable(o -> sender.warnIfLongerThan("outbox.deadLetters.timeout", o.deadLetters().timeout(),
-            "The dead-letter pass abandons a hook call at its timeout and hands its letters again after a backoff, so"
-                + " slow dead-letter sends end as retries and letters acked meanwhile repeat on their dead-letter"
-                + " topic"));
+        outbox.ifAvailable(sender::warnAboveDeadLetterTimeout);
         return hook;
     }
 }

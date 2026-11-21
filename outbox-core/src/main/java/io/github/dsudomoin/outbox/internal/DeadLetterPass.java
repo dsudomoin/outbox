@@ -579,11 +579,7 @@ public final class DeadLetterPass {
             if (suppressed < 0) {
                 return;
             }
-            if (error == null) {
-                log.warn("{} ({} more since the previous report not logged)", what, suppressed);
-            } else {
-                log.warn("{} ({} more since the previous report not logged)", what, suppressed, error);
-            }
+            log.warn("{} ({} more since the previous report not logged)", what, suppressed, error); // null: no trace
         }
     }
 }
