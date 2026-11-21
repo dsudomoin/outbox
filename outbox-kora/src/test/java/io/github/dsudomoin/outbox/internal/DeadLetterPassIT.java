@@ -22,6 +22,7 @@ import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.ByteReads;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
+import io.github.dsudomoin.outbox.testing.Intercepting;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
@@ -55,10 +56,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
-import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
 class DeadLetterPassIT {
@@ -429,12 +428,9 @@ class DeadLetterPassIT {
         await(Duration.ofSeconds(5), () -> pass.runOnce() == 1);
 
         assertThat(calls).as("decided once").hasValue(1);
-        try (var c = TestDb.connect(); var st = c.createStatement();
-                var rs = st.executeQuery("select message_id from " + names.base() + " order by id")) {
-            var order = new ArrayList<UUID>();
-            while (rs.next()) {
-                order.add(rs.getObject(1, UUID.class));
-            }
+        try (var c = TestDb.connect()) {
+            var order = TestSql.queryStrings(c, "select message_id::text from " + names.base() + " order by id")
+                    .stream().map(UUID::fromString).toList();
             assertThat(order).as("behind the send").containsExactly(live, messageId);
         }
         var handler = new RecordingHandler();
@@ -535,42 +531,15 @@ class DeadLetterPassIT {
         execute("update " + names.dead() + " set status = 'scheduled'");
         var failed = new AtomicBoolean();
         var rollbackFailed = new AtomicBoolean();
-        var factory = new JdbcConnectionFactory() {
-            @Override
-            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
-                return db.withConnection(callback);
+        var factory = TestDb.opening(db, () -> Intercepting.connection(db.newConnection(), (c, method, args) -> {
+            if (method.getName().equals("prepareStatement") && args[0].toString()
+                    .startsWith("delete from " + names.dead()) && failed.compareAndSet(false, true)) {
+                throw new SQLException("injected: its insert is done, its delete is not");
             }
-
-            @Override
-            public Connection currentConnection() {
-                return db.currentConnection();
+            if (method.getName().equals("rollback") && rollbackFailed.compareAndSet(false, true)) {
+                throw new SQLException("injected: the rollback did not happen");
             }
-
-            @Override
-            public Connection newConnection() {
-                var c = db.newConnection();
-                return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
-                        new Class<?>[] {Connection.class}, (proxy, method, args) -> {
-                            if (method.getName().equals("prepareStatement") && args[0].toString()
-                                    .startsWith("delete from " + names.dead()) && failed.compareAndSet(false, true)) {
-                                throw new SQLException("injected: its insert is done, its delete is not");
-                            }
-                            if (method.getName().equals("rollback") && rollbackFailed.compareAndSet(false, true)) {
-                                throw new SQLException("injected: the rollback did not happen");
-                            }
-                            try {
-                                return method.invoke(c, args);
-                            } catch (InvocationTargetException e) {
-                                throw e.getCause();
-                            }
-                        });
-            }
-
-            @Override
-            public DataBaseTelemetry telemetry() {
-                return db.telemetry();
-            }
-        };
+        }));
         var pass = new DeadLetterPass(new KoraOutboxTransactions(factory), names, config, null,
                 new OutboxMetrics(registry));
         passes.add(pass);
@@ -645,40 +614,12 @@ class DeadLetterPassIT {
         letter("t", "k", "p", List.of());
         execute("update " + names.dead() + " set status = 'scheduled'");
         var seen = new CopyOnWriteArrayList<String>(); // the idle bound in effect as each key-lock try is sent
-        var factory = new JdbcConnectionFactory() {
-            @Override
-            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
-                return db.withConnection(callback);
+        var factory = TestDb.opening(db, () -> Intercepting.connection(db.newConnection(), (c, method, args) -> {
+            if (method.getName().equals("prepareStatement")
+                    && args[0].toString().contains("pg_try_advisory_xact_lock")) {
+                seen.add(TestSql.queryString(c, "select current_setting('idle_in_transaction_session_timeout')"));
             }
-
-            @Override
-            public Connection currentConnection() {
-                return db.currentConnection();
-            }
-
-            @Override
-            public Connection newConnection() {
-                var c = db.newConnection();
-                return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
-                        new Class<?>[] {Connection.class}, (proxy, method, args) -> {
-                            if (method.getName().equals("prepareStatement")
-                                    && args[0].toString().contains("pg_try_advisory_xact_lock")) {
-                                seen.add(TestSql.queryString(c,
-                                        "select current_setting('idle_in_transaction_session_timeout')"));
-                            }
-                            try {
-                                return method.invoke(c, args);
-                            } catch (InvocationTargetException e) {
-                                throw e.getCause();
-                            }
-                        });
-            }
-
-            @Override
-            public DataBaseTelemetry telemetry() {
-                return db.telemetry();
-            }
-        };
+        }));
         var pass = new DeadLetterPass(new KoraOutboxTransactions(factory), names, config, null,
                 new OutboxMetrics(registry));
         passes.add(pass);
@@ -1037,43 +978,25 @@ class DeadLetterPassIT {
     private JdbcConnectionFactory commitFailsOnce(Runnable afterRollback) {
         var failed = new AtomicBoolean();
         var ran = new AtomicBoolean();
-        return new JdbcConnectionFactory() {
-            @Override
-            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
-                return db.withConnection(callback);
-            }
-
-            @Override
-            public Connection currentConnection() {
-                return db.currentConnection();
-            }
-
-            @Override
-            public Connection newConnection() {
-                var c = db.newConnection();
-                return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
-                        new Class<?>[] {Connection.class}, (proxy, method, args) -> {
-                            if (method.getName().equals("commit") && failed.compareAndSet(false, true)) {
-                                throw new SQLException("injected commit failure");
-                            }
-                            Object result;
-                            try {
-                                result = method.invoke(c, args);
-                            } catch (InvocationTargetException e) {
-                                throw e.getCause();
-                            }
-                            if (method.getName().equals("rollback") && failed.get() && ran.compareAndSet(false, true)) {
-                                afterRollback.run();
-                            }
-                            return result;
-                        });
-            }
-
-            @Override
-            public DataBaseTelemetry telemetry() {
-                return db.telemetry();
-            }
-        };
+        return TestDb.opening(db, () -> {
+            var c = db.newConnection();
+            return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
+                    new Class<?>[] {Connection.class}, (proxy, method, args) -> {
+                        if (method.getName().equals("commit") && failed.compareAndSet(false, true)) {
+                            throw new SQLException("injected commit failure");
+                        }
+                        Object result;
+                        try {
+                            result = method.invoke(c, args);
+                        } catch (InvocationTargetException e) {
+                            throw e.getCause();
+                        }
+                        if (method.getName().equals("rollback") && failed.get() && ran.compareAndSet(false, true)) {
+                            afterRollback.run();
+                        }
+                        return result;
+                    });
+        });
     }
 
     /** Until {@code thread} parks, waiting for the pass's run lock. */
@@ -1126,15 +1049,10 @@ class DeadLetterPassIT {
 
     /** Each row's message id, topic, key and the md5 of its payload and headers, by id. */
     private static List<String> contents(String table) throws SQLException {
-        var all = new ArrayList<String>();
-        try (var c = TestDb.connect(); var st = c.createStatement(); var rs = st.executeQuery("select concat_ws(' ',"
-                + " message_id, topic, encode(key, 'hex'), md5(payload), md5(headers)) from " + table
-                + " order by id")) {
-            while (rs.next()) {
-                all.add(rs.getString(1));
-            }
+        try (var c = TestDb.connect()) {
+            return TestSql.queryStrings(c, "select concat_ws(' ', message_id, topic, encode(key, 'hex'), md5(payload),"
+                    + " md5(headers)) from " + table + " order by id");
         }
-        return all;
     }
 
     private static List<DeadLetterDecision> all(List<DeadLetter> letters, DeadLetterDecision decision) {

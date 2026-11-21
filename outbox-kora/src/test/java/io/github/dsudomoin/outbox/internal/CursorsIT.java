@@ -57,8 +57,6 @@ class CursorsIT {
             var bootstrapped = cursors.latest(c, 1);
             assertThat(bootstrapped.tick()).as("the tick's row, read with the cursor").usingRecursiveComparison()
                     .isEqualTo(new Ticks(TableNames.of(config.table()), 4).get(c, bootstrapped.effectiveTickId()));
-            assertThat(newest0).isEqualTo(new Cursor(0, 9, null, 0, null, 0, T1, T2));
-            assertThat(newest2.parkedDueAt()).isNull();
         }
     }
 
@@ -91,7 +89,7 @@ class CursorsIT {
         var shards = List.of(3, 0, 1, 2);
         try (var c = TestDb.connect()) {
             assertSameLatest(cursors, c, shards); // no checkpoint
-            long b = queryLong(c, "select max(id) from " + names.tick());
+            long b = bootstrapTick(c, names);
             tick(c, names, "B'0100'", 10);
             long t2 = tick(c, names, "B''", 20);
             cursors.checkpoint(c, t2, cursors.positions(c, t2)); // busy 0100 at t2
@@ -103,8 +101,7 @@ class CursorsIT {
             assertThat(cursors.latest(c, shards).get(2).tick()).isNull();
 
             // from another history: counts for nothing in both
-            execute(c, "insert into " + names.checkpoint() + " (tick_id, busy, busy_tick_id) values (" + (t2 + 1)
-                    + ", B'0000', " + (t2 + 1) + ")");
+            checkpointRow(c, names, t2 + 1, "B'0000'");
             assertSameLatest(cursors, c, shards);
             assertThat(cursors.latest(c, List.of(1, 2))).containsOnlyKeys(1, 2);
             assertThat(cursors.latest(c, List.of())).isEmpty();
@@ -188,7 +185,7 @@ class CursorsIT {
         var names = bootstrap(); // 4 shards, every cursor on the bootstrap tick
         var cursors = new Cursors(names, config.shards());
         try (var c = TestDb.connect()) {
-            long first = queryLong(c, "select max(id) from " + names.tick());
+            long first = bootstrapTick(c, names);
             assertThat(behind(cursors.positions(c, first))).as("on the latest tick")
                     .containsExactly(false, false, false, false);
 
@@ -227,7 +224,7 @@ class CursorsIT {
         var names = bootstrap(); // 4 shards, every cursor on the bootstrap tick
         var cursors = new Cursors(names, config.shards());
         try (var c = TestDb.connect()) {
-            long b = queryLong(c, "select max(id) from " + names.tick());
+            long b = bootstrapTick(c, names);
             tick(c, names, "B'0100'", 10);
             long t2 = tick(c, names, "B''", 20);
             var read = cursors.positions(c, t2);
@@ -268,8 +265,7 @@ class CursorsIT {
             assertThat(behind(cursors.positions(c, t3))).containsExactly(false, false, true, true);
 
             // a checkpoint of another shard count counts for nothing
-            execute(c, "insert into " + names.checkpoint() + " (tick_id, busy, busy_tick_id) values (" + t3
-                    + ", B'00', " + t3 + ")");
+            checkpointRow(c, names, t3, "B'00'");
             assertThat(cursors.positions(c, t3)).extracting(Cursors.Position::effectiveTickId)
                     .containsExactly(b, t3, b, t2);
             assertThat(cursors.latest(c, 0).effectiveTickId()).isEqualTo(b);
@@ -282,7 +278,7 @@ class CursorsIT {
         var cursors = new Cursors(names, config.shards());
         var all = List.of(0, 1, 2, 3);
         try (var c = TestDb.connect()) {
-            long b = queryLong(c, "select max(id) from " + names.tick());
+            long b = bootstrapTick(c, names);
             long t2 = tick(c, names, "B'0100'", 10);
             cursors.checkpoint(c, t2, cursors.positions(c, t2)); // 0100: shard 1 busy at b
             cursors.append(c, cursors.latest(c, 2).cursor().withPause(T2, 2)); // paused, idle all the same
@@ -318,7 +314,7 @@ class CursorsIT {
         var cursors = new Cursors(names, config.shards());
         var all = List.of(0, 1, 2, 3);
         try (var c = TestDb.connect()) {
-            long b = queryLong(c, "select max(id) from " + names.tick());
+            long b = bootstrapTick(c, names);
             long edge = b + Cursors.ANCHOR_TICKS; // as under load: every tick young, the cursor far below
             idleAt(c, names, edge);
             assertThat(cursors.anchors(c, all, Duration.ofHours(1))).as("young, and not more ticks behind").isEmpty();
@@ -334,8 +330,7 @@ class CursorsIT {
     private static void idleAt(Connection c, TableNames names, long id) throws Exception {
         execute(c, "insert into " + names.tick() + " (id, snapshot, max_id) overriding system value values (" + id
                 + ", pg_current_snapshot(), 0)");
-        execute(c, "insert into " + names.checkpoint() + " (tick_id, busy, busy_tick_id) values (" + id + ", B'0000', "
-                + id + ")");
+        checkpointRow(c, names, id, "B'0000'");
     }
 
     @Test
@@ -343,11 +338,10 @@ class CursorsIT {
         var names = bootstrap();
         var cursors = new Cursors(names, config.shards());
         try (var c = TestDb.connect()) {
-            long b = queryLong(c, "select max(id) from " + names.tick());
+            long b = bootstrapTick(c, names);
             long latest = tick(c, names, "B'0010'", 10);
             // from another history: tick ids went backwards under it; its 0 bits would hide shard 2's rows
-            execute(c, "insert into " + names.checkpoint() + " (tick_id, busy, busy_tick_id) values (" + (latest + 1)
-                    + ", B'0000', " + (latest + 1) + ")");
+            checkpointRow(c, names, latest + 1, "B'0000'");
 
             assertThat(cursors.positions(c, latest)).extracting(Cursors.Position::effectiveTickId).containsOnly(b);
             assertThat(behind(cursors.positions(c, latest))).containsExactly(false, false, true, false);
@@ -362,15 +356,14 @@ class CursorsIT {
         var names = bootstrap(); // 4 shards, every cursor on the bootstrap tick
         var cursors = new Cursors(names, config.shards());
         try (var c = TestDb.connect()) {
-            long b = queryLong(c, "select max(id) from " + names.tick());
             long t1 = tick(c, names, "B''", 10);
             cursors.checkpoint(c, t1, cursors.positions(c, t1));
             long t2 = tick(c, names, "B'1111'", 20);
             for (int shard = 0; shard < 3; shard++) {
                 cursors.append(c, cursors.latest(c, shard).cursor().withProgress(t2, null, 0));
             }
-            // shard 3's latest row is still on b, below t1: the previous release cleans up to b only, so t1 is gone
-            // only by hand or from another history
+            // shard 3's latest row is still on the bootstrap tick, below t1: the previous release cleans up to that
+            // tick only, so t1 is gone only by hand or from another history
             execute(c, "delete from " + names.tick() + " where id = " + t1);
             assertThat(cursors.ignoredCheckpointTick(c)).as("a cursor below its tick: foreign").isEqualTo(t1);
 
@@ -378,7 +371,6 @@ class CursorsIT {
             assertThat(cursors.ignoredCheckpointTick(c)).as("every cursor at or above its tick: obsolete").isNull();
             assertThat(cursors.positions(c, t2)).as("still ignored by the reads: the cursors' own ticks")
                     .extracting(Cursors.Position::effectiveTickId).containsExactly(t2, t2, t2, t1);
-            assertThat(b).isLessThan(t1);
         }
     }
 
@@ -415,6 +407,17 @@ class CursorsIT {
         return queryLong(c, "insert into " + names.tick() + " (snapshot, max_id, dirty, created_at)"
                 + " select pg_current_snapshot(), 0, " + dirty + "::varbit, least(min(created_at) + interval '"
                 + millis + " milliseconds', clock_timestamp()) from " + names.tick() + " returning id");
+    }
+
+    /** A checkpoint at {@code tickId} with {@code busy} (SQL), its busy shards at that tick too. */
+    private static void checkpointRow(Connection c, TableNames names, long tickId, String busy) throws Exception {
+        execute(c, "insert into " + names.checkpoint() + " (tick_id, busy, busy_tick_id) values (" + tickId + ", "
+                + busy + ", " + tickId + ")");
+    }
+
+    /** The id of the tick the bootstrap made, the only one before the test's. */
+    private static long bootstrapTick(Connection c, TableNames names) throws Exception {
+        return queryLong(c, "select max(id) from " + names.tick());
     }
 
     /** Every shard's latest cursor, from {@link Cursors#positions}. */

@@ -22,11 +22,16 @@ public final class Intercepting {
         return (DataSource) Proxy.newProxyInstance(DataSource.class.getClassLoader(), new Class<?>[] {DataSource.class},
                 (ds, method, args) -> {
                     var result = invoke(source, method, args);
-                    return !method.getName().equals("getConnection") ? result : Proxy.newProxyInstance(
-                            Connection.class.getClassLoader(), new Class<?>[] {Connection.class}, (c, call, values) -> {
-                                before.run((Connection) result, call, values);
-                                return invoke(result, call, values);
-                            });
+                    return !method.getName().equals("getConnection") ? result : connection((Connection) result, before);
+                });
+    }
+
+    /** {@code real} with {@code before} run ahead of each of its calls. */
+    public static Connection connection(Connection real, ConnectionCall before) {
+        return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[] {Connection.class},
+                (c, call, values) -> {
+                    before.run(real, call, values);
+                    return invoke(real, call, values);
                 });
     }
 

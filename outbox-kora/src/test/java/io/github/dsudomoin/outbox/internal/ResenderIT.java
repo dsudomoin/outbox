@@ -7,12 +7,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
+import io.github.dsudomoin.outbox.testing.Intercepting;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
@@ -201,23 +200,17 @@ class ResenderIT {
 
     /** {@code c}, counting the insert and key-lock statements prepared on it. */
     private static Connection counting(Connection c, AtomicInteger inserts, AtomicInteger locks) {
-        return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[] {Connection.class},
-                (proxy, method, args) -> {
-                    if (method.getName().equals("prepareStatement") && args[0] instanceof String sql) {
-                        // the key locks go with the first insert, ahead of it in one statement batch
-                        if (sql.contains("pg_advisory_xact_lock")) {
-                            locks.incrementAndGet();
-                        }
-                        if (sql.startsWith("insert ") || sql.contains("; insert ")) {
-                            inserts.incrementAndGet();
-                        }
-                    }
-                    try {
-                        return method.invoke(c, args);
-                    } catch (InvocationTargetException e) {
-                        throw e.getCause();
-                    }
-                });
+        return Intercepting.connection(c, (real, method, args) -> {
+            if (method.getName().equals("prepareStatement") && args[0] instanceof String sql) {
+                // the key locks go with the first insert, ahead of it in one statement batch
+                if (sql.contains("pg_advisory_xact_lock")) {
+                    locks.incrementAndGet();
+                }
+                if (sql.startsWith("insert ") || sql.contains("; insert ")) {
+                    inserts.incrementAndGet();
+                }
+            }
+        });
     }
 
     private List<Stored> stored() throws SQLException {

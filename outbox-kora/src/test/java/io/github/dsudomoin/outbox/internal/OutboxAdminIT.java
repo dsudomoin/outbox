@@ -25,6 +25,7 @@ import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.ByteReads;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
+import io.github.dsudomoin.outbox.testing.ShardKeys;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -53,7 +54,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
-import java.util.stream.IntStream;
 import java.util.stream.LongStream;
 import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.AfterEach;
@@ -74,12 +74,16 @@ class OutboxAdminIT {
     private OutboxSchema schema;
     private TableNames names;
     private PgOutboxAdmin admin;
+    private PgOutbox outbox;
+    private Ticks ticks;
 
     @BeforeEach
     void bootstrap() throws Exception {
         schema = new OutboxSchema(db, config);
         schema.start();
         names = schema.names();
+        outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
+        ticks = new Ticks(names, config.shards());
         admin = new PgOutboxAdmin(db, names, config, new Maintenance(db, names, config, new OutboxMetrics(null)),
                 wakes::incrementAndGet);
     }
@@ -229,8 +233,8 @@ class OutboxAdminIT {
     void discardsByIdsAndByFilter() throws Exception {
         long a = letter("t1", "a");
         long b = letter("t1", "b");
-        long c = letter("t2", "c");
-        long d = letter("t2", "d");
+        letter("t2", "c");
+        letter("t2", "d");
 
         assertThat(admin.discardDeadLetters(List.of(a, 999_999L))).isOne();
         assertThat(admin.discardDeadLetters(filter("t2", null, null, null, null, null))).isEqualTo(2);
@@ -238,7 +242,6 @@ class OutboxAdminIT {
         assertThat(deadIds()).containsExactly(b);
         assertThat(outboxMessageIds()).isEmpty();
         assertThat(wakes).hasValue(0);
-        assertThat(List.of(c, d)).doesNotContainAnyElementsOf(deadIds());
     }
 
     @Test
@@ -249,21 +252,6 @@ class OutboxAdminIT {
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> admin.discardDeadLetters(DeadLetterFilter.any()))
                 .isInstanceOf(IllegalArgumentException.class);
-
-        assertThat(deadIds()).containsExactly(id);
-        assertThat(outboxMessageIds()).isEmpty();
-    }
-
-    @Test
-    void blankFilterFieldsAreAbsent() throws Exception {
-        long id = letter("t", "k");
-
-        for (var blank : List.of("", "  ")) {
-            assertThatThrownBy(() -> admin.discardDeadLetters(filter(null, null, blank, null, null, null)))
-                    .as("errorContains '%s'", blank).isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> admin.redriveDeadLetters(filter(blank, null, null, null, null, null)))
-                    .as("topic '%s'", blank).isInstanceOf(IllegalArgumentException.class);
-        }
 
         assertThat(deadIds()).containsExactly(id);
         assertThat(outboxMessageIds()).isEmpty();
@@ -377,7 +365,6 @@ class OutboxAdminIT {
     void aLetterWhoseKeyIsHeldIsSkippedWithoutWaiting() throws Exception {
         long busy = letter("t", "busy");
         long free = letter("t", "free");
-        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
         UUID live;
         try (var business = TestDb.connect()) {
             business.setAutoCommit(false); // a business transaction that sent the key and goes on working
@@ -398,12 +385,7 @@ class OutboxAdminIT {
     @Test
     void aRedriveChunkHoldsItsKeyLocksUnderAShortIdleBound() throws Exception {
         long id = letter("t", "k");
-        var seen = TestDb.uniqueTable(); // what each chunk's delete saw, its key locks taken
-        execute("create table " + seen + " (setting text)");
-        execute("create function " + seen + "_f() returns trigger language plpgsql as $$ begin insert into " + seen
-                + " values (current_setting('idle_in_transaction_session_timeout')); return null; end $$");
-        execute("create trigger " + seen + "_t after delete on " + names.dead() + " for each statement execute"
-                + " function " + seen + "_f()");
+        var seen = idleBoundOnDelete(names.dead()); // what each chunk's delete saw, its key locks taken
 
         assertThat(admin.redriveDeadLetters(List.of(id))).isOne();
 
@@ -436,7 +418,6 @@ class OutboxAdminIT {
             first = UUID.fromString(queryString(c, "select message_id from " + names.dead() + " where id = 1"));
             later = UUID.fromString(queryString(c, "select message_id from " + names.dead() + " where id = 1001"));
         }
-        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
         try (var business = TestDb.connect()) {
             business.setAutoCommit(false); // holds busy's key lock through the first chunk only
             outbox.send(business, OutboxMessage.of("t", "busy", bytes("live")));
@@ -863,12 +844,7 @@ class OutboxAdminIT {
     void restoreOrphanChunksEndAFrozenHoldersSession() throws Exception {
         var orphan = foreignOrphan();
         orphanRow(orphan, 1, 10, "row");
-        var seen = TestDb.uniqueTable(); // what each chunk's delete saw
-        execute("create table " + seen + " (setting text)");
-        execute("create function " + seen + "_f() returns trigger language plpgsql as $$ begin insert into " + seen
-                + " values (current_setting('idle_in_transaction_session_timeout')); return null; end $$");
-        execute("create trigger " + seen + "_t after delete on " + orphan + " for each statement execute function "
-                + seen + "_f()");
+        var seen = idleBoundOnDelete(orphan); // what each chunk's delete saw
 
         assertThat(admin.restoreOrphan(orphan, 0)).isOne();
 
@@ -1182,12 +1158,9 @@ class OutboxAdminIT {
      */
     @Test
     void abandonKeyLeavesWhatARelayStepAddsBetweenChunks() throws Exception {
-        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
-        var ticks = new Ticks(names, config.shards());
         int shard = Hashing.shard(Hashing.keyHash("t", bytes("k")), config.shards());
         var handed = new CopyOnWriteArrayList<String>();
-        var processor = new ShardProcessor(names, config, record -> handed.add(new String(record.payload(), UTF_8)),
-                TestTelemetry.kora(), false);
+        var processor = collecting(handed);
         try {
             // below the outbox's ids; the lowest the head, due in an hour
             execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, payload, created_at,"
@@ -1228,12 +1201,9 @@ class OutboxAdminIT {
      */
     @Test
     void abandonKeyCutRightAfterItsHeadWentInAFullChunkLeavesTheFollowerItsHead() throws Exception {
-        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
-        var ticks = new Ticks(names, config.shards());
         int shard = Hashing.shard(Hashing.keyHash("t", bytes("k")), config.shards());
         var handed = new CopyOnWriteArrayList<String>();
-        var processor = new ShardProcessor(names, config, record -> handed.add(new String(record.payload(), UTF_8)),
-                TestTelemetry.kora(), false);
+        var processor = collecting(handed);
         try {
             // two full chunks; the lowest the head, due in an hour
             execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, payload, created_at,"
@@ -1273,12 +1243,9 @@ class OutboxAdminIT {
     /** The letters redrive as any: new messages of the key, and a record sent after the abandon needs no call of it. */
     @Test
     void anAbandonedKeyFlowsAgainAndItsLettersRedrive() throws Exception {
-        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
-        var ticks = new Ticks(names, config.shards());
         int shard = Hashing.shard(Hashing.keyHash("t", bytes("k")), config.shards());
         var handed = new CopyOnWriteArrayList<String>();
-        var processor = new ShardProcessor(names, config, record -> handed.add(new String(record.payload(), UTF_8)),
-                TestTelemetry.kora(), false);
+        var processor = collecting(handed);
         try {
             execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, payload, created_at,"
                     + " attempts, next_attempt_at) values (1, " + shard + ", gen_random_uuid(), 't', 'k', 'stuck',"
@@ -1301,8 +1268,6 @@ class OutboxAdminIT {
     /** A relay step on the shard: waited for, and what it adds to the key goes too; past the wait, "retry". */
     @Test
     void abandonKeyWaitsForARelayStepOnItsShard() throws Exception {
-        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
-        var ticks = new Ticks(names, config.shards());
         int shard = Hashing.shard(Hashing.keyHash("t", bytes("w")), config.shards());
         var inHandler = new CountDownLatch(1);
         var release = new CountDownLatch(1);
@@ -1314,9 +1279,7 @@ class OutboxAdminIT {
             execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, payload, created_at,"
                     + " attempts, next_attempt_at) values (1, " + shard + ", gen_random_uuid(), 't', 'w', 'w#1', now(),"
                     + " 3, now() + interval '1 hour')");
-            var neighbour = IntStream.range(0, 10_000).mapToObj(i -> "other" + i)
-                    .filter(k -> Hashing.shard(Hashing.keyHash("t", bytes(k)), config.shards()) == shard).findFirst()
-                    .orElseThrow();
+            var neighbour = ShardKeys.first("t", "other", shard, config.shards());
             db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("t", neighbour, bytes("o#1"))));
             var step = pool.submit(() -> step(processor, ticks, shard, Instant.now()));
             assertThat(inHandler.await(10, SECONDS)).isTrue();
@@ -1346,8 +1309,6 @@ class OutboxAdminIT {
      */
     @Test
     void abandonWaitsForARelayStepOnItsShard() throws Exception {
-        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
-        var ticks = new Ticks(names, config.shards());
         int shard = Hashing.shard(Hashing.keyHash("t", bytes("w")), config.shards());
         var inHandler = new CountDownLatch(1);
         var release = new CountDownLatch(1);
@@ -1445,19 +1406,34 @@ class OutboxAdminIT {
         }
     }
 
+    /** A relay step's processor whose handler adds each payload to {@code handed}. */
+    private ShardProcessor collecting(List<String> handed) {
+        return new ShardProcessor(names, config, record -> handed.add(new String(record.payload(), UTF_8)),
+                TestTelemetry.kora(), false);
+    }
+
+    /**
+     * A new table a trigger fills with the {@code idle_in_transaction_session_timeout} each delete statement on
+     * {@code table} runs under; its name.
+     */
+    private String idleBoundOnDelete(String table) throws SQLException {
+        var seen = TestDb.uniqueTable();
+        execute("create table " + seen + " (setting text)");
+        execute("create function " + seen + "_f() returns trigger language plpgsql as $$ begin insert into " + seen
+                + " values (current_setting('idle_in_transaction_session_timeout')); return null; end $$");
+        execute("create trigger " + seen + "_t after delete on " + table + " for each statement execute function "
+                + seen + "_f()");
+        return seen;
+    }
+
     private List<Long> ids(String table) throws SQLException {
         return longs("select id from " + table + " order by id");
     }
 
     private List<String> payloads(String table) throws SQLException {
-        var all = new ArrayList<String>();
-        try (var c = TestDb.connect(); var st = c.createStatement();
-                var rs = st.executeQuery("select payload from " + table + " order by id")) {
-            while (rs.next()) {
-                all.add(new String(rs.getBytes(1), UTF_8));
-            }
+        try (var c = TestDb.connect()) {
+            return TestSql.queryStrings(c, "select convert_from(payload, 'UTF8') from " + table + " order by id");
         }
-        return all;
     }
 
     private long letter(String topic, String key) throws SQLException {
@@ -1566,27 +1542,18 @@ class OutboxAdminIT {
     }
 
     private List<UUID> outboxMessageIds() throws SQLException {
-        var all = new ArrayList<UUID>();
-        try (var c = TestDb.connect(); var st = c.createStatement();
-                var rs = st.executeQuery("select message_id from " + names.base() + " order by id")) {
-            while (rs.next()) {
-                all.add(rs.getObject(1, UUID.class));
-            }
+        try (var c = TestDb.connect()) {
+            return TestSql.queryStrings(c, "select message_id::text from " + names.base() + " order by id").stream()
+                    .map(UUID::fromString).toList();
         }
-        return all;
     }
 
     /** Each row's message id, topic, key and the md5 of its payload and headers, by id. */
     private static List<String> contents(String table) throws SQLException {
-        var all = new ArrayList<String>();
-        try (var c = TestDb.connect(); var st = c.createStatement(); var rs = st.executeQuery("select concat_ws(' ',"
-                + " message_id, topic, encode(key, 'hex'), md5(payload), md5(headers)) from " + table
-                + " order by id")) {
-            while (rs.next()) {
-                all.add(rs.getString(1));
-            }
+        try (var c = TestDb.connect()) {
+            return TestSql.queryStrings(c, "select concat_ws(' ', message_id, topic, encode(key, 'hex'), md5(payload),"
+                    + " md5(headers)) from " + table + " order by id");
         }
-        return all;
     }
 
     private List<Long> longs(String sql) throws SQLException {

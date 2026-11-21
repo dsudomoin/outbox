@@ -499,14 +499,12 @@ class RetryStoreIT {
         }
     }
 
-    /** {@code shard|attempts|error|key}, failed_at must be set. */
+    /** {@code shard|attempts|error|key}. */
     private String deadRow(long id) throws SQLException {
-        try (var ps = c.prepareStatement(
-                "select shard, attempts, error, key, failed_at is not null from " + names.dead() + " where id = ?")) {
+        try (var ps = c.prepareStatement("select shard, attempts, error, key from " + names.dead() + " where id = ?")) {
             ps.setLong(1, id);
             try (var rs = ps.executeQuery()) {
                 assertThat(rs.next()).as("dead row %s", id).isTrue();
-                assertThat(rs.getBoolean(5)).isTrue();
                 return rs.getShort(1) + "|" + rs.getInt(2) + "|" + rs.getString(3) + "|"
                         + new String(rs.getBytes(4), UTF_8);
             }

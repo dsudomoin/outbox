@@ -10,6 +10,7 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.internal.BatchReader.BatchRow;
 import io.github.dsudomoin.outbox.internal.BatchReader.ShardRead;
+import io.github.dsudomoin.outbox.testing.Intercepting;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -35,6 +36,7 @@ import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
+import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction1;
 
 class BatchReaderIT {
 
@@ -239,16 +241,14 @@ class BatchReaderIT {
         assertThat(messageIds(read(0, p, c, 0, 100, true))).containsExactly(aId, cId);
 
         try (var conn = TestDb.connect()) {
-            long ranges = queryLong(conn, "select count(*) from pg_inherits where inhparent = to_regclass('"
-                    + names.base() + "') and inhrelid::regclass::text like '" + names.partitionPrefix() + "%'");
-            assertThat(ranges).isGreaterThanOrEqualTo(4);
+            assertThat(ranges(conn)).isGreaterThanOrEqualTo(4);
             for (boolean checkBlocked : List.of(true, false)) {
-                var used = partitionsInPlan(conn, checkBlocked, p, c);
+                var used = partitionsInPlan(conn, checkBlocked, p, c, false);
                 assertThat(used).as("partitions in the plan (checkBlocked = %s)", checkBlocked).hasSizeBetween(1, 2);
                 assertThat(partitionsInPlan(conn, checkBlocked, p, c, true)).as("budgeted").isEqualTo(used);
             }
             var empty = new PgSnapshot(p.xmin(), p.xmax(), new long[0]);
-            assertThat(partitionsInPlan(conn, true, empty, c)).as("empty xip prunes its branch").hasSize(1);
+            assertThat(partitionsInPlan(conn, true, empty, c, false)).as("empty xip prunes its branch").hasSize(1);
         }
         var q = tick();
         var noneInFlight = new PgSnapshot(q.xmin(), q.xmax(), new long[0]); // binds an empty xip array
@@ -482,9 +482,7 @@ class BatchReaderIT {
         assertThat(readMany(reads, 1000).rows().values().stream().mapToInt(List::size).sum()).isPositive();
 
         try (var conn = TestDb.connect()) {
-            long ranges = queryLong(conn, "select count(*) from pg_inherits where inhparent = to_regclass('"
-                    + names.base() + "') and inhrelid::regclass::text like '" + names.partitionPrefix() + "%'");
-            assertThat(ranges).isGreaterThanOrEqualTo(20);
+            assertThat(ranges(conn)).isGreaterThanOrEqualTo(20);
             var covering = new TreeSet<String>(); // the ranges of [p.xmax, c.xmax) and of p's xip
             for (long x : List.of(p.xmax(), c.xmax() - 1, p.xip()[0], p.xip()[p.xip().length - 1])) {
                 covering.add(names.unqualified(names.partitionPrefix()) + x / 1000 * 1000);
@@ -492,7 +490,8 @@ class BatchReaderIT {
             assertThat(partitionsScanned(conn, reads)).as("partitions scanned").isNotEmpty().isSubsetOf(covering);
             // and at plan time: the statement does not even open the others (run-time pruning opens and locks them
             // all, past the fast-path locks with a few dozen partitions)
-            assertThat(partitionsPlanned(conn, reads)).as("partitions planned").isNotEmpty().isSubsetOf(covering);
+            assertThat(partitionsPlanned(conn, reads, false)).as("partitions planned").isNotEmpty()
+                    .isSubsetOf(covering);
             assertThat(partitionsPlanned(conn, reads, true)).as("partitions planned, budgeted").isNotEmpty()
                     .isSubsetOf(covering);
         }
@@ -530,20 +529,14 @@ class BatchReaderIT {
     }
 
     /**
-     * EXPLAIN of the statement {@code read} runs with the parameters bound exactly as {@code read} binds them, under a
-     * custom plan. Inlined literals would hide a parameter cast the planner cannot fold (a varchar bound to
-     * {@code ?::xid8[]} goes through the stable {@code array_in} and prunes nothing).
+     * EXPLAIN of the statement {@code read} runs, plain or budgeted, with the parameters bound exactly as {@code read}
+     * binds them, under a custom plan. Inlined literals would hide a parameter cast the planner cannot fold (a varchar
+     * bound to {@code ?::xid8[]} goes through the stable {@code array_in} and prunes nothing).
      */
-    private TreeSet<String> partitionsInPlan(Connection c, boolean checkBlocked, PgSnapshot prev, PgSnapshot target)
-            throws SQLException {
-        return partitionsInPlan(c, checkBlocked, prev, target, false);
-    }
-
-    /** {@link #partitionsInPlan(Connection, boolean, PgSnapshot, PgSnapshot)} of the plain or the budgeted statement. */
     private TreeSet<String> partitionsInPlan(Connection c, boolean checkBlocked, PgSnapshot prev, PgSnapshot target,
             boolean budgeted) throws SQLException {
         var used = new TreeSet<String>();
-        var partition = Pattern.compile(Pattern.quote(names.unqualified(names.partitionPrefix())) + "\\d+");
+        var partition = partitionName();
         execute(c, "set plan_cache_mode = force_custom_plan");
         try (var ps = c.prepareStatement("explain " + (budgeted ? reader.budgetedSql(checkBlocked)
                 : reader.sql(checkBlocked)))) {
@@ -605,7 +598,7 @@ class BatchReaderIT {
      */
     private TreeSet<String> partitionsScanned(Connection c, List<ShardRead> reads) throws SQLException {
         var used = new TreeSet<String>();
-        var partition = Pattern.compile(Pattern.quote(names.unqualified(names.partitionPrefix())) + "\\d+");
+        var partition = partitionName();
         c.setAutoCommit(false);
         try (var ps = c.prepareStatement("explain (analyze) " + reader.manySql(true))) {
             reader.bindMany(ps, reads, 1000);
@@ -624,16 +617,14 @@ class BatchReaderIT {
         return used;
     }
 
-    /** {@code EXPLAIN} (no analyze) of the statement {@code readMany} runs, bound as it binds it: the partitions planned. */
-    private TreeSet<String> partitionsPlanned(Connection c, List<ShardRead> reads) throws SQLException {
-        return partitionsPlanned(c, reads, false);
-    }
-
-    /** {@link #partitionsPlanned(Connection, List)} of the plain statement, or of the budgeted one. */
+    /**
+     * {@code EXPLAIN} (no analyze) of the statement {@code readMany} runs, plain or budgeted, bound as it binds it: the
+     * partitions planned.
+     */
     private TreeSet<String> partitionsPlanned(Connection c, List<ShardRead> reads, boolean budgeted)
             throws SQLException {
         var planned = new TreeSet<String>();
-        var partition = Pattern.compile(Pattern.quote(names.unqualified(names.partitionPrefix())) + "\\d+");
+        var partition = partitionName();
         c.setAutoCommit(false);
         try (var ps = c.prepareStatement("explain " + (budgeted ? reader.budgetedManySql(true) : reader.manySql(true)))) {
             execute(c, "set local plan_cache_mode = force_custom_plan");
@@ -656,40 +647,44 @@ class BatchReaderIT {
         return planned;
     }
 
-    /** {@code c}, adding the SQL of each statement it prepares to {@code prepared}. */
-    private static Connection recording(Connection c, List<String> prepared) {
-        return (Connection) java.lang.reflect.Proxy.newProxyInstance(Connection.class.getClassLoader(),
-                new Class<?>[] {Connection.class}, (proxy, method, args) -> {
-                    if (method.getName().equals("prepareStatement")) {
-                        prepared.add((String) args[0]);
-                    }
-                    try {
-                        return method.invoke(c, args);
-                    } catch (java.lang.reflect.InvocationTargetException e) {
-                        throw e.getCause();
-                    }
-                });
+    /** A range partition's unqualified name. */
+    private Pattern partitionName() {
+        return Pattern.compile(Pattern.quote(names.unqualified(names.partitionPrefix())) + "\\d+");
     }
 
-    private BatchReader.Batch readMany(List<ShardRead> reads, int totalLimit) throws SQLException {
+    /** The outbox's range partitions. */
+    private long ranges(Connection c) throws SQLException {
+        return queryLong(c, "select count(*) from pg_inherits where inhparent = to_regclass('"
+                + names.base() + "') and inhrelid::regclass::text like '" + names.partitionPrefix() + "%'");
+    }
+
+    /** {@code c}, adding the SQL of each statement it prepares to {@code prepared}. */
+    private static Connection recording(Connection c, List<String> prepared) {
+        return Intercepting.connection(c, (real, method, args) -> {
+            if (method.getName().equals("prepareStatement")) {
+                prepared.add((String) args[0]);
+            }
+        });
+    }
+
+    /** {@code call} in a transaction of its own under a custom plan, committed. */
+    private static <T> T customPlan(SqlFunction1<Connection, T> call) throws SQLException {
         try (var c = TestDb.connect()) {
             c.setAutoCommit(false);
             execute(c, "set local plan_cache_mode = force_custom_plan");
-            var batch = reader.readMany(c, reads, totalLimit);
+            var result = call.apply(c);
             c.commit();
-            return batch;
+            return result;
         }
+    }
+
+    private BatchReader.Batch readMany(List<ShardRead> reads, int totalLimit) throws SQLException {
+        return customPlan(c -> reader.readMany(c, reads, totalLimit));
     }
 
     private BatchReader.Batch readMany(List<ShardRead> reads, int totalLimit, long totalBytes, boolean oneAtLeast)
             throws SQLException {
-        try (var c = TestDb.connect()) {
-            c.setAutoCommit(false);
-            execute(c, "set local plan_cache_mode = force_custom_plan");
-            var batch = reader.readMany(c, reads, totalLimit, totalBytes, oneAtLeast);
-            c.commit();
-            return batch;
-        }
+        return customPlan(c -> reader.readMany(c, reads, totalLimit, totalBytes, oneAtLeast));
     }
 
     /** {@code n} committed transactions of 1 to 10 rows each over 100 keys. */
@@ -743,13 +738,7 @@ class BatchReaderIT {
 
     private List<BatchRow> read(int shard, PgSnapshot prev, PgSnapshot target, long lastId, int limit,
             boolean checkBlocked) throws SQLException {
-        try (var c = TestDb.connect()) {
-            c.setAutoCommit(false);
-            execute(c, "set local plan_cache_mode = force_custom_plan");
-            var rows = reader.read(c, shard, prev, target, lastId, limit, checkBlocked);
-            c.commit();
-            return rows;
-        }
+        return customPlan(c -> reader.read(c, shard, prev, target, lastId, limit, checkBlocked));
     }
 
     private void insertRetry(Connection c, long id, int shard, String topic, @Nullable byte[] key)
