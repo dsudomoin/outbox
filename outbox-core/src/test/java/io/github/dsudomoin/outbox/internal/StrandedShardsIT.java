@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.internal;
 
+import static io.github.dsudomoin.outbox.testing.Intercepting.intercepting;
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -14,11 +15,9 @@ import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.testing.ByteReads;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
+import io.github.dsudomoin.outbox.testing.ShardKeys;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Proxy;
-import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -61,7 +60,7 @@ class StrandedShardsIT {
     private final Set<UUID> delivered = ConcurrentHashMap.newKeySet();
     private final Map<UUID, Integer> times = new ConcurrentHashMap<>();
     private final Queue<UUID> order = new ConcurrentLinkedQueue<>();
-    private final Map<Integer, Integer> nextKey = new HashMap<>();
+    private final ShardKeys keys = new ShardKeys(TOPIC, SHARDS);
     private OutboxRuntime writer;
     private OutboxRuntime relay;
     private TableNames names;
@@ -208,7 +207,7 @@ class StrandedShardsIT {
         var inDead = send(keyOfShard(1));
         var plain = send(keyOfShard(1));
         try (var c = direct.getConnection()) {
-            var columns = "id, shard, message_id, topic, key, payload, headers, created_at";
+            var columns = RetryStore.COLUMNS;
             execute(c, "insert into " + names.retry() + " (" + columns + ", attempts, next_attempt_at, last_error)"
                     + " select " + columns + ", 1, now() + interval '1 hour', 'down' from " + names.base()
                     + " where message_id = '" + inRetry + "'");
@@ -272,26 +271,11 @@ class StrandedShardsIT {
     void aCallRepeatedAfterAFailureMidwayKeepsAKeysOrder() throws Exception {
         leaveTheOtherShardsOnANewerTick();
         var key = keyOfShard(1);
-        var sent = new ArrayList<UUID>();
-        for (int i = 0; i < 3; i++) { // over a chunk of 1 000 rows, one key
-            var messages = new ArrayList<OutboxMessage>();
-            for (int j = 0; j < 500; j++) {
-                messages.add(OutboxMessage.of(TOPIC, key, "p".getBytes(UTF_8)));
-            }
-            sent.addAll(transactions.inTx(c -> writer.outbox().sendAll(messages)));
-        }
+        var sent = sendOfKey(key, 1500); // over a chunk of 1 000 rows, one key
         makeATick();
         deleteTheirTick();
         startRelay();
-        var once = new AtomicBoolean();
-        admin().afterChunk = c -> {
-            if (once.compareAndSet(false, true)) {
-                throw new SQLException("connection lost after the first chunk", "08006");
-            }
-        };
-        assertThatThrownBy(() -> admin().recoverStrandedShards());
-        admin().afterChunk = null;
-        makeATick();
+        failAfterTheFirstChunk();
 
         assertThat(admin().recoverStrandedShards()).as("only the rows the first call left").isEqualTo(500);
         try (var c = direct.getConnection()) {
@@ -313,20 +297,13 @@ class StrandedShardsIT {
     void aCursorRowWithNewDueTimesAloneKeepsTheTickACallRepeatedAfterAFailureGoesTo() throws Exception {
         leaveTheOtherShardsOnANewerTick();
         var key = keyOfShard(1);
-        var sent = new ArrayList<UUID>();
-        for (int i = 0; i < 3; i++) { // over a chunk of 1 000 rows, one key
-            var messages = new ArrayList<OutboxMessage>();
-            for (int j = 0; j < 500; j++) {
-                messages.add(OutboxMessage.of(TOPIC, key, "p".getBytes(UTF_8)));
-            }
-            sent.addAll(transactions.inTx(c -> writer.outbox().sendAll(messages)));
-        }
+        var sent = sendOfKey(key, 1500); // over a chunk of 1 000 rows, one key
         // two keys in the retry table, after the key's rows: the first call's chunk is of that key alone
         var abandoned = keyOfShard(1);
         var waiting = keyOfShard(1);
         var inRetry = List.of(send(abandoned), send(waiting));
         try (var c = direct.getConnection()) {
-            var columns = "id, shard, message_id, topic, key, payload, headers, created_at";
+            var columns = RetryStore.COLUMNS;
             for (var id : inRetry) {
                 execute(c, "insert into " + names.retry() + " (" + columns + ", attempts, next_attempt_at,"
                         + " last_error) select " + columns + ", 1, now() + interval '1 hour', 'down' from "
@@ -336,15 +313,7 @@ class StrandedShardsIT {
         makeATick();
         deleteTheirTick();
         startRelay();
-        var once = new AtomicBoolean();
-        admin().afterChunk = c -> {
-            if (once.compareAndSet(false, true)) {
-                throw new SQLException("connection lost after the first chunk", "08006");
-            }
-        };
-        assertThatThrownBy(() -> admin().recoverStrandedShards());
-        admin().afterChunk = null;
-        makeATick();
+        failAfterTheFirstChunk();
         var seq = "select max(seq) from " + names.cursor() + " where shard = 1";
         long before;
         try (var c = direct.getConnection()) {
@@ -580,10 +549,7 @@ class StrandedShardsIT {
 
     @Test
     void aFailedStepCostsAHealthyShardNothingOnARepeatableReadSession() throws Exception {
-        var repeatableRead = new PGSimpleDataSource();
-        repeatableRead.setUrl(TestDataSources.jdbcUrl());
-        repeatableRead.setUser(TestDataSources.user());
-        repeatableRead.setPassword(TestDataSources.password());
+        var repeatableRead = (PGSimpleDataSource) TestDataSources.newDataSource();
         repeatableRead.setOptions("-c default_transaction_isolation=repeatable\\ read");
         // a tick attempt, and with it a read of the latest tick, between any two steps of a pass
         config.idlePollInterval(Duration.ofMillis(1)).minTickInterval(Duration.ZERO);
@@ -611,24 +577,39 @@ class StrandedShardsIT {
                 .noneMatch(failure -> failure.contains("before any query"));
     }
 
+    /** {@code rows} messages of {@code key}, 500 per transaction, in send order. */
+    private List<UUID> sendOfKey(String key, int rows) {
+        var sent = new ArrayList<UUID>();
+        for (int i = 0; i < rows; i += 500) {
+            var messages = new ArrayList<OutboxMessage>();
+            for (int j = i; j < Math.min(rows, i + 500); j++) {
+                messages.add(OutboxMessage.of(TOPIC, key, "p".getBytes(UTF_8)));
+            }
+            sent.addAll(transactions.inTx(c -> writer.outbox().sendAll(messages)));
+        }
+        return sent;
+    }
+
+    /** A recovery that loses its connection after its first chunk, then a new tick. */
+    private void failAfterTheFirstChunk() throws Exception {
+        var once = new AtomicBoolean();
+        admin().afterChunk = c -> {
+            if (once.compareAndSet(false, true)) {
+                throw new SQLException("connection lost after the first chunk", "08006");
+            }
+        };
+        assertThatThrownBy(() -> admin().recoverStrandedShards());
+        admin().afterChunk = null;
+        makeATick();
+    }
+
     /** {@code source} whose connections add to {@code atClose}, closed by a worker: whether they are in autocommit. */
     private static DataSource recordingAutocommit(DataSource source, Queue<Boolean> atClose) {
-        return (DataSource) Proxy.newProxyInstance(DataSource.class.getClassLoader(), new Class<?>[] {DataSource.class},
-                (ds, method, args) -> {
-                    var result = method.invoke(source, args);
-                    return !method.getName().equals("getConnection") ? result : Proxy.newProxyInstance(
-                            Connection.class.getClassLoader(), new Class<?>[] {Connection.class}, (c, call, values) -> {
-                                if (call.getName().equals("close")
-                                        && Thread.currentThread().getName().startsWith("outbox-relay-")) {
-                                    atClose.add(((Connection) result).getAutoCommit());
-                                }
-                                try {
-                                    return call.invoke(result, values);
-                                } catch (InvocationTargetException e) {
-                                    throw e.getCause();
-                                }
-                            });
-                });
+        return intercepting(source, (real, call, args) -> {
+            if (call.getName().equals("close") && Thread.currentThread().getName().startsWith("outbox-relay-")) {
+                atClose.add(real.getAutoCommit());
+            }
+        });
     }
 
     @Test
@@ -649,7 +630,6 @@ class StrandedShardsIT {
             assertThat(ticks.make(c, Duration.ZERO)).isTrue();
         }
         assertThat(maintenance.runOnce()).isTrue();
-        long oldTick = cursors(cursors, midBatch).tickId();
         var checkpoint = "select tick_id from " + names.checkpoint();
         long before;
         long target;
@@ -657,7 +637,9 @@ class StrandedShardsIT {
         var idleRow = sendMany(idle, 1);
         var read = sendMany(midBatch, 1); // delivered before, in the batch in progress
         var unread = sendMany(midBatch, 1);
+        long oldTick;
         try (var c = direct.getConnection()) {
+            oldTick = cursors.latest(c, midBatch).cursor().tickId();
             before = queryLong(c, checkpoint);
             execute(c, "delete from " + names.tick() + " where id = " + gone);
             assertThat(ticks.make(c, Duration.ZERO)).isTrue();
@@ -701,12 +683,6 @@ class StrandedShardsIT {
         assertThat(times.get(idleRow.get(0))).isEqualTo(1);
         assertThat(times.get(unread.get(0))).isEqualTo(1);
         assertThat(delivered).as("past its last id").doesNotContainAnyElementsOf(read);
-    }
-
-    private Cursor cursors(Cursors cursors, int shard) throws Exception {
-        try (var c = direct.getConnection()) {
-            return cursors.latest(c, shard).cursor();
-        }
     }
 
     @Test
@@ -904,15 +880,8 @@ class StrandedShardsIT {
     }
 
     /** A new key hashing to {@code shard}. */
-    private synchronized String keyOfShard(int shard) {
-        int i = nextKey.getOrDefault(shard, 0);
-        while (true) {
-            var key = shard + "-" + i++;
-            if (Hashing.shard(Hashing.keyHash(TOPIC, key.getBytes(UTF_8)), SHARDS) == shard) {
-                nextKey.put(shard, i);
-                return key;
-            }
-        }
+    private String keyOfShard(int shard) {
+        return keys.next(shard);
     }
 
     /** A send on a thread of its own, its transaction open until {@link #commit()}. */

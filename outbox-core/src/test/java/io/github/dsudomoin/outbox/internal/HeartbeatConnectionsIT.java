@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.internal;
 
+import static io.github.dsudomoin.outbox.testing.Intercepting.intercepting;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -160,21 +161,38 @@ class HeartbeatConnectionsIT {
      */
     @Test
     void aDatabaseThatCannotWriteLeavesTheLaneOn() throws Exception {
+        assertThat(readOnlyUntil(true, "outbox heartbeat of instance")).doesNotContain("cannot write");
+    }
+
+    /**
+     * A lane that could not write is off for a few maintenance intervals only, then measured again: a standby promoted,
+     * a role fixed, and the beats are back on it without a restart.
+     */
+    @Test
+    void aLaneOffForCannotWriteIsMeasuredAgain() throws Exception {
+        assertThat(readOnlyUntil(false, "cannot write")).containsOnlyOnce("cannot write");
+    }
+
+    /**
+     * A runtime whose lane (and, with {@code appToo}, the application's connections) is read-only until
+     * {@code logged} shows, then writes again; waits for the lane to serve two more connections and returns the log.
+     */
+    private static String readOnlyUntil(boolean appToo, String logged) throws Exception {
         var config = new TestOutboxConfig().relayEnabled(false).maintenanceInterval(Duration.ofMillis(100));
         var readOnly = new AtomicBoolean();
-        var app = readOnlyWhile(readOnly);
+        var source = readOnlyWhile(readOnly);
         var own = new AtomicInteger();
         ConnectionSource lane = () -> {
             own.incrementAndGet();
-            return app.getConnection();
+            return source.getConnection();
         };
         try (var log = new CapturedStderr()) {
-            var runtime = OutboxRuntime.builder(config, new JdbcTransactions(app), record -> {})
+            var runtime = OutboxRuntime.builder(config, new JdbcTransactions(appToo ? source : MAIN), record -> {})
                     .heartbeatConnections(lane).build();
             runtime.start();
             try {
                 readOnly.set(true);
-                awaitLog(log, "outbox heartbeat of instance");
+                awaitLog(log, logged);
                 readOnly.set(false);
                 int at = own.get();
                 long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
@@ -185,42 +203,7 @@ class HeartbeatConnectionsIT {
             } finally {
                 runtime.close();
             }
-            assertThat(log.text()).doesNotContain("cannot write");
-        }
-    }
-
-    /**
-     * A lane that could not write is off for a few maintenance intervals only, then measured again: a standby promoted,
-     * a role fixed, and the beats are back on it without a restart.
-     */
-    @Test
-    void aLaneOffForCannotWriteIsMeasuredAgain() throws Exception {
-        var config = new TestOutboxConfig().relayEnabled(false).maintenanceInterval(Duration.ofMillis(100));
-        var readOnly = new AtomicBoolean();
-        var lanes = readOnlyWhile(readOnly);
-        var own = new AtomicInteger();
-        ConnectionSource lane = () -> {
-            own.incrementAndGet();
-            return lanes.getConnection();
-        };
-        try (var log = new CapturedStderr()) {
-            var runtime = OutboxRuntime.builder(config, new JdbcTransactions(MAIN), record -> {})
-                    .heartbeatConnections(lane).build();
-            runtime.start();
-            try {
-                readOnly.set(true);
-                awaitLog(log, "cannot write");
-                readOnly.set(false);
-                int at = own.get();
-                long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-                while (own.get() < at + 2) {
-                    assertThat(System.nanoTime()).as("the lane is measured again and serves").isLessThan(deadline);
-                    Thread.sleep(20);
-                }
-            } finally {
-                runtime.close();
-            }
-            assertThat(log.text()).containsOnlyOnce("cannot write");
+            return log.text();
         }
     }
 
@@ -456,22 +439,13 @@ class HeartbeatConnectionsIT {
      */
     private static ConnectionSource creating(String table) {
         var created = new AtomicBoolean();
-        return () -> {
-            var real = MAIN.getConnection();
-            return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
-                    new Class<?>[] {Connection.class}, (proxy, method, args) -> {
-                        if (method.getName().equals("prepareStatement") && created.compareAndSet(false, true)) {
-                            try (var c = MAIN.getConnection()) {
-                                TestSql.execute(c, "create table " + table + " (id int)");
-                            }
-                        }
-                        try {
-                            return method.invoke(real, args);
-                        } catch (InvocationTargetException e) {
-                            throw e.getCause();
-                        }
-                    });
-        };
+        return intercepting(MAIN, (real, call, args) -> {
+            if (call.getName().equals("prepareStatement") && created.compareAndSet(false, true)) {
+                try (var c = MAIN.getConnection()) {
+                    TestSql.execute(c, "create table " + table + " (id int)");
+                }
+            }
+        })::getConnection;
     }
 
     private static DataSource other() {
@@ -520,10 +494,10 @@ class HeartbeatConnectionsIT {
 
     @Test
     void aSourceInAnotherTimeZoneIsCheckedAtStartAsOneDatabase() throws Exception {
-        var lane = new Recorded("lane", inZone("Europe/Moscow"), n -> false);
+        var lane = new Recorded("lane", TestDataSources.inZone("Europe/Moscow"), n -> false);
         var connections = new HeartbeatConnections(new Recorded("app", MAIN, n -> false), lane);
 
-        try (var reference = inZone("UTC").getConnection()) {
+        try (var reference = TestDataSources.inZone("UTC").getConnection()) {
             connections.start(reference, TABLE);
         }
         try (var c = connections.newConnection()) {
@@ -533,8 +507,8 @@ class HeartbeatConnectionsIT {
 
     @Test
     void aSourceInAnotherTimeZoneFirstReachedByABeatIsOneDatabase() throws Exception {
-        var lane = new Recorded("lane", inZone("Europe/Moscow"), n -> n == 1);
-        var app = new Recorded("app", inZone("UTC"), n -> false);
+        var lane = new Recorded("lane", TestDataSources.inZone("Europe/Moscow"), n -> n == 1);
+        var app = new Recorded("app", TestDataSources.inZone("UTC"), n -> false);
         var connections = new HeartbeatConnections(app, lane);
         try (var reference = MAIN.getConnection()) {
             connections.start(reference, TABLE);
@@ -553,40 +527,14 @@ class HeartbeatConnectionsIT {
 
     @Test
     void anotherDatabaseIsRefusedAcrossTimeZonesToo() throws Exception {
-        var other = new PGSimpleDataSource() {
-            @Override
-            public Connection getConnection() throws SQLException {
-                var c = super.getConnection();
-                TestSql.execute(c, "set time zone 'Europe/Moscow'");
-                return c;
-            }
-        };
-        other.setUrl(TestDataSources.jdbcUrl());
-        other.setUser(TestDataSources.user());
-        other.setPassword(TestDataSources.password());
+        var other = TestDataSources.inZone("Europe/Moscow");
         other.setDatabaseName(OTHER);
         var connections = new HeartbeatConnections(new Recorded("app", MAIN, n -> false),
                 new Recorded("lane", other, n -> false));
 
-        try (var reference = inZone("UTC").getConnection()) {
+        try (var reference = TestDataSources.inZone("UTC").getConnection()) {
             assertThatThrownBy(() -> connections.start(reference, TABLE)).isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("reaches another database than the application's");
         }
-    }
-
-    /** Connections of the main database whose sessions run in {@code zone}. */
-    private static DataSource inZone(String zone) {
-        var ds = new PGSimpleDataSource() {
-            @Override
-            public Connection getConnection() throws SQLException {
-                var c = super.getConnection();
-                TestSql.execute(c, "set time zone '" + zone + "'");
-                return c;
-            }
-        };
-        ds.setUrl(TestDataSources.jdbcUrl());
-        ds.setUser(TestDataSources.user());
-        ds.setPassword(TestDataSources.password());
-        return ds;
     }
 }

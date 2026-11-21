@@ -15,7 +15,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 
 /**
@@ -25,6 +25,12 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
  * as the outbox: {@code partition by range (xid)}, ranges below H = 3000 and the tail {@code [H, MAXVALUE)}.
  */
 class PgFactsIT {
+
+    /** Every supported major. */
+    static List<String> majors() {
+        return List.of("postgres:14-alpine", "postgres:15-alpine", "postgres:16-alpine", "postgres:17-alpine",
+                "postgres:18-alpine");
+    }
 
     private static final Map<String, PostgreSQLContainer> SERVERS = new ConcurrentHashMap<>();
     private static final String H = "3000";
@@ -39,8 +45,7 @@ class PgFactsIT {
      * partition and nothing can be attached there: the window cannot be closed early.
      */
     @ParameterizedTest
-    @ValueSource(strings = {"postgres:14-alpine", "postgres:15-alpine", "postgres:16-alpine", "postgres:17-alpine",
-            "postgres:18-alpine"})
+    @MethodSource("majors")
     void aPendingTailRefusesInsertsAndOverlappingAttaches(String image) throws Exception {
         try (var holder = connect(image); var c = connect(image)) {
             outbox(c, false);
@@ -78,8 +83,7 @@ class PgFactsIT {
      * skips the scan of a tail holding rows refuses the rows above its bound from the moment it is validated.
      */
     @ParameterizedTest
-    @ValueSource(strings = {"postgres:14-alpine", "postgres:15-alpine", "postgres:16-alpine", "postgres:17-alpine",
-            "postgres:18-alpine"})
+    @MethodSource("majors")
     void onlyAValidatedCheckSparesTheAttachItsScan(String image) throws Exception {
         try (var c = connect(image)) {
             for (var check : List.of("none", "not valid", "validated")) {
@@ -117,8 +121,7 @@ class PgFactsIT {
 
     /** With a default partition, no partition of the parent can be detached concurrently, the default's included. */
     @ParameterizedTest
-    @ValueSource(strings = {"postgres:14-alpine", "postgres:15-alpine", "postgres:16-alpine", "postgres:17-alpine",
-            "postgres:18-alpine"})
+    @MethodSource("majors")
     void aDefaultPartitionForbidsConcurrentDetaches(String image) throws Exception {
         try (var c = connect(image)) {
             outbox(c, true);
@@ -136,8 +139,7 @@ class PgFactsIT {
      * {@code lock_timeout} is shorter than the wait fails: the swap only ever takes the lock without waiting.
      */
     @ParameterizedTest
-    @ValueSource(strings = {"postgres:14-alpine", "postgres:15-alpine", "postgres:16-alpine", "postgres:17-alpine",
-            "postgres:18-alpine"})
+    @MethodSource("majors")
     void aQueuedExclusiveRequestFailsAWriterWithAShortLockTimeout(String image) throws Exception {
         try (var holder = connect(image); var swap = connect(image); var writer = connect(image)) {
             outbox(holder, false);

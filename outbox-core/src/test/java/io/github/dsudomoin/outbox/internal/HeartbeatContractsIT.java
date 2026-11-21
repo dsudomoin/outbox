@@ -20,6 +20,10 @@ import org.junit.jupiter.api.Test;
 
 class HeartbeatContractsIT {
 
+    /** A message of contract version 2 of topic orders. */
+    private static final OutboxMessage V2 = OutboxMessage.of("orders", "k", "p".getBytes(UTF_8))
+            .withHeader(Contracts.HEADER, "2".getBytes(US_ASCII));
+
     /** A beat that gives up on the cursor table's lock, which a recovery holds, has read the reports before. */
     @Test
     void aBeatThatGivesUpOnItsLockStillReadsTheReports() throws Exception {
@@ -30,8 +34,6 @@ class HeartbeatContractsIT {
             schema.start();
             var names = schema.names();
             var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, OutboxTelemetry.NONE);
-            var v2 = OutboxMessage.of("orders", "k", "p".getBytes(UTF_8))
-                    .withHeader(Contracts.HEADER, "2".getBytes(US_ASCII));
             var row = "select relay || ' ' || contracts::text || ' ' || routes::text from " + names.instance()
                     + " where instance_id = ?";
             String bootstrapped = db.inTx(c -> TestSql.queryString(c, row, schema.instanceId()));
@@ -43,7 +45,7 @@ class HeartbeatContractsIT {
             try (var other = ds.getConnection()) {
                 TestSql.execute(other, "insert into " + names.instance() + " (instance_id, shards, relay, contracts,"
                         + " expires_at) values ('old/1/00000000', 4, true, '{\"orders\": 1}', now() + interval '1h')");
-                db.inTx(c -> outbox.send(v2)); // the bootstrap's read is from before that row
+                db.inTx(c -> outbox.send(V2)); // the bootstrap's read is from before that row
                 other.setAutoCommit(false);
                 TestSql.execute(other, "lock table " + names.cursor() + " in access exclusive mode");
                 try (var err = new CapturedStderr()) {
@@ -53,7 +55,7 @@ class HeartbeatContractsIT {
                 other.rollback();
             }
 
-            assertThatThrownBy(() -> db.inTx(c -> outbox.send(v2)))
+            assertThatThrownBy(() -> db.inTx(c -> outbox.send(V2)))
                     .isInstanceOfSatisfying(OutboxIncompatibleContractException.class,
                             e -> assertThat(e.incompatibleInstances()).containsExactly("old/1/00000000"));
         }
@@ -117,14 +119,12 @@ class HeartbeatContractsIT {
             schema.start();
             var names = schema.names();
             var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, OutboxTelemetry.NONE);
-            var v2 = OutboxMessage.of("orders", "k", "p".getBytes(UTF_8))
-                    .withHeader(Contracts.HEADER, "2".getBytes(US_ASCII));
             expire(db, names);
 
             new Heartbeat(db, schema, schema.config(), false).beat();
 
             assertThat(live(db, names, schema.instanceId())).as("renewed").isEqualTo("true");
-            assertThatThrownBy(() -> db.inTx(c -> outbox.send(v2)))
+            assertThatThrownBy(() -> db.inTx(c -> outbox.send(V2)))
                     .isInstanceOfSatisfying(OutboxIncompatibleContractException.class,
                             e -> assertThat(e.incompatibleInstances()).containsExactly(schema.instanceId()));
         }
@@ -139,14 +139,12 @@ class HeartbeatContractsIT {
             schema.start();
             var names = schema.names();
             var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, OutboxTelemetry.NONE);
-            var v2 = OutboxMessage.of("orders", "k", "p".getBytes(UTF_8))
-                    .withHeader(Contracts.HEADER, "2".getBytes(US_ASCII));
             expire(db, names);
 
             new Heartbeat(db, schema, schema.config(), false).beat();
 
             assertThat(live(db, names, schema.instanceId())).as("renewed").isEqualTo("true");
-            db.inTx(c -> outbox.send(v2)); // no live relay instance
+            db.inTx(c -> outbox.send(V2)); // no live relay instance
             assertThat(schema.contractGuard().snapshot().reports).isEmpty();
         }
     }
@@ -174,13 +172,12 @@ class HeartbeatContractsIT {
         try (var schema = new OutboxSchema(db, db, new TestOutboxConfig(), Map.of(), Set.of())) {
             schema.start();
             var names = schema.names();
-            var live = "select (expires_at > now())::text from " + names.instance() + " where instance_id = ?";
             db.inTx(c -> {
                 TestSql.execute(c, "update " + names.instance() + " set last_seen = now() - interval '2 minutes',"
                         + " expires_at = now() - interval '1 minute'");
                 return null;
             });
-            String expired = db.inTx(c -> TestSql.queryString(c, live, schema.instanceId()));
+            String expired = live(db, names, schema.instanceId());
             assertThat(expired).isEqualTo("false");
             try (var recovering = ds.getConnection()) {
                 recovering.setAutoCommit(false);
@@ -189,7 +186,7 @@ class HeartbeatContractsIT {
                     new Heartbeat(db, schema, schema.config(), false).beat();
                     assertThat(err.text()).contains("waited 100 ms for a lock").doesNotContain("failed");
                 }
-                String refreshed = db.inTx(c -> TestSql.queryString(c, live, schema.instanceId()));
+                String refreshed = live(db, names, schema.instanceId());
                 assertThat(refreshed).as("refreshed while the cursor table is locked").isEqualTo("true");
                 recovering.rollback();
             }

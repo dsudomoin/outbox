@@ -1,5 +1,7 @@
 package io.github.dsudomoin.outbox.testing;
 
+import java.sql.Connection;
+import java.sql.SQLException;
 import javax.sql.DataSource;
 import org.postgresql.ds.PGSimpleDataSource;
 import org.testcontainers.postgresql.PostgreSQLContainer;
@@ -52,6 +54,22 @@ public final class TestDataSources {
     /** The database name in {@link #jdbcUrl()}. */
     static String databaseName() {
         return Pg.INSTANCE.getDatabaseName();
+    }
+
+    /** Connections of the test database whose sessions run in {@code zone}. */
+    public static PGSimpleDataSource inZone(String zone) {
+        var ds = new PGSimpleDataSource() {
+            @Override
+            public Connection getConnection() throws SQLException {
+                var c = super.getConnection();
+                TestSql.execute(c, "set time zone '" + zone + "'");
+                return c;
+            }
+        };
+        ds.setUrl(jdbcUrl());
+        ds.setUser(user());
+        ds.setPassword(password());
+        return ds;
     }
 
     /** A new physical connection per {@code getConnection()}; one the server does not answer fails, not hangs the run. */

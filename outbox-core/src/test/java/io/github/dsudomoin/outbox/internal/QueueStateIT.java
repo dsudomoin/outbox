@@ -16,6 +16,7 @@ import io.github.dsudomoin.outbox.OutboxTelemetry.ShardQueue;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.internal.Cursors.Position;
 import io.github.dsudomoin.outbox.internal.Ticks.Tick;
+import io.github.dsudomoin.outbox.testing.ShardKeys;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import java.sql.Connection;
@@ -41,7 +42,7 @@ class QueueStateIT {
     private final DataSource direct = TestDataSources.newDataSource();
     private final JdbcTransactions transactions = new JdbcTransactions(direct);
     private final Recording telemetry = new Recording();
-    private final Map<Integer, Integer> nextKey = new HashMap<>();
+    private final ShardKeys keys = new ShardKeys(TOPIC, SHARDS);
     private OutboxRuntime writer;
     private TableNames names;
     private long extraId = 1_000_000;
@@ -120,8 +121,9 @@ class QueueStateIT {
             // the count waits for the lock past its budget
             execute(holder, "lock table " + names.base() + " in access exclusive mode");
             execute(c, "set statement_timeout = '7s'");
-            var read = read(c);
-            long latestMaxId = read.latest().maxId();
+            var latest = new Ticks(names, SHARDS).latest(c);
+            long latestMaxId = latest.maxId();
+            long effective = new Cursors(names, SHARDS).positions(c, latest.id()).get(0).effectiveTickId();
             double perShard = (latestMaxId - before) / (double) SHARDS;
 
             var state = queueState.read(c);
@@ -137,8 +139,7 @@ class QueueStateIT {
             assertThat(queryLong(c, "select 1")).isEqualTo(1);
 
             // a tick without max_id: unknown
-            execute(c, "update " + names.tick() + " set max_id = null where id = " + read.positions().get(0)
-                    .effectiveTickId());
+            execute(c, "update " + names.tick() + " set max_id = null where id = " + effective);
             var unknown = queueState.read(c);
             assertThat(unknown.get(0).pending()).isNaN();
             assertThat(unknown.get(0).estimated()).isTrue();
@@ -161,7 +162,7 @@ class QueueStateIT {
             try (var step = direct.getConnection()) {
                 step.setAutoCommit(false);
                 new Cursors(names, SHARDS).append(step, new Cursor(0, tick, null, 0, null, 0, null, null));
-                var columns = "id, shard, message_id, topic, key, payload, headers, created_at";
+                var columns = RetryStore.COLUMNS;
                 execute(step, "insert into " + names.retry() + " (" + columns + ", attempts, next_attempt_at)"
                         + " select " + columns + ", 1, now() + interval '1 hour' from " + names.base()
                         + " where message_id = '" + ids.get(2) + "'");
@@ -259,13 +260,6 @@ class QueueStateIT {
                 + "', now() - interval '" + hoursAgo + " hours', 1, now() + interval '1 hour')");
     }
 
-    private record Read(Tick latest, List<Position> positions) {}
-
-    private Read read(Connection c) throws SQLException {
-        var latest = new Ticks(names, SHARDS).latest(c);
-        return new Read(latest, new Cursors(names, SHARDS).positions(c, latest.id()));
-    }
-
     private Tick latestTick() throws SQLException {
         try (var c = direct.getConnection()) {
             return new Ticks(names, SHARDS).latest(c);
@@ -291,14 +285,7 @@ class QueueStateIT {
 
     /** A new key hashing to {@code shard}. */
     private String keyOfShard(int shard) {
-        int i = nextKey.getOrDefault(shard, 0);
-        while (true) {
-            var key = shard + "-" + i++;
-            if (Hashing.shard(Hashing.keyHash(TOPIC, key.getBytes(UTF_8)), SHARDS) == shard) {
-                nextKey.put(shard, i);
-                return key;
-            }
-        }
+        return keys.next(shard);
     }
 
     private static final class Recording implements OutboxTelemetry {
