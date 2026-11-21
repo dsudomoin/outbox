@@ -30,9 +30,11 @@ import io.github.dsudomoin.outbox.micrometer.OutboxStepContext;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.RoundTrips;
+import io.github.dsudomoin.outbox.testing.ShardKeys;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.github.dsudomoin.outbox.testing.TestTracing;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -583,15 +585,8 @@ class ShardProcessorIT {
     @Test
     void twoHeadsOfOneKeyAreHandedOnce() throws Exception {
         bootstrap(); // the relay keeps one head per key; rows written outside it may not
-        try (var c = TestDb.connect(); var ps = c.prepareStatement("insert into " + names.retry() + " (id, shard,"
-                + " message_id, topic, key, payload, created_at, next_attempt_at) values (?, 0, gen_random_uuid(),"
-                + " 't', 'k'::bytea, ?, now(), ?)")) {
-            for (int i = 1; i <= 3; i++) {
-                ps.setLong(1, i);
-                ps.setBytes(2, ("k#" + i).getBytes(UTF_8));
-                ps.setObject(3, i == 3 ? null : now.atOffset(ZoneOffset.UTC));
-                ps.executeUpdate();
-            }
+        for (int i = 1; i <= 3; i++) {
+            insertRetry(i, "k", "k#" + i, i != 3);
         }
 
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 3, true));
@@ -1110,12 +1105,7 @@ class ShardProcessorIT {
         tick();
         processUntilNoWork(); // all six heads diverted together, due together
         assertThat(retryRows()).hasSize(7);
-        script = records -> {
-            if (records.stream().anyMatch(payload("p#1"))) {
-                throw new IllegalStateException("handleBatch cannot take p#1");
-            }
-            return handler.handleBatch(records);
-        };
+        script = failingAsAWholeOn("p#1");
 
         for (int pass = 0; pass < 5 && !retryRows().isEmpty(); pass++) {
             now = cursor().retryDueAt();
@@ -1162,12 +1152,7 @@ class ShardProcessorIT {
         tick();
         processUntilNoWork();
         assertThat(retryRows()).hasSize(3);
-        script = records -> {
-            if (records.stream().anyMatch(payload("k#2"))) {
-                throw new IllegalStateException("handleBatch cannot take k#2");
-            }
-            return handler.handleBatch(records);
-        };
+        script = failingAsAWholeOn("k#2");
 
         for (int pass = 0; pass < 5 && !retryRows().isEmpty(); pass++) {
             now = cursor().retryDueAt();
@@ -1195,14 +1180,7 @@ class ShardProcessorIT {
         var calls = new AtomicInteger();
         script = records -> { // ignores interrupts and outlives batchTimeout: every call fails as a whole
             calls.incrementAndGet();
-            long until = System.nanoTime() + timeout.plusMillis(200).toNanos();
-            while (System.nanoTime() < until) {
-                try {
-                    Thread.sleep(10);
-                } catch (InterruptedException ignored) {
-                    // keeps going
-                }
-            }
+            outlive(timeout.plusMillis(200));
             return records.stream().map(r -> Outcome.delivered()).toList();
         };
         now = due;
@@ -1246,14 +1224,7 @@ class ShardProcessorIT {
         var calls = new AtomicInteger();
         script = records -> { // ignores interrupts and outlives batchTimeout: every call fails as a whole
             calls.incrementAndGet();
-            long until = System.nanoTime() + timeout.plusMillis(200).toNanos();
-            while (System.nanoTime() < until) {
-                try {
-                    Thread.sleep(10);
-                } catch (InterruptedException ignored) {
-                    // keeps going
-                }
-            }
+            outlive(timeout.plusMillis(200));
             return records.stream().map(r -> Outcome.delivered()).toList();
         };
 
@@ -1342,14 +1313,7 @@ class ShardProcessorIT {
         assertThat(retryRows()).hasSize(7);
         OutboxHandler hangsOnP = record -> { // delivers the rows before p#1, then hangs past batchTimeout on it
             if (payload("p#1").test(record)) {
-                long until = System.nanoTime() + timeout.plusMillis(200).toNanos();
-                while (System.nanoTime() < until) {
-                    try {
-                        Thread.sleep(10);
-                    } catch (InterruptedException ignored) {
-                        // keeps going
-                    }
-                }
+                outlive(timeout.plusMillis(200));
                 throw new RuntimeException("p#1 hung");
             }
             handler.handle(record);
@@ -1601,12 +1565,7 @@ class ShardProcessorIT {
 
     /** A key of topic {@code t} on {@code shard}. */
     private String keyOnShard(int shard) {
-        for (int i = 0; ; i++) {
-            var key = "k" + i;
-            if (Hashing.shard(Hashing.keyHash("t", key.getBytes(UTF_8)), config.shards()) == shard) {
-                return key;
-            }
-        }
+        return ShardKeys.first("t", "k", shard, config.shards());
     }
 
     /** {@code function(internalNs, LOCK_SWAP)} on {@code c}, as maintenance quiesces the relay for a tail swap. */
@@ -1850,12 +1809,7 @@ class ShardProcessorIT {
         var ids = new ArrayList<>(send(messages.toArray(OutboxMessage[]::new)));
         ids.remove(400);
         tick();
-        script = records -> {
-            if (records.stream().anyMatch(payload("poison"))) {
-                throw new IllegalStateException("cannot handle the poison");
-            }
-            return handler.handleBatch(records);
-        };
+        script = failingAsAWholeOn("poison");
 
         int steps = 0;
         int pauses = 0;
@@ -2500,13 +2454,7 @@ class ShardProcessorIT {
             if (records.stream().noneMatch(r -> new String(r.payload(), UTF_8).startsWith("f"))) {
                 return handler.handleBatch(records);
             }
-            while (stuck.getCount() > 0) { // a call holding an f row keeps its thread until released
-                try {
-                    stuck.await();
-                } catch (InterruptedException ignored) {
-                    // a handler that ignores cancellation keeps its thread
-                }
-            }
+            holdUntil(stuck); // a call holding an f row keeps its thread until released
             return records.stream().map(r -> Outcome.delivered()).toList();
         };
         now = due;
@@ -2574,13 +2522,7 @@ class ShardProcessorIT {
         var calls = new AtomicInteger();
         script = records -> { // each call holds its thread until its own latch is released
             var latch = latches.get(calls.getAndIncrement());
-            while (latch.getCount() > 0) {
-                try {
-                    latch.await();
-                } catch (InterruptedException ignored) {
-                    // a handler that ignores cancellation keeps its thread
-                }
-            }
+            holdUntil(latch);
             return records.stream().map(r -> Outcome.notAttempted()).toList();
         };
         send(msg("t", "a", "a#1"), msg("t", "b", "b#1"));
@@ -2622,13 +2564,7 @@ class ShardProcessorIT {
         bootstrap();
         var stuck = new CountDownLatch(1);
         var sick = new ShardProcessor(names, config, record -> { // every call holds its thread until released
-            while (stuck.getCount() > 0) {
-                try {
-                    stuck.await();
-                } catch (InterruptedException ignored) {
-                    // a handler that ignores cancellation keeps its thread
-                }
-            }
+            holdUntil(stuck);
         }, TestTelemetry.kora(), false);
         try {
             send(msg("t", "a", "a#1"));
@@ -2682,13 +2618,7 @@ class ShardProcessorIT {
         bootstrap();
         var stuck = new CountDownLatch(1);
         var sick = new ShardProcessor(names, config, records -> { // every call holds its thread
-            while (stuck.getCount() > 0) {
-                try {
-                    stuck.await();
-                } catch (InterruptedException ignored) {
-                    // a handler that ignores cancellation keeps its thread
-                }
-            }
+            holdUntil(stuck);
         }, TestTelemetry.kora(), false);
         try {
             send(msg("t", "a", "a#1"), msg("t", "b", "b#1"));
@@ -2739,13 +2669,7 @@ class ShardProcessorIT {
             if (records.stream().anyMatch(payload("r#1"))) {
                 return handler.handleBatch(records);
             }
-            while (stuck.getCount() > 0) {
-                try {
-                    stuck.await();
-                } catch (InterruptedException ignored) {
-                    // a handler that ignores cancellation keeps its thread
-                }
-            }
+            holdUntil(stuck);
             return records.stream().map(r -> Outcome.notAttempted()).toList();
         };
         send(msg("t", "a", "a#1"), msg("t", "b", "b#1"));
@@ -3014,14 +2938,7 @@ class ShardProcessorIT {
         now = now.plus(REQUEUE_DELAY);
         script = records -> {
             if (records.size() > 1) { // the call of all groups fails as a whole, and spends the pass's time
-                long until = System.nanoTime() + Duration.ofMillis(400).toNanos();
-                while (System.nanoTime() < until) {
-                    try {
-                        Thread.sleep(10);
-                    } catch (InterruptedException ignored) {
-                        // keeps going
-                    }
-                }
+                outlive(Duration.ofMillis(400));
                 return List.of();
             }
             return handler.handleBatch(records);
@@ -3815,12 +3732,7 @@ class ShardProcessorIT {
         send(msg("t", "k", "k#1"));
         tick();
         process();
-        script = records -> {
-            if (records.stream().anyMatch(payload("k#2"))) {
-                throw new IllegalStateException("cannot handle k#2");
-            }
-            return handler.handleBatch(records);
-        };
+        script = failingAsAWholeOn("k#2");
         send(msg("t", "k", "k#2"), msg("t", "j", "j#1"));
         tick();
 
@@ -3874,16 +3786,8 @@ class ShardProcessorIT {
         bootstrap();
         var terminated = new AtomicInteger();
         script = records -> { // the step's backend dies after the handler answered, as when its lock is lost
-            try (var c = TestDb.connect(); var ps = c.prepareStatement("select pg_terminate_backend(pid, 5000)"
-                    + " from pg_locks where locktype = 'advisory' and classid = ?::int4::oid"
-                    + " and objid = ?::int4::oid and objsubid = 2 and granted")) {
-                ps.setInt(1, names.internalNamespace());
-                ps.setInt(2, TableNames.LOCK_SHARD_BASE);
-                try (var rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        terminated.addAndGet(rs.getBoolean(1) ? 1 : 0);
-                    }
-                }
+            try (var c = TestDb.connect()) {
+                terminated.addAndGet(TestSql.terminateStep(c, names.internalNamespace(), 0));
             } catch (SQLException e) {
                 throw new IllegalStateException(e);
             }
@@ -4502,12 +4406,7 @@ class ShardProcessorIT {
         send(msg("t", "a", "p1"), msg("t", "b", "p2"));
         tick();
         process();
-        script = records -> {
-            if (records.stream().anyMatch(payload("p1"))) {
-                throw new IllegalStateException("handleBatch cannot take p1");
-            }
-            return handler.handleBatch(records);
-        };
+        script = failingAsAWholeOn("p1");
         now = now.plus(REQUEUE_DELAY);
         calls.clear();
 
@@ -5132,13 +5031,7 @@ class ShardProcessorIT {
         var release = new CountDownLatch(1);
         script = records -> {
             if (payloads(records).contains("h#1")) {
-                while (release.getCount() > 0) {
-                    try {
-                        release.await();
-                    } catch (InterruptedException ignored) {
-                        // a handler that ignores cancellation keeps its thread
-                    }
-                }
+                holdUntil(release);
             }
             return records.stream().map(r -> Outcome.delivered()).toList();
         };
@@ -5615,6 +5508,39 @@ class ShardProcessorIT {
         return result;
     }
 
+    /** Sleeps {@code d} whatever interrupts come, as a handler that ignores cancellation. */
+    private static void outlive(Duration d) {
+        long until = System.nanoTime() + d.toNanos();
+        while (System.nanoTime() < until) {
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException ignored) {
+                // keeps going
+            }
+        }
+    }
+
+    /** Waits for {@code latch} whatever interrupts come: a handler that ignores cancellation keeps its thread. */
+    private static void holdUntil(CountDownLatch latch) {
+        while (latch.getCount() > 0) {
+            try {
+                latch.await();
+            } catch (InterruptedException ignored) {
+                // keeps going
+            }
+        }
+    }
+
+    /** The handler's answer, but a call holding a record of payload {@code p} fails as a whole. */
+    private Function<List<OutboxRecord>, List<Outcome>> failingAsAWholeOn(String p) {
+        return records -> {
+            if (records.stream().anyMatch(payload(p))) {
+                throw new IllegalStateException("handleBatch cannot take " + p);
+            }
+            return handler.handleBatch(records);
+        };
+    }
+
     /** A handler that ignores interrupts and outlives {@code timeout} whenever {@code hangs} matches the call. */
     private static Function<List<OutboxRecord>, List<Outcome>> hangingPast(Duration timeout,
             Predicate<List<OutboxRecord>> hangs, Function<List<OutboxRecord>, List<Outcome>> otherwise) {
@@ -5622,14 +5548,7 @@ class ShardProcessorIT {
             if (!hangs.test(records)) {
                 return otherwise.apply(records);
             }
-            long until = System.nanoTime() + timeout.plusMillis(200).toNanos();
-            while (System.nanoTime() < until) {
-                try {
-                    Thread.sleep(10);
-                } catch (InterruptedException ignored) {
-                    // keeps going
-                }
-            }
+            outlive(timeout.plusMillis(200));
             return records.stream().map(r -> Outcome.delivered()).toList();
         };
     }
@@ -5666,13 +5585,6 @@ class ShardProcessorIT {
                 rs -> rs.getString(1)).get(0));
     }
 
-    /** Tick {@code id} made exactly {@code by} before tick {@code later}, whatever time passed between them. */
-    private void madeBefore(long id, long later, Duration by) throws SQLException {
-        try (var c = TestDb.connect()) {
-            execute(c, "update " + names.tick() + " set created_at = (select created_at from " + names.tick()
-                    + " where id = " + later + ") - interval '" + by.toMillis() + " milliseconds' where id = " + id);
-        }
-    }
 
     private Cursor cursor() throws SQLException {
         try (var c = TestDb.connect()) {
