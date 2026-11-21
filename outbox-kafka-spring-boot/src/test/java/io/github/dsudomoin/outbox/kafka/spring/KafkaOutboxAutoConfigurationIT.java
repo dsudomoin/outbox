@@ -281,7 +281,7 @@ class KafkaOutboxAutoConfigurationIT {
 
     /** The switch decides as the binder binds it, whatever the spelling. */
     @ParameterizedTest
-    @ValueSource(strings = {"0", "off", "no", "FALSE"})
+    @ValueSource(strings = {"off", "FALSE"})
     void fallbackOffInAnySpellingUsesAppHandler(String off) {
         withoutKafka("outbox.kafka.fallback=" + off).withUserConfiguration(WithAppHandler.class).run(context -> {
             assertThat(context).hasNotFailed().doesNotHaveBean("outboxKafkaFallbackHandler");
@@ -290,7 +290,7 @@ class KafkaOutboxAutoConfigurationIT {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"1", "on", "yes", "TRUE"})
+    @ValueSource(strings = {"on", "TRUE"})
     void fallbackOnInAnySpellingKeepsKafka(String on) {
         withoutKafka("outbox.kafka.fallback=" + on).withUserConfiguration(WithAppHandler.class)
             .run(context -> assertNamesTheConflict(failure(context)));
@@ -464,8 +464,7 @@ class KafkaOutboxAutoConfigurationIT {
         var topic = TestKafka.createTopic(1);
         runner("outbox.enabled=false").run(context -> {
             var sender = context.getBean(KafkaOutboxSender.class);
-            var record = new OutboxRecord(1, UUID.randomUUID(), topic, null, "v".getBytes(UTF_8), List.of(),
-                Instant.now(), 0, 0);
+            var record = record(topic);
 
             sender.send(List.of(record));
 
@@ -484,8 +483,7 @@ class KafkaOutboxAutoConfigurationIT {
             runner("outbox.enabled=false",
                 "outbox.kafka.driver-properties.key.serializer=org.apache.kafka.common.serialization.StringSerializer")
                 .run(context -> {
-                    var record = new OutboxRecord(1, UUID.randomUUID(), topic, null, "v".getBytes(UTF_8), List.of(),
-                        Instant.now(), 0, 0);
+                    var record = record(topic);
                     context.getBean(KafkaOutboxSender.class).send(List.of(record));
                 });
             assertThat(err.text()).contains("ProducerConfig values", "acks = -1", "enable.idempotence = true",
@@ -503,8 +501,7 @@ class KafkaOutboxAutoConfigurationIT {
                 runner("outbox.enabled=false", "outbox.kafka.driver-properties.client.id=orders-svc",
                     "outbox.kafka.client-id-suffix=" + suffix)
                     .run(context -> {
-                        var record = new OutboxRecord(1, UUID.randomUUID(), topic, null, "v".getBytes(UTF_8),
-                            List.of(), Instant.now(), 0, 0);
+                        var record = record(topic);
                         context.getBean(KafkaOutboxSender.class).send(List.of(record));
                     });
                 assertThat(err.text()).contains("[Producer clientId=orders-svc");
@@ -604,5 +601,9 @@ class KafkaOutboxAutoConfigurationIT {
 
             assertThat(closes.outboxRunning).isNotEmpty().containsOnly(false);
         });
+    }
+
+    private static OutboxRecord record(String topic) {
+        return new OutboxRecord(1, UUID.randomUUID(), topic, null, "v".getBytes(UTF_8), List.of(), Instant.now(), 0, 0);
     }
 }

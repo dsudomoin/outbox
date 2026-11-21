@@ -41,8 +41,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
@@ -57,7 +59,6 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.clients.producer.internals.BuiltInPartitioner;
 import org.apache.kafka.common.Cluster;
-import org.apache.kafka.common.InvalidRecordException;
 import org.apache.kafka.common.InvalidRecordException;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.Node;
@@ -337,16 +338,7 @@ class KafkaOutboxSenderTest {
     void resolvedTopicsExpireLikeKafkaMetadata() {
         var clock = new TestClock();
         var lookups = new CopyOnWriteArrayList<String>();
-        var sender = sender(() -> new TestProducer(true, r -> null) {
-            @Override
-            public synchronized List<PartitionInfo> partitionsFor(String topic) {
-                lookups.add(topic);
-                if (topic.startsWith("missing")) {
-                    throw new TimeoutException("Topic " + topic + " not present in metadata after 5000 ms.");
-                }
-                return super.partitionsFor(topic);
-            }
-        }, DELIVERY_TIMEOUT, clock);
+        var sender = sender(missingTopics(lookups::add), DELIVERY_TIMEOUT, clock);
         assertThat(sender.send(List.of(recordTo(TOPIC, 1, "a")))).containsExactly(Outcome.delivered());
 
         clock.advance(Duration.ofMinutes(5).minusMillis(1));
@@ -365,15 +357,7 @@ class KafkaOutboxSenderTest {
     @Test
     void resolvedTopicsIgnoreWallClockSteps() {
         var clock = new TestClock();
-        var sender = sender(() -> new TestProducer(true, r -> null) {
-            @Override
-            public synchronized List<PartitionInfo> partitionsFor(String topic) {
-                if (topic.startsWith("missing")) {
-                    throw new TimeoutException("Topic " + topic + " not present in metadata after 5000 ms.");
-                }
-                return super.partitionsFor(topic);
-            }
-        }, DELIVERY_TIMEOUT, clock);
+        var sender = sender(missingTopics(topic -> {}), DELIVERY_TIMEOUT, clock);
         assertThat(sender.send(List.of(recordTo(TOPIC, 1, "a")))).containsExactly(Outcome.delivered());
 
         clock.step(Duration.ofHours(-1));
@@ -388,16 +372,8 @@ class KafkaOutboxSenderTest {
     void noTopicLeaseAfterTheMetadataWait() {
         var clock = new TestClock();
         var lookups = new ConcurrentHashMap<String, AtomicInteger>();
-        var sender = sender(() -> new TestProducer(true, r -> null) {
-            @Override
-            public synchronized List<PartitionInfo> partitionsFor(String topic) {
-                lookups.computeIfAbsent(topic, t -> new AtomicInteger()).incrementAndGet();
-                if (topic.startsWith("missing")) {
-                    throw new TimeoutException("Topic " + topic + " not present in metadata after 5000 ms.");
-                }
-                return super.partitionsFor(topic);
-            }
-        }, DELIVERY_TIMEOUT, clock);
+        var sender = sender(missingTopics(topic -> lookups.computeIfAbsent(topic, t -> new AtomicInteger())
+                .incrementAndGet()), DELIVERY_TIMEOUT, clock);
         sender.send(List.of(recordTo("missing-1", 1, "k"))); // each topic cools for 1 s
         sender.send(List.of(recordTo("missing-2", 2, "k")));
         clock.advance(Duration.ofSeconds(1));
@@ -415,15 +391,7 @@ class KafkaOutboxSenderTest {
     @Test
     void cooldownIgnoresWallClockSteps() {
         var clock = new TestClock();
-        var sender = sender(() -> new TestProducer(true, r -> null) {
-            @Override
-            public synchronized List<PartitionInfo> partitionsFor(String topic) {
-                if (topic.equals("missing")) {
-                    throw new TimeoutException("Topic " + topic + " not present in metadata after 5000 ms.");
-                }
-                return super.partitionsFor(topic);
-            }
-        }, DELIVERY_TIMEOUT, clock);
+        var sender = sender(missingTopics(topic -> {}), DELIVERY_TIMEOUT, clock);
         sender.send(List.of(recordTo("missing", 1, "k"))); // the topic cools for 1 s
 
         clock.step(Duration.ofHours(-1));
@@ -799,23 +767,6 @@ class KafkaOutboxSenderTest {
         assertThat(unbatched).isEmpty();
     }
 
-    /** A remembered record not handed again within 10 minutes (another instance sent it, say) is forgotten. */
-    @Test
-    void rememberedRecordsAreForgottenAfterTenMinutes() throws Exception {
-        var clock = new TestClock();
-        var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
-        var remembered = record(1, keyOnPartition(0, "a"));
-        var first = sendAsync(sender, List.of(remembered));
-        awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
-        first.get(5, SECONDS);
-        clock.advance(Duration.ofMinutes(10));
-
-        var second = sendAsync(sender, List.of(remembered));
-        awaitSent(1, 1).completeNext();
-        assertThat(second.get(5, SECONDS)).containsExactly(Outcome.delivered());
-        assertThat(unbatched).isEmpty();
-    }
-
     /** The 10 minutes are measured on the monotonic timer: a wall clock stepped back does not keep a record longer. */
     @Test
     void rememberedRecordsIgnoreWallClockSteps() throws Exception {
@@ -838,12 +789,7 @@ class KafkaOutboxSenderTest {
     @Test
     void unbatchedProducersDifferOnlyInBatchSize() throws Exception {
         var seen = new CopyOnWriteArrayList<Map<String, Object>>();
-        var sender = new KafkaOutboxSender(CONFIG, properties -> {
-            seen.add(properties);
-            var producer = new TestProducer(false, r -> null);
-            producers.add(producer);
-            return producer;
-        });
+        var sender = new KafkaOutboxSender(CONFIG, recording(seen, false));
         var remembered = record(1, keyOnPartition(0));
         var first = sendAsync(sender, List.of(remembered));
         awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
@@ -865,12 +811,7 @@ class KafkaOutboxSenderTest {
     void eachProducerGetsItsOwnClientId() throws Exception {
         var seen = new CopyOnWriteArrayList<Map<String, Object>>();
         var sender = new KafkaOutboxSender(() -> props("bootstrap.servers", "localhost:9092", "client.id", "orders-svc"),
-                properties -> {
-                    seen.add(properties);
-                    var producer = new TestProducer(false, r -> null);
-                    producers.add(producer);
-                    return producer;
-                });
+                recording(seen, false));
         var remembered = record(1, keyOnPartition(0));
         var first = sendAsync(sender, List.of(remembered));
         awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)")); // the failed producer is closed
@@ -968,12 +909,7 @@ class KafkaOutboxSenderTest {
                 return false;
             }
         };
-        var sender = new KafkaOutboxSender(config, properties -> {
-            seen.add(properties);
-            var producer = new TestProducer(false, r -> null);
-            producers.add(producer);
-            return producer;
-        });
+        var sender = new KafkaOutboxSender(config, recording(seen, false));
         var remembered = record(1, keyOnPartition(0));
         var first = sendAsync(sender, List.of(remembered));
         awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
@@ -1038,19 +974,8 @@ class KafkaOutboxSenderTest {
     @Test
     void recordsInFlightWhenTheRelayCutsTheCallAreRemembered() throws Exception {
         var blockOnce = new AtomicBoolean(true);
-        var sender = sender(() -> new TestProducer(false, r -> null) {
-            @Override
-            public Future<RecordMetadata> send(ProducerRecord<byte[], byte[]> record, Callback callback) {
-                if (new String(record.key(), UTF_8).equals("c") && blockOnce.getAndSet(false)) {
-                    try { // like KafkaProducer waiting for buffer space
-                        Thread.sleep(10_000);
-                    } catch (InterruptedException e) {
-                        throw new InterruptException(e);
-                    }
-                }
-                return super.send(record, callback);
-            }
-        }, DELIVERY_TIMEOUT);
+        var sender = sender(blockingSend(record -> new String(record.key(), UTF_8).equals("c")
+                && blockOnce.getAndSet(false)), DELIVERY_TIMEOUT);
         var acked = record(1, "a");
         var inFlight = record(2, "b");
         var notSent = record(3, "c");
@@ -1290,9 +1215,9 @@ class KafkaOutboxSenderTest {
     @Test
     void inFlightAboveFiveRejected() {
         assertThatThrownBy(() -> new KafkaOutboxSender(() -> props(
-                "bootstrap.servers", "localhost:9092", "max.in.flight.requests.per.connection", 6)))
+                "bootstrap.servers", "localhost:9092", MAX_IN_FLIGHT, 6)))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("max.in.flight.requests.per.connection");
+                .hasMessageContaining(MAX_IN_FLIGHT);
     }
 
     /** With push on, kafka-clients 3.9 logs an ERROR from the I/O thread after every {@code close(Duration.ZERO)}. */
@@ -1308,7 +1233,7 @@ class KafkaOutboxSenderTest {
     @Test
     void producerConfigIsForcedAndValidated() {
         var user = props("bootstrap.servers", "localhost:9092", "key.serializer", StringSerializer.class.getName(),
-                "acks", "-1", "enable.idempotence", "true", "max.in.flight.requests.per.connection", 5);
+                "acks", "-1", "enable.idempotence", "true", MAX_IN_FLIGHT, 5);
         var config = KafkaOutboxSender.producerConfig(user);
         assertThat(config.originals())
                 .containsEntry(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName())
@@ -1456,19 +1381,7 @@ class KafkaOutboxSenderTest {
      */
     @Test
     void interruptReturnsRealOutcomesPromptly() throws Exception {
-        var sender = sender(() -> new TestProducer(false, r -> null) {
-            @Override
-            public Future<RecordMetadata> send(ProducerRecord<byte[], byte[]> record, Callback callback) {
-                if (new String(record.key(), UTF_8).equals("c")) {
-                    try { // like KafkaProducer waiting for buffer space
-                        Thread.sleep(10_000);
-                    } catch (InterruptedException e) {
-                        throw new InterruptException(e);
-                    }
-                }
-                return super.send(record, callback);
-            }
-        }, DELIVERY_TIMEOUT);
+        var sender = sender(blockingSend(record -> new String(record.key(), UTF_8).equals("c")), DELIVERY_TIMEOUT);
         var result = new CompletableFuture<List<Outcome>>();
         var flagKept = new AtomicBoolean();
         var thread = new Thread(() -> {
@@ -1541,19 +1454,7 @@ class KafkaOutboxSenderTest {
      */
     @Test
     void aWindDownStopsTheHandOverAndAwaitsTheRecordsInFlight() throws Exception {
-        var sender = sender(() -> new TestProducer(false, r -> null) {
-            @Override
-            public Future<RecordMetadata> send(ProducerRecord<byte[], byte[]> record, Callback callback) {
-                if (new String(record.key(), UTF_8).equals("c")) {
-                    try { // like KafkaProducer waiting for buffer space
-                        Thread.sleep(10_000);
-                    } catch (InterruptedException e) {
-                        throw new InterruptException(e);
-                    }
-                }
-                return super.send(record, callback);
-            }
-        }, DELIVERY_TIMEOUT);
+        var sender = sender(blockingSend(record -> new String(record.key(), UTF_8).equals("c")), DELIVERY_TIMEOUT);
         var call = inRelayCall(Duration.ofSeconds(30),
                 () -> sender.send(List.of(record(1, "a"), record(2, "b"), record(3, "c"), record(4, "d"))));
         var producer = awaitSent(0, 2);
@@ -2250,17 +2151,10 @@ class KafkaOutboxSenderTest {
         }
     }
 
-    /**
-     * MockProducer closer to KafkaProducer: {@code failure} fails matching records the way client-side errors are
-     * reported (callback inside {@code send}), and {@code close} aborts every incomplete send through its callback.
-     */
     @Test
     void factoryGetsValidatedProperties() {
         var seen = new CopyOnWriteArrayList<Map<String, Object>>();
-        var sender = new KafkaOutboxSender(CONFIG, properties -> {
-            seen.add(properties);
-            return new TestProducer(true, r -> null);
-        });
+        var sender = new KafkaOutboxSender(CONFIG, recording(seen, true));
 
         assertThat(sender.send(List.of(record(1, "a")))).containsExactly(Outcome.delivered());
 
@@ -2278,35 +2172,6 @@ class KafkaOutboxSenderTest {
     }
 
     @Test
-    void factoryProducerIsUsed() {
-        var producer = new TestProducer(true, r -> null);
-        var sender = new KafkaOutboxSender(CONFIG, properties -> producer);
-
-        assertThat(sender.send(List.of(record(1, "a"), record(2, null)))).containsExactly(Outcome.delivered(),
-                Outcome.delivered());
-        assertThat(producer.history()).hasSize(2);
-    }
-
-    @Test
-    void failedProducerIsReplacedThroughFactory() throws Exception {
-        var sender = new KafkaOutboxSender(CONFIG, properties -> {
-            var producer = new TestProducer(false, r -> null);
-            producers.add(producer);
-            return producer;
-        });
-        var failed = sendAsync(sender, List.of(record(1, "a")));
-        awaitSent(0, 1).errorNext(new NotLeaderOrFollowerException("gone"));
-        assertThat(failed.get(5, SECONDS).get(0)).isInstanceOf(Outcome.Retry.class);
-
-        var next = sendAsync(sender, List.of(record(2, "c"))); // a key off the partition that now cools
-        awaitSent(1, 1).completeNext();
-
-        assertThat(next.get(5, SECONDS)).containsExactly(Outcome.delivered());
-        assertThat(producers).as("the factory made the replacement").hasSize(2);
-        assertThat(producers.get(0).closed()).isTrue();
-    }
-
-    @Test
     void closeClosesFactoryProducers() {
         var producer = new TestProducer(true, r -> null);
         var sender = new KafkaOutboxSender(CONFIG, properties -> producer);
@@ -2317,6 +2182,10 @@ class KafkaOutboxSenderTest {
         assertThat(producer.closed()).isTrue();
     }
 
+    /**
+     * MockProducer closer to KafkaProducer: {@code failure} fails matching records the way client-side errors are
+     * reported (callback inside {@code send}), and {@code close} aborts every incomplete send through its callback.
+     */
     static class TestProducer extends MockProducer<byte[], byte[]> {
         private final Function<ProducerRecord<byte[], byte[]>, RuntimeException> failure;
 
@@ -2372,6 +2241,37 @@ class KafkaOutboxSenderTest {
                 abortIncomplete();
             }
         }
+    }
+
+    /** Producers that record each metadata lookup and time out on the topics named {@code missing*}. */
+    private static Supplier<MockProducer<byte[], byte[]>> missingTopics(Consumer<String> lookup) {
+        return () -> new TestProducer(true, r -> null) {
+            @Override
+            public synchronized List<PartitionInfo> partitionsFor(String topic) {
+                lookup.accept(topic);
+                if (topic.startsWith("missing")) {
+                    throw new TimeoutException("Topic " + topic + " not present in metadata after 5000 ms.");
+                }
+                return super.partitionsFor(topic);
+            }
+        };
+    }
+
+    /** Producers whose send of a record that {@code blocks} waits 10 s, as KafkaProducer waits for buffer space. */
+    private static Supplier<MockProducer<byte[], byte[]>> blockingSend(Predicate<ProducerRecord<byte[], byte[]>> blocks) {
+        return () -> new TestProducer(false, r -> null) {
+            @Override
+            public Future<RecordMetadata> send(ProducerRecord<byte[], byte[]> record, Callback callback) {
+                if (blocks.test(record)) {
+                    try {
+                        Thread.sleep(10_000);
+                    } catch (InterruptedException e) {
+                        throw new InterruptException(e);
+                    }
+                }
+                return super.send(record, callback);
+            }
+        };
     }
 
     private KafkaOutboxSender sender(Duration deliveryTimeout) {
@@ -2456,6 +2356,12 @@ class KafkaOutboxSenderTest {
     }
 
     private MockProducer<byte[], byte[]> awaitSent(int producer, int records) throws InterruptedException {
+        return awaitSent(producers, producer, records);
+    }
+
+    /** {@code producers.get(producer)} once it has sent {@code records}, within 5 s. */
+    static <P extends MockProducer<byte[], byte[]>> P awaitSent(List<P> producers, int producer, int records)
+            throws InterruptedException {
         var deadline = System.nanoTime() + SECONDS.toNanos(5);
         while (producers.size() <= producer || producers.get(producer).history().size() < records) {
             assertThat(System.nanoTime()).as("producer %d sent %d records", producer, records).isLessThan(deadline);

@@ -324,12 +324,7 @@ class KafkaDeadLetterHandlerTest {
     }
 
     private TestProducer awaitSent(int producer, int records) throws InterruptedException {
-        var deadline = System.nanoTime() + SECONDS.toNanos(5);
-        while (producers.size() <= producer || producers.get(producer).history().size() < records) {
-            assertThat(System.nanoTime()).as("producer %d sent %d records", producer, records).isLessThan(deadline);
-            Thread.sleep(5);
-        }
-        return producers.get(producer);
+        return KafkaOutboxSenderTest.awaitSent(producers, producer, records);
     }
 
     private static DeadLetter letter(long id, String key, String payload, @Nullable String error,
