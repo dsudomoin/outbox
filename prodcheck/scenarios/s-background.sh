@@ -81,7 +81,7 @@ s_drain() { # relay off and on, parked and waiting records, the hook's run at th
   tx_send 1002 'topic=payments&key=h1&tag=hook-discard' > /dev/null
   tx_send 1002 'topic=payments&key=h2&tag=hook-keep' > /dev/null
   out=$(drain_call 1002 60)
-  check "$(passes is "$(psql_q "select count(*) from outbox_dead where status = 'pending'")" = 0)" "хук решил письма внутри того же вызова: $out"
+  check "$(passes no_pending)" "хук решил письма внутри того же вызова: $out"
   check "$(passes is "$(psql_q "select count(*) from outbox_dead where key = convert_to('h1', 'UTF8')")" = 0)" "discard хука удалил письмо"
   check "$(passes is "$(psql_q "select status from outbox_dead where key = convert_to('h2', 'UTF8')")" = kept)" "keep оставил письмо"
   inst_stop 1002
@@ -173,12 +173,11 @@ s_silent_drop_background() { # socketTimeout = 0: maintenance, the dead-letter p
   local started=$(now)
   beat() { [ "$(psql_q "select count(*) from outbox_instance where expires_at > now() and last_seen > now() - interval '10 seconds'")" = 1 ]; }
   maintained() { [ "$(psql_q "select extract(epoch from clock_timestamp() - succeeded_at) < 10 from outbox_maintenance")" = t ]; }
-  decided() { [ "$(psql_q "select count(*) from outbox_dead where status = 'pending'")" = 0 ]; }
   local limit=90 hb=-1 mt=-1 dl=-1 elapsed
   while elapsed=$(($(now) - started)); [ "$elapsed" -lt "$limit" ]; do
     if [ "$hb" = -1 ] && beat; then hb=$elapsed; fi
     if [ "$mt" = -1 ] && maintained; then mt=$elapsed; fi
-    if [ "$dl" = -1 ] && decided; then dl=$elapsed; fi
+    if [ "$dl" = -1 ] && no_pending; then dl=$elapsed; fi
     if [ "$hb" != -1 ] && [ "$mt" != -1 ] && [ "$dl" != -1 ]; then break; fi
     sleep 2
   done

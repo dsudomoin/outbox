@@ -146,7 +146,7 @@ class AdminCoexistenceIT {
         return AdminRows.ROUTES.stream();
     }
 
-    /** {@link AdminRows#ROUTES}, made by {@link AdminRows#seedEveryRoute}, against the app's own mappings. */
+    /** {@link AdminRows#ROUTES} against the app's own mappings, so no controller route goes untested. */
     @Test
     void theRoutesHereAreAllOfTheControllers() {
         try (var server = app()) {
