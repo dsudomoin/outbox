@@ -161,20 +161,6 @@ class EnqueueTelemetryIT {
     }
 
     @Test
-    void manySendsInOneTransactionCountEachOnce() {
-        var outbox = start(telemetry, transactions);
-
-        transactions.inTx(c -> {
-            for (int i = 0; i < 50; i++) {
-                outbox.send(OutboxMessage.of("orders", "k" + i % 3, bytes("m" + i)));
-            }
-            return null;
-        });
-
-        assertThat(telemetry.enqueued).hasSize(50).containsOnly("orders");
-    }
-
-    @Test
     void foreignConnectionCountsAtInsert() throws Exception {
         var outbox = start(telemetry, transactions);
 

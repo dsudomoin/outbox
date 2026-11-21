@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox;
 
+import static io.github.dsudomoin.outbox.testing.Handlers.answering;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -63,23 +64,11 @@ class RelayTelemetryIT {
         // 4 shards, the relay running; one worker steps both shards of the send together first
         var config = new TestOutboxConfig().workers(1);
         int goodShard = shard("good");
-        String bad = "bad";
-        for (int i = 0; shard(bad) == goodShard; i++) {
-            bad = "bad" + i;
-        }
+        String bad = keyOffShard("bad", goodShard);
         int badShard = shard(bad);
         var handler = new RecordingHandler();
         var outbox = start(config, handler);
-        // the step's own SQL fails, not its handler call (a handler failure is an outcome): every cursor append of the
-        // bad shard raises, failing each step that holds it
-        var function = config.table() + "_fail";
-        var cursor = config.table() + "_cursor";
-        try (var c = transactions.newConnection()) {
-            TestSql.execute(c, "create function " + function + "() returns trigger language plpgsql as $$ begin"
-                    + " if new.shard = " + badShard + " then raise exception 'shard down'; end if; return new; end $$");
-            TestSql.execute(c, "create trigger fail before insert on " + cursor
-                    + " for each row execute function " + function + "()");
-        }
+        failCursorAppends(config, badShard);
 
         var messages = new ArrayList<OutboxMessage>();
         for (int i = 0; i < 5; i++) {
@@ -88,9 +77,7 @@ class RelayTelemetryIT {
         }
         var ids = transactions.inTx(c -> outbox.sendAll(messages));
         await(Duration.ofSeconds(30), () -> telemetry.failedAlone(badShard) >= 2);
-        try (var c = transactions.newConnection()) {
-            TestSql.execute(c, "drop trigger fail on " + cursor);
-        }
+        restoreCursorAppends(config);
         await(Duration.ofSeconds(30), () -> delivered(handler).containsAll(ids));
         runtime.close(); // no step in flight from here
 
@@ -112,22 +99,11 @@ class RelayTelemetryIT {
         // the next tick, 1 s and 3 s later, not once per tick
         var config = new TestOutboxConfig().workers(1).minTickInterval(Duration.ofMillis(50))
                 .idlePollInterval(Duration.ofMillis(200)).retry(Duration.ofSeconds(1), Duration.ofMinutes(5), 0);
-        int goodShard = shard("good");
-        String bad = "bad";
-        for (int i = 0; shard(bad) == goodShard; i++) {
-            bad = "bad" + i;
-        }
+        String bad = keyOffShard("bad", shard("good"));
         int badShard = shard(bad);
         var handler = new RecordingHandler();
         var outbox = start(config, handler);
-        var function = config.table() + "_fail";
-        var cursor = config.table() + "_cursor";
-        try (var c = transactions.newConnection()) {
-            TestSql.execute(c, "create function " + function + "() returns trigger language plpgsql as $$ begin"
-                    + " if new.shard = " + badShard + " then raise exception 'shard down'; end if; return new; end $$");
-            TestSql.execute(c, "create trigger fail before insert on " + cursor
-                    + " for each row execute function " + function + "()");
-        }
+        failCursorAppends(config, badShard);
         var badMessages = new ArrayList<OutboxMessage>();
         for (int i = 0; i < 5; i++) {
             badMessages.add(OutboxMessage.of("orders", bad, bytes("b" + i)));
@@ -148,9 +124,7 @@ class RelayTelemetryIT {
                 .as("calls of a record of the failing shard in 6 s").hasSizeBetween(1, 4));
         assertThat(telemetry.failedAlone(badShard)).isLessThanOrEqualTo(4);
 
-        try (var c = transactions.newConnection()) {
-            TestSql.execute(c, "drop trigger fail on " + cursor);
-        }
+        restoreCursorAppends(config);
         await(Duration.ofSeconds(30), () -> delivered(handler).containsAll(badIds) && telemetry.steps.stream()
                 .anyMatch(s -> s.shards.equals(List.of(badShard)) && s.finished.get() > 0));
         await(Duration.ofSeconds(10), () -> delivered(handler).containsAll(goodIds));
@@ -332,10 +306,7 @@ class RelayTelemetryIT {
     @Test
     void fetchedCountsEveryRowReadPerShard() throws Exception {
         String a = "a";
-        String b = "b";
-        for (int i = 0; shard(b) == shard(a); i++) {
-            b = "b" + i;
-        }
+        String b = keyOffShard("b", shard(a));
         var config = new TestOutboxConfig();
         var events = new Events(transactions, config.table() + "_cursor");
         var handler = new RecordingHandler();
@@ -376,30 +347,24 @@ class RelayTelemetryIT {
         var events = new Events(transactions, config.table() + "_cursor");
         var calls = new AtomicInteger();
         var slowShard = new AtomicInteger(-1);
-        OutboxHandler handler = new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {}
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                int call = calls.incrementAndGet();
-                if (call == 1) {
-                    return java.util.Collections.nCopies(records.size(), Outcome.retry(new IllegalStateException("x")));
-                }
-                if (call == 2) {
-                    slowShard.set(records.get(0).shard());
-                    long end = System.nanoTime() + timeout.toNanos() + timeout.toNanos() / 5;
-                    while (System.nanoTime() < end) {
-                        try {
-                            Thread.sleep(10); // past the cancel at batchTimeout: no outcome of this call counts
-                        } catch (InterruptedException ignored) {
-                            // keeps the handler thread as a call stuck past its deadline does
-                        }
+        OutboxHandler handler = answering(records -> {
+            int call = calls.incrementAndGet();
+            if (call == 1) {
+                return java.util.Collections.nCopies(records.size(), Outcome.retry(new IllegalStateException("x")));
+            }
+            if (call == 2) {
+                slowShard.set(records.get(0).shard());
+                long end = System.nanoTime() + timeout.toNanos() + timeout.toNanos() / 5;
+                while (System.nanoTime() < end) {
+                    try {
+                        Thread.sleep(10); // past the cancel at batchTimeout: no outcome of this call counts
+                    } catch (InterruptedException ignored) {
+                        // keeps the handler thread as a call stuck past its deadline does
                     }
                 }
-                return java.util.Collections.nCopies(records.size(), Outcome.delivered());
             }
-        };
+            return java.util.Collections.nCopies(records.size(), Outcome.delivered());
+        });
         var outbox = start(config, handler, events);
 
         transactions.inTx(c -> outbox.sendAll(messages));
@@ -422,19 +387,13 @@ class RelayTelemetryIT {
         var config = new TestOutboxConfig();
         var events = new Events(transactions, config.table() + "_cursor");
         var first = new java.util.concurrent.atomic.AtomicBoolean(true);
-        OutboxHandler handler = new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {}
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                if (records.size() == 3 && first.compareAndSet(true, false)) {
-                    return List.of(Outcome.delivered(), Outcome.retry(new java.io.IOException("down")),
-                            Outcome.notAttempted());
-                }
-                return java.util.Collections.nCopies(records.size(), Outcome.delivered());
+        OutboxHandler handler = answering(records -> {
+            if (records.size() == 3 && first.compareAndSet(true, false)) {
+                return List.of(Outcome.delivered(), Outcome.retry(new java.io.IOException("down")),
+                        Outcome.notAttempted());
             }
-        };
+            return java.util.Collections.nCopies(records.size(), Outcome.delivered());
+        });
         var outbox = start(config, handler, events);
         var messages = keys.stream().map(k -> OutboxMessage.of("orders", k, bytes(k))).toList();
 
@@ -452,17 +411,11 @@ class RelayTelemetryIT {
         var config = new TestOutboxConfig();
         var events = new Events(transactions, config.table() + "_cursor");
         var reports = new CopyOnWriteArrayList<Boolean>();
-        OutboxHandler handler = new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {}
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                reports.add(io.github.dsudomoin.outbox.internal.RecordScope.reports());
-                OutboxHandler.recordFinished(records.get(0), Outcome.delivered());
-                return java.util.Collections.nCopies(records.size(), Outcome.delivered());
-            }
-        };
+        OutboxHandler handler = answering(records -> {
+            reports.add(io.github.dsudomoin.outbox.internal.RecordScope.reports());
+            OutboxHandler.recordFinished(records.get(0), Outcome.delivered());
+            return java.util.Collections.nCopies(records.size(), Outcome.delivered());
+        });
         var outbox = start(config, handler, events);
 
         var id = transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", "k", bytes("m"))));
@@ -575,16 +528,10 @@ class RelayTelemetryIT {
         var config = new TestOutboxConfig().relayEnabled(false).requeueDelay(Duration.ofMillis(50));
         var events = new Events(transactions, config.table() + "_cursor");
         var requeues = new AtomicInteger();
-        OutboxHandler handler = new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {}
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                return records.stream().map(r -> new String(r.payload(), UTF_8).equals("p")
-                        && requeues.getAndIncrement() < 2 ? Outcome.requeue() : Outcome.delivered()).toList();
-            }
-        };
+        OutboxHandler handler = answering(records -> {
+            return records.stream().map(r -> new String(r.payload(), UTF_8).equals("p")
+                    && requeues.getAndIncrement() < 2 ? Outcome.requeue() : Outcome.delivered()).toList();
+        });
         var outbox = start(config, handler, events);
 
         transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", "k", bytes("p"))));
@@ -601,6 +548,35 @@ class RelayTelemetryIT {
 
     private Outbox start(TestOutboxConfig config, OutboxHandler handler) {
         return start(config, handler, telemetry);
+    }
+
+    /** {@code prefix}, or {@code prefix<i>} for the first i that is, of a key on another shard than {@code shard}. */
+    private static String keyOffShard(String prefix, int shard) {
+        String key = prefix;
+        for (int i = 0; shard(key) == shard; i++) {
+            key = prefix + i;
+        }
+        return key;
+    }
+
+    /**
+     * The step's own SQL failing for {@code shard}, not its handler call (a handler failure is an outcome): every
+     * cursor append of the shard raises, failing each step that holds it.
+     */
+    private void failCursorAppends(TestOutboxConfig config, int shard) throws Exception {
+        var function = config.table() + "_fail";
+        try (var c = transactions.newConnection()) {
+            TestSql.execute(c, "create function " + function + "() returns trigger language plpgsql as $$ begin"
+                    + " if new.shard = " + shard + " then raise exception 'shard down'; end if; return new; end $$");
+            TestSql.execute(c, "create trigger fail before insert on " + config.table() + "_cursor"
+                    + " for each row execute function " + function + "()");
+        }
+    }
+
+    private void restoreCursorAppends(TestOutboxConfig config) throws Exception {
+        try (var c = transactions.newConnection()) {
+            TestSql.execute(c, "drop trigger fail on " + config.table() + "_cursor");
+        }
     }
 
     private Outbox start(TestOutboxConfig config, OutboxHandler handler, OutboxTelemetry telemetry) {

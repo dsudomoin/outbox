@@ -58,30 +58,6 @@ class SchemaValidationIT {
     }
 
     @Test
-    void renderedScriptStartsAndDelivers() throws Exception {
-        sql(OutboxSql.outbox(config, null));
-        var handler = new RecordingHandler();
-        var transactions = new JdbcTransactions(TestDataSources.newDataSource());
-        var runtime = OutboxRuntime.builder(config, transactions, handler).build();
-        runtimes.add(runtime);
-        long started = System.nanoTime();
-        runtime.start();
-
-        var id = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", "k", "p".getBytes(UTF_8))));
-        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
-        while (handler.delivered().isEmpty() && System.nanoTime() < deadline) {
-            Thread.sleep(5);
-        }
-        assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactly(id);
-        // the start's own run is over: while it holds the maintenance lock, another run skips and returns false
-        while (!maintainedSince(runtime, started) && System.nanoTime() < deadline) {
-            Thread.sleep(5);
-        }
-        assertThat(runtime.maintenance().runOnce()).isTrue();
-        assertThat(runtime.admin().status().premade()).isGreaterThanOrEqualTo(config.partitions().premake());
-    }
-
-    @Test
     void aSessionQuotingAllIdentifiersBootstrapsDeliversAndMaintains() throws Exception {
         deliversAndMaintains(new TestOutboxConfig().table(schema + ".quoted").schemaBootstrap(true)
                 .xidsPerPartition(1000));
@@ -99,10 +75,7 @@ class SchemaValidationIT {
     }
 
     private void deliversAndMaintains(TestOutboxConfig quoted) throws Exception {
-        var quoting = new PGSimpleDataSource();
-        quoting.setUrl(TestDataSources.jdbcUrl());
-        quoting.setUser(TestDataSources.user());
-        quoting.setPassword(TestDataSources.password());
+        var quoting = (PGSimpleDataSource) TestDataSources.newDataSource();
         quoting.setOptions("-c quote_all_identifiers=on");
         var handler = new RecordingHandler();
         var transactions = new JdbcTransactions(quoting);

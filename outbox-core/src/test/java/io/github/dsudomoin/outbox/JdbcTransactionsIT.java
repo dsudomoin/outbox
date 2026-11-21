@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox;
 
+import static io.github.dsudomoin.outbox.testing.Intercepting.intercepting;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -7,9 +8,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.List;
@@ -55,8 +54,8 @@ class JdbcTransactionsIT {
     }
 
     @Test
-    void throwingAfterCommitActionDoesNotReachCaller() {
-        var table = "jt_" + Long.toHexString(System.nanoTime());
+    void throwingAfterCommitActionDoesNotReachCaller() throws Exception {
+        var table = TestSql.uniqueTable();
         var later = new AtomicInteger();
 
         var result = transactions.inTx(c -> {
@@ -72,13 +71,7 @@ class JdbcTransactionsIT {
 
         assertThat(result).isEqualTo("done");
         assertThat(later).as("the next action still runs").hasValue(1);
-        int rows = transactions.inTx(c -> {
-            try (var st = c.createStatement(); var rs = st.executeQuery("select count(*) from " + table)) {
-                rs.next();
-                return rs.getInt(1);
-            }
-        });
-        assertThat(rows).as("the commit stands").isZero();
+        assertThat(rows(table)).as("the commit stands").isZero();
     }
 
     @Test
@@ -291,7 +284,7 @@ class JdbcTransactionsIT {
     }
 
     private static String table() throws SQLException {
-        var table = "jt_" + Long.toHexString(System.nanoTime());
+        var table = TestSql.uniqueTable();
         try (var c = TestDataSources.newDataSource().getConnection(); var st = c.createStatement()) {
             st.execute("create table " + table + " (id int)");
         }
@@ -330,35 +323,20 @@ class JdbcTransactionsIT {
         }
 
         DataSource source() {
-            return (DataSource) Proxy.newProxyInstance(DataSource.class.getClassLoader(),
-                    new Class<?>[] {DataSource.class}, (proxy, method, args) -> {
-                        var result = invoke(method, real, args);
-                        return result instanceof Connection c ? connection(c) : result;
-                    });
-        }
-
-        private Connection connection(Connection c) {
-            return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
-                    new Class<?>[] {Connection.class}, (proxy, method, args) -> {
-                        var call = method.getName().equals("setAutoCommit") ? "setAutoCommit(" + args[0] + ")"
-                                : method.getName();
-                        calls.add(call);
-                        if (call.equals(fault)) {
-                            if (call.equals("close")) {
-                                c.close();
-                            }
-                            throw thrown != null ? thrown : new SQLException("injected " + call);
-                        }
-                        return invoke(method, c, args);
-                    });
-        }
-
-        private static Object invoke(Method method, Object on, Object[] args) throws Throwable {
-            try {
-                return method.invoke(on, args);
-            } catch (InvocationTargetException e) {
-                throw e.getCause();
-            }
+            return intercepting(real, (c, method, args) -> {
+                var call = method.getName().equals("setAutoCommit") ? "setAutoCommit(" + args[0] + ")"
+                        : method.getName();
+                calls.add(call);
+                if (call.equals(fault)) {
+                    if (call.equals("close")) {
+                        c.close();
+                    }
+                    if (thrown instanceof Error e) {
+                        throw e;
+                    }
+                    throw thrown != null ? (Exception) thrown : new SQLException("injected " + call);
+                }
+            });
         }
     }
 }

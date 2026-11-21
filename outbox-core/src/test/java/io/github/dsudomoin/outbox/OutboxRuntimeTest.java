@@ -50,6 +50,14 @@ class OutboxRuntimeTest {
         assertThat(transactions.asked).hasValue(0);
     }
 
+    @Test
+    void noHandlerMessageNamesBothFrameworks() {
+        assertThatThrownBy(() -> OutboxRuntime.builder(new TestOutboxConfig(), transactions, null).build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("outbox-kafka-spring-boot")
+                .hasMessageContaining("KafkaOutboxModule");
+    }
+
     /** A binding that must not be asked for a connection. */
     private static final class NoDatabase implements OutboxTransactions {
 

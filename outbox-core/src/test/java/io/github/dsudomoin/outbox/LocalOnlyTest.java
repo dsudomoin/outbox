@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox;
 
+import static io.github.dsudomoin.outbox.testing.Handlers.answering;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -52,16 +53,10 @@ class LocalOnlyTest {
         var records = List.of(record("billing", "k"), record("billing", "k", VALUED), record("billing", null));
         var seen = new AtomicReference<List<OutboxRecord>>();
         var answer = List.of(Outcome.delivered(), Outcome.requeue(), Outcome.delivered());
-        var wrapped = new LocalOnly(new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {}
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> batch) {
-                seen.set(batch);
-                return answer;
-            }
-        });
+        var wrapped = new LocalOnly(answering(batch -> {
+            seen.set(batch);
+            return answer;
+        }));
 
         assertThat(wrapped.handleBatch(records)).isSameAs(answer);
         assertThat(seen.get()).isSameAs(records);
@@ -75,15 +70,7 @@ class LocalOnlyTest {
         assertThatThrownBy(() -> handler.handleBatch(List.of(record("billing", "k"))))
                 .as("the relay dead-letters a lone record whose call throws this").isSameAs(poison);
 
-        var wrapped = new LocalOnly(new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {}
-
-            @Override
-            public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                return null;
-            }
-        });
+        var wrapped = new LocalOnly(answering(records -> null));
         assertThat(wrapped.handleBatch(List.of(record("billing", "k"), record("billing", null))))
                 .as("the relay fails the whole call").isNull();
     }
@@ -113,15 +100,7 @@ class LocalOnlyTest {
                 records -> null,
                 records -> Arrays.asList(new Outcome[records.size()]));
         for (var answer : answers) {
-            var wrapped = new LocalOnly(new OutboxHandler() {
-                @Override
-                public void handle(OutboxRecord record) {}
-
-                @Override
-                public List<Outcome> handleBatch(List<OutboxRecord> records) {
-                    return answer.apply(records);
-                }
-            });
+            var wrapped = new LocalOnly(answering(records -> answer.apply(records)));
             var records = List.of(record("billing", "k"), record("billing", "j", MARKER), record("billing", null));
 
             try (var err = new CapturedStderr()) {

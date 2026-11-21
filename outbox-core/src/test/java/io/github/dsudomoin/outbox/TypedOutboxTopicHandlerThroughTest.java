@@ -5,9 +5,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import jakarta.annotation.Nullable;
-import java.sql.Connection;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -95,14 +93,6 @@ class TypedOutboxTopicHandlerThroughTest {
                 .hasToString(handler.toString());
     }
 
-    @Test
-    void noHandlerMessageNamesBothFrameworks() {
-        assertThatThrownBy(() -> OutboxRuntime.builder(new TestOutboxConfig(), new NoTransactions(), null).build())
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("outbox-kafka-spring-boot")
-                .hasMessageContaining("KafkaOutboxModule");
-    }
-
     private static OutboxRecord record(@Nullable String payload) {
         return new OutboxRecord(1, UUID.randomUUID(), "audit", null, payload == null ? null : payload.getBytes(UTF_8),
                 List.of(), Instant.EPOCH, 0, 0);
@@ -140,30 +130,6 @@ class TypedOutboxTopicHandlerThroughTest {
         public List<Outcome> handleBatch(List<OutboxRecord> records) {
             batches.add(records);
             return outcomes;
-        }
-    }
-
-    /** Never asked: the build fails before any database access. */
-    private static final class NoTransactions implements OutboxTransactions {
-
-        @Override
-        public Connection newConnection() {
-            throw new AssertionError("no database access expected");
-        }
-
-        @Override
-        public Connection currentConnection() {
-            throw new AssertionError("no database access expected");
-        }
-
-        @Override
-        public void afterCommit(Runnable action) {
-            throw new AssertionError("no transaction expected");
-        }
-
-        @Override
-        public String transactionHint() {
-            return "a test transaction";
         }
     }
 }

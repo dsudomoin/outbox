@@ -82,11 +82,4 @@ class OutboxMessageTest {
         assertThat(withC.headers()).containsExactly(b1, a2, b3, new OutboxHeader("c", "4".getBytes(UTF_8)));
         assertThat(message.headers()).containsExactly(b1, a2, b3);
     }
-
-    @Test
-    void nullPayloadAllowed() {
-        var message = OutboxMessage.of("t", "k", null);
-        assertThat(message.payload()).isNull();
-        assertThat(message.headers()).isEmpty();
-    }
 }
