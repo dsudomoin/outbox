@@ -15,12 +15,11 @@ import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
+import io.github.dsudomoin.outbox.testing.Intercepting;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
@@ -478,7 +477,6 @@ class PgInboxIT {
         start();
         long after = System.currentTimeMillis();
         long hour = lowest() + 2 * HOUR; // the hour init saw, wherever the clock is now
-        var name = HOURS;
         var current = ranges();
         // fresh: hourly ranges from floor(now - retention) to past now + premake, named after their lower bound
         assertThat(hour).isIn(Math.floorDiv(before, HOUR) * HOUR, Math.floorDiv(after, HOUR) * HOUR);
@@ -486,7 +484,7 @@ class PgInboxIT {
         for (var b : current) {
             long from = millis(b.from());
             assertThat(millis(b.to())).isEqualTo(from + HOUR);
-            assertThat(b.name()).isEqualTo(table() + "_t" + name.format(Instant.ofEpochMilli(from)));
+            assertThat(b.name()).isEqualTo(table() + "_t" + HOURS.format(Instant.ofEpochMilli(from)));
         }
         assertThat(highest()).isGreaterThan(before + Duration.ofHours(3).toMillis());
         // time passes: partitions of an older range, expired by now - retention
@@ -594,10 +592,8 @@ class PgInboxIT {
     void rangeOrphanedBetweenDetachAndDropIsDroppedOnceExpired() throws Exception {
         start();
         long hour = lowest() + 2 * HOUR; // the hour init saw, wherever the clock is now
-        var expired = table() + "_t" + HOURS
-                .format(Instant.ofEpochMilli(hour - 5 * HOUR));
-        var recent = table() + "_t" + HOURS
-                .format(Instant.ofEpochMilli(hour + 240 * HOUR));
+        var expired = table() + "_t" + HOURS.format(Instant.ofEpochMilli(hour - 5 * HOUR));
+        var recent = table() + "_t" + HOURS.format(Instant.ofEpochMilli(hour + 240 * HOUR));
         try (var c = TestDb.connect()) {
             attach(c, expired, hour - 5 * HOUR);
             try (var ps = c.prepareStatement("insert into " + table() + " (message_id) values (?)")) {
@@ -723,8 +719,7 @@ class PgInboxIT {
     void theOrphanGaugeKeepsItsLastValueWhileTheStepRuns() throws Exception {
         start();
         long hour = lowest() + 2 * HOUR;
-        var expired = table() + "_t" + HOURS
-                .format(Instant.ofEpochMilli(hour - 5 * HOUR));
+        var expired = table() + "_t" + HOURS.format(Instant.ofEpochMilli(hour - 5 * HOUR));
         var registry = new SimpleMeterRegistry();
         var maintaining = new PgInbox(db, config, new OutboxMetrics(registry));
         maintaining.runMaintenance();
@@ -840,8 +835,7 @@ class PgInboxIT {
         config.attachOrphans(false);
         start();
         var range = rangeOf(System.currentTimeMillis());
-        var far = table() + "_t" + HOURS
-                .format(Instant.ofEpochMilli(highest() + 10 * HOUR));
+        var far = table() + "_t" + HOURS.format(Instant.ofEpochMilli(highest() + 10 * HOUR));
         try (var c = TestDb.connect()) {
             execute(c, "alter table " + table() + " detach partition " + range.name());
             standalone(c, far);
@@ -1029,17 +1023,11 @@ class PgInboxIT {
 
     /** {@code c}, whose statements containing {@code sql} fail to prepare. */
     private static Connection failing(Connection c, String sql) {
-        return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[] {Connection.class},
-                (proxy, method, args) -> {
-                    if (method.getName().equals("prepareStatement") && ((String) args[0]).contains(sql)) {
-                        throw new SQLException("connection reset", "08006");
-                    }
-                    try {
-                        return method.invoke(c, args);
-                    } catch (InvocationTargetException e) {
-                        throw e.getCause();
-                    }
-                });
+        return Intercepting.connection(c, (real, method, args) -> {
+            if (method.getName().equals("prepareStatement") && ((String) args[0]).contains(sql)) {
+                throw new SQLException("connection reset", "08006");
+            }
+        });
     }
 
     @Test
@@ -1090,10 +1078,9 @@ class PgInboxIT {
                 .inboxPremake(Duration.ofHours(1));
         start();
 
-        var name = MINUTES;
         var current = ranges();
         assertThat(current).isNotEmpty().allSatisfy(b -> assertThat(b.name())
-                .isEqualTo(table() + "_t" + name.format(Instant.ofEpochMilli(millis(b.from())))));
+                .isEqualTo(table() + "_t" + MINUTES.format(Instant.ofEpochMilli(millis(b.from())))));
         var id = UuidV7.next();
         assertThat(accept(id)).isTrue();
         assertThat(accept(id)).isFalse();

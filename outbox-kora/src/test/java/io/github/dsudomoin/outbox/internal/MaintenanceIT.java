@@ -53,10 +53,7 @@ import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
-import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
-import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
-import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
@@ -2216,34 +2213,16 @@ class MaintenanceIT {
         bootstrap();
         var hanging = new AtomicBoolean();
         var released = new CountDownLatch(1);
-        var maintenance = new Maintenance(new KoraOutboxTransactions(new JdbcConnectionFactory() {
-            @Override
-            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
-                return db.withConnection(callback);
-            }
-
-            @Override
-            public Connection currentConnection() {
-                return db.currentConnection();
-            }
-
-            @Override
-            public Connection newConnection() {
-                if (hanging.get()) {
-                    try {
-                        released.await();
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
+        var maintenance = new Maintenance(new KoraOutboxTransactions(TestDb.opening(db, () -> {
+            if (hanging.get()) {
+                try {
+                    released.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
                 }
-                return db.newConnection();
             }
-
-            @Override
-            public DataBaseTelemetry telemetry() {
-                return db.telemetry();
-            }
-        }), names, config, new OutboxMetrics(null));
+            return db.newConnection();
+        })), names, config, new OutboxMetrics(null));
         deadTableWithoutIndex(1);
         try (var c = TestDb.connect(); var holder = openDeadInsert(2)) {
             assertThat(maintenance.runOnce()).isTrue();

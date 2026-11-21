@@ -28,6 +28,7 @@ import io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.micrometer.OutboxStepContext;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
+import io.github.dsudomoin.outbox.testing.Intercepting;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.RoundTrips;
 import io.github.dsudomoin.outbox.testing.ShardKeys;
@@ -4714,7 +4715,7 @@ class ShardProcessorIT {
 
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 90, true));
 
-        assertThat(chunkReads()).containsExactly("plain");
+        assertThat(chunkReads(names, statements)).containsExactly("plain");
         assertThat(handler.delivered()).hasSize(91).extracting(OutboxRecord::messageId).doesNotHaveDuplicates();
         assertIdOrderPerKey(handler.delivered());
         assertThat(chunkReadsOfAStep(msg("t", "a", "a#2"))).containsExactly("budgeted");
@@ -4742,7 +4743,7 @@ class ShardProcessorIT {
 
         assertThat(calls).allSatisfy(call -> assertThat(call.size() == 1 || bytesOf(call) <= 1_000_000)
                 .as("%s rows of %s bytes", call.size(), bytesOf(call)).isTrue());
-        assertThat(chunkReads()).as("never plain while large rows come").doesNotContain("plain");
+        assertThat(chunkReads(names, statements)).as("never plain while large rows come").doesNotContain("plain");
         assertThat(handler.delivered()).hasSize(25).extracting(OutboxRecord::messageId).doesNotHaveDuplicates();
     }
 
@@ -4765,7 +4766,7 @@ class ShardProcessorIT {
         failing = null;
         statements.clear();
         process();
-        assertThat(chunkReads()).containsExactly("budgeted");
+        assertThat(chunkReads(names, statements)).containsExactly("budgeted");
         assertThat(delivered()).containsExactly("a#1", "a#2", "a#3");
     }
 
@@ -4775,11 +4776,11 @@ class ShardProcessorIT {
         tick();
         statements.clear();
         process();
-        return chunkReads();
+        return chunkReads(names, statements);
     }
 
     /** The chunk reads among {@link #statements}, in order: {@code plain} or {@code budgeted} each. */
-    private List<String> chunkReads() {
+    static List<String> chunkReads(TableNames names, List<String> statements) {
         var reader = new BatchReader(names);
         var plain = List.of(reader.sql(true), reader.sql(false), reader.manySql(true), reader.manySql(false));
         var budgeted = List.of(reader.budgetedSql(true), reader.budgetedSql(false), reader.budgetedManySql(true),
@@ -5477,23 +5478,16 @@ class ShardProcessorIT {
 
     /** {@code c}, adding the SQL of each statement it prepares to {@link #statements}. */
     private Connection recording(Connection c) {
-        return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[] {Connection.class},
-                (proxy, method, args) -> {
-                    if (method.getName().startsWith("prepare")) {
-                        statements.add((String) args[0]);
-                        statementTimes.add(System.nanoTime());
-                        var fail = failing;
-                        if (fail != null && fail.test((String) args[0])) {
-                            throw new PSQLException("Ran out of memory retrieving query results.",
-                                    PSQLState.OUT_OF_MEMORY);
-                        }
-                    }
-                    try {
-                        return method.invoke(c, args);
-                    } catch (InvocationTargetException e) {
-                        throw e.getCause();
-                    }
-                });
+        return Intercepting.connection(c, (real, method, args) -> {
+            if (method.getName().startsWith("prepare")) {
+                statements.add((String) args[0]);
+                statementTimes.add(System.nanoTime());
+                var fail = failing;
+                if (fail != null && fail.test((String) args[0])) {
+                    throw new PSQLException("Ran out of memory retrieving query results.", PSQLState.OUT_OF_MEMORY);
+                }
+            }
+        });
     }
 
     /** One {@link #process()}; the longest time between two statements it prepared is added to {@code gaps}. */
@@ -5584,7 +5578,6 @@ class ShardProcessorIT {
         return Long.parseLong(rows("select count(*) from " + names.cursor() + " where shard = 0",
                 rs -> rs.getString(1)).get(0));
     }
-
 
     private Cursor cursor() throws SQLException {
         try (var c = TestDb.connect()) {

@@ -4,8 +4,6 @@ import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.internal.BatchReader.ShardRead;
-import io.github.dsudomoin.outbox.testing.Intercepting;
-import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -73,10 +71,6 @@ class ChunkReadBenchmark {
         var names = schema.names();
         var ticks = new Ticks(names, shards);
         var outbox = new PgOutbox(db, schema, shards, () -> {}, TestTelemetry.kora());
-        var reader = new BatchReader(names);
-        var plain = List.of(reader.manySql(true), reader.manySql(false), reader.sql(true), reader.sql(false));
-        var budgeted = List.of(reader.budgetedManySql(true), reader.budgetedManySql(false), reader.budgetedSql(true),
-                reader.budgetedSql(false));
         try (var processor = new ShardProcessor(names, config, record -> {}, TestTelemetry.kora(), false)) {
             var random = new Random(2);
             var group = IntStream.range(0, shards).boxed().toList();
@@ -89,13 +83,12 @@ class ChunkReadBenchmark {
                     latest = ticks.latest(c).id();
                 }
                 var prepared = new ArrayList<String>();
-                try (var c = recording(prepared)) {
+                try (var c = BatchReaderIT.recording(TestDb.connect(), prepared)) {
                     ShardProcessor.prepareTransaction(c, config.batchTimeout());
                     processor.tryProcess(c, group, latest, Instant.now());
                     c.commit();
                 }
-                steps.add(String.join("+", prepared.stream().filter(sql -> plain.contains(sql)
-                        || budgeted.contains(sql)).map(sql -> budgeted.contains(sql) ? "budgeted" : "plain").toList()));
+                steps.add(String.join("+", ShardProcessorIT.chunkReads(names, prepared)));
             }
             System.out.println("steady stream of " + ROWS + " rows of " + PAYLOAD + " B a step, chunk reads: " + steps);
         }
@@ -183,15 +176,6 @@ class ChunkReadBenchmark {
             }).toList();
             db.inTx((SqlFunction0<List<UUID>>) () -> outbox.sendAll(messages));
         }
-    }
-
-    /** A new connection, adding the SQL of each statement it prepares to {@code prepared}. */
-    private static Connection recording(List<String> prepared) throws SQLException {
-        return Intercepting.intercepting(TestDataSources.newDataSource(), (real, method, args) -> {
-            if (method.getName().startsWith("prepare") && args != null && args[0] instanceof String sql) {
-                prepared.add(sql);
-            }
-        }).getConnection();
     }
 
     private static PgSnapshot tick(Ticks ticks) throws SQLException {

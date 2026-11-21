@@ -428,11 +428,7 @@ class DeadLetterPassIT {
         await(Duration.ofSeconds(5), () -> pass.runOnce() == 1);
 
         assertThat(calls).as("decided once").hasValue(1);
-        try (var c = TestDb.connect()) {
-            var order = TestSql.queryStrings(c, "select message_id::text from " + names.base() + " order by id")
-                    .stream().map(UUID::fromString).toList();
-            assertThat(order).as("behind the send").containsExactly(live, messageId);
-        }
+        assertThat(OutboxAdminIT.messageIds(names.base())).as("behind the send").containsExactly(live, messageId);
         var handler = new RecordingHandler();
         relay(handler).drain();
         assertThat(handler.delivered()).extracting(r -> new String(r.payload(), UTF_8))
@@ -751,14 +747,14 @@ class DeadLetterPassIT {
         }
         execute("update " + names.dead() + " set status = 'scheduled',"
                 + " payload = decode(repeat(md5(id::text), 4096), 'hex')"); // 64 KB each
-        var stored = contents(names.dead());
+        var stored = OutboxAdminIT.contents(names.dead());
         var pass = new DeadLetterPass(ByteReads.of(db), names, config, null, new OutboxMetrics(registry));
         passes.add(pass);
 
         long read = ByteReads.during(() -> assertThat(pass.runOnce()).isEqualTo(10));
 
         assertThat(read).as("bytes read into Java: the keys at most").isLessThan(1024);
-        assertThat(contents(names.base())).as("in id order, byte for byte").isEqualTo(stored);
+        assertThat(OutboxAdminIT.contents(names.base())).as("in id order, byte for byte").isEqualTo(stored);
     }
 
     @Test
@@ -1045,14 +1041,6 @@ class DeadLetterPassIT {
             ps.executeUpdate();
         }
         return id;
-    }
-
-    /** Each row's message id, topic, key and the md5 of its payload and headers, by id. */
-    private static List<String> contents(String table) throws SQLException {
-        try (var c = TestDb.connect()) {
-            return TestSql.queryStrings(c, "select concat_ws(' ', message_id, topic, encode(key, 'hex'), md5(payload),"
-                    + " md5(headers)) from " + table + " order by id");
-        }
     }
 
     private static List<DeadLetterDecision> all(List<DeadLetter> letters, DeadLetterDecision decision) {

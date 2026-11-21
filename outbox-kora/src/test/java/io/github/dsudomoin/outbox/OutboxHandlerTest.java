@@ -315,7 +315,7 @@ class OutboxHandlerTest {
                 records -> null,
                 records -> Arrays.asList(new Outcome[records.size()]));
         for (var answer : answers) {
-            OutboxHandler broken = answering(records -> answer.apply(records));
+            OutboxHandler broken = answering(answer);
             var handler = OutboxHandler.byTopic(Map.of("ok", new RecordingHandler()), broken);
             var records = List.of(record("t", "k"), record("ok", "k"), record("t", null));
 

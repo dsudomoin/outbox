@@ -24,6 +24,7 @@ import io.github.dsudomoin.outbox.kora.KoraOutboxTelemetry;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
+import io.github.dsudomoin.outbox.testing.Intercepting;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.RoundTrips;
 import io.github.dsudomoin.outbox.testing.ShardKeys;
@@ -323,13 +324,11 @@ class OutboxRelayIT {
             }
             borrows.incrementAndGet();
             long borrowed = System.nanoTime();
-            return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
-                    new Class<?>[] {Connection.class}, (proxy, method, args) -> {
-                        if (method.getName().equals("close")) {
-                            longest.accumulateAndGet(System.nanoTime() - borrowed, Math::max);
-                        }
-                        return invoke(method, c, args);
-                    });
+            return Intercepting.connection(c, (real, call, args) -> {
+                if (call.getName().equals("close")) {
+                    longest.accumulateAndGet(System.nanoTime() - borrowed, Math::max);
+                }
+            });
         }), handler);
         relay.start();
 
@@ -1251,21 +1250,19 @@ class OutboxRelayIT {
         var slow = keyOnShard(0, "slow");
         var failing = keyOnShard(1, "failing");
         var offers = new CopyOnWriteArrayList<Long>();
-        var relay = relay(answering(records -> {
-            return records.stream().map(r -> {
-                if (slow.equals(key(r))) {
-                    try {
-                        Thread.sleep(3000); // longer than the pause, within batchTimeout
-                    } catch (InterruptedException e) {
-                        throw new IllegalStateException(e);
-                    }
+        var relay = relay(eachRecord(r -> {
+            if (slow.equals(key(r))) {
+                try {
+                    Thread.sleep(3000); // longer than the pause, within batchTimeout
+                } catch (InterruptedException e) {
+                    throw new IllegalStateException(e);
                 }
-                if (!failing.equals(key(r))) {
-                    return Outcome.delivered();
-                }
-                offers.add(System.nanoTime());
-                return (Outcome) Outcome.retry(new RuntimeException("target down"));
-            }).toList();
+            }
+            if (!failing.equals(key(r))) {
+                return Outcome.delivered();
+            }
+            offers.add(System.nanoTime());
+            return Outcome.retry(new RuntimeException("target down"));
         }));
         var outbox = outbox(relay::wake);
         // a row on each shard: each delivers a full batchSize read, so each is busy and steps alone, shard 0 first
@@ -2681,13 +2678,11 @@ class OutboxRelayIT {
             var count = open.computeIfAbsent(thread, t -> new AtomicInteger());
             peaks.merge(thread, count.incrementAndGet(), Math::max);
             var closed = new AtomicBoolean();
-            return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
-                    new Class<?>[] {Connection.class}, (proxy, method, args) -> {
-                        if (method.getName().equals("close") && closed.compareAndSet(false, true)) {
-                            count.decrementAndGet();
-                        }
-                        return invoke(method, c, args);
-                    });
+            return Intercepting.connection(c, (real, call, args) -> {
+                if (call.getName().equals("close") && closed.compareAndSet(false, true)) {
+                    count.decrementAndGet();
+                }
+            });
         });
     }
 
@@ -2789,20 +2784,11 @@ class OutboxRelayIT {
 
     /** {@link #db} whose new connections report the SQL of every statement they prepare. */
     private JdbcConnectionFactory observed(Consumer<String> prepared) {
-        return opening(db, () -> {
-            var c = db.newConnection();
-            return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
-                    new Class<?>[] {Connection.class}, (proxy, method, args) -> {
-                        if (method.getName().equals("prepareStatement")) {
-                            prepared.accept((String) args[0]);
-                        }
-                        try {
-                            return method.invoke(c, args);
-                        } catch (InvocationTargetException e) {
-                            throw e.getCause();
-                        }
-                    });
-        });
+        return opening(db, () -> Intercepting.connection(db.newConnection(), (real, call, args) -> {
+            if (call.getName().equals("prepareStatement")) {
+                prepared.accept((String) args[0]);
+            }
+        }));
     }
 
     /** {@link #db} whose new connections count the shard steps (shard lock attempts) per shard. */
@@ -2953,7 +2939,6 @@ class OutboxRelayIT {
     private String keyOnShard(int shard, String prefix) {
         return ShardKeys.first("t", prefix, shard, config.shards());
     }
-
 
     /** {@code n} messages over 20 keys per shard of {@code first..last}, several per key, keys interleaved. */
     private List<OutboxMessage> messagesOnShards(int n, int first, int last) {

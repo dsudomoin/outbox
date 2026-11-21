@@ -127,7 +127,7 @@ class OutboxConfigTest {
     }
 
     @Test
-    void zeroSwapLockTimeoutIsNoWait() {
+    void swapLockTimeoutIsZeroOrAtLeastOneMillisecond() {
         var config = parse("outbox.partitions.swapLockTimeout = 0ms");
 
         OutboxSchema.validate(config);

@@ -15,7 +15,7 @@ import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 
-/** The heartbeat pool's config, copied from plain Hikari configs: no pool, no database. */
+/** What the Kora adapter adds to the heartbeat pool: when it derives one, and the HOCON flag; no database. */
 class HeartbeatPoolTest {
 
     @Test

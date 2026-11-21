@@ -659,7 +659,7 @@ class BatchReaderIT {
     }
 
     /** {@code c}, adding the SQL of each statement it prepares to {@code prepared}. */
-    private static Connection recording(Connection c, List<String> prepared) {
+    static Connection recording(Connection c, List<String> prepared) {
         return Intercepting.connection(c, (real, method, args) -> {
             if (method.getName().equals("prepareStatement")) {
                 prepared.add((String) args[0]);

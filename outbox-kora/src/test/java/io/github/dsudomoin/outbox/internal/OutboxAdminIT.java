@@ -1430,7 +1430,7 @@ class OutboxAdminIT {
         return longs("select id from " + table + " order by id");
     }
 
-    private List<String> payloads(String table) throws SQLException {
+    static List<String> payloads(String table) throws SQLException {
         try (var c = TestDb.connect()) {
             return TestSql.queryStrings(c, "select convert_from(payload, 'UTF8') from " + table + " order by id");
         }
@@ -1542,14 +1542,18 @@ class OutboxAdminIT {
     }
 
     private List<UUID> outboxMessageIds() throws SQLException {
+        return messageIds(names.base());
+    }
+
+    static List<UUID> messageIds(String table) throws SQLException {
         try (var c = TestDb.connect()) {
-            return TestSql.queryStrings(c, "select message_id::text from " + names.base() + " order by id").stream()
+            return TestSql.queryStrings(c, "select message_id::text from " + table + " order by id").stream()
                     .map(UUID::fromString).toList();
         }
     }
 
     /** Each row's message id, topic, key and the md5 of its payload and headers, by id. */
-    private static List<String> contents(String table) throws SQLException {
+    static List<String> contents(String table) throws SQLException {
         try (var c = TestDb.connect()) {
             return TestSql.queryStrings(c, "select concat_ws(' ', message_id, topic, encode(key, 'hex'), md5(payload),"
                     + " md5(headers)) from " + table + " order by id");

@@ -17,6 +17,7 @@ import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
+import io.github.dsudomoin.outbox.testing.Intercepting;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
@@ -24,8 +25,6 @@ import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
@@ -474,20 +473,11 @@ class XidRecoveryIT {
         bootstrap();
         forgeRegression();
         var failing = new AtomicBoolean(true);
-        var factory = TestDb.opening(db, () -> {
-            var c = db.newConnection();
-            return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
-                    new Class<?>[] {Connection.class}, (proxy, method, args) -> {
-                        if (method.getName().equals("commit") && failing.compareAndSet(true, false)) {
-                            throw new IllegalStateException("injected commit failure");
-                        }
-                        try {
-                            return method.invoke(c, args);
-                        } catch (InvocationTargetException e) {
-                            throw e.getCause();
-                        }
-                    });
-        });
+        var factory = TestDb.opening(db, () -> Intercepting.connection(db.newConnection(), (c, method, args) -> {
+            if (method.getName().equals("commit") && failing.compareAndSet(true, false)) {
+                throw new IllegalStateException("injected commit failure");
+            }
+        }));
         var maintenance = new Maintenance(new KoraOutboxTransactions(factory), names, config, new OutboxMetrics(null));
 
         assertThatThrownBy(maintenance::checkHalt).isInstanceOf(IllegalStateException.class)

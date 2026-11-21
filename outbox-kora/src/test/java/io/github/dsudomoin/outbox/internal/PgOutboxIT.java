@@ -13,7 +13,6 @@ import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.RoundTrips;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
-import io.github.dsudomoin.outbox.testing.TestSql;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.github.dsudomoin.outbox.testing.TestTracing;
 import java.sql.Connection;
@@ -162,7 +161,7 @@ class PgOutboxIT {
 
         assertThatThrownBy(() -> a.get(10, SECONDS)).hasRootCauseMessage("rollback A");
         assertThat(b.get(10, SECONDS)).isGreaterThan(aBeforeRollback.get());
-        assertThat(payloadsInIdOrder()).containsExactly("b");
+        assertThat(OutboxAdminIT.payloads(names.base())).containsExactly("b");
     }
 
     @Test
@@ -193,7 +192,7 @@ class PgOutboxIT {
 
         assertThat(bSent.returnedAt()).isGreaterThan(aBeforeCommit.get());
         assertThat(row(bSent.id()).id()).isGreaterThan(row(aIds.get(0)).id()).isGreaterThan(row(aIds.get(1)).id());
-        assertThat(payloadsInIdOrder()).containsExactly("a1", "a2", "b");
+        assertThat(OutboxAdminIT.payloads(names.base())).containsExactly("a1", "a2", "b");
     }
 
     @Test
@@ -231,7 +230,7 @@ class PgOutboxIT {
         var ids = db.inTx((SqlFunction0<List<UUID>>) () -> outbox.sendAll(messages));
 
         assertThat(ids).hasSize(messages.size()).doesNotHaveDuplicates();
-        assertThat(messageIdsInIdOrder()).containsExactlyElementsOf(ids);
+        assertThat(OutboxAdminIT.messageIds(names.base())).containsExactlyElementsOf(ids);
         for (int i = 0; i < messages.size(); i++) {
             var m = messages.get(i);
             var row = row(ids.get(i));
@@ -415,7 +414,7 @@ class PgOutboxIT {
         });
 
         assertThat(advisoryLocks).as("no lock statement for unkeyed rows").hasValue(0);
-        assertThat(messageIdsInIdOrder()).containsExactlyElementsOf(ids);
+        assertThat(OutboxAdminIT.messageIds(names.base())).containsExactlyElementsOf(ids);
         for (int i = 0; i < messages.size(); i++) {
             var row = row(ids.get(i));
             assertThat(row.shard()).isBetween(0, config.shards() - 1);
@@ -468,20 +467,6 @@ class PgOutboxIT {
     private long count() throws SQLException {
         try (var c = TestDb.connect()) {
             return queryLong(c, "select count(*) from " + names.base());
-        }
-    }
-
-    private List<String> payloadsInIdOrder() throws SQLException {
-        try (var c = TestDb.connect()) {
-            return TestSql.queryStrings(c, "select convert_from(payload, 'UTF8') from " + names.base()
-                    + " order by id");
-        }
-    }
-
-    private List<UUID> messageIdsInIdOrder() throws SQLException {
-        try (var c = TestDb.connect()) {
-            return TestSql.queryStrings(c, "select message_id::text from " + names.base() + " order by id").stream()
-                    .map(UUID::fromString).toList();
         }
     }
 

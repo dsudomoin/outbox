@@ -323,7 +323,6 @@ class OutboxTopicHandlerTest {
                 .hasMessageContaining("OutboxHandler").hasMessageContaining("OutboxTopicHandler");
     }
 
-
     /** A record no instance reading its contract version can ever handle. */
     private static void assertPermanent(Outcome outcome, OutboxRecord record, String reason) {
         assertThat(outcome).isInstanceOfSatisfying(Outcome.Permanent.class, p -> assertThat(p.error())
