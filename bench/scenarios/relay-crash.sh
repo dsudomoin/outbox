@@ -40,9 +40,7 @@ ready=$(now)
 load "$RATE" "$WRITERS"
 relay="" e2e=""
 while [ "$(now)" -lt $((launched + 600)) ] && { [ -z "$relay" ] || [ -z "$e2e" ]; }; do
-  if [ -z "$relay" ] && [ "$(psql_q "select coalesce(bool_and(e.tick_id >= t.id), false)
-      from $(effective_ticks "$table") e,
-      (select min(id) as id from ${table}_tick where id > $last_tick) t")" = t ]; then
+  if [ -z "$relay" ] && [ "$(psql_q "select $(relay_passed "$table" "id > $last_tick")")" = t ]; then
     relay=$(($(now) - launched))
   fi
   if [ -z "$e2e" ] && [ "$(psql_q "select count(*) from bench_crash_pending p
@@ -54,8 +52,7 @@ done
 sleep 30
 load_stop
 post=$(metric bench_messages_sent_total) || post=""
-stopped=$(now); rc=0; reconcile "$table" 900 "${post:+$((pre + post))}" "$pre_consumed" || rc=$?
-if [ "$rc" = 1 ]; then drain="не за 900 с"; else drain="за $(($(now) - stopped)) с"; fi
+reconcile_timed "$table" 900 "${post:+$((pre + post))}" "$pre_consumed"; rc=$RC drain=$DRAIN
 mark_end "$id"
 window "$t0" "$t1"
 after=$(totals)

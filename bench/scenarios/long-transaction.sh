@@ -26,8 +26,7 @@ cpu_stop; cpu=$CPU
 sleep 60
 t3=$(now)
 load_stop
-stopped=$(now); rc=0; reconcile "$table" 900 "$(metric bench_messages_sent_total)" || rc=$?
-if [ "$rc" = 1 ]; then drain="не за 900 с"; else drain="за $(($(now) - stopped)) с"; fi
+reconcile_timed "$table" 900 "$(metric bench_messages_sent_total)"; rc=$RC drain=$DRAIN
 mark_end "$id"
 minutes=$(p99_by_minute "$t1" "$t2")
 end=$(totals)
@@ -35,7 +34,7 @@ app_stop
 
 row() { # row PHASE T0 T1
   window "$2" "$3"
-  echo "| $1 | $(utc "$2" | cut -c12-) – $(utc "$3" | cut -c12-) | $(f0 "$COMMITTED") | $(f0 "$DELIVERED") \
+  echo "| $1 | $(hms "$2") – $(hms "$3") | $(f0 "$COMMITTED") | $(f0 "$DELIVERED") \
 | $(f0 "$CONSUMED") | $(f3 "$P50") s | $(f3 "$P99") s | $(f1 "$LAG") s |"
 }
 

@@ -49,8 +49,6 @@ sizes() {
 }
 mb() { f1 "$(calc "$1 / 1048576")"; }
 
-drop_all() { drop_outbox "$1"; psql_q "drop table if exists ${1}_parked" > /dev/null; }
-
 # analyzed: "relname:autoanalyze_count:autovacuum_count" of every user table, one per line, for a before/after diff.
 analyzed() {
   psql_q "select relname || ':' || autoanalyze_count || ':' || autovacuum_count from pg_stat_user_tables order by 1"
@@ -106,7 +104,7 @@ for line in sys.stdin:
 print(", ".join(f"{n} +{a - old.get(n, (0, 0))[0]}/+{v - old.get(n, (0, 0))[1]}" for n, (a, v) in sorted(new.items()))
       or "нет")')
 }
-span() { echo "$(utc "$1" | cut -c12-) – $(utc "$2" | cut -c12-)"; }
+span() { echo "$(hms "$1") – $(hms "$2")"; }
 row() { log "$1: $2"; printf -v "$1" '%s%s\n' "${!1}" "$2"; } # row VAR TEXT: appends a table row to VAR
 IDLE_ROWS="" BULK_ROWS="" LOW_ROWS="" WAL_ROWS=""
 
@@ -122,7 +120,7 @@ background() {
 idle() { # idle SHARDS
   local shards=$1 table=bench_shardcost_s$1_idle id
   log "shard-cost-s$shards-idle"
-  drop_all "$table"
+  drop_outbox "$table"
   app_start "shard-cost-s$shards-idle" "${DEFAULTS[@]}" CONSUMER_THREADS=0 OUTBOX_TABLE="$table" OUTBOX_SHARDS="$shards"
   id=$(mark shard-cost "shard cost: idle, shards $shards")
   sleep "$WARMUP"
@@ -137,14 +135,14 @@ idle() { # idle SHARDS
   fi
   mark_end "$id"
   app_stop
-  drop_all "$table"
+  drop_outbox "$table"
   row IDLE_ROWS "| $shards | $(f1 "$XID_S") | $(f0 "$WAL_S") | $(f1 "$COMMIT_S") | $(span "$T0" "$T1") |"
 }
 
 bulk() { # bulk SHARDS
   local shards=$1 table=bench_shardcost_s$1_bulk id d0 d1 stored parts rest
   log "shard-cost-s$shards-bulk"
-  drop_all "$table"
+  drop_outbox "$table"
   app_start "shard-cost-s$shards-bulk" "${DEFAULTS[@]}" CONSUMER_THREADS=0 BENCH_HANDLER=noop OUTBOX_TABLE="$table" \
     OUTBOX_SHARDS="$shards"
   id=$(mark shard-cost "shard cost: bulk, shards $shards")
@@ -161,7 +159,7 @@ bulk() { # bulk SHARDS
   window "$T0" "$T1"
   local batches; batches=$(per_s outbox_batch_duration_seconds_count "$T0" "$T1")
   app_stop
-  drop_all "$table"
+  drop_outbox "$table"
   row BULK_ROWS "| $shards | $(f0 "$COMMITTED") | $(f0 "$DELIVERED") | $(f3 "$P50") / $(f3 "$P99") s | $(f0 "$GROWTH") \
 | $CPU % | $(f0 "$(calc "$WAL_B / max($d1 - $d0, 1)")") | $(f1 "$batches") | $(mb "$parts") \
 | $(f0 "$(calc "$parts / max($stored, 1)")") | $(mb "$rest") | $(span "$T0" "$T1") |"
@@ -170,7 +168,7 @@ bulk() { # bulk SHARDS
 low() { # low SHARDS RATE
   local shards=$1 rate=$2 table=bench_shardcost_s$1_r$2 id
   log "shard-cost-s$shards-r$rate"
-  drop_all "$table"
+  drop_outbox "$table"
   kafka_reset
   app_start "shard-cost-s$shards-r$rate" "${DEFAULTS[@]}" DB_POOL_SIZE=48 CONSUMER_THREADS=12 OUTBOX_TABLE="$table" \
     OUTBOX_SHARDS="$shards"
@@ -188,7 +186,7 @@ low() { # low SHARDS RATE
 / $(f3 "$P99") s | $(f1 "$(per_s outbox_batch_duration_seconds_count "$T0" "$T1")") | $CPU % | $(f0 "$WAL_S") \
 | $(span "$T0" "$T1") |"
   app_stop
-  drop_all "$table"
+  drop_outbox "$table"
 }
 
 started=$(date -u +'%Y-%m-%d %H:%M')

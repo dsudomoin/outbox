@@ -36,7 +36,7 @@ app_stop
 
 row() { # row PHASE T0 T1
   window "$2" "$3"
-  echo "| $1 | $(utc "$2" | cut -c12-) – $(utc "$3" | cut -c12-) | $(f0 "$COMMITTED") | $(f0 "$DELIVERED") \
+  echo "| $1 | $(hms "$2") – $(hms "$3") | $(f0 "$COMMITTED") | $(f0 "$DELIVERED") \
 | $(f3 "$P50") s | $(f3 "$P99") s | $(f1 "$LAG") s |"
 }
 

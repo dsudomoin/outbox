@@ -42,11 +42,8 @@ chaos_start() {
 }
 # stop_inst I: graceful stop of instance I, its counters kept for the totals as chaos_kill keeps them
 stop_inst() {
-  local c j=0 v
   on "$1" load_stop || true
-  if c=$(counters "$1"); then
-    for v in $c; do [ "$j" -lt 6 ] && KILLED[j]=$((KILLED[j] + v)); j=$((j + 1)); done
-  fi
+  keep_counters "$1"
   LOADS[$1]=""
   inst_stop "$1"
   fault "bench-$1 stopped ($([ "$1" = 2 ] && echo "$OLD_REV" || echo new))"

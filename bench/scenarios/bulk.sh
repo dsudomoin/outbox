@@ -63,7 +63,7 @@ run() {
   echo "$DELIVERED" > "$LOGS/$name.rate"
   echo "| $shards | $label | $(f0 "$COMMITTED") | $(f0 "$DELIVERED") \
 | $(f3 "$P50") s | $(f3 "$P99") s | $(f3 "$TX50") s | $cpu% | $(f0 "$GROWTH") | $drained \
-| $(utc "$t0") – $(utc "$t1" | cut -c12-) |" | out
+| $(utc "$t0") – $(hms "$t1") |" | out
 }
 
 # top_statements: the five statements with the most execution time since the last reset, with mean ms per call.

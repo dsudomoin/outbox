@@ -13,7 +13,6 @@ SUMMARY=$LOGS/chaos-summary.txt
 CHAOS_WRITERS=${CHAOS_WRITERS:-16} # per instance: 3 × (16 writers + 8 relay + 4 consumer) fits max_connections 300
 
 rnd() { echo $(($1 + RANDOM % ($2 - $1 + 1))); } # rnd LO HI: a random integer in [LO, HI]
-hms() { date -u -r "$1" +%H:%M:%S; }
 
 # chaos_begin NAME TABLE INSTANCES TEXT [ENV=VALUE...]: fresh outbox table and topic, empty business tables, INSTANCES
 # instances (consumer threads split 12 / INSTANCES), the run's annotation and CSV. TEXT describes the setup.
@@ -89,12 +88,18 @@ counters() {
     END { for (j = 1; j <= n; j++) printf "%.0f%s", s[j], (j < n ? " " : "\n") }'
 }
 
-# chaos_kill I [NOTE]: kill -9 of instance I; its counters, read just before, are kept (KILLED) for the totals.
-chaos_kill() {
-  local c j=0 v pid=${APP_PIDS[$1]:-}
+# keep_counters I: instance I's counters, read now, added to KILLED for the totals.
+keep_counters() {
+  local c j=0 v
   if c=$(counters "$1"); then
     for v in $c; do [ "$j" -lt 6 ] && KILLED[j]=$((KILLED[j] + v)); j=$((j + 1)); done
   fi
+}
+
+# chaos_kill I [NOTE]: kill -9 of instance I; its counters, read just before, are kept (KILLED) for the totals.
+chaos_kill() {
+  local pid=${APP_PIDS[$1]:-}
+  keep_counters "$1"
   inst_kill9 "$1"
   fault "kill -9 bench-$1 (pid $pid)${2:+: $2}"
 }
@@ -157,7 +162,7 @@ csv_row() {
   if [ -n "$i" ] && [ "$i" -gt "$MAX_PARTS" ]; then MAX_PARTS=$i; fi
   p99=$(prom 'histogram_quantile(0.99, sum by (le) (increase(outbox_delivery_delay_seconds_bucket[30s])))' 2> /dev/null) ||
     p99=""
-  echo "$(date -u -r "$t" +'%Y-%m-%d %H:%M:%S'),$((t - T0)),$ups,$tot,$(relay_lag || true),$(group_lag || true),$db,\
+  echo "$(utc "$t"),$((t - T0)),$ups,$tot,$(relay_lag || true),$(group_lag || true),$db,\
 ${p99/NaN/}$heap" >> "$CSV"
 }
 
@@ -217,13 +222,8 @@ reconcile_orders() {
   R_DRAINED=""
   while [ "$(now)" -lt "$deadline" ]; do
     lag=$(group_lag) || lag=""
-    read -r retry paused passed <<< "$(psql_q "select (select count(*) from ${TABLE}_retry),
-      (select count(*) from (select distinct on (shard) paused_until from ${TABLE}_cursor order by shard, seq desc) c
-        where paused_until > now()),
-      (select coalesce(bool_and(e.tick_id >= t.id), false)
-        from $(effective_ticks "$TABLE") e,
-        (select min(id) as id from ${TABLE}_tick where created_at > '$STOPPED_AT') t)" 2> /dev/null | tr '|' ' ')" ||
-      true
+    read -r retry paused passed <<< "$(psql_q "select (select count(*) from ${TABLE}_retry), $(paused_shards "$TABLE"),
+      $(relay_passed "$TABLE" "created_at > '$STOPPED_AT'")" 2> /dev/null | tr '|' ' ')" || true
     cur=""
     if [ "$lag" = 0 ] && [ "${retry:-}" = 0 ] && [ "${paused:-}" = 0 ] && [ "${passed:-}" = t ]; then
       heavy=$(psql_q "set work_mem = '256MB';

@@ -61,7 +61,7 @@ run() { # run RATE SHARDS
   echo "| $rate | $shards | $(f0 "$DELIVERED") | $(f3 "$P50") / $(f3 "$(q_over 0.95 outbox_delivery_delay_seconds "$t0" "$t1")") \
 / $(f3 "$P99") s | $(f3 "$(q_over 0.5 outbox_batch_duration_seconds "$t0" "$t1")") / \
 $(f3 "$(q_over 0.99 outbox_batch_duration_seconds "$t0" "$t1")") s, $(f1 "$(per_s outbox_batch_duration_seconds_count "$t0" "$t1")") \
-| $CPU % | $rd | $tk | $cu | $all | $(((x1 - x0) / (t1 - t0))) | $(utc "$t0" | cut -c12-) – $(utc "$t1" | cut -c12-) |" | out
+| $CPU % | $rd | $tk | $cu | $all | $(((x1 - x0) / (t1 - t0))) | $(hms "$t0") – $(hms "$t1") |" | out
   app_stop
   drop_outbox "$table"
 }

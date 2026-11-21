@@ -78,6 +78,7 @@ sleep() { command sleep "$@" & wait $!; } # interruptible, so a TERM runs cleanu
 log() { echo "$(date -u +%H:%M:%S) $*" >&2; }
 now() { date +%s; }
 utc() { date -u -r "$1" +'%Y-%m-%d %H:%M:%S'; }
+hms() { date -u -r "$1" +%H:%M:%S; }
 out() { cat >> "$RESULTS"; } # appends stdin to RESULTS.md
 f0() { printf '%.0f' "$1"; }
 f1() { printf '%.1f' "$1"; }
@@ -153,8 +154,10 @@ load_stop() { curl -sf -XDELETE "$BENCH/load" > /dev/null; }
 metric() {
   local m
   m=$(curl -sf "$METRICS") || return 1
-  echo "$m" | awk -v m="$1" '$1 == m || index($1, m "{") == 1 { s += $2 } END { printf "%.0f", s }'
+  echo "$m" | metric_sum "$1"
 }
+# metric_sum NAME: sum of the series of NAME in /metrics text on stdin.
+metric_sum() { awk -v m="$1" '$1 == m || index($1, m "{") == 1 { s += $2 } END { printf "%.0f", s }'; }
 
 # wait_delivered TIMEOUT_S: until this process's delivered counter reaches its committed counter; 1 on timeout. An
 # unreachable /metrics never counts as delivered.
@@ -191,6 +194,19 @@ effective_ticks() {
       order by seq desc limit 1) n join ${1}_tick v on v.id = n.tick_id and v.created_at <= n.created_at) k on true)"
 }
 
+# paused_shards BASE: SQL, the number of shards of BASE whose latest cursor row is paused now.
+paused_shards() {
+  echo "(select count(*) from (select distinct on (shard) paused_until from ${1}_cursor order by shard, seq desc) c
+    where paused_until > now())"
+}
+
+# relay_passed BASE TICK_WHERE: SQL, true once every shard's effective tick reached the first tick of BASE matching
+# TICK_WHERE.
+relay_passed() {
+  echo "(select coalesce(bool_and(e.tick_id >= t.id), false) from $(effective_ticks "$1") e,
+    (select min(id) as id from ${1}_tick where $2) t)"
+}
+
 # drop_outbox BASE: the outbox tables of one run (partitions go with the parent).
 drop_outbox() {
   psql_q "drop table if exists $1, ${1}_tick, ${1}_cursor, ${1}_checkpoint, ${1}_retry, ${1}_parked, ${1}_dead,
@@ -218,9 +234,7 @@ reconcile() {
   esac
   while [ "$(now)" -lt "$deadline" ]; do
     lag=$(group_lag)
-    read -r retry paused missing rows <<< "$(psql_q "select (select count(*) from ${1}_retry),
-      (select count(*) from (select distinct on (shard) paused_until from ${1}_cursor order by shard, seq desc) c
-        where paused_until > now()),
+    read -r retry paused missing rows <<< "$(psql_q "select (select count(*) from ${1}_retry), $(paused_shards "$1"),
       count(*) filter (where not exists (select 1 from inbox i where i.message_id = o.message_id)
         and not exists (select 1 from ${1}_dead d where d.id = o.id)), count(*) from $1 o" | tr '|' ' ')"
     consumed=$(metric bench_consumer_received_total) && consumed=$((consumed + before)) || consumed=""
@@ -249,6 +263,14 @@ reconcile() {
   RECON="NOT DRAINED — сверка без результата, в пути $missing (лаг группы ${lag:-неизвестен}, строк retry $retry, \
 шардов на паузе $paused, через ${2} с)"
   return 1
+}
+
+# reconcile_timed BASE TIMEOUT EXPECTED [CONSUMED_BEFORE]: reconcile, timed from now. Sets RECON, RC (its code) and
+# DRAIN ("за N с", or "не за TIMEOUT с" when not drained).
+reconcile_timed() {
+  local stopped; stopped=$(now)
+  RC=0; reconcile "$@" || RC=$?
+  if [ "$RC" = 1 ]; then DRAIN="не за $2 с"; else DRAIN="за $(($(now) - stopped)) с"; fi
 }
 
 # verdict BASE RC: call last, after the section is written. A clean reconciliation (RC 0) drops BASE; otherwise BASE
@@ -446,7 +468,7 @@ rate_note() {
 # писателей F" (this process).
 totals() {
   local m; m=$(curl -sf "$METRICS")
-  sum() { echo "$m" | awk -v n="$1" '$1 == n || index($1, n "{") == 1 { s += $2 } END { printf "%.0f", s }'; }
+  sum() { echo "$m" | metric_sum "$1"; }
   echo "закоммичено $(sum bench_messages_sent_total), доставлено $(sum outbox_messages_delivered_total)," \
     "потреблено $(sum bench_consumer_received_total), дубликатов $(sum bench_consumer_duplicates_total)," \
     "нарушений порядка $(sum bench_consumer_order_violations_total)," \

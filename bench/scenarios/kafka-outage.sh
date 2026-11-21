@@ -32,8 +32,7 @@ while [ "$(now)" -lt $((up + 1200)) ]; do
 done
 sleep 30
 load_stop
-stopped=$(now); rc=0; reconcile "$table" 900 "$(metric bench_messages_sent_total)" || rc=$?
-if [ "$rc" = 1 ]; then drain="не за 900 с"; else drain="за $(($(now) - stopped)) с"; fi
+reconcile_timed "$table" 900 "$(metric bench_messages_sent_total)"; rc=$RC drain=$DRAIN
 mark_end "$id"
 window "$t0" "$t1"
 base_p99=$P99
@@ -53,7 +52,7 @@ out << EOF
 
 Режим заказов (1 сообщение на транзакцию, писателей $WRITERS), $RATE msg/s, обработчик Kafka, консьюмер с inbox;
 шардов 32, relay workers 8. Kafka остановили (\`docker stop $KAFKA\`) в $(utc "$down") UTC на $OUTAGE с и снова
-запустили в $(utc "$up" | cut -c12-); писатели всё это время продолжали коммитить. $(rate_note "$RATE")
+запустили в $(hms "$up"); писатели всё это время продолжали коммитить. $(rate_note "$RATE")
 
 | базовый p99 задержки | пик очереди | выбрано (очередь ≤ 1 с трафика) | p99 задержки от начала сбоя до выборки + 30 с | dead |
 |---|---|---|---|---|

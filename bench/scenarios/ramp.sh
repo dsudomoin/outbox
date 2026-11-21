@@ -20,13 +20,12 @@ for rate in $RATES; do
   t1=$(now); cpu_stop; cpu=$CPU
   window "$t0" "$t1"
   rows="$rows| $rate | $(f0 "$COMMITTED") | $(f0 "$DELIVERED") | $(f0 "$CONSUMED") | $(f3 "$P50") s | $(f3 "$P99") s \
-| $(f3 "$TX99") s | $cpu% | $(utc "$t0" | cut -c12-) – $(utc "$t1" | cut -c12-) |
+| $(f3 "$TX99") s | $cpu% | $(hms "$t0") – $(hms "$t1") |
 "
   first=${first:-$t0}
 done
 load_stop
-stopped=$(now); rc=0; reconcile "$table" 900 "$(metric bench_messages_sent_total)" || rc=$?
-if [ "$rc" = 1 ]; then drain="не за 900 с"; else drain="за $(($(now) - stopped)) с"; fi
+reconcile_timed "$table" 900 "$(metric bench_messages_sent_total)"; rc=$RC drain=$DRAIN
 mark_end "$id"
 end=$(totals)
 app_stop

@@ -25,14 +25,13 @@ load 0 "$WRITERS"
 measure
 load_stop
 table=bench_max_single
-stopped=$(now); single_rc=0; reconcile "$table" 900 "$(metric bench_messages_sent_total)" || single_rc=$?
-if [ "$single_rc" = 1 ]; then single_drain="не за 900 с"; else single_drain="за $(($(now) - stopped)) с"; fi
+reconcile_timed "$table" 900 "$(metric bench_messages_sent_total)"; single_rc=$RC single_drain=$DRAIN
 single_recon=$RECON
 mark_end "$id"
 window "$T0" "$T1"
 single="| 1 сообщение на транзакцию, писателей $WRITERS, kafka + консьюмер | $(f0 "$COMMITTED") | $(f0 "$DELIVERED") \
 | $(f0 "$CONSUMED") | $(f3 "$P50") s | $(f3 "$P99") s | $(f3 "$TX99") s | $CPU% | $(f0 "$GROWTH") \
-| $(utc "$T0") – $(utc "$T1" | cut -c12-) |"
+| $(utc "$T0") – $(hms "$T1") |"
 single_totals=$(totals)
 f0 "$CONSUMED" > "$LOGS/max-single.consumed"
 app_stop
@@ -75,7 +74,7 @@ bulk() {
   window "$T0" "$T1"
   bulk="$bulk| по $2 сообщений на транзакцию, писателей $1, шардов $3, relay workers $4, noop, без консьюмера | $(f0 "$COMMITTED") \
 | $(f0 "$DELIVERED") | – | $(f3 "$P50") s | $(f3 "$P99") s | $(f3 "$TX99") s | $CPU% | $(f0 "$GROWTH") \
-| $(utc "$T0") – $(utc "$T1" | cut -c12-) |
+| $(utc "$T0") – $(hms "$T1") |
 "
   drains="$drains $1 × $2: в пути $backlog, выбрано $drain;"
   app_stop

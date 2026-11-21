@@ -21,8 +21,7 @@ t2=$(now)
 sleep 90
 t3=$(now)
 load_stop
-stopped=$(now); rc=0; reconcile "$table" 900 "$(metric bench_messages_sent_total)" || rc=$?
-if [ "$rc" = 1 ]; then drain="не за 900 с"; else drain="за $(($(now) - stopped)) с"; fi
+reconcile_timed "$table" 900 "$(metric bench_messages_sent_total)"; rc=$RC drain=$DRAIN
 sleep 35 # the dead-size gauge comes from maintenance, every 30 s
 mark_end "$id"
 dead=$(psql_q "select count(*) from ${table}_dead")
@@ -33,7 +32,7 @@ app_stop
 
 row() { # row PHASE T0 T1
   window "$2" "$3"
-  echo "| $1 | $(utc "$2" | cut -c12-) – $(utc "$3" | cut -c12-) | $(f0 "$COMMITTED") | $(f0 "$DELIVERED") \
+  echo "| $1 | $(hms "$2") – $(hms "$3") | $(f0 "$COMMITTED") | $(f0 "$DELIVERED") \
 | $(f0 "$CONSUMED") | $(f3 "$P50") s | $(f3 "$P99") s |"
 }
 
