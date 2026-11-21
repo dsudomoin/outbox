@@ -4,7 +4,6 @@ dependencies {
     api("io.micrometer:micrometer-core:1.12.13")
     // ObservationOutboxTelemetry's tracing(...): the application brings micrometer-tracing and its bridge
     compileOnly("io.micrometer:micrometer-tracing:1.2.12")
-    compileOnly("jakarta.annotation:jakarta.annotation-api:2.1.1")
 
     testImplementation(testFixtures(project(":outbox-core")))
     testImplementation("io.micrometer:micrometer-tracing-bridge-otel:1.2.12")

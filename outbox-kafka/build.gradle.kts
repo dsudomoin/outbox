@@ -7,7 +7,6 @@ dependencies {
     api(project(":outbox-core"))
     api("org.apache.kafka:kafka-clients:3.9.2")
     implementation("org.slf4j:slf4j-api:2.0.17")
-    compileOnly("jakarta.annotation:jakarta.annotation-api:2.1.1")
 
     testFixturesApi("org.testcontainers:testcontainers-kafka:2.0.5")
 

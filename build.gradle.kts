@@ -33,6 +33,7 @@ configure(published.map { project(":$it") }) {
     }
 
     dependencies {
+        "compileOnly"("jakarta.annotation:jakarta.annotation-api:2.1.1") // @Nullable, kept out of the POM
         "testImplementation"(platform("org.junit:junit-bom:$junitVersion"))
         "testImplementation"("org.junit.jupiter:junit-jupiter")
         "testRuntimeOnly"("org.junit.platform:junit-platform-launcher")

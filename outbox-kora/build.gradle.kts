@@ -22,6 +22,5 @@ dependencies {
     testImplementation("ru.tinkoff.kora:json-common")
     testImplementation("com.google.protobuf:protobuf-java:3.25.8")
     testAnnotationProcessor("ru.tinkoff.kora:annotation-processors")
-    testImplementation("io.opentelemetry:opentelemetry-sdk-trace:1.53.0")
     testImplementation("io.opentelemetry:opentelemetry-sdk-testing:1.53.0")
 }

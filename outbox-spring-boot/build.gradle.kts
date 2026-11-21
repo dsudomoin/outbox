@@ -14,7 +14,6 @@ dependencies {
     compileOnly("com.fasterxml.jackson.core:jackson-databind")
     compileOnly("tools.jackson.core:jackson-databind:3.1.7")
     compileOnly("com.google.protobuf:protobuf-java:3.25.8")
-    compileOnly("jakarta.annotation:jakarta.annotation-api:2.1.1")
 }
 
 // ReadmeExamplesTest compiles the docs' snippets against these and starts the smallest app with them. Not on the test

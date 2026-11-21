@@ -4,7 +4,6 @@ dependencies {
     api(project(":outbox-kafka"))
     api(project(":outbox-spring-boot"))
     compileOnly("org.springframework.boot:spring-boot-autoconfigure")
-    compileOnly("jakarta.annotation:jakarta.annotation-api:2.1.1")
 
     testImplementation(testFixtures(project(":outbox-kafka")))
 }
