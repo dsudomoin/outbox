@@ -497,6 +497,10 @@ class KafkaOutboxSenderTest {
         assertThat(producer.closed()).isFalse();
     }
 
+    /**
+     * A record the broker refuses closes the producer and fails the records in flight with it, of any key: those were
+     * not refused, so the relay must not charge them an attempt for it.
+     */
     @Test
     void brokerSideRecordTooLargeIsPermanentAndCloses() throws Exception {
         var sender = sender(DELIVERY_TIMEOUT);
@@ -509,26 +513,6 @@ class KafkaOutboxSenderTest {
         assertThat(outcomes.get(1)).as("aborted by the refusal's close: no attempt")
                 .isInstanceOf(Outcome.NotAttempted.class);
         assertThat(producer.closed()).isTrue();
-    }
-
-    /**
-     * A record the broker refuses closes the producer and fails the records in flight with it, of any key: those were
-     * not refused, so the relay must not charge them an attempt for it.
-     */
-    @Test
-    void aBrokerRefusalChargesNoBatchMate() throws Exception {
-        var handler = sender(DELIVERY_TIMEOUT).handler();
-        var result = executor.submit(() -> handler.handleBatch(List.of(record(1, "a"), record(2, "poison"),
-                record(3, "c"))));
-        var producer = awaitSent(0, 3);
-        producer.completeNext();
-        producer.errorNext(new RecordTooLargeException("broker says too large"));
-
-        assertThat(result.get(5, SECONDS)).satisfiesExactly(
-                o -> assertThat(o).isEqualTo(Outcome.delivered()),
-                o -> assertThat(o).isInstanceOfSatisfying(Outcome.Permanent.class,
-                        p -> assertThat(p.error()).isInstanceOf(RecordTooLargeException.class)),
-                o -> assertThat(o).isInstanceOf(Outcome.NotAttempted.class));
     }
 
     /**
@@ -620,12 +604,8 @@ class KafkaOutboxSenderTest {
         var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
         var onP1 = keyOnPartition(0, "a");
         var onP2 = keyOnPartition(1, "b");
-        var first = sendAsync(sender, List.of(record(1, onP1)));
-        awaitSent(0, 1).errorNext(new NotEnoughReplicasException("not enough"));
-        first.get(5, SECONDS);
-        var second = sendAsync(sender, List.of(record(2, onP2)));
-        awaitSent(1, 1).errorNext(new NotEnoughReplicasException("not enough"));
-        second.get(5, SECONDS);
+        failed(sendAsync(sender, List.of(record(1, onP1))), 0, new NotEnoughReplicasException("not enough"));
+        failed(sendAsync(sender, List.of(record(2, onP2))), 1, new NotEnoughReplicasException("not enough"));
         clock.advance(Duration.ofSeconds(1)); // both cooldowns end: the next call probes both
 
         var probe = sendAsync(sender, List.of(record(3, onP1), record(4, onP2)));
@@ -650,14 +630,12 @@ class KafkaOutboxSenderTest {
         var clock = new TestClock();
         var onP = keyOnPartition(0);
         var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
-        var first = sendAsync(sender, List.of(record(1, onP)));
-        awaitSent(0, 1).errorNext(new NotEnoughReplicasException("not enough"));
-        first.get(5, SECONDS);
+        failed(sendAsync(sender, List.of(record(1, onP))), 0, new NotEnoughReplicasException("not enough"));
         clock.advance(Duration.ofSeconds(1)); // the 1 s cooldown ends
 
-        var probe = sendAsync(sender, List.of(record(2, onP)));
-        awaitSent(1, 1).errorNext(new RecordTooLargeException("broker says too large"));
-        assertThat(probe.get(5, SECONDS)).singleElement().isInstanceOf(Outcome.Permanent.class);
+        assertThat(failed(sendAsync(sender, List.of(record(2, onP))), 1,
+                new RecordTooLargeException("broker says too large"))).singleElement()
+                .isInstanceOf(Outcome.Permanent.class);
 
         var next = sendAsync(sender, List.of(record(3, onP)));
         awaitSent(2, 1).completeNext();
@@ -702,9 +680,8 @@ class KafkaOutboxSenderTest {
     void brokerRefusalBehindABatchMateEndsThePartitionsCooldown() throws Exception {
         var clock = new TestClock();
         var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
-        var first = sendAsync(sender, List.of(record(1, keyOnPartition(0, "a"))));
-        awaitSent(0, 1).errorNext(new NotEnoughReplicasException("not enough"));
-        first.get(5, SECONDS);
+        failed(sendAsync(sender, List.of(record(1, keyOnPartition(0, "a")))), 0,
+                new NotEnoughReplicasException("not enough"));
         clock.advance(Duration.ofSeconds(1)); // the 1 s cooldown ends
 
         var probe = sendAsync(sender, List.of(record(2, keyOnPartition(0, "a")), record(3, keyOnPartition(0, "b"))));
@@ -729,9 +706,8 @@ class KafkaOutboxSenderTest {
         var clock = new TestClock();
         var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
         var remembered = record(1, keyOnPartition(0, "a"));
-        var first = sendAsync(sender, List.of(remembered));
-        awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
-        assertThat(first.get(5, SECONDS)).singleElement().isInstanceOf(Outcome.Retry.class);
+        assertThat(failed(sendAsync(sender, List.of(remembered)), 0, new TimeoutException("Expiring 1 record(s)")))
+                .singleElement().isInstanceOf(Outcome.Retry.class);
         clock.advance(Duration.ofSeconds(1));
 
         var second = sendAsync(sender, List.of(record(2, keyOnPartition(1, "b")), remembered,
@@ -773,9 +749,7 @@ class KafkaOutboxSenderTest {
         var clock = new TestClock();
         var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
         var remembered = record(1, keyOnPartition(0, "a"));
-        var first = sendAsync(sender, List.of(remembered));
-        awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
-        first.get(5, SECONDS);
+        failed(sendAsync(sender, List.of(remembered)), 0, new TimeoutException("Expiring 1 record(s)"));
         clock.step(Duration.ofHours(-1));
         clock.advance(Duration.ofMinutes(10));
 
@@ -791,9 +765,7 @@ class KafkaOutboxSenderTest {
         var seen = new CopyOnWriteArrayList<Map<String, Object>>();
         var sender = new KafkaOutboxSender(CONFIG, recording(seen, false));
         var remembered = record(1, keyOnPartition(0));
-        var first = sendAsync(sender, List.of(remembered));
-        awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
-        first.get(5, SECONDS);
+        failed(sendAsync(sender, List.of(remembered)), 0, new TimeoutException("Expiring 1 record(s)"));
 
         // its partition cools for 1 s, so it is not attempted, but the call holds it
         assertThat(sender.send(List.of(remembered))).singleElement().isInstanceOf(Outcome.NotAttempted.class);
@@ -813,9 +785,8 @@ class KafkaOutboxSenderTest {
         var sender = new KafkaOutboxSender(() -> props("bootstrap.servers", "localhost:9092", "client.id", "orders-svc"),
                 recording(seen, false));
         var remembered = record(1, keyOnPartition(0));
-        var first = sendAsync(sender, List.of(remembered));
-        awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)")); // the failed producer is closed
-        first.get(5, SECONDS);
+        failed(sendAsync(sender, List.of(remembered)), 0,
+                new TimeoutException("Expiring 1 record(s)")); // the failed producer is closed
         assertThat(sender.send(List.of(remembered))).singleElement().isInstanceOf(Outcome.NotAttempted.class);
         var next = sendAsync(sender, List.of(record(2, keyOnPartition(1))));
         awaitSent(2, 1).completeNext();
@@ -864,9 +835,7 @@ class KafkaOutboxSenderTest {
         var sender = new KafkaOutboxSender(() -> props("bootstrap.servers", "localhost:9092", "client.id", "orders-svc"),
                 recording(seen, false));
         var remembered = record(1, keyOnPartition(0));
-        var first = executor.submit(() -> held(sender, List.of(remembered)));
-        awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
-        first.get(5, SECONDS);
+        failed(heldAsync(sender, List.of(remembered)), 0, new TimeoutException("Expiring 1 record(s)"));
 
         // its partition cools for 1 s, so it is not attempted, but the call holds it
         assertThat(held(sender, List.of(remembered))).singleElement().isInstanceOf(Outcome.NotAttempted.class);
@@ -911,9 +880,7 @@ class KafkaOutboxSenderTest {
         };
         var sender = new KafkaOutboxSender(config, recording(seen, false));
         var remembered = record(1, keyOnPartition(0));
-        var first = sendAsync(sender, List.of(remembered));
-        awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
-        first.get(5, SECONDS);
+        failed(sendAsync(sender, List.of(remembered)), 0, new TimeoutException("Expiring 1 record(s)"));
         assertThat(sender.send(List.of(remembered))).singleElement().isInstanceOf(Outcome.NotAttempted.class);
 
         assertThat(seen).hasSize(2).allSatisfy(p -> assertThat(p.get("client.id")).isEqualTo("orders-svc"));
@@ -931,9 +898,7 @@ class KafkaOutboxSenderTest {
         var sender = sender(() -> new TestProducer(false,
                 r -> r.value().length > 100 ? new RecordTooLargeException("too large") : null),
                 DELIVERY_TIMEOUT, clock);
-        var first = sendAsync(sender, List.of(record(1, onP)));
-        awaitSent(0, 1).errorNext(new NotEnoughReplicasException("not enough"));
-        first.get(5, SECONDS);
+        failed(sendAsync(sender, List.of(record(1, onP))), 0, new NotEnoughReplicasException("not enough"));
         clock.advance(Duration.ofSeconds(1)); // the 1 s cooldown ends
 
         assertThat(sender.send(List.of(record(2, onP, "x".repeat(101))))).singleElement()
@@ -1009,12 +974,8 @@ class KafkaOutboxSenderTest {
         var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
         var x = record(1, keyOnPartition(0, "a"));
         var y = record(2, keyOnPartition(1, "b"));
-        var first = sendAsync(sender, List.of(x));
-        awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
-        first.get(5, SECONDS);
-        var second = sendAsync(sender, List.of(y));
-        awaitSent(1, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
-        second.get(5, SECONDS);
+        failed(sendAsync(sender, List.of(x)), 0, new TimeoutException("Expiring 1 record(s)"));
+        failed(sendAsync(sender, List.of(y)), 1, new TimeoutException("Expiring 1 record(s)"));
         clock.advance(Duration.ofSeconds(1)); // both partitions' cooldowns end
 
         var callA = sendAsync(sender, List.of(x));
@@ -1334,10 +1295,9 @@ class KafkaOutboxSenderTest {
     void batchMateOfAnInvalidRecordDoesNotCoolItsPartition() throws Exception {
         var onP = keyOnPartition(0);
         var sender = sender(DELIVERY_TIMEOUT);
-        var first = sendAsync(sender, List.of(record(1, onP)));
-        awaitSent(0, 1).errorNext(new KafkaException(
-                "Failed to append record because it was part of a batch which had one more more invalid records"));
-        assertThat(first.get(5, SECONDS).get(0)).isInstanceOf(Outcome.Retry.class);
+        assertThat(failed(sendAsync(sender, List.of(record(1, onP))), 0, new KafkaException(
+                "Failed to append record because it was part of a batch which had one more more invalid records"))
+                .get(0)).isInstanceOf(Outcome.Retry.class);
 
         var next = sendAsync(sender, List.of(record(2, onP)));
         awaitSent(1, 1).completeNext();
@@ -1744,9 +1704,7 @@ class KafkaOutboxSenderTest {
             return null;
         }), DELIVERY_TIMEOUT);
         var sender = holder[0];
-        var first = sendAsync(sender, List.of(record(1, onP)));
-        awaitSent(0, 1).errorNext(new TimeoutException("expired"));
-        first.get(5, SECONDS);
+        failed(sendAsync(sender, List.of(record(1, onP))), 0, new TimeoutException("expired"));
 
         var result = sendAsync(sender, List.of(record(2, onP), record(3, onQ), record(4, onP)));
         awaitSent(1, 1).completeNext();
@@ -1767,9 +1725,7 @@ class KafkaOutboxSenderTest {
         var clock = new TestClock();
         var onP = keyOnPartition(0);
         var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
-        var first = sendAsync(sender, List.of(record(1, onP)));
-        awaitSent(0, 1).errorNext(new TimeoutException("partition p expired"));
-        first.get(5, SECONDS);
+        failed(sendAsync(sender, List.of(record(1, onP))), 0, new TimeoutException("partition p expired"));
         clock.advance(Duration.ofSeconds(1)); // the 1 s cooldown ends
 
         var probe = sendAsync(sender, List.of(record(2, onP)));
@@ -1934,9 +1890,8 @@ class KafkaOutboxSenderTest {
                 return super.send(record, callback);
             }
         }, DELIVERY_TIMEOUT);
-        var failed = sendAsync(sender, List.of(record(1, key)));
-        awaitSent(0, 1).errorNext(new NotLeaderOrFollowerException("gone")); // the partition cools for 1 s
-        assertThat(failed.get(5, SECONDS)).singleElement().isInstanceOf(Outcome.Retry.class);
+        assertThat(failed(sendAsync(sender, List.of(record(1, key))), 0, new NotLeaderOrFollowerException("gone")))
+                .singleElement().isInstanceOf(Outcome.Retry.class); // the partition cools for 1 s
         Thread.sleep(1100);
         var probe = new CompletableFuture<List<Outcome>>();
         var thread = new Thread(() -> probe.complete(sender.send(List.of(record(2, key, "block")))));
@@ -1954,9 +1909,7 @@ class KafkaOutboxSenderTest {
     void successOnPartitionResetsItsCooldown() throws Exception {
         var onP = keyOnPartition(0);
         var sender = sender(DELIVERY_TIMEOUT);
-        var first = sendAsync(sender, List.of(record(1, onP)));
-        awaitSent(0, 1).errorNext(new TimeoutException("expired"));
-        first.get(5, SECONDS);
+        failed(sendAsync(sender, List.of(record(1, onP))), 0, new TimeoutException("expired"));
         Thread.sleep(1100); // first cooldown (1 s) ends
 
         var second = sendAsync(sender, List.of(record(2, onP), record(3, onP)));
@@ -2022,9 +1975,7 @@ class KafkaOutboxSenderTest {
         var clock = new TestClock();
         var sender = new KafkaOutboxSender(CONFIG, recording(new CopyOnWriteArrayList<>(), false), clock, clock);
         var x = record(1, keyOnPartition(0, "a"));
-        var first = heldAsync(sender, List.of(x));
-        awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
-        first.get(5, SECONDS);
+        failed(heldAsync(sender, List.of(x)), 0, new TimeoutException("Expiring 1 record(s)"));
         clock.advance(Duration.ofSeconds(1)); // the partition's cooldown ends
 
         var second = heldAsync(sender, List.of(x));
@@ -2040,9 +1991,7 @@ class KafkaOutboxSenderTest {
         var clock = new TestClock();
         var sender = new KafkaOutboxSender(CONFIG, recording(new CopyOnWriteArrayList<>(), false), clock, clock);
         var remembered = record(1, keyOnPartition(0, "a"));
-        var first = heldAsync(sender, List.of(remembered));
-        awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
-        first.get(5, SECONDS);
+        failed(heldAsync(sender, List.of(remembered)), 0, new TimeoutException("Expiring 1 record(s)"));
         // its partition cools, so nothing is sent, but the call holds it: a producer of the held unbatched pool
         assertThat(held(sender, List.of(remembered))).singleElement().isInstanceOf(Outcome.NotAttempted.class);
         var heldUnbatched = producers.get(1);
@@ -2237,17 +2186,12 @@ class KafkaOutboxSenderTest {
     }
 
     private KafkaOutboxSender sender(Supplier<MockProducer<byte[], byte[]>> make, Duration deliveryTimeout) {
-        return sender(make, deliveryTimeout, Clock.systemUTC(), System::nanoTime);
+        return sender(make, deliveryTimeout, Duration.ZERO);
     }
 
     private KafkaOutboxSender sender(Supplier<MockProducer<byte[], byte[]>> make, Duration deliveryTimeout,
             TestClock clock) {
-        return sender(make, deliveryTimeout, clock, clock);
-    }
-
-    private KafkaOutboxSender sender(Supplier<MockProducer<byte[], byte[]>> make, Duration deliveryTimeout,
-            Clock clock, LongSupplier nanos) {
-        return sender(make, deliveryTimeout, Duration.ZERO, clock, nanos);
+        return sender(make, deliveryTimeout, Duration.ZERO, clock, clock);
     }
 
     private KafkaOutboxSender sender(Supplier<MockProducer<byte[], byte[]>> make, Duration deliveryTimeout,
@@ -2311,6 +2255,12 @@ class KafkaOutboxSenderTest {
 
     private Future<List<Outcome>> sendAsync(KafkaOutboxSender sender, List<OutboxRecord> records) {
         return executor.submit(() -> sender.send(records));
+    }
+
+    /** The outcomes of {@code call} once its first send, on producer {@code producer}, failed with {@code error}. */
+    private List<Outcome> failed(Future<List<Outcome>> call, int producer, RuntimeException error) throws Exception {
+        awaitSent(producer, 1).errorNext(error);
+        return call.get(5, SECONDS);
     }
 
     private MockProducer<byte[], byte[]> awaitSent(int producer, int records) throws InterruptedException {

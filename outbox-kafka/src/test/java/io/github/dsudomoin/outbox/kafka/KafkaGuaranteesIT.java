@@ -100,7 +100,7 @@ class KafkaGuaranteesIT {
                 .filter(r -> Arrays.equals(r.payload(), bytes("x")))
                 .findFirst()
                 .filter(r -> crashed.compareAndSet(false, true))
-                .ifPresent(r -> terminated.set(terminateStep(runtime, r.shard())));
+                .ifPresent(r -> terminated.set(terminateStep(transactions, runtime, r.shard())));
 
         var ids = sendAll(runtime, List.of(
                 OutboxMessage.of(topic, "k", bytes("k#1")),
@@ -434,10 +434,10 @@ class KafkaGuaranteesIT {
     }
 
     /**
-     * A fresh table; the sender bounds a call by delivery.timeout.ms (20 s here) + 5 s + max.block.ms, so the relay
-     * gives it that.
+     * A fresh table; the sender bounds a call by delivery.timeout.ms (20 s here, {@link TestKafka#shortTimeouts}) + 5 s
+     * + max.block.ms, so the relay gives it that.
      */
-    private static TestOutboxConfig config() {
+    static TestOutboxConfig config() {
         return new TestOutboxConfig().batchTimeout(Duration.ofSeconds(30)).deadLettersTimeout(Duration.ofSeconds(30));
     }
 
@@ -494,7 +494,7 @@ class KafkaGuaranteesIT {
      * Terminates the backend holding {@code shard}'s advisory lock: the connection of the step working on it, which
      * holds the lock until its commit. Returns how many it terminated.
      */
-    private int terminateStep(OutboxRuntime runtime, int shard) {
+    static int terminateStep(JdbcTransactions transactions, OutboxRuntime runtime, int shard) {
         try (var c = transactions.newConnection()) {
             return TestSql.terminateStep(c, runtime.schema().names().internalNamespace(), shard);
         } catch (SQLException e) {
@@ -503,9 +503,8 @@ class KafkaGuaranteesIT {
     }
 
     private long count(String sql) {
-        try (var c = transactions.newConnection(); var ps = c.prepareStatement(sql); var rs = ps.executeQuery()) {
-            rs.next();
-            return rs.getLong(1);
+        try (var c = transactions.newConnection()) {
+            return TestSql.queryLong(c, sql);
         } catch (SQLException e) {
             throw new IllegalStateException(e);
         }

@@ -15,7 +15,6 @@ import io.github.dsudomoin.outbox.micrometer.OutboxDeliveryTracingObservationHan
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
-import io.github.dsudomoin.outbox.testing.TestSql;
 import io.micrometer.core.instrument.observation.DefaultMeterObservationHandler;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.micrometer.observation.ObservationHandler;
@@ -41,7 +40,6 @@ import io.opentelemetry.sdk.trace.data.SpanData;
 import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
 import io.opentelemetry.sdk.trace.samplers.Sampler;
 import java.io.IOException;
-import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -110,7 +108,7 @@ class KafkaTelemetryIT {
     void oneCallWithRecordsFromThreeTracesKeepsEachTrace() throws Exception {
         var topic = TestKafka.createTopic(3);
         var handler = new Handler();
-        var runtime = start(config().relayEnabled(false), handler);
+        var runtime = start(KafkaGuaranteesIT.config().relayEnabled(false), handler);
         var writers = new ArrayList<Span>();
         var ids = new ArrayList<UUID>();
         for (int i = 0; i < 3; i++) {
@@ -155,13 +153,13 @@ class KafkaTelemetryIT {
     void countersThroughRealSends() throws Exception {
         var topic = TestKafka.createTopic(3);
         var handler = new Handler();
-        handler.fail = r -> switch (key(r)) {
+        handler.fail = r -> switch (r.keyAsString()) {
             case "retried" -> r.attempts() == 0 ? Outcome.retry(new IOException("down once")) : null;
             case "dead" -> Outcome.permanent(new IllegalArgumentException("refused for good"));
             case "requeued" -> r.requeues() == 0 ? Outcome.requeue() : null;
             default -> null;
         };
-        var runtime = start(config().headFailuresBeforeDivert(1), handler);
+        var runtime = start(KafkaGuaranteesIT.config().headFailuresBeforeDivert(1), handler);
         var ids = transactions.inTx(c -> runtime.outbox().sendAll(Stream.of("a", "b", "c", "retried", "dead",
                 "requeued").map(k -> OutboxMessage.of(topic, k, bytes(k))).toList()));
         var dead = ids.get(4);
@@ -187,7 +185,7 @@ class KafkaTelemetryIT {
         var down = new AtomicBoolean(true);
         handler.fail = r -> down.get() ? Outcome.retry(new IOException("down")) : null;
         // never diverted to the retry table: the record holds its shard back until it is delivered
-        var runtime = start(config().headFailuresBeforeDivert(1_000), handler);
+        var runtime = start(KafkaGuaranteesIT.config().headFailuresBeforeDivert(1_000), handler);
         transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of(topic, "k", bytes("late"))));
 
         await(TIMEOUT, () -> runtime.maintenance().runOnce() && lag() > 0);
@@ -203,7 +201,7 @@ class KafkaTelemetryIT {
     @Test
     void relayStepsAreObservedAndFailuresCounted() throws Exception {
         var topic = TestKafka.createTopic(3);
-        var config = config().relayEnabled(false);
+        var config = KafkaGuaranteesIT.config().relayEnabled(false);
         var drained = start(config, new Handler());
         transactions.inTx(c -> drained.outbox().send(OutboxMessage.of(topic, "k", bytes("drained"))));
 
@@ -219,12 +217,12 @@ class KafkaTelemetryIT {
         assertThat(counter("outbox.relay.failures")).isZero();
 
         var handler = new Handler();
-        var running = start(config(), handler);
+        var running = start(KafkaGuaranteesIT.config(), handler);
         var crashed = new AtomicBoolean();
         var terminated = new AtomicInteger();
         handler.afterSend = records -> {
             if (crashed.compareAndSet(false, true)) {
-                terminated.set(terminateStep(running, records.get(0).shard()));
+                terminated.set(KafkaGuaranteesIT.terminateStep(transactions, running, records.get(0).shard()));
             }
         };
         transactions.inTx(c -> running.outbox().send(OutboxMessage.of(topic, "k", bytes("crashed"))));
@@ -242,9 +240,10 @@ class KafkaTelemetryIT {
     @Test
     void aRecordWithoutTraceContextHasTheStepAsParentAndNoLink() throws Exception {
         var topic = TestKafka.createTopic(1);
-        var config = config().relayEnabled(false);
+        var config = KafkaGuaranteesIT.config().relayEnabled(false);
         var runtime = start(config, new Handler());
-        var untraced = start(OutboxRuntime.builder(config().sameTablesAs(config).relayEnabled(false), transactions, r -> {}));
+        var untraced = start(OutboxRuntime.builder(KafkaGuaranteesIT.config().sameTablesAs(config).relayEnabled(false),
+                transactions, r -> {}));
         var outsideAnySpan = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of(topic, "a", bytes("a"))));
         var withoutContext = transactions.inTx(c -> untraced.outbox().send(OutboxMessage.of(topic, "b", bytes("b"))));
 
@@ -267,7 +266,7 @@ class KafkaTelemetryIT {
     @Test
     void enqueueSpanPerMessage() throws Exception {
         var topic = TestKafka.createTopic(3);
-        var config = config().relayEnabled(false);
+        var config = KafkaGuaranteesIT.config().relayEnabled(false);
         var runtime = start(config, new Handler());
         var keys = List.of("a", "b", "c");
         var writer = tracer.nextSpan().name("writer").start();
@@ -299,7 +298,7 @@ class KafkaTelemetryIT {
     @Test
     void stepSpanIsClientEndsAfterCommitAndParentsTheSettle() throws Exception {
         var topic = TestKafka.createTopic(1);
-        var runtime = start(config().relayEnabled(false), new Handler());
+        var runtime = start(KafkaGuaranteesIT.config().relayEnabled(false), new Handler());
         transactions.inTx(c -> runtime.outbox().sendAll(List.of(
                 OutboxMessage.of(topic, "k", bytes("1")), OutboxMessage.of(topic, "k", bytes("2")))));
 
@@ -332,7 +331,7 @@ class KafkaTelemetryIT {
                 Thread.currentThread().interrupt();
             }
         };
-        var runtime = start(config().relayEnabled(false), handler);
+        var runtime = start(KafkaGuaranteesIT.config().relayEnabled(false), handler);
         var ids = transactions.inTx(c -> runtime.outbox().sendAll(Stream.of("a", "b", "c")
                 .map(k -> OutboxMessage.of(topic, k, bytes(k))).toList()));
 
@@ -350,7 +349,7 @@ class KafkaTelemetryIT {
     @Test
     void messagingSystemIsOutbox() throws Exception {
         var topic = TestKafka.createTopic(1);
-        var runtime = start(config().relayEnabled(false), new Handler());
+        var runtime = start(KafkaGuaranteesIT.config().relayEnabled(false), new Handler());
         var id = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of(topic, "k", bytes("v"))));
 
         runtime.relay().drain();
@@ -364,7 +363,7 @@ class KafkaTelemetryIT {
     @Test
     void shardOnDeliverySpans() throws Exception {
         var topic = TestKafka.createTopic(3);
-        var config = config().relayEnabled(false);
+        var config = KafkaGuaranteesIT.config().relayEnabled(false);
         var runtime = start(config, new Handler());
         var keys = IntStream.range(0, 8).mapToObj(i -> "k" + i).toList();
         var ids = transactions.inTx(c -> runtime.outbox().sendAll(
@@ -435,14 +434,6 @@ class KafkaTelemetryIT {
                 .tracing(tracer, propagator).build();
     }
 
-    /**
-     * A fresh table; the sender bounds a call by delivery.timeout.ms (20 s here, {@link TestKafka#shortTimeouts}) + 5 s
-     * + max.block.ms, so the relay gives it that.
-     */
-    private static TestOutboxConfig config() {
-        return new TestOutboxConfig().batchTimeout(Duration.ofSeconds(30)).deadLettersTimeout(Duration.ofSeconds(30));
-    }
-
     private OutboxRuntime start(TestOutboxConfig config, Handler handler) {
         return start(OutboxRuntime.builder(config, transactions, handler).telemetry(telemetry));
     }
@@ -461,18 +452,6 @@ class KafkaTelemetryIT {
         var sender = new KafkaOutboxSender(() -> properties);
         closing.add(sender);
         return sender;
-    }
-
-    /**
-     * Terminates the backend holding {@code shard}'s advisory lock: the connection of the step working on it, which
-     * holds the lock until its commit. Returns how many it terminated.
-     */
-    private int terminateStep(OutboxRuntime runtime, int shard) {
-        try (var c = transactions.newConnection()) {
-            return TestSql.terminateStep(c, runtime.schema().names().internalNamespace(), shard);
-        } catch (SQLException e) {
-            throw new IllegalStateException(e);
-        }
     }
 
     private List<SpanData> spans(String name) {
@@ -499,10 +478,6 @@ class KafkaTelemetryIT {
     private double counter(String name, String... tags) {
         var counter = meters.find(name).tags(tags).counter();
         return counter == null ? 0 : counter.count();
-    }
-
-    private static String key(OutboxRecord record) {
-        return new String(record.key(), UTF_8);
     }
 
     private static byte[] bytes(String s) {

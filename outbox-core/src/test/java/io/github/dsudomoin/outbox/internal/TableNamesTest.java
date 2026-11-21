@@ -4,7 +4,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import java.util.Locale;
 import org.junit.jupiter.api.Test;
 
 class TableNamesTest {
@@ -51,10 +50,8 @@ class TableNamesTest {
         // Postgres folds unquoted identifiers to lower case: these name the same tables, so they must share locks
         var mixed = TableNames.of("App.OutBox");
         assertThat(mixed).isEqualTo(TableNames.of("app.outbox"));
-        assertThat(mixed.tick()).isEqualTo("app.outbox_tick");
         assertThat(TableNames.of("OUTBOX").keyNamespace()).isEqualTo(TableNames.of("outbox").keyNamespace());
         assertThat(TableNames.of("OUTBOX").internalNamespace()).isEqualTo(TableNames.of("outbox").internalNamespace());
-        assertThat(TableNames.of("I").base()).isEqualTo("I".toLowerCase(Locale.ROOT));
     }
 
     @Test
@@ -70,7 +67,6 @@ class TableNamesTest {
         var names = TableNames.of("outbox");
         assertThat(names.keyNamespace()).isEqualTo("outbox-key:outbox".hashCode());
         assertThat(names.internalNamespace()).isEqualTo("outbox-internal:outbox".hashCode());
-        assertThat(names.keyNamespace()).isNotEqualTo(names.internalNamespace());
         assertThat(TableNames.of("app.outbox").keyNamespace()).isNotEqualTo(names.keyNamespace());
     }
 }

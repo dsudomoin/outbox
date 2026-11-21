@@ -7,10 +7,10 @@ import io.github.dsudomoin.outbox.InboxRuntime;
 import io.github.dsudomoin.outbox.JdbcTransactions;
 import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.OutboxSql;
+import io.github.dsudomoin.outbox.testing.Intercepting;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -23,22 +23,16 @@ class SchemaCheckIT {
 
     @Test
     void newerLibraryOnOlderSchemaFails() throws Exception {
-        var schema = "s" + TestSql.uniqueTable();
-        var config = new TestOutboxConfig().table(schema + ".outbox");
-        var names = TableNames.of(config.table());
-        var tables = new ArrayList<>(SchemaObjects.outbox(names).tables());
-        var tick = tables.get(1);
-        var columns = new ArrayList<>(tick.columns());
-        columns.add(new SchemaObjects.Column("lineage", "bigint", false, null, false, 2));
-        tables.set(1, new SchemaObjects.Table(tick.name(), tick.since(), tick.partitionKey(), columns,
-                tick.constraints(), tick.checks(), tick.indexes()));
-
         try (var c = TestDataSources.newDataSource().getConnection()) {
-            TestSql.execute(c, "create schema " + schema);
-            TestSql.execute(c, OutboxSql.outbox(config, null));
+            var names = outboxSchema(c);
+            var tables = new ArrayList<>(SchemaObjects.outbox(names).tables());
+            var tick = tables.get(1);
+            var columns = new ArrayList<>(tick.columns());
+            columns.add(new SchemaObjects.Column("lineage", "bigint", false, null, false, 2));
+            tables.set(1, new SchemaObjects.Table(tick.name(), tick.since(), tick.partitionKey(), columns,
+                    tick.constraints(), tick.checks(), tick.indexes()));
 
-            assertThatThrownBy(() -> SchemaCheck.run(c, c, new SchemaObjects(tables), config.table(),
-                    "OutboxSql.outbox"))
+            assertThatThrownBy(() -> SchemaCheck.run(c, c, new SchemaObjects(tables), names.base(), "OutboxSql.outbox"))
                     .hasMessageContaining("column " + names.tick() + ".lineage is missing (schema version 2: apply"
                             + " OutboxSql.outbox)");
         }
@@ -121,8 +115,7 @@ class SchemaCheckIT {
             outbox.start();
             inbox.start();
 
-            SchemaCheck.run(c, c, SchemaObjects.outbox(TableNames.of(config.table())), config.table(),
-                    "OutboxSql.outbox");
+            check(c, TableNames.of(config.table()));
             SchemaCheck.run(c, c, SchemaObjects.inbox(TableNames.of(config.inbox().table())), config.inbox().table(),
                     "OutboxSql.inbox");
         }
@@ -132,7 +125,7 @@ class SchemaCheckIT {
     void anIndexOnOtherColumnsFails() throws Exception {
         assertSchemaProblem((c, n) -> {
             TestSql.execute(c, "drop index " + n.retry() + "_key");
-            TestSql.execute(c, "create index " + unqualified(n.retry()) + "_key on " + n.retry() + " (shard, id)");
+            TestSql.execute(c, "create index " + n.unqualified(n.retry()) + "_key on " + n.retry() + " (shard, id)");
         }, n -> "index " + n.retry() + "_key is btree (shard, id), not btree (shard, topic, key, id)");
     }
 
@@ -140,7 +133,7 @@ class SchemaCheckIT {
     void anIndexWithoutItsPredicateFails() throws Exception {
         assertSchemaProblem((c, n) -> {
             TestSql.execute(c, "drop index " + n.retry() + "_waiting");
-            TestSql.execute(c, "create index " + unqualified(n.retry()) + "_waiting on " + n.retry()
+            TestSql.execute(c, "create index " + n.unqualified(n.retry()) + "_waiting on " + n.retry()
                     + " (waiting_since)");
         }, n -> "index " + n.retry() + "_waiting is btree (waiting_since), not btree (waiting_since) where"
                 + " waiting_since is not null");
@@ -150,7 +143,7 @@ class SchemaCheckIT {
     void anIndexOfAnotherMethodFails() throws Exception {
         assertSchemaProblem((c, n) -> {
             TestSql.execute(c, "drop index " + n.parked() + "_due");
-            TestSql.execute(c, "create index " + unqualified(n.parked()) + "_due on " + n.parked()
+            TestSql.execute(c, "create index " + n.unqualified(n.parked()) + "_due on " + n.parked()
                     + " using brin (shard, due_at)");
         }, n -> "index " + n.parked() + "_due is brin (shard, due_at), not btree (shard, due_at)");
     }
@@ -159,7 +152,7 @@ class SchemaCheckIT {
     void aDescendingKeyFails() throws Exception {
         assertSchemaProblem((c, n) -> {
             TestSql.execute(c, "drop index " + n.parked() + "_due");
-            TestSql.execute(c, "create index " + unqualified(n.parked()) + "_due on " + n.parked()
+            TestSql.execute(c, "create index " + n.unqualified(n.parked()) + "_due on " + n.parked()
                     + " (shard desc, due_at)");
         }, n -> "index " + n.parked() + "_due is btree (shard DESC, due_at), not btree (shard, due_at)");
     }
@@ -168,7 +161,7 @@ class SchemaCheckIT {
     void anotherOperatorClassFails() throws Exception {
         assertSchemaProblem((c, n) -> {
             TestSql.execute(c, "drop index " + n.retry() + "_key");
-            TestSql.execute(c, "create index " + unqualified(n.retry()) + "_key on " + n.retry()
+            TestSql.execute(c, "create index " + n.unqualified(n.retry()) + "_key on " + n.retry()
                     + " (shard, topic text_pattern_ops, key, id)");
         }, n -> "index " + n.retry() + "_key is btree (shard, topic text_pattern_ops, key, id)");
     }
@@ -190,7 +183,7 @@ class SchemaCheckIT {
     @Test
     void aDeferrablePrimaryKeyFails() throws Exception {
         assertSchemaProblem((c, n) -> {
-            TestSql.execute(c, "alter table " + n.instance() + " drop constraint " + unqualified(n.instance())
+            TestSql.execute(c, "alter table " + n.instance() + " drop constraint " + n.unqualified(n.instance())
                     + "_pkey");
             TestSql.execute(c, "alter table " + n.instance() + " add primary key (instance_id) deferrable");
         }, n -> n.instance() + " has a deferrable primary key");
@@ -200,7 +193,7 @@ class SchemaCheckIT {
     void anIndexOnAnotherTableFails() throws Exception {
         assertSchemaProblem((c, n) -> {
             TestSql.execute(c, "drop index " + n.parked() + "_due");
-            TestSql.execute(c, "create index " + unqualified(n.parked()) + "_due on " + n.retry() + " (shard, id)");
+            TestSql.execute(c, "create index " + n.unqualified(n.parked()) + "_due on " + n.retry() + " (shard, id)");
         }, n -> "index " + n.parked() + "_due is on " + n.retry() + ", not on " + n.parked());
     }
 
@@ -208,7 +201,7 @@ class SchemaCheckIT {
     void aUniqueIndexFails() throws Exception {
         assertSchemaProblem((c, n) -> {
             TestSql.execute(c, "drop index " + n.retry() + "_key");
-            TestSql.execute(c, "create unique index " + unqualified(n.retry()) + "_key on " + n.retry()
+            TestSql.execute(c, "create unique index " + n.unqualified(n.retry()) + "_key on " + n.retry()
                     + " (shard, topic, key, id)");
         }, n -> "index " + n.retry() + "_key is unique");
     }
@@ -216,7 +209,7 @@ class SchemaCheckIT {
     @Test
     void aPrimaryKeyOnOtherColumnsFails() throws Exception {
         assertSchemaProblem((c, n) -> {
-            TestSql.execute(c, "alter table " + n.instance() + " drop constraint " + unqualified(n.instance())
+            TestSql.execute(c, "alter table " + n.instance() + " drop constraint " + n.unqualified(n.instance())
                     + "_pkey");
             TestSql.execute(c, "alter table " + n.instance() + " add primary key (instance_id, shards)");
         }, n -> n.instance() + " has primary key (instance_id, shards), not (instance_id)");
@@ -225,26 +218,21 @@ class SchemaCheckIT {
     @Test
     void noPrimaryKeyFails() throws Exception {
         assertSchemaProblem((c, n) -> TestSql.execute(c, "alter table " + n.redriven() + " drop constraint "
-                + unqualified(n.redriven()) + "_pkey"), n -> n.redriven() + " has no primary key");
+                + n.unqualified(n.redriven()) + "_pkey"), n -> n.redriven() + " has no primary key");
     }
 
     @Test
     void behindATransactionPoolerOnBackendsQuotingAllIdentifiersTheSchemaPasses() throws Exception {
-        var schema = "s" + TestSql.uniqueTable();
-        var config = new TestOutboxConfig().table(schema + ".outbox");
-        var n = TableNames.of(config.table());
         var source = TestDataSources.newDataSource();
 
         try (var first = source.getConnection(); var second = source.getConnection()) {
-            TestSql.execute(first, "create schema " + schema);
-            TestSql.execute(first, OutboxSql.outbox(config, null));
+            var n = outboxSchema(first);
             // as a role or database default would have it on every backend the pooler hands out
             TestSql.execute(first, "set quote_all_identifiers = on");
             TestSql.execute(second, "set quote_all_identifiers = on");
             var pooled = transactionPooled(first, second);
 
-            assertThatCode(() -> SchemaCheck.run(pooled, pooled, SchemaObjects.outbox(n), config.table(),
-                    "OutboxSql.outbox")).doesNotThrowAnyException();
+            assertThatCode(() -> check(pooled, n)).doesNotThrowAnyException();
         }
     }
 
@@ -273,28 +261,19 @@ class SchemaCheckIT {
                     } else if (name.equals("getAutoCommit")) {
                         return state.pinned == null;
                     }
-                    try {
-                        return method.invoke(target, args);
-                    } catch (InvocationTargetException e) {
-                        throw e.getCause();
-                    }
+                    return Intercepting.invoke(target, method, args);
                 });
     }
 
     @Test
     void storageOptionsAndAQuotedNameAreTheMigrationsToChoose() throws Exception {
-        var schema = "s" + TestSql.uniqueTable();
-        var config = new TestOutboxConfig().table(schema + ".outbox");
-        var n = TableNames.of(config.table());
-
         try (var c = TestDataSources.newDataSource().getConnection()) {
-            TestSql.execute(c, "create schema " + schema);
-            TestSql.execute(c, OutboxSql.outbox(config, null));
+            var n = outboxSchema(c);
             TestSql.execute(c, "drop index " + n.retry() + "_key");
-            TestSql.execute(c, "create index " + unqualified(n.retry()) + "_key on " + n.retry()
+            TestSql.execute(c, "create index " + n.unqualified(n.retry()) + "_key on " + n.retry()
                     + " (\"shard\", \"topic\", \"key\", \"id\") with (fillfactor = 70)");
 
-            SchemaCheck.run(c, c, SchemaObjects.outbox(n), config.table(), "OutboxSql.outbox");
+            check(c, n);
         }
     }
 
@@ -305,22 +284,26 @@ class SchemaCheckIT {
 
     /** A schema as {@link OutboxSql#outbox} renders it, passing the check, then with {@code damage} done failing it. */
     private static void assertSchemaProblem(Damage damage, Function<TableNames, String> problem) throws Exception {
-        var schema = "s" + TestSql.uniqueTable();
-        var config = new TestOutboxConfig().table(schema + ".outbox");
-        var n = TableNames.of(config.table());
-
         try (var c = TestDataSources.newDataSource().getConnection()) {
-            TestSql.execute(c, "create schema " + schema);
-            TestSql.execute(c, OutboxSql.outbox(config, null));
-            SchemaCheck.run(c, c, SchemaObjects.outbox(n), config.table(), "OutboxSql.outbox");
+            var n = outboxSchema(c);
+            check(c, n);
             damage.on(c, n);
 
-            assertThatThrownBy(() -> SchemaCheck.run(c, c, SchemaObjects.outbox(n), config.table(),
-                    "OutboxSql.outbox")).hasMessageContaining(problem.apply(n));
+            assertThatThrownBy(() -> check(c, n)).hasMessageContaining(problem.apply(n));
         }
     }
 
-    private static String unqualified(String name) {
-        return name.substring(name.indexOf('.') + 1);
+    /** A schema of its own holding an outbox as {@link OutboxSql#outbox} renders it; its names. */
+    private static TableNames outboxSchema(Connection c) throws SQLException {
+        var schema = "s" + TestSql.uniqueTable();
+        var config = new TestOutboxConfig().table(schema + ".outbox");
+        TestSql.execute(c, "create schema " + schema);
+        TestSql.execute(c, OutboxSql.outbox(config, null));
+        return TableNames.of(config.table());
+    }
+
+    /** The schema check of the outbox named {@code n}, on {@code c}. */
+    private static void check(Connection c, TableNames n) throws SQLException {
+        SchemaCheck.run(c, c, SchemaObjects.outbox(n), n.base(), "OutboxSql.outbox");
     }
 }

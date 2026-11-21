@@ -23,7 +23,6 @@ import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
-import org.postgresql.ds.PGSimpleDataSource;
 import org.springframework.beans.factory.NoUniqueBeanDefinitionException;
 import org.springframework.boot.LazyInitializationBeanFactoryPostProcessor;
 import org.springframework.context.ApplicationContext;
@@ -145,7 +144,7 @@ class OutboxAutoConfigurationIT {
         @Bean(defaultCandidate = false)
         @OutboxOwner
         DataSource ownerDataSource() {
-            var ds = (PGSimpleDataSource) TestDataSources.newDataSource();
+            var ds = TestDataSources.newDataSource();
             ds.setUser(owner);
             ds.setPassword("pw");
             return ds;

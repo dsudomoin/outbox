@@ -8,10 +8,10 @@ import io.github.dsudomoin.outbox.ConnectionSource;
 import io.github.dsudomoin.outbox.JdbcTransactions;
 import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
+import io.github.dsudomoin.outbox.testing.Intercepting;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -59,11 +59,7 @@ class HeartbeatConnectionsIT {
                         if (method.getName().equals("close")) {
                             return null; // a source that rolls nothing back and keeps the connection
                         }
-                        try {
-                            return method.invoke(kept, args);
-                        } catch (InvocationTargetException e) {
-                            throw e.getCause();
-                        }
+                        return Intercepting.invoke(kept, method, args);
                     });
             var runtime = OutboxRuntime.builder(config, new JdbcTransactions(MAIN), record -> {})
                     .heartbeatConnections(keeping).build();
@@ -445,7 +441,7 @@ class HeartbeatConnectionsIT {
     }
 
     private static DataSource other() {
-        var ds = (PGSimpleDataSource) TestDataSources.newDataSource();
+        var ds = TestDataSources.newDataSource();
         ds.setDatabaseName(OTHER);
         return ds;
     }
@@ -531,6 +527,20 @@ class HeartbeatConnectionsIT {
         try (var reference = TestDataSources.inZone("UTC").getConnection()) {
             assertThatThrownBy(() -> connections.start(reference, TABLE)).isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("reaches another database than the application's");
+        }
+    }
+
+    @Test
+    void otherDatabaseFailsTheStartBeforeAnyRow() throws Exception {
+        var config = new TestOutboxConfig();
+        var runtime = OutboxRuntime.builder(config, new JdbcTransactions(MAIN), record -> {})
+                .heartbeatConnections(other()::getConnection).build();
+
+        assertThatThrownBy(runtime::start).isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("reaches another database than the application's");
+        try (var c = MAIN.getConnection()) {
+            assertThat(TestSql.queryString(c, "select to_regclass(?)::text", config.table() + "_instance"))
+                    .as("no instance table, so no row: the check ran before the bootstrap").isNull();
         }
     }
 }

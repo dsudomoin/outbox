@@ -502,35 +502,12 @@ class TransactionalHandlerIT {
     }
 
     @Configuration(proxyBeanMethods = false)
-    static class RollbackForApp {
-
-        @Bean
-        OutboxTopicHandler handler(Effects effects) {
-            return new RollbackForHandler(effects);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
     @EnableTransactionManagement(rollbackOn = RollbackOn.ALL_EXCEPTIONS)
     static class AllExceptionsApp {
 
         @Bean
         OutboxTopicHandler handler(Effects effects) {
             return new PlainHandler(effects);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class ServiceApp {
-
-        @Bean
-        EffectService effectService(Effects effects) {
-            return new EffectService(effects);
-        }
-
-        @Bean
-        OutboxTopicHandler handler(EffectService service) {
-            return new ViaService(service);
         }
     }
 
@@ -549,51 +526,6 @@ class TransactionalHandlerIT {
         @Bean
         TemplateAroundBatch handler(Effects effects, PlatformTransactionManager transactions) {
             return new TemplateAroundBatch(effects, new TransactionTemplate(transactions));
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class FollowUpApp {
-
-        @Bean
-        FollowUps followUps() {
-            return new FollowUps();
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class TypedRollbackForOnInterfaceApp {
-
-        @Bean
-        OutboxTopicHandler handler(Effects effects) {
-            return new TypedRollbackForOnInterface(effects);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class TypedRollbackForListedLaterApp {
-
-        @Bean
-        OutboxTopicHandler handler(Effects effects) {
-            return new TypedRollbackForListedLater(effects);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class PlainRollbackForListedLaterApp {
-
-        @Bean
-        OutboxTopicHandler handler(Effects effects) {
-            return new PlainRollbackForListedLater(effects);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class TypedRollbackForListedFirstApp {
-
-        @Bean
-        OutboxTopicHandler handler(Effects effects) {
-            return new TypedRollbackForListedFirst(effects);
         }
     }
 
@@ -616,10 +548,19 @@ class TransactionalHandlerIT {
     }
 
     private static ApplicationContextRunner app(Class<?> config, String... properties) throws SQLException {
+        return withEffects(properties).withUserConfiguration(config);
+    }
+
+    /** A {@code type} built over the {@link Effects} as the one bean {@code handler}. */
+    private static ApplicationContextRunner handler(Class<?> type, String... properties) throws SQLException {
+        return withEffects(properties).withBean("handler", type);
+    }
+
+    /** The {@link Effects} over a new business table. */
+    private static ApplicationContextRunner withEffects(String... properties) throws SQLException {
         var table = TestSql.uniqueTable();
         TestApps.execute("create table " + table + " (message_id uuid primary key)");
-        return runner(properties).withPropertyValues("business.table=" + table)
-            .withUserConfiguration(Common.class, config);
+        return runner(properties).withPropertyValues("business.table=" + table).withUserConfiguration(Common.class);
     }
 
     /** A bean whose start is the whole test; no business table, no Inbox. */
@@ -666,7 +607,7 @@ class TransactionalHandlerIT {
 
     @Test
     void checkedExceptionRollsBackEverything() throws Exception {
-        app(RollbackForApp.class).run(context -> assertRetriedFromNothing(context));
+        handler(RollbackForHandler.class).run(context -> assertRetriedFromNothing(context));
     }
 
     private static void assertRetriedFromNothing(ApplicationContext context) {
@@ -686,7 +627,7 @@ class TransactionalHandlerIT {
 
     @Test
     void permanentAndWaitRollBack() throws Exception {
-        app(RollbackForApp.class).run(context -> {
+        handler(RollbackForHandler.class).run(context -> {
             var effects = effects(context);
             effects.step = attempt -> {
                 throw new OutboxPermanentException("never");
@@ -697,7 +638,7 @@ class TransactionalHandlerIT {
             assertThat(effects.rows()).isZero();
             assertThat(noMarker(context, id)).isTrue();
         });
-        app(RollbackForApp.class).run(context -> {
+        handler(RollbackForHandler.class).run(context -> {
             var effects = effects(context);
             effects.step = attempt -> {
                 throw new OutboxWaitException("not now");
@@ -714,7 +655,7 @@ class TransactionalHandlerIT {
 
     @Test
     void reHandAfterCommitIsNoOp() throws Exception {
-        app(RollbackForApp.class, "outbox.relay.batch-timeout=2s").run(context -> {
+        handler(RollbackForHandler.class, "outbox.relay.batch-timeout=2s").run(context -> {
             var effects = effects(context);
             effects.step = attempt -> {
                 if (attempt == 1) {
@@ -805,25 +746,25 @@ class TransactionalHandlerIT {
 
     @Test
     void rollbackForOnInterfaceRollsBackOnInterfaceProxy() throws Exception {
-        app(TypedRollbackForOnInterfaceApp.class, JDK_PROXIES).run(context -> assertRetriedFromNothing(context));
+        handler(TypedRollbackForOnInterface.class, JDK_PROXIES).run(context -> assertRetriedFromNothing(context));
     }
 
     /** {@code Proxy} hands over the method of the first listed interface having it, where Spring finds no annotation. */
     @Test
     void annotationOnALaterListedInterfaceRefusedForATypedHandler() throws Exception {
-        app(TypedRollbackForListedLaterApp.class, JDK_PROXIES).run(context -> assertThat(failure(context))
+        handler(TypedRollbackForListedLater.class, JDK_PROXIES).run(context -> assertThat(failure(context))
             .contains("handler").contains("handle(OutboxRecord)")
             .contains("list RollbackForOnInterface first in the class's implements clause"));
     }
 
     @Test
     void annotationOnTheFirstListedInterfaceRollsBackForATypedHandler() throws Exception {
-        app(TypedRollbackForListedFirstApp.class, JDK_PROXIES).run(context -> assertRetriedFromNothing(context));
+        handler(TypedRollbackForListedFirst.class, JDK_PROXIES).run(context -> assertRetriedFromNothing(context));
     }
 
     @Test
     void annotationOnALaterListedInterfaceRollsBackForAPlainHandler() throws Exception {
-        app(PlainRollbackForListedLaterApp.class, JDK_PROXIES).run(context -> assertRetriedFromNothing(context));
+        handler(PlainRollbackForListedLater.class, JDK_PROXIES).run(context -> assertRetriedFromNothing(context));
     }
 
     @Test
@@ -906,7 +847,7 @@ class TransactionalHandlerIT {
 
     @Test
     void followUpSendJoinsHandlerTransaction() throws Exception {
-        app(RollbackForApp.class).withUserConfiguration(FollowUpApp.class).run(context -> {
+        handler(RollbackForHandler.class).withBean(FollowUps.class).run(context -> {
             var effects = effects(context);
             var outbox = context.getBean(Outbox.class);
             var sent = new CopyOnWriteArrayList<UUID>();
@@ -927,6 +868,6 @@ class TransactionalHandlerIT {
 
     @Test
     void serviceShapeFromDocs() throws Exception {
-        app(ServiceApp.class).run(context -> assertRetriedFromNothing(context));
+        handler(ViaService.class).withBean(EffectService.class).run(context -> assertRetriedFromNothing(context));
     }
 }

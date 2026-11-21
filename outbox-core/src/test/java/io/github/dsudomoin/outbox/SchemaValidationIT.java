@@ -75,7 +75,7 @@ class SchemaValidationIT {
     }
 
     private void deliversAndMaintains(TestOutboxConfig quoted) throws Exception {
-        var quoting = (PGSimpleDataSource) TestDataSources.newDataSource();
+        var quoting = TestDataSources.newDataSource();
         quoting.setOptions("-c quote_all_identifiers=on");
         var handler = new RecordingHandler();
         var transactions = new JdbcTransactions(quoting);
@@ -272,7 +272,7 @@ class SchemaValidationIT {
     }
 
     private static PGSimpleDataSource as(String role) {
-        var ds = (PGSimpleDataSource) TestDataSources.newDataSource();
+        var ds = TestDataSources.newDataSource();
         ds.setUser(role);
         ds.setPassword("pw");
         return ds;

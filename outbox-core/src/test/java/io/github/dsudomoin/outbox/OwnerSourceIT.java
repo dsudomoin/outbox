@@ -18,6 +18,7 @@ import java.io.IOException;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.time.InstantSource;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -196,13 +197,15 @@ class OwnerSourceIT {
         config.xidsPerPartition(1000).premake(2);
         var member = new JdbcTransactions(as(members[0]));
         startSchema(member);
-        var inbox = new PgInbox(new JdbcTransactions(as(app)), member, config, OutboxTelemetry.NONE);
+        var inbox = new PgInbox(new JdbcTransactions(as(app)), member, config, OutboxTelemetry.NONE,
+                InstantSource.system());
         inbox.start();
         var made = "^(outbox_(tail|tail_next|[xo][0-9]+)|inbox_t[0-9]+)$";
         assertThat(giveTo(members[0], made)).as("partitions").hasSizeGreaterThan(4);
 
         startSchema(member);
-        new PgInbox(new JdbcTransactions(as(app)), member, config, OutboxTelemetry.NONE).start();
+        new PgInbox(new JdbcTransactions(as(app)), member, config, OutboxTelemetry.NONE, InstantSource.system())
+                .start();
         assertThat(foreignTables()).as("tables owned by another role than " + owner + " after a start").isEmpty();
 
         giveTo(members[0], made);
@@ -287,7 +290,7 @@ class OwnerSourceIT {
         var database = "d" + TestSql.uniqueTable();
         sql("create database " + database);
         try {
-            var admin = (PGSimpleDataSource) TestDataSources.newDataSource();
+            var admin = TestDataSources.newDataSource();
             admin.setDatabaseName(database);
             var ownerSource = as(owner);
             ownerSource.setDatabaseName(database);
@@ -590,7 +593,7 @@ class OwnerSourceIT {
     }
 
     private static PGSimpleDataSource as(String role) {
-        var ds = (PGSimpleDataSource) TestDataSources.newDataSource();
+        var ds = TestDataSources.newDataSource();
         ds.setUser(role);
         ds.setPassword("pw");
         return ds;

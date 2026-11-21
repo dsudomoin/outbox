@@ -32,7 +32,6 @@ class TypedOutboxTopicHandlerThroughTest {
         var handler = new Recording(Set.of("audit"), TEXT);
         var through = TypedOutboxTopicHandler.calledThrough(handler, new Recording(Set.of("other"), NEVER));
 
-        assertThat(through).isInstanceOf(TypedOutboxTopicHandler.class);
         assertThat(through.topics()).isEqualTo(handler.topics());
         assertThat(through.contractVersion()).isEqualTo(handler.contractVersion()).isEqualTo(2);
     }

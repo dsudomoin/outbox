@@ -26,21 +26,9 @@ class LargeBacklogIT {
     private static final int MESSAGES = 4000;
     private static final int PAYLOAD = 100 * 1024;
 
-    /** Default settings but the table; a fresh outbox, so 256 shards. */
-    private static OutboxConfig defaults(String table) {
+    /** Default settings but the table and whether the relay runs; a fresh outbox, so 256 shards. */
+    private static OutboxConfig defaults(String table, boolean relay) {
         return new OutboxConfig() {
-            @Override
-            public String table() {
-                return table;
-            }
-        };
-    }
-
-    @Test
-    void aBacklogOf100KbMessagesIsDeliveredByA512MbService() throws Exception {
-        var table = TestSql.uniqueTable();
-        var transactions = new JdbcTransactions(TestDataSources.newDataSource());
-        try (var writer = OutboxRuntime.builder(new OutboxConfig() {
             @Override
             public String table() {
                 return table;
@@ -51,11 +39,18 @@ class LargeBacklogIT {
                 return new RelayConfig() {
                     @Override
                     public boolean enabled() {
-                        return false;
+                        return relay;
                     }
                 };
             }
-        }, transactions, record -> {}).build()) {
+        };
+    }
+
+    @Test
+    void aBacklogOf100KbMessagesIsDeliveredByA512MbService() throws Exception {
+        var table = TestSql.uniqueTable();
+        var transactions = new JdbcTransactions(TestDataSources.newDataSource());
+        try (var writer = OutboxRuntime.builder(defaults(table, false), transactions, record -> {}).build()) {
             writer.start();
             var random = new Random(7);
             for (int tx = 0; tx < MESSAGES / 100; tx++) {
@@ -104,7 +99,7 @@ class LargeBacklogIT {
             int expected = Integer.parseInt(args[4]);
             var delivered = new AtomicLong();
             var failures = new AtomicLong();
-            try (var runtime = OutboxRuntime.builder(defaults(args[3]), new JdbcTransactions(ds),
+            try (var runtime = OutboxRuntime.builder(defaults(args[3], true), new JdbcTransactions(ds),
                     record -> delivered.incrementAndGet()).telemetry(new OutboxTelemetry() {
                         @Override
                         public void relayFailed(Throwable error) {

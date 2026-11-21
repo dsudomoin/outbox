@@ -97,7 +97,7 @@ class OutboxSqlIT {
 
     /** Connections whose {@code search_path} is {@code schema}. */
     private static PGSimpleDataSource dataSource(String schema) {
-        var ds = (PGSimpleDataSource) TestDataSources.newDataSource();
+        var ds = TestDataSources.newDataSource();
         ds.setCurrentSchema(schema);
         return ds;
     }

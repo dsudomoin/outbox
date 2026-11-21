@@ -2,8 +2,6 @@ package io.github.dsudomoin.outbox;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.zaxxer.hikari.HikariConfig;
-import com.zaxxer.hikari.HikariDataSource;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import java.time.Duration;
 import java.util.Map;
@@ -33,14 +31,7 @@ class DiskFullIT {
                 .withTmpFs(Map.of("/var/lib/postgresql/data", "rw,size=256m"))
                 .withCommand("postgres", "-c", "max_wal_size=64MB", "-c", "min_wal_size=32MB")) {
             pg.start();
-            var hikari = new HikariConfig();
-            hikari.setJdbcUrl(pg.getJdbcUrl());
-            hikari.setUsername(pg.getUsername());
-            hikari.setPassword(pg.getPassword());
-            hikari.setMaximumPoolSize(10);
-            hikari.setConnectionTimeout(3_000);
-            hikari.addDataSourceProperty("socketTimeout", "10");
-            try (var ds = new HikariDataSource(hikari)) {
+            try (var ds = UnusualWritesIT.pool(pg)) {
                 var transactions = new JdbcTransactions(ds);
                 Set<UUID> delivered = ConcurrentHashMap.newKeySet();
                 var config = new TestOutboxConfig().maintenanceInterval(Duration.ofMillis(500));

@@ -234,25 +234,15 @@ class EnqueueTelemetryIT {
     }
 
     private int storedShard(UUID id) throws SQLException {
-        try (var c = transactions.newConnection();
-                var ps = c.prepareStatement("select shard from " + config.table() + " where message_id = ?")) {
-            ps.setObject(1, id);
-            try (var rs = ps.executeQuery()) {
-                assertThat(rs.next()).as("row of %s", id).isTrue();
-                return rs.getInt(1);
-            }
+        try (var c = transactions.newConnection()) {
+            return (int) TestSql.queryLong(c,
+                    "select shard from " + config.table() + " where message_id = '" + id + "'");
         }
     }
 
     private long countOf(UUID id) throws SQLException {
-        var c = transactions.currentConnection();
-        try (var ps = c.prepareStatement("select count(*) from " + config.table() + " where message_id = ?")) {
-            ps.setObject(1, id);
-            try (var rs = ps.executeQuery()) {
-                rs.next();
-                return rs.getLong(1);
-            }
-        }
+        return TestSql.queryLong(transactions.currentConnection(), "select count(*) from " + config.table()
+                + " where message_id = '" + id + "'");
     }
 
     private static byte[] bytes(String s) {

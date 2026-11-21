@@ -59,8 +59,7 @@ class CoolingTargetIT {
         await(Duration.ofSeconds(30), () -> failuresAtCall.size() > COOLING_CALLS);
 
         for (int i = 1; i <= COOLING_CALLS; i++) {
-            var gap = Duration.ofNanos(calls.get(i)[0] - calls.get(i - 1)[0]);
-            assertThat(gap).as("pause after cooling call %d", i)
+            assertThat(gap(i)).as("pause after cooling call %d", i)
                     .isGreaterThanOrEqualTo(COOLING.minusMillis(50)).isLessThan(COOLING.multipliedBy(2));
         }
         assertThat(failuresAtCall.get(COOLING_CALLS)).as("one per cooling call, towards the divert")
@@ -76,10 +75,8 @@ class CoolingTargetIT {
 
         await(Duration.ofSeconds(30), () -> calls.size() > 3);
 
-        var second = Duration.ofNanos(calls.get(2)[0] - calls.get(1)[0]);
-        var third = Duration.ofNanos(calls.get(3)[0] - calls.get(2)[0]);
-        assertThat(second).as("second pause").isGreaterThanOrEqualTo(Duration.ofMillis(1950));
-        assertThat(third).as("third pause").isGreaterThanOrEqualTo(Duration.ofMillis(3950));
+        assertThat(gap(2)).as("second pause").isGreaterThanOrEqualTo(Duration.ofMillis(1950));
+        assertThat(gap(3)).as("third pause").isGreaterThanOrEqualTo(Duration.ofMillis(3950));
         assertThat(calls.get(3)[1]).as("records in the first call after three failures").isEqualTo(1);
     }
 
@@ -94,8 +91,7 @@ class CoolingTargetIT {
 
         await(Duration.ofSeconds(30), () -> calls.size() > 2);
 
-        assertThat(Duration.ofNanos(calls.get(2)[0] - calls.get(1)[0])).as("second pause")
-                .isGreaterThanOrEqualTo(Duration.ofMillis(1950));
+        assertThat(gap(2)).as("second pause").isGreaterThanOrEqualTo(Duration.ofMillis(1950));
     }
 
     /** A target asking to come back sooner than {@code retry.initialDelay} still waits that long: no spinning shard. */
@@ -107,8 +103,7 @@ class CoolingTargetIT {
         await(Duration.ofSeconds(30), () -> calls.size() > 2);
 
         for (int i = 1; i <= 2; i++) {
-            assertThat(Duration.ofNanos(calls.get(i)[0] - calls.get(i - 1)[0])).as("pause after call %d", i)
-                    .isGreaterThanOrEqualTo(Duration.ofMillis(950));
+            assertThat(gap(i)).as("pause after call %d", i).isGreaterThanOrEqualTo(Duration.ofMillis(950));
         }
     }
 
@@ -121,7 +116,7 @@ class CoolingTargetIT {
 
         await(Duration.ofSeconds(10), () -> calls.size() > 1);
 
-        assertThat(Duration.ofNanos(calls.get(1)[0] - calls.get(0)[0])).as("pause after the call")
+        assertThat(gap(1)).as("pause after the call")
                 .isGreaterThanOrEqualTo(Duration.ofMillis(1950)).isLessThan(Duration.ofSeconds(4));
     }
 
@@ -185,6 +180,11 @@ class CoolingTargetIT {
         runtime.start();
         cursorTable = runtime.schema().names().cursor(); // before the first row is sent, so before the first call
         return runtime;
+    }
+
+    /** The pause before call {@code call}, counted from 0. */
+    private Duration gap(int call) {
+        return Duration.ofNanos(calls.get(call)[0] - calls.get(call - 1)[0]);
     }
 
     /** Distinct keys, so that a call failing as a whole pauses the shard rather than diverting one key. */

@@ -89,26 +89,14 @@ class HandlerBeansIT {
             .contains("second (" + Other.class.getName() + ")").doesNotContain("outbox.kafka.fallback"));
     }
 
-    @Configuration(proxyBeanMethods = false)
-    static class AppHandlerBesideKafka {
-
-        @Bean
-        OutboxHandler outboxKafkaFallbackHandler() {
-            return new Fallback();
-        }
-
-        @Bean
-        OutboxHandler appHandler() {
-            return new Other();
-        }
-    }
-
     @Test
     void severalOutboxHandlersNameTheKafkaKey() {
-        runner().withUserConfiguration(AppHandlerBesideKafka.class).run(context -> assertThat(failure(context))
-            .contains("several OutboxHandler beans: ").contains("outboxKafkaFallbackHandler").contains("appHandler")
-            .endsWith("; outbox-kafka-spring-boot provides outboxKafkaFallbackHandler while"
-                + " outbox.kafka.fallback=true: set outbox.kafka.fallback=false to let your own handler take them"));
+        runner().withBean("outboxKafkaFallbackHandler", Fallback.class).withBean("appHandler", Other.class)
+            .run(context -> assertThat(failure(context))
+                .contains("several OutboxHandler beans: ").contains("outboxKafkaFallbackHandler").contains("appHandler")
+                .endsWith("; outbox-kafka-spring-boot provides outboxKafkaFallbackHandler while"
+                    + " outbox.kafka.fallback=true: set outbox.kafka.fallback=false to let your own handler"
+                    + " take them"));
     }
 
     @Configuration(proxyBeanMethods = false)
@@ -120,44 +108,21 @@ class HandlerBeansIT {
         }
     }
 
-    @Configuration(proxyBeanMethods = false)
-    static class AppHandlerOnly {
-
-        @Bean
-        OutboxHandler appHandler() {
-            return new Other();
-        }
-    }
-
     @Test
     void parentContextHandlerIsNamedToo() {
         try (var parent = new AnnotationConfigApplicationContext(KafkaInParent.class)) {
-            runner().withParent(parent).withUserConfiguration(AppHandlerOnly.class).run(context ->
+            runner().withParent(parent).withBean("appHandler", Other.class).run(context ->
                 assertThat(failure(context)).contains("outboxKafkaFallbackHandler (" + Fallback.class.getName() + ")")
                     .contains("appHandler").contains("outbox.kafka.fallback=false"));
         }
     }
 
-    @Configuration(proxyBeanMethods = false)
-    static class BothRoles {
-
-        @Bean
-        Both both() {
-            return new Both();
-        }
-    }
-
-    @Test
-    void bothRolesRefused() {
-        runner().withUserConfiguration(BothRoles.class).run(context -> assertThat(failure(context))
-            .contains("both (" + Both.class.getName() + ")").contains("implement OutboxTopicHandler only"));
-    }
-
     @Test
     void bothRolesBesideKafkaKeepTheirOwnMessage() {
-        runner().withUserConfiguration(BothRoles.class, KafkaInParent.class).run(context -> assertThat(failure(context))
-            .contains("both (" + Both.class.getName() + ")").contains("implement OutboxTopicHandler only")
-            .doesNotContain("several OutboxHandler beans"));
+        runner().withBean("both", Both.class).withUserConfiguration(KafkaInParent.class)
+            .run(context -> assertThat(failure(context))
+                .contains("both (" + Both.class.getName() + ")").contains("implement OutboxTopicHandler only")
+                .doesNotContain("several OutboxHandler beans"));
     }
 
     @Configuration(proxyBeanMethods = false)
@@ -216,64 +181,31 @@ class HandlerBeansIT {
         });
     }
 
-    @Configuration(proxyBeanMethods = false)
-    static class TwoAuditRoutes {
-
-        @Bean
-        OutboxTopicHandler auditOne() {
-            return new Route("audit");
-        }
-
-        @Bean
-        OutboxTopicHandler auditTwo() {
-            return new Route("billing", "audit");
-        }
-    }
-
     @Test
     void duplicateTopicNamesBeans() {
-        runner().withUserConfiguration(TwoAuditRoutes.class).run(context -> assertThat(failure(context))
-            .contains("outbox topic audit is claimed by both beans ").contains("auditOne").contains("auditTwo"));
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class EmptyRoute {
-
-        @Bean
-        OutboxTopicHandler emptyRoute() {
-            return new Route();
-        }
+        runner().withBean("auditOne", OutboxTopicHandler.class, () -> new Route("audit"))
+            .withBean("auditTwo", OutboxTopicHandler.class, () -> new Route("billing", "audit"))
+            .run(context -> assertThat(failure(context))
+                .contains("outbox topic audit is claimed by both beans ").contains("auditOne").contains("auditTwo"));
     }
 
     @Test
     void emptyTopicsNamesBean() {
-        runner().withUserConfiguration(EmptyRoute.class).run(context -> assertThat(failure(context))
-            .contains("emptyRoute").contains("claims no topics"));
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class WithFallback {
-
-        @Bean
-        OutboxHandler appFallback() {
-            return new Fallback();
-        }
-
-        @Bean
-        OutboxTopicHandler auditRoute() {
-            return new Route("billing", "audit");
-        }
+        runner().withBean("emptyRoute", OutboxTopicHandler.class, () -> new Route())
+            .run(context -> assertThat(failure(context)).contains("emptyRoute").contains("claims no topics"));
     }
 
     @Test
     void startupLineListsRoutes() {
         try (var stderr = new CapturedStderr()) {
-            runner().withUserConfiguration(WithRoute.class, WithFallback.class).run(context -> {
-                assertThat(context).hasNotFailed();
-                assertThat(stderr.text()).containsOnlyOnce("outbox routes: ")
-                    .contains("outbox routes: audit -> auditRoute, billing -> auditRoute, orders -> ordersRoute;"
-                        + " other topics -> appFallback");
-            });
+            runner().withUserConfiguration(WithRoute.class).withBean("appFallback", Fallback.class)
+                .withBean("auditRoute", OutboxTopicHandler.class, () -> new Route("billing", "audit"))
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(stderr.text()).containsOnlyOnce("outbox routes: ")
+                        .contains("outbox routes: audit -> auditRoute, billing -> auditRoute, orders -> ordersRoute;"
+                            + " other topics -> appFallback");
+                });
         }
         try (var stderr = new CapturedStderr()) {
             runner().withUserConfiguration(WithRoute.class).run(context -> {

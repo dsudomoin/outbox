@@ -104,10 +104,11 @@ class MessagingConventionsIT {
     @Test
     void expectedSpansAndMetrics() throws Exception {
         var topic = TestKafka.createTopic(1);
-        var config = config().shards(1).relayEnabled(false);
+        var config = KafkaGuaranteesIT.config().shards(1).relayEnabled(false);
         var telemetry = telemetry(config);
         var handler = new Handler();
-        handler.fail = r -> key(r).equals("dead") ? Outcome.permanent(new IllegalArgumentException("refused")) : null;
+        handler.fail = r -> r.keyAsString().equals("dead") ? Outcome.permanent(new IllegalArgumentException("refused"))
+                : null;
         var runtime = start(config, telemetry, handler);
         var writer = tracer.spanBuilder("writer").startSpan();
         UUID ok;
@@ -182,10 +183,11 @@ class MessagingConventionsIT {
     @Test
     void contextIsRestoredFromTheRow() throws Exception {
         var topic = TestKafka.createTopic(1);
-        var config = config().relayEnabled(false);
+        var config = KafkaGuaranteesIT.config().relayEnabled(false);
         var writing = start(config, telemetry(config), new Handler());
         var handler = new Handler();
-        var relaying = start(config().sameTablesAs(config).relayEnabled(false), telemetry(config), handler);
+        var relaying = start(KafkaGuaranteesIT.config().sameTablesAs(config).relayEnabled(false), telemetry(config),
+                handler);
         var writer = tracer.spanBuilder("writer").startSpan();
         UUID id;
         try (var scope = writer.makeCurrent()) {
@@ -212,7 +214,7 @@ class MessagingConventionsIT {
     @Test
     void kafkaSpanIsAChildOfDeliver() throws Exception {
         var topic = TestKafka.createTopic(1);
-        var config = config().relayEnabled(false);
+        var config = KafkaGuaranteesIT.config().relayEnabled(false);
         var runtime = start(config, telemetry(config), new Handler());
         var writer = tracer.spanBuilder("writer").startSpan();
         UUID id;
@@ -224,10 +226,8 @@ class MessagingConventionsIT {
 
         runtime.relay().drain();
 
-        var received = TestKafka.consumeUntil(topic, TIMEOUT,
-                r -> r.stream().anyMatch(c -> KafkaOutboxHeaders.messageId(c).equals(id)));
-        var record = received.stream().filter(c -> KafkaOutboxHeaders.messageId(c).equals(id)).findFirst()
-                .orElseThrow();
+        var record = TestKafka.byMessageId(
+                TestKafka.consumeUntil(topic, TIMEOUT, r -> TestKafka.byMessageId(r).containsKey(id))).get(id);
         var deliver = deliver(id);
         var send = span(s -> s.getName().equals("send " + topic));
         assertThat(send.getKind()).isEqualTo(SpanKind.PRODUCER);
@@ -246,10 +246,10 @@ class MessagingConventionsIT {
     @Test
     void deliverLinksToFetch() throws Exception {
         var topic = TestKafka.createTopic(1);
-        var config = config().shards(1).relayEnabled(false);
+        var config = KafkaGuaranteesIT.config().shards(1).relayEnabled(false);
         var runtime = start(config, telemetry(config), new Handler());
-        var untraced = start(OutboxRuntime.builder(config().sameTablesAs(config).shards(1).relayEnabled(false), transactions,
-                r -> {}));
+        var untraced = start(OutboxRuntime.builder(
+                KafkaGuaranteesIT.config().sameTablesAs(config).shards(1).relayEnabled(false), transactions, r -> {}));
         var writer = tracer.spanBuilder("writer").startSpan();
         UUID traced;
         try (var scope = writer.makeCurrent()) {
@@ -282,11 +282,11 @@ class MessagingConventionsIT {
     @Test
     void separateAttemptInsideABatch() throws Exception {
         var topic = TestKafka.createTopic(1);
-        var config = config().shards(1).headFailuresBeforeDivert(1);
+        var config = KafkaGuaranteesIT.config().shards(1).headFailuresBeforeDivert(1);
         var telemetry = telemetry(config);
         var handler = new Handler();
-        handler.fail = r -> key(r).equals("b") && r.attempts() == 0 ? Outcome.retry(new IOException("down once"))
-                : null;
+        handler.fail = r -> r.keyAsString().equals("b") && r.attempts() == 0
+                ? Outcome.retry(new IOException("down once")) : null;
         var runtime = start(config, telemetry, handler);
         var ids = transactions.inTx(c -> runtime.outbox().sendAll(Stream.of("a", "b", "c")
                 .map(k -> OutboxMessage.of(topic, k, bytes(k))).toList()));
@@ -337,7 +337,7 @@ class MessagingConventionsIT {
     @Test
     void emptyStepExportsNoSpan() throws Exception {
         var topic = TestKafka.createTopic(1);
-        var config = config().shards(1).batchSize(2).relayEnabled(false);
+        var config = KafkaGuaranteesIT.config().shards(1).batchSize(2).relayEnabled(false);
         var telemetry = telemetry(config);
         var runtime = start(config, telemetry, new Handler());
         transactions.inTx(c -> runtime.outbox().sendAll(Stream.of("a", "b")
@@ -364,7 +364,7 @@ class MessagingConventionsIT {
     @Test
     void failedStepExportsItsFetchSpan() throws Exception {
         var topic = TestKafka.createTopic(1);
-        var config = config().shards(1);
+        var config = KafkaGuaranteesIT.config().shards(1);
         var telemetry = telemetry(config);
         var handler = new Handler();
         var runtime = start(config, telemetry, handler);
@@ -403,7 +403,7 @@ class MessagingConventionsIT {
     void rolledBackWriteIsNotCounted() throws Exception {
         var topic = TestKafka.createTopic(1);
         var refused = "refused-" + UUID.randomUUID();
-        var config = config().relayEnabled(false);
+        var config = KafkaGuaranteesIT.config().relayEnabled(false);
         var telemetry = telemetry(config);
         var runtime = start(config, telemetry, new Handler());
         refuse(config, refused);
@@ -530,11 +530,6 @@ class MessagingConventionsIT {
         return new MessagingConventionsTelemetry(tracer, propagator, config.table());
     }
 
-    /** A fresh table. */
-    private static TestOutboxConfig config() {
-        return new TestOutboxConfig().batchTimeout(Duration.ofSeconds(30)).deadLettersTimeout(Duration.ofSeconds(30));
-    }
-
     private OutboxRuntime start(TestOutboxConfig config, MessagingConventionsTelemetry telemetry, Handler handler) {
         return start(OutboxRuntime.builder(config, transactions, handler).telemetry(telemetry));
     }
@@ -607,10 +602,6 @@ class MessagingConventionsIT {
             }
         }
         return last;
-    }
-
-    private static String key(OutboxRecord record) {
-        return new String(record.key(), UTF_8);
     }
 
     private static byte[] bytes(String s) {

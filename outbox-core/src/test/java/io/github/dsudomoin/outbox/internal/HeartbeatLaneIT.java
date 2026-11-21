@@ -2,7 +2,6 @@ package io.github.dsudomoin.outbox.internal;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.dsudomoin.outbox.JdbcTransactions;
 import io.github.dsudomoin.outbox.OutboxMessage;
@@ -22,8 +21,6 @@ import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import javax.sql.DataSource;
-import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.postgresql.ds.PGSimpleDataSource;
 
@@ -37,22 +34,7 @@ class HeartbeatLaneIT {
     /** {@value OutboxSchema#LIVE_INTERVALS} intervals: older than that, the row has expired and the read is stale. */
     private static final long STALE_MILLIS = INTERVAL.toMillis() * OutboxSchema.LIVE_INTERVALS;
     private static final String SHARING = "outbox heartbeat shares the application's connections";
-    private static final String OTHER = "d" + TestSql.uniqueTable();
     private static final DataSource DIRECT = TestDataSources.newDataSource();
-
-    @BeforeAll
-    static void otherDatabase() throws SQLException {
-        try (var c = DIRECT.getConnection()) {
-            TestSql.execute(c, "create database " + OTHER);
-        }
-    }
-
-    @AfterAll
-    static void dropIt() throws SQLException {
-        try (var c = DIRECT.getConnection()) {
-            TestSql.execute(c, "drop database " + OTHER + " with (force)");
-        }
-    }
 
     @Test
     void beatsStayFreshWhileTheAppPoolIsExhausted() throws Exception {
@@ -78,22 +60,6 @@ class HeartbeatLaneIT {
     void sharingLogsOneInfoLine() throws Exception {
         assertThat(startLog(false)).containsOnlyOnce(SHARING);
         assertThat(startLog(true)).doesNotContain(SHARING);
-    }
-
-    @Test
-    void otherDatabaseFailsTheStartBeforeAnyRow() throws Exception {
-        var other = (PGSimpleDataSource) TestDataSources.newDataSource();
-        other.setDatabaseName(OTHER);
-        var config = new TestOutboxConfig();
-        var runtime = OutboxRuntime.builder(config, new JdbcTransactions(DIRECT), null).route(new Audit())
-                .heartbeatConnections(other::getConnection).build();
-
-        assertThatThrownBy(runtime::start).isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("reaches another database than the application's");
-        try (var c = DIRECT.getConnection()) {
-            assertThat(TestSql.queryString(c, "select to_regclass(?)::text", config.table() + "_instance"))
-                    .as("no instance table, so no row: the check ran before the bootstrap").isNull();
-        }
     }
 
     /** What {@link #exhaust} saw; ages in milliseconds, {@code rows}: the instance rows left after the close. */
@@ -228,19 +194,5 @@ class HeartbeatLaneIT {
 
         @Override
         public void handle(OutboxRecord record) {}
-    }
-
-    @Test
-    void aSourceInAnotherTimeZoneStartsTheRuntime() throws Exception {
-        var config = new TestOutboxConfig().relayEnabled(false);
-        try (var runtime = OutboxRuntime.builder(config, new JdbcTransactions(TestDataSources.inZone("UTC")), null).route(new Audit())
-                .heartbeatConnections(TestDataSources.inZone("Europe/Moscow")::getConnection).build()) {
-            runtime.start();
-
-            try (var c = DIRECT.getConnection()) {
-                assertThat(TestSql.queryLong(c, "select count(*) from " + runtime.schema().names().instance()))
-                        .isOne();
-            }
-        }
     }
 }

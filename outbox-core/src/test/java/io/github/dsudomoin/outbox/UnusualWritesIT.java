@@ -75,14 +75,7 @@ class UnusualWritesIT {
                         new PortBinding(Ports.Binding.bindPort(port), new ExposedPort(5432))));
         pg.start();
         closing.add(pg);
-        var hikari = new HikariConfig();
-        hikari.setJdbcUrl(pg.getJdbcUrl());
-        hikari.setUsername(pg.getUsername());
-        hikari.setPassword(pg.getPassword());
-        hikari.setMaximumPoolSize(10);
-        hikari.setConnectionTimeout(3_000);
-        hikari.addDataSourceProperty("socketTimeout", "10");
-        var ds = new HikariDataSource(hikari);
+        var ds = pool(pg);
         closing.add(ds);
         var transactions = new JdbcTransactions(ds);
         var runtime = start(new TestOutboxConfig().maintenanceInterval(Duration.ofMillis(500)), transactions);
@@ -132,6 +125,18 @@ class UnusualWritesIT {
         assertThat(delivered).doesNotContainKey(rollback);
         assertThat(order).containsSubsequence("p/commit", "p/last");
         assertThat(order).doesNotContain("p/blocked", "r/rollback");
+    }
+
+    /** A pool of 10 on {@code pg}: a connection waits up to 3 s, a socket read up to 10 s. */
+    static HikariDataSource pool(PostgreSQLContainer pg) {
+        var hikari = new HikariConfig();
+        hikari.setJdbcUrl(pg.getJdbcUrl());
+        hikari.setUsername(pg.getUsername());
+        hikari.setPassword(pg.getPassword());
+        hikari.setMaximumPoolSize(10);
+        hikari.setConnectionTimeout(3_000);
+        hikari.addDataSourceProperty("socketTimeout", "10");
+        return new HikariDataSource(hikari);
     }
 
     /**

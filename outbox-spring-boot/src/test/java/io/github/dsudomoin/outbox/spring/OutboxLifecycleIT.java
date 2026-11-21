@@ -48,8 +48,6 @@ import org.springframework.transaction.support.TransactionTemplate;
 /** The outbox's start and stop within the application context. */
 class OutboxLifecycleIT {
 
-    private static final String NOT_STARTED = "the outbox starts with the application context's lifecycle; send"
-        + " from an ApplicationRunner or later, not from @PostConstruct";
     private static final Duration WAIT = Duration.ofSeconds(10);
 
     /** What the runner sent. */
@@ -102,7 +100,7 @@ class OutboxLifecycleIT {
     void sendFromPostConstructFailsWithMessage() {
         runner().withUserConfiguration(WithRoute.class).withBean(EarlySender.class).run(context ->
             assertThat(context).hasFailed().getFailure().rootCause().isInstanceOf(IllegalStateException.class)
-                .hasMessage(NOT_STARTED));
+                .hasMessage(OutboxLifecycle.NOT_STARTED));
     }
 
     /** Records its start and stop, and whether the outbox ran at the time. */

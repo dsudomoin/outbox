@@ -26,7 +26,7 @@ class ShardProcessorTest {
 
     @Test
     void choosesTheNewestTickThatFits() {
-        var candidates = ticks(1, 150L, 200L, 250L);
+        var candidates = ticks(150L, 200L, 250L);
 
         assertThat(ShardProcessor.chooseTarget(100L, candidates, 100).id()).isEqualTo(2);
         assertThat(ShardProcessor.chooseTarget(100L, candidates, 150).id()).isEqualTo(3);
@@ -57,18 +57,18 @@ class ShardProcessorTest {
 
     @Test
     void firstTickIsChosenEvenWhenItDoesNotFit() {
-        assertThat(ShardProcessor.chooseTarget(0L, ticks(1, 5000L, 5001L), 100).id()).isEqualTo(1);
-        assertThat(ShardProcessor.chooseTarget(0L, ticks(1, 5000L), 100).id()).isEqualTo(1);
+        assertThat(ShardProcessor.chooseTarget(0L, ticks(5000L, 5001L), 100).id()).isEqualTo(1);
+        assertThat(ShardProcessor.chooseTarget(0L, ticks(5000L), 100).id()).isEqualTo(1);
     }
 
     @Test
     void unknownHighWaterMarksStopTheMerge() {
         // ticks made before the upgrade (or by an old instance during a rolling deploy) carry no max_id
-        assertThat(ShardProcessor.chooseTarget(null, ticks(1, 10L, 20L), 100).id()).isEqualTo(1);
-        assertThat(ShardProcessor.chooseTarget(null, ticks(1, null, null), 100).id()).isEqualTo(1);
-        assertThat(ShardProcessor.chooseTarget(0L, ticks(1, 10L, null, 30L), 100).id()).isEqualTo(1);
-        assertThat(ShardProcessor.chooseTarget(0L, ticks(1, 10L, 20L, null), 100).id()).isEqualTo(2);
-        assertThat(ShardProcessor.chooseTarget(0L, ticks(1, null, 20L), 100).id()).isEqualTo(2);
+        assertThat(ShardProcessor.chooseTarget(null, ticks(10L, 20L), 100).id()).isEqualTo(1);
+        assertThat(ShardProcessor.chooseTarget(null, ticks(null, null), 100).id()).isEqualTo(1);
+        assertThat(ShardProcessor.chooseTarget(0L, ticks(10L, null, 30L), 100).id()).isEqualTo(1);
+        assertThat(ShardProcessor.chooseTarget(0L, ticks(10L, 20L, null), 100).id()).isEqualTo(2);
+        assertThat(ShardProcessor.chooseTarget(0L, ticks(null, 20L), 100).id()).isEqualTo(2);
     }
 
     @Test
@@ -86,14 +86,12 @@ class ShardProcessorTest {
     @Test
     void holdsPermanentIsTheRunningCallsSetting() throws Exception {
         var seen = new ArrayList<Boolean>();
-        new ShardProcessor.HandlerCall(() -> {
-            seen.add(ShardProcessor.holdsPermanent());
-            return List.of();
-        }, TimeUnit.SECONDS.toNanos(30), true).call();
-        new ShardProcessor.HandlerCall(() -> {
-            seen.add(ShardProcessor.holdsPermanent());
-            return List.of();
-        }, TimeUnit.SECONDS.toNanos(30), false).call();
+        for (boolean hold : new boolean[] {true, false}) {
+            new ShardProcessor.HandlerCall(() -> {
+                seen.add(ShardProcessor.holdsPermanent());
+                return List.of();
+            }, TimeUnit.SECONDS.toNanos(30), hold).call();
+        }
 
         assertThat(seen).containsExactly(true, false);
         assertThat(ShardProcessor.holdsPermanent()).as("outside a call").isFalse();
@@ -234,11 +232,11 @@ class ShardProcessorTest {
         return new OutboxRecord(id, UUID.randomUUID(), "t", key.getBytes(), new byte[0], List.of(), Instant.EPOCH, 0, 0);
     }
 
-    /** Ticks with consecutive ids from {@code firstId}. */
-    private static List<Tick> ticks(long firstId, Long... maxIds) {
+    /** Ticks with consecutive ids from 1. */
+    private static List<Tick> ticks(Long... maxIds) {
         var ticks = new ArrayList<Tick>();
         for (int i = 0; i < maxIds.length; i++) {
-            ticks.add(tick(firstId + i, maxIds[i]));
+            ticks.add(tick(1 + i, maxIds[i]));
         }
         return ticks;
     }

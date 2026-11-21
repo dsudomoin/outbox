@@ -11,6 +11,7 @@ import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
+import jakarta.annotation.Nullable;
 import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
@@ -189,18 +190,7 @@ class GuardedTelemetryTest {
     void deliveryStartedGetsTheDelegatesOwnStep() {
         var own = new OutboxTelemetry.RelayStep() {};
         var seen = new ArrayList<OutboxTelemetry.RelayStep>();
-        var t = GuardedTelemetry.of(new OutboxTelemetry() {
-            @Override
-            public RelayStep stepStarted(List<Integer> shards) {
-                return own;
-            }
-
-            @Override
-            public Delivery deliveryStarted(RelayStep step, List<OutboxRecord> records, Instant now) {
-                seen.add(step);
-                return Delivery.NONE;
-            }
-        });
+        var t = GuardedTelemetry.of(stepping(own, seen));
 
         var step = t.stepStarted(List.of(1));
         t.deliveryStarted(step, RECORDS, Instant.EPOCH);
@@ -213,18 +203,7 @@ class GuardedTelemetryTest {
     @Test
     void aNullStepIsNone() {
         var seen = new ArrayList<OutboxTelemetry.RelayStep>();
-        var t = GuardedTelemetry.of(new OutboxTelemetry() {
-            @Override
-            public RelayStep stepStarted(List<Integer> shards) {
-                return null;
-            }
-
-            @Override
-            public Delivery deliveryStarted(RelayStep step, List<OutboxRecord> records, Instant now) {
-                seen.add(step);
-                return Delivery.NONE;
-            }
-        });
+        var t = GuardedTelemetry.of(stepping(null, seen));
 
         var step = t.stepStarted(List.of(1));
         t.deliveryStarted(step, RECORDS, Instant.EPOCH);
@@ -277,22 +256,7 @@ class GuardedTelemetryTest {
 
     @Test
     void scopeThatSwallowsTheCallsFailureStillFails() {
-        var swallowing = new OutboxTelemetry() {
-            @Override
-            public Delivery deliveryStarted(List<OutboxRecord> records, Instant now) {
-                return new Delivery() {
-                    @Override
-                    public <T> T inRecordScope(OutboxRecord record, Callable<T> call) {
-                        try {
-                            return call.call();
-                        } catch (Exception e) {
-                            return null; // a bug: the handler's failure would read as a delivery
-                        }
-                    }
-                };
-            }
-        };
-        var delivery = delivery(swallowing);
+        var delivery = delivery(new DeliveryScope(Scope.SWALLOW));
         var failure = new IOException("handler");
         try (var err = new CapturedStderr()) {
             assertThatThrownBy(() -> delivery.inRecordScope(RECORD, () -> {
@@ -304,30 +268,18 @@ class GuardedTelemetryTest {
 
     @Test
     void callRunsOnceWhenScopeThrowsAfterOrBeforeIt() throws Exception {
-        for (boolean after : new boolean[] {true, false}) {
+        for (var scope : List.of(Scope.THROW_AFTER, Scope.THROW_BEFORE)) {
             var calls = new AtomicInteger();
-            var delivery = delivery(new ScopeThrowing(after));
-            assertThat(delivery.inRecordScope(RECORD, calls::incrementAndGet)).as("after " + after).isEqualTo(1);
-            assertThat(calls).as("after " + after).hasValue(1);
+            var delivery = delivery(new DeliveryScope(scope));
+            assertThat(delivery.inRecordScope(RECORD, calls::incrementAndGet)).as(scope.toString()).isEqualTo(1);
+            assertThat(calls).as(scope.toString()).hasValue(1);
         }
     }
 
     @Test
     void callRunsOnceWhenScopeCallsItTwice() throws Exception {
         var calls = new AtomicInteger();
-        var twice = new OutboxTelemetry() {
-            @Override
-            public Delivery deliveryStarted(List<OutboxRecord> records, Instant now) {
-                return new Delivery() {
-                    @Override
-                    public <T> T inRecordScope(OutboxRecord record, Callable<T> call) throws Exception {
-                        call.call();
-                        return call.call();
-                    }
-                };
-            }
-        };
-        var delivery = delivery(twice);
+        var delivery = delivery(new DeliveryScope(Scope.TWICE));
         try (var err = new CapturedStderr()) {
             assertThat(delivery.inRecordScope(RECORD, calls::incrementAndGet)).isEqualTo(1);
             assertThat(err.text()).contains("Delivery.inRecordScope");
@@ -664,21 +616,6 @@ class GuardedTelemetryTest {
         }
     }
 
-    /** A record scope that throws after running its call ({@code after}) or instead of running it. */
-    private record ScopeThrowing(boolean after) implements OutboxTelemetry {
-        @Override
-        public Delivery deliveryStarted(List<OutboxRecord> records, Instant now) {
-            return new Delivery() {
-                @Override
-                public <T> T inRecordScope(OutboxRecord record, Callable<T> call) throws Exception {
-                    if (after) {
-                        call.call();
-                    }
-                    throw new IllegalStateException("telemetry bug");
-                }
-            };
-        }
-    }
     /** Every message hook throws, its scope before running the insert. */
     private static final class MessageThrowing implements OutboxTelemetry {
         @Override
@@ -712,7 +649,33 @@ class GuardedTelemetryTest {
         }
     }
 
-    private enum Scope { THROW_AFTER, SKIP, TWICE, SWALLOW }
+    /** A scope's bug; {@code THROW_BEFORE} throws without running the call. */
+    private enum Scope { THROW_AFTER, THROW_BEFORE, SKIP, TWICE, SWALLOW }
+
+    /** {@code call} run in a scope with the bug {@code bug}. */
+    private static <T> T buggy(Scope bug, Callable<T> call) throws Exception {
+        switch (bug) {
+            case THROW_AFTER -> {
+                call.call();
+                throw new IllegalStateException("telemetry bug");
+            }
+            case THROW_BEFORE -> throw new IllegalStateException("telemetry bug");
+            case SKIP -> {
+                return null;
+            }
+            case TWICE -> {
+                call.call();
+                return call.call();
+            }
+            default -> {
+                try {
+                    return call.call();
+                } catch (Exception e) {
+                    return null; // a bug: the handler's failure would read as a delivery
+                }
+            }
+        }
+    }
 
     /** A message scope with one of the bugs of {@link Scope}. */
     private record MessageScope(Scope bug) implements OutboxTelemetry {
@@ -724,31 +687,42 @@ class GuardedTelemetryTest {
                     return new Message() {
                         @Override
                         public <T> T inScope(Callable<T> insert) throws Exception {
-                            switch (bug) {
-                                case THROW_AFTER -> {
-                                    insert.call();
-                                    throw new IllegalStateException("telemetry bug");
-                                }
-                                case SKIP -> {
-                                    return null;
-                                }
-                                case TWICE -> {
-                                    insert.call();
-                                    return insert.call();
-                                }
-                                default -> {
-                                    try {
-                                        return insert.call();
-                                    } catch (Exception e) {
-                                        return null;
-                                    }
-                                }
-                            }
+                            return buggy(bug, insert);
                         }
                     };
                 }
             };
         }
+    }
+
+    /** A record scope with one of the bugs of {@link Scope}. */
+    private record DeliveryScope(Scope bug) implements OutboxTelemetry {
+        @Override
+        public Delivery deliveryStarted(List<OutboxRecord> records, Instant now) {
+            return new Delivery() {
+                @Override
+                public <T> T inRecordScope(OutboxRecord record, Callable<T> call) throws Exception {
+                    return buggy(bug, call);
+                }
+            };
+        }
+    }
+
+    /** A telemetry whose steps are {@code returned}; each delivery adds the step it started on to {@code seen}. */
+    private static OutboxTelemetry stepping(@Nullable OutboxTelemetry.RelayStep returned,
+            List<OutboxTelemetry.RelayStep> seen) {
+        return new OutboxTelemetry() {
+            @Override
+            public RelayStep stepStarted(List<Integer> shards) {
+                return returned;
+            }
+
+            @Override
+            public Delivery deliveryStarted(RelayStep step, List<OutboxRecord> records, Instant now) {
+                seen.add(step);
+                return Delivery.NONE;
+            }
+        };
     }
 
     private static OutboxTelemetry.Delivery delivery(OutboxTelemetry t) {

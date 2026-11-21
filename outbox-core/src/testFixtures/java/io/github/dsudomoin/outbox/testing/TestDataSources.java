@@ -102,7 +102,7 @@ public final class TestDataSources {
     }
 
     /** A new physical connection per {@code getConnection()}; one the server does not answer fails, not hangs the run. */
-    public static DataSource newDataSource() {
+    public static PGSimpleDataSource newDataSource() {
         var ds = new PGSimpleDataSource();
         ds.setUrl(jdbcUrl());
         ds.setUser(user());

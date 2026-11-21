@@ -36,25 +36,15 @@ class HungTargetIT {
     }
 
     @Test
-    void hungCallsTakeEveryHandlerThreadWhileTheInstanceLooksAlive() throws Exception {
-        var free = new ConcurrentHashMap<OutboxGauge, DoubleSupplier>();
-        var runtime = runtime(hanging(ConcurrentHashMap.newKeySet()), free);
-        send(runtime, "a", 8);
-
-        await(() -> free.get(OutboxGauge.HANDLER_THREADS_FREE).getAsDouble() == 0);
-
-        assertThat(runtime.relay().running()).isTrue();
-        assertThat(runtime.admin().status().instances()).singleElement()
-                .satisfies(i -> assertThat(i.live()).as("the heartbeat says the process runs, no more").isTrue());
-    }
-
-    @Test
     void aHungTargetDoesNotStopAnotherOnItsOwnOutboxAndLosesNothing() throws Exception {
         Set<UUID> delivered = ConcurrentHashMap.newKeySet();
         var free = new ConcurrentHashMap<OutboxGauge, DoubleSupplier>();
         var hung = runtime(hanging(delivered), free);
         var sent = send(hung, "a", 8);
         await(() -> free.get(OutboxGauge.HANDLER_THREADS_FREE).getAsDouble() == 0);
+        assertThat(hung.relay().running()).isTrue();
+        assertThat(hung.admin().status().instances()).singleElement()
+                .satisfies(i -> assertThat(i.live()).as("the heartbeat says the process runs, no more").isTrue());
 
         Set<UUID> healthy = ConcurrentHashMap.newKeySet();
         var other = runtime(record -> healthy.add(record.messageId()), new ConcurrentHashMap<>());

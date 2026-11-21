@@ -41,7 +41,6 @@ import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.context.annotation.Import;
 import org.springframework.context.annotation.Scope;
 import org.springframework.context.annotation.ScopedProxyMode;
 import org.springframework.context.support.SimpleThreadScope;
@@ -409,51 +408,6 @@ class HandlerProxiesIT {
     }
 
     @Configuration(proxyBeanMethods = false)
-    static class Common {
-
-        @Bean
-        Calls calls() {
-            return new Calls();
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class PlainTxApp {
-
-        @Bean
-        OutboxTopicHandler ordersRoute(Calls calls) {
-            return new PlainTx(calls);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class TypedTxApp {
-
-        @Bean
-        OutboxTopicHandler typedHandler(Calls calls) {
-            return new TypedTx(calls);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class ClassTxTypedApp {
-
-        @Bean
-        OutboxTopicHandler typedHandler(Calls calls) {
-            return new ClassTxTyped(calls);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class FallbackTxApp {
-
-        @Bean
-        OutboxHandler fallback(Calls calls) {
-            return new FallbackTx(calls);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
     static class TypedAspectApp {
 
         @Bean
@@ -518,92 +472,6 @@ class HandlerProxiesIT {
     }
 
     @Configuration(proxyBeanMethods = false)
-    static class PlainTxBatchApp {
-
-        @Bean
-        OutboxTopicHandler txBatch(Calls calls) {
-            return new PlainTxBatch(calls);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class TypedTxBatchApp {
-
-        @Bean
-        OutboxTopicHandler txBatch(Calls calls) {
-            return new TypedTxBatch(calls);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class TypedWithApiApp {
-
-        @Bean
-        OutboxTopicHandler typedHandler() {
-            return new TypedWithApi();
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class WithBatchAspect {
-
-        @Bean
-        BatchAspect batchAspect(Calls calls) {
-            return new BatchAspect(calls);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    @Import(WithBatchAspect.class)
-    static class PlainBatchApp {
-
-        @Bean
-        OutboxTopicHandler batched(Calls calls) {
-            return new PlainBatch(calls);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    @Import(WithBatchAspect.class)
-    static class FallbackBatchApp {
-
-        @Bean
-        OutboxHandler batched(Calls calls) {
-            return new FallbackBatch(calls);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    @Import(WithBatchAspect.class)
-    static class TypedBatchApp {
-
-        @Bean
-        OutboxTopicHandler batched(Calls calls) {
-            return new TypedBatch(calls);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    @Import(WithBatchAspect.class)
-    static class PlainDefaultBatchApp {
-
-        @Bean
-        OutboxTopicHandler batched(Calls calls) {
-            return new PlainTx(calls);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    @Import(WithBatchAspect.class)
-    static class TypedDefaultBatchApp {
-
-        @Bean
-        OutboxTopicHandler batched(Calls calls) {
-            return new Typed(calls);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
     static class TombstoneAspectApp {
 
         @Bean
@@ -614,51 +482,6 @@ class HandlerProxiesIT {
         @Bean
         TombstoneAspect tombstoneAspect(Calls calls) {
             return new TombstoneAspect(calls);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class TypedTxOnInterfaceApp {
-
-        @Bean
-        OutboxTopicHandler typedHandler() {
-            return new TypedTxOnInterface();
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class ViaBaseTxOnInterfaceApp {
-
-        @Bean
-        OutboxTopicHandler ordersRoute() {
-            return new ViaBaseTxOnInterface();
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class FinalHandleApp {
-
-        @Bean
-        OutboxTopicHandler finalBean() {
-            return new FinalHandle();
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class FinalHookApp {
-
-        @Bean
-        OutboxTopicHandler finalBean() {
-            return new FinalHook();
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class FinalBatchApp {
-
-        @Bean
-        OutboxTopicHandler finalBean() {
-            return new FinalBatch();
         }
     }
 
@@ -691,7 +514,17 @@ class HandlerProxiesIT {
     }
 
     private static ApplicationContextRunner app(Class<?> config, String... properties) {
-        return runner(properties).withUserConfiguration(Common.class, config);
+        return runner(properties).withBean(Calls.class).withUserConfiguration(config);
+    }
+
+    /** {@code handler} as the one bean {@code name}, built over the {@link Calls}. */
+    private static ApplicationContextRunner app(String name, Class<?> handler, String... properties) {
+        return runner(properties).withBean(Calls.class).withBean(name, handler);
+    }
+
+    /** {@code handler} as the bean {@code batched}, which {@link BatchAspect} advises. */
+    private static ApplicationContextRunner batched(Class<?> handler, String... properties) {
+        return app("batched", handler, properties).withBean(BatchAspect.class);
     }
 
     private static List<String> seenAfter(ApplicationContext context, String topic, int calls) {
@@ -720,25 +553,25 @@ class HandlerProxiesIT {
 
     @Test
     void plainTransactionalHandlePerRecord() {
-        app(PlainTxApp.class).run(context ->
+        app("ordersRoute", PlainTx.class).run(context ->
             assertThat(seenAfter(context, "orders", 2)).containsExactly("plain in tx", "plain in tx"));
     }
 
     @Test
     void typedTransactionalHookPerRecord() {
-        app(TypedTxApp.class).run(context ->
+        app("typedHandler", TypedTx.class).run(context ->
             assertThat(seenAfter(context, "audit", 2)).containsExactly("typed v in tx", "typed v in tx"));
     }
 
     @Test
     void classLevelTransactionalTyped() {
-        app(ClassTxTypedApp.class).run(context ->
+        app("typedHandler", ClassTxTyped.class).run(context ->
             assertThat(seenAfter(context, "audit", 2)).containsExactly("typed v in tx", "typed v in tx"));
     }
 
     @Test
     void fallbackOutboxHandlerProxied() {
-        app(FallbackTxApp.class).run(context ->
+        app("fallback", FallbackTx.class).run(context ->
             assertThat(seenAfter(context, "other", 2)).containsExactly("fallback in tx", "fallback in tx"));
     }
 
@@ -750,7 +583,7 @@ class HandlerProxiesIT {
 
     @Test
     void jdkPlainTransactionalWorks() {
-        app(PlainTxApp.class, JDK_PROXIES).run(context ->
+        app("ordersRoute", PlainTx.class, JDK_PROXIES).run(context ->
             assertThat(seenAfter(context, "orders", 2)).containsExactly("plain in tx", "plain in tx"));
     }
 
@@ -762,16 +595,19 @@ class HandlerProxiesIT {
 
     @Test
     void jdkTypedTransactionalHookFailsStart() {
-        app(TypedTxApp.class, JDK_PROXIES).run(context -> assertThat(failure(context)).contains("typedHandler")
+        app("typedHandler", TypedTx.class, JDK_PROXIES).run(context -> assertThat(failure(context))
+            .contains("typedHandler")
             .contains("handle(" + AuditEvent.class.getSimpleName() + ", OutboxRecord)")
             .contains("spring.aop.proxy-target-class=true"));
     }
 
     @Test
     void transactionalOnInterfaceFailsStartOnClassProxy() {
-        app(TypedTxOnInterfaceApp.class).run(context -> assertThat(failure(context)).contains("typedHandler")
+        app("typedHandler", TypedTxOnInterface.class).run(context -> assertThat(failure(context))
+            .contains("typedHandler")
             .contains("handle(OutboxRecord)").contains("advise the hook"));
-        app(ViaBaseTxOnInterfaceApp.class).run(context -> assertThat(failure(context)).contains("ordersRoute")
+        app("ordersRoute", ViaBaseTxOnInterface.class).run(context -> assertThat(failure(context))
+            .contains("ordersRoute")
             .contains("handle(OutboxRecord)").contains("only through an interface"));
     }
 
@@ -792,15 +628,16 @@ class HandlerProxiesIT {
 
     @Test
     void jdkTypedHookDeclaredByAnInterfaceStillFailsStart() {
-        app(TypedWithApiApp.class, JDK_PROXIES).run(context -> assertThat(failure(context)).contains("typedHandler")
+        app("typedHandler", TypedWithApi.class, JDK_PROXIES).run(context -> assertThat(failure(context))
+            .contains("typedHandler")
             .contains("handle(" + AuditEvent.class.getSimpleName() + ", OutboxRecord)")
             .contains("spring.aop.proxy-target-class=true"));
     }
 
     @Test
     void aspectOnInheritedHandleBatchFailsStart() {
-        for (var run : List.of(app(PlainDefaultBatchApp.class), app(PlainDefaultBatchApp.class, JDK_PROXIES),
-                app(TypedDefaultBatchApp.class), app(TypedDefaultBatchApp.class, JDK_PROXIES))) {
+        for (var run : List.of(batched(PlainTx.class), batched(PlainTx.class, JDK_PROXIES),
+                batched(Typed.class), batched(Typed.class, JDK_PROXIES))) {
             run.run(context -> assertThat(failure(context)).contains("batched").contains("handleBatch(List)")
                 .contains(BatchAspect.class.getName()).contains("override handleBatch or advise handle"));
         }
@@ -808,11 +645,11 @@ class HandlerProxiesIT {
 
     @Test
     void finalCalledMethodOnClassBasedProxyFailsStart() {
-        app(FinalHandleApp.class).run(context -> assertThat(failure(context)).contains("finalBean")
+        app("finalBean", FinalHandle.class).run(context -> assertThat(failure(context)).contains("finalBean")
             .contains("handle(OutboxRecord)").contains("is final"));
-        app(FinalHookApp.class).run(context -> assertThat(failure(context)).contains("finalBean")
+        app("finalBean", FinalHook.class).run(context -> assertThat(failure(context)).contains("finalBean")
             .contains("handle(" + AuditEvent.class.getSimpleName() + ", OutboxRecord)").contains("is final"));
-        app(FinalBatchApp.class).run(context -> assertThat(failure(context)).contains("finalBean")
+        app("finalBean", FinalBatch.class).run(context -> assertThat(failure(context)).contains("finalBean")
             .contains("handleBatch(List)").contains("is final"));
         app(NestedProxiesApp.class).run(context -> assertThat(failure(context)).contains("nested")
             .contains("handle(OutboxRecord)").contains("is final"));
@@ -821,11 +658,11 @@ class HandlerProxiesIT {
     @Test
     void aspectOnOverriddenHandleBatchRuns() {
         for (var properties : List.of(new String[0], new String[] {JDK_PROXIES})) {
-            app(PlainBatchApp.class, properties).run(context -> assertThat(seenAfterOne(context, "orders"))
+            batched(PlainBatch.class, properties).run(context -> assertThat(seenAfterOne(context, "orders"))
                 .containsExactly("batch aspect no tx", "plain no tx"));
-            app(FallbackBatchApp.class, properties).run(context -> assertThat(seenAfterOne(context, "other"))
+            batched(FallbackBatch.class, properties).run(context -> assertThat(seenAfterOne(context, "other"))
                 .containsExactly("batch aspect no tx", "fallback no tx"));
-            app(TypedBatchApp.class, properties).run(context -> assertThat(seenAfterOne(context, "audit"))
+            batched(TypedBatch.class, properties).run(context -> assertThat(seenAfterOne(context, "audit"))
                 .containsExactly("batch aspect no tx", "typed v no tx"));
         }
     }
@@ -833,10 +670,12 @@ class HandlerProxiesIT {
     @Test
     void adviceOnHandleOfBatchOverrideFailsStart() {
         for (var properties : List.of(new String[0], new String[] {JDK_PROXIES})) {
-            app(PlainTxBatchApp.class, properties).run(context -> assertThat(failure(context)).contains("txBatch")
+            app("txBatch", PlainTxBatch.class, properties).run(context -> assertThat(failure(context))
+                .contains("txBatch")
                 .contains("handle(OutboxRecord)").contains("TransactionAttributeSourceAdvisor")
                 .contains("advise handleBatch, or use a TransactionTemplate inside the override"));
-            app(TypedTxBatchApp.class, properties).run(context -> assertThat(failure(context)).contains("txBatch")
+            app("txBatch", TypedTxBatch.class, properties).run(context -> assertThat(failure(context))
+                .contains("txBatch")
                 .contains("handle(" + AuditEvent.class.getSimpleName() + ", OutboxRecord)")
                 .contains("TransactionAttributeSourceAdvisor")
                 .contains("advise handleBatch, or use a TransactionTemplate inside the override"));
@@ -869,7 +708,7 @@ class HandlerProxiesIT {
     /** A v2 send is checked against the reports, and this instance reports what the proxied handler's target reads. */
     @Test
     void typedContractVersionFromTarget() {
-        app(TypedTxApp.class).run(context -> assertContractV2(context, "typed v2 in tx"));
+        app("typedHandler", TypedTx.class).run(context -> assertContractV2(context, "typed v2 in tx"));
         app(TypedAspectApp.class, JDK_PROXIES).run(context -> assertContractV2(context, "typed v2 no tx"));
     }
 

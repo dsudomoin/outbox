@@ -866,12 +866,7 @@ class NetworkBlackholeIT {
         var config = new TestOutboxConfig().networkTimeout(Duration.ofSeconds(1));
         var cut = OutboxRuntime.builder(config, new JdbcTransactions(forgottenAfter("advisory_xact_lock(?, ?)",
                 throughTheHole(3, 0))), record -> {}).build();
-        CompletableFuture.runAsync(() -> {
-            try {
-                cut.start();
-            } catch (RuntimeException e) { // cut off, as it should be; the hole's close ends its wait
-            }
-        });
+        CompletableFuture.runAsync(cut::start); // cut off, as it should be; the hole's close ends its wait
         await(() -> {
             try (var c = DIRECT.getConnection()) {
                 return TestSql.queryLong(c, "select count(*) from pg_locks where locktype = 'advisory'"
@@ -894,12 +889,7 @@ class NetworkBlackholeIT {
         made.close();
         var cut = InboxRuntime.builder(config, new JdbcTransactions(forgottenAfter("advisory_xact_lock(?, ?)",
                 throughTheHole(3, 0)))).build();
-        CompletableFuture.runAsync(() -> {
-            try {
-                cut.start();
-            } catch (RuntimeException e) { // cut off, as it should be; the hole's close ends its wait
-            }
-        });
+        CompletableFuture.runAsync(cut::start); // cut off, as it should be; the hole's close ends its wait
         await(() -> {
             try (var c = DIRECT.getConnection()) {
                 return TestSql.queryLong(c, "select count(*) from pg_locks where locktype = 'advisory' and granted") > 0;

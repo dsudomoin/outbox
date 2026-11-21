@@ -11,7 +11,6 @@ import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
-import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import jakarta.annotation.Nullable;
 import java.time.Duration;
 import java.time.Instant;
@@ -131,8 +130,7 @@ class KafkaRecordScopeIT {
     }
 
     private OutboxRuntime start(OutboxTelemetry telemetry, Handler handler) {
-        var config = new TestOutboxConfig().relayEnabled(false).batchTimeout(Duration.ofSeconds(30))
-                .deadLettersTimeout(Duration.ofSeconds(30));
+        var config = KafkaGuaranteesIT.config().relayEnabled(false);
         var runtime = OutboxRuntime.builder(config, transactions, handler).telemetry(telemetry).build();
         closing.add(runtime);
         runtime.start();

@@ -223,15 +223,11 @@ class KafkaOutboxAutoConfigurationIT {
                 + " outbox.kafka.fallback=true: set outbox.kafka.fallback=false to let your own handler take them");
     }
 
-    @Test
-    void appOutboxHandlerWithFallbackFails() {
-        runner().withUserConfiguration(WithAppHandler.class)
-            .run(context -> assertNamesTheConflict(failure(context)));
-    }
-
     /** The conflict comes first: a sender that cannot be built must not hide it behind advice to configure Kafka. */
     @Test
     void appOutboxHandlerWithFallbackFailsWhateverTheSender() {
+        runner().withUserConfiguration(WithAppHandler.class)
+            .run(context -> assertNamesTheConflict(failure(context)));
         withoutKafka().withUserConfiguration(WithAppHandler.class)
             .run(context -> assertNamesTheConflict(failure(context)));
         runner("outbox.kafka.driver-properties.acks=1").withUserConfiguration(WithAppHandler.class)

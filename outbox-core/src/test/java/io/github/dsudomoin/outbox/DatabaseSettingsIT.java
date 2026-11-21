@@ -165,13 +165,7 @@ class DatabaseSettingsIT {
                     throw new IllegalStateException(e);
                 }
             });
-            var inboxStart = CompletableFuture.runAsync(() -> {
-                try {
-                    inbox.start();
-                } catch (Exception e) {
-                    throw new IllegalStateException(e);
-                }
-            });
+            var inboxStart = CompletableFuture.runAsync(inbox::start);
             runtime.start();
             inboxStart.get(30, TimeUnit.SECONDS);
             release.get(30, TimeUnit.SECONDS);

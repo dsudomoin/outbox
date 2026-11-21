@@ -6,22 +6,32 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.internal.Hashing;
+import io.github.dsudomoin.outbox.internal.RecordScope;
+import io.github.dsudomoin.outbox.testing.Intercepting;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.ShardKeys;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import jakarta.annotation.Nullable;
+import java.io.IOException;
+import java.lang.reflect.Proxy;
+import java.sql.Connection;
+import java.sql.SQLException;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
+import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -215,20 +225,11 @@ class RelayTelemetryIT {
         var cursor = config.table() + "_cursor";
         var direct = TestDataSources.newDataSource();
         var rollbackErrors = new AtomicInteger();
-        var failing = (javax.sql.DataSource) java.lang.reflect.Proxy.newProxyInstance(
-                javax.sql.DataSource.class.getClassLoader(), new Class<?>[] {javax.sql.DataSource.class},
-                (proxy, method, args) -> {
-                    var target = method.getName().equals("getConnection") && (args == null || args.length == 0)
-                            ? commitAndRollbackFailing(direct.getConnection(), cursor, rollbackErrors) : null;
-                    if (target != null) {
-                        return target;
-                    }
-                    try {
-                        return method.invoke(direct, args);
-                    } catch (java.lang.reflect.InvocationTargetException e) {
-                        throw e.getCause();
-                    }
-                });
+        var failing = (DataSource) Proxy.newProxyInstance(DataSource.class.getClassLoader(),
+                new Class<?>[] {DataSource.class},
+                (proxy, method, args) -> method.getName().equals("getConnection") && (args == null || args.length == 0)
+                        ? commitAndRollbackFailing(direct.getConnection(), cursor, rollbackErrors)
+                        : Intercepting.invoke(direct, method, args));
         var events = new Events(transactions, cursor);
         var failingTransactions = new JdbcTransactions(failing);
         var r = OutboxRuntime.builder(config, failingTransactions, new RecordingHandler()).telemetry(events).build();
@@ -268,20 +269,14 @@ class RelayTelemetryIT {
      * in {@code ; commit}) is followed by a {@code commit()} that throws, the step committed, and whose rollback after
      * that rolls back and then throws an Error.
      */
-    private static java.sql.Connection commitAndRollbackFailing(java.sql.Connection c, String cursor,
-            AtomicInteger errors) {
-        var once = new java.util.concurrent.atomic.AtomicBoolean();
-        var stepSent = new java.util.concurrent.atomic.AtomicBoolean();
-        var commitFailed = new java.util.concurrent.atomic.AtomicBoolean();
-        return (java.sql.Connection) java.lang.reflect.Proxy.newProxyInstance(
-                java.sql.Connection.class.getClassLoader(), new Class<?>[] {java.sql.Connection.class},
+    private static Connection commitAndRollbackFailing(Connection c, String cursor, AtomicInteger errors) {
+        var once = new AtomicBoolean();
+        var stepSent = new AtomicBoolean();
+        var commitFailed = new AtomicBoolean();
+        return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
+                new Class<?>[] {Connection.class},
                 (proxy, method, args) -> {
-                    Object result;
-                    try {
-                        result = method.invoke(c, args);
-                    } catch (java.lang.reflect.InvocationTargetException e) {
-                        throw e.getCause();
-                    }
+                    var result = Intercepting.invoke(c, method, args);
                     switch (method.getName()) {
                         case "prepareStatement" -> {
                             var sql = (String) args[0];
@@ -293,7 +288,7 @@ class RelayTelemetryIT {
                         case "commit" -> {
                             if (stepSent.getAndSet(false)) {
                                 commitFailed.set(true);
-                                throw new java.sql.SQLException("commit failed (test)");
+                                throw new SQLException("commit failed (test)");
                             }
                         }
                         case "rollback" -> {
@@ -351,7 +346,7 @@ class RelayTelemetryIT {
         OutboxHandler handler = answering(records -> {
             int call = calls.incrementAndGet();
             if (call == 1) {
-                return java.util.Collections.nCopies(records.size(), Outcome.retry(new IllegalStateException("x")));
+                return Collections.nCopies(records.size(), Outcome.retry(new IllegalStateException("x")));
             }
             if (call == 2) {
                 slowShard.set(records.get(0).shard());
@@ -364,7 +359,7 @@ class RelayTelemetryIT {
                     }
                 }
             }
-            return java.util.Collections.nCopies(records.size(), Outcome.delivered());
+            return Collections.nCopies(records.size(), Outcome.delivered());
         });
         var outbox = start(config, handler, events);
 
@@ -387,13 +382,13 @@ class RelayTelemetryIT {
         var sameShard = List.of(keys.next(0), keys.next(0), keys.next(0));
         var config = new TestOutboxConfig();
         var events = new Events(transactions, config.table() + "_cursor");
-        var first = new java.util.concurrent.atomic.AtomicBoolean(true);
+        var first = new AtomicBoolean(true);
         OutboxHandler handler = answering(records -> {
             if (records.size() == 3 && first.compareAndSet(true, false)) {
-                return List.of(Outcome.delivered(), Outcome.retry(new java.io.IOException("down")),
+                return List.of(Outcome.delivered(), Outcome.retry(new IOException("down")),
                         Outcome.notAttempted());
             }
-            return java.util.Collections.nCopies(records.size(), Outcome.delivered());
+            return Collections.nCopies(records.size(), Outcome.delivered());
         });
         var outbox = start(config, handler, events);
         var messages = sameShard.stream().map(k -> OutboxMessage.of("orders", k, bytes(k))).toList();
@@ -413,9 +408,9 @@ class RelayTelemetryIT {
         var events = new Events(transactions, config.table() + "_cursor");
         var reports = new CopyOnWriteArrayList<Boolean>();
         OutboxHandler handler = answering(records -> {
-            reports.add(io.github.dsudomoin.outbox.internal.RecordScope.reports());
+            reports.add(RecordScope.reports());
             OutboxHandler.recordFinished(records.get(0), Outcome.delivered());
-            return java.util.Collections.nCopies(records.size(), Outcome.delivered());
+            return Collections.nCopies(records.size(), Outcome.delivered());
         });
         var outbox = start(config, handler, events);
 
@@ -428,7 +423,7 @@ class RelayTelemetryIT {
                 "deliveryFinished");
         assertThat(events.sameRecord).as("the handed record itself").containsOnly(true).isNotEmpty();
         assertThat(reports).containsOnly(true);
-        assertThat(io.github.dsudomoin.outbox.internal.RecordScope.reports()).as("outside a call").isFalse();
+        assertThat(RecordScope.reports()).as("outside a call").isFalse();
         OutboxHandler.recordFinished(events.lastHanded, Outcome.delivered()); // outside a call: nothing, no throw
         assertThat(events.single().log).isEqualTo(log);
     }
@@ -438,7 +433,7 @@ class RelayTelemetryIT {
         var sameShard = List.of(keys.next(0), keys.next(0));
         var config = new TestOutboxConfig();
         var events = new Events(transactions, config.table() + "_cursor");
-        var failed = new java.util.concurrent.atomic.AtomicBoolean();
+        var failed = new AtomicBoolean();
         OutboxHandler handler = record -> {
             if (new String(record.key(), UTF_8).equals(sameShard.get(1)) && failed.compareAndSet(false, true)) {
                 throw new IllegalStateException("down");
@@ -520,7 +515,7 @@ class RelayTelemetryIT {
         await(Duration.ofSeconds(10), () -> handler.delivered().size() >= 6);
         runtime.close();
 
-        var handedSix = events.ended().stream().filter(step -> step.maxHanded == 6).toList();
+        var handedSix = events.ended().stream().filter(step -> step.handedTimes.contains(6)).toList();
         assertThat(handedSix).as("the main call, then the retry call").hasSizeGreaterThanOrEqualTo(2)
                 .allSatisfy(step -> assertThat(step.log).contains("fetched(" + shard("k") + ",6)"));
     }
@@ -658,14 +653,13 @@ class RelayTelemetryIT {
         }
 
         @Override
-        public Delivery deliveryStarted(RelayStep step, List<OutboxRecord> records, java.time.Instant now) {
+        public Delivery deliveryStarted(RelayStep step, List<OutboxRecord> records, Instant now) {
             if (!(step instanceof Observed observed)) {
                 foreignSteps++;
                 return Delivery.NONE;
             }
             observed.log.add("deliveryStarted");
             observed.handed = records.size();
-            observed.maxHanded = Math.max(observed.maxHanded, records.size());
             observed.handedTimes.add(records.size());
             records.forEach(r -> handedOnSteps.add(r.messageId()));
             return new Delivery() {
@@ -723,7 +717,7 @@ class RelayTelemetryIT {
             try (var c = transactions.newConnection()) {
                 // the newest row, not a count: a maintenance run may delete older rows of the shard meanwhile
                 return TestSql.queryLong(c, "select coalesce(max(seq), 0) from " + cursor + " where shard = " + shard);
-            } catch (java.sql.SQLException e) {
+            } catch (SQLException e) {
                 throw new IllegalStateException(e);
             }
         }
@@ -734,7 +728,6 @@ class RelayTelemetryIT {
             final List<Throwable> errors = new CopyOnWriteArrayList<>();
             volatile int shard = -1;
             volatile int handed;
-            volatile int maxHanded;
             final List<Integer> handedTimes = new CopyOnWriteArrayList<>();
             volatile long cursorRowsAtSettle = -1;
             volatile long cursorRowsAtFinish = -1;

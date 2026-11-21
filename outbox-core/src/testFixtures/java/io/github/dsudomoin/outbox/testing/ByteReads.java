@@ -1,7 +1,6 @@
 package io.github.dsudomoin.outbox.testing;
 
 import io.github.dsudomoin.outbox.OutboxTransactions;
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.sql.CallableStatement;
 import java.sql.Connection;
@@ -88,12 +87,7 @@ public final class ByteReads {
     @SuppressWarnings("unchecked")
     private static <T> T wrap(Class<T> type, T target) {
         return (T) Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[] {type}, (proxy, method, args) -> {
-            Object result;
-            try {
-                result = method.invoke(target, args);
-            } catch (InvocationTargetException e) {
-                throw e.getCause();
-            }
+            var result = Intercepting.invoke(target, method, args);
             var count = COUNT.get();
             if (count != null && result instanceof byte[] bytes) {
                 count.addAndGet(bytes.length);

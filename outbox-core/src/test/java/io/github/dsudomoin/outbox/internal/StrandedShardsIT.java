@@ -45,7 +45,6 @@ import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.postgresql.ds.PGSimpleDataSource;
 
 /**
  * Shards whose tick was deleted, repaired by the one admin call on a running relay: the rows of those shards come back
@@ -61,8 +60,8 @@ class StrandedShardsIT {
     private final JdbcTransactions transactions = new JdbcTransactions(direct);
     private final TestOutboxConfig config = new TestOutboxConfig().shards(SHARDS);
     private final ExecutorService pool = Executors.newCachedThreadPool();
-    private final Set<UUID> delivered = ConcurrentHashMap.newKeySet();
     private final Map<UUID, Integer> times = new ConcurrentHashMap<>();
+    private final Set<UUID> delivered = times.keySet();
     private final Queue<UUID> order = new ConcurrentLinkedQueue<>();
     private final ShardKeys keys = new ShardKeys(TOPIC, SHARDS);
     private OutboxRuntime writer;
@@ -562,7 +561,7 @@ class StrandedShardsIT {
 
     @Test
     void aFailedStepCostsAHealthyShardNothingOnARepeatableReadSession() throws Exception {
-        var repeatableRead = (PGSimpleDataSource) TestDataSources.newDataSource();
+        var repeatableRead = TestDataSources.newDataSource();
         repeatableRead.setOptions("-c default_transaction_isolation=repeatable\\ read");
         // a tick attempt, and with it a read of the latest tick, between any two steps of a pass
         config.idlePollInterval(Duration.ofMillis(1)).minTickInterval(Duration.ZERO);
@@ -798,9 +797,8 @@ class StrandedShardsIT {
     }
 
     private void deliver(OutboxRecord record) {
-        times.merge(record.messageId(), 1, Integer::sum);
         order.add(record.messageId());
-        delivered.add(record.messageId());
+        times.merge(record.messageId(), 1, Integer::sum);
     }
 
     /** Every shard but {@link #STRANDED} moves off the bootstrap tick, before any of them has a row. */
