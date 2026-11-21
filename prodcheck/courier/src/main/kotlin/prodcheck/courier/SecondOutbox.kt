@@ -36,6 +36,7 @@ class SecondOutbox(
         val config = object : OutboxConfig {
             override fun table() = this@SecondOutbox.table
             override fun shards() = main.shards()
+            override fun networkTimeout() = main.networkTimeout()
             override fun relay() = main.relay()
             override fun partitions() = main.partitions()
             override fun inbox() = main.inbox()
