@@ -538,7 +538,7 @@ public final class XidPartitions {
                     : window.endAfter(window.contains(seen.toLocalTime()) ? window.endAfter(seen) : seen);
         }
         if (oversized && !oversizedNow(now)) {
-            if (cutUntil == null && due(largeLogged, STUCK_LOG_INTERVAL)) { // in a window that did not fit: said
+            if (cutUntil == null && LogLimit.due(largeLogged, STUCK_LOG_INTERVAL)) { // in a window that did not fit: said
                 var until = window == null
                         ? "for good: outbox.partitions.tailConversion.window is empty, set one (maxStall "
                                 + maxStall.toMillis() + " ms)"
@@ -671,7 +671,7 @@ public final class XidPartitions {
      */
     private void missed(State s, String cause, boolean relaySteps) {
         int missed = ++missedSwaps;
-        if ((missed >= STUCK_SWAPS || s.ahead < premake / 2) && due(stuckLogged, STUCK_LOG_INTERVAL)) {
+        if ((missed >= STUCK_SWAPS || s.ahead < premake / 2) && LogLimit.due(stuckLogged, STUCK_LOG_INTERVAL)) {
             if (relaySteps) {
                 log.error("outbox partition tail swap of {} has not run on {} due runs in a row, {} ranges ahead of the"
                         + " current xid: {}. The swap waits for the relay steps in flight to end, up to"
@@ -1450,13 +1450,7 @@ public final class XidPartitions {
 
     /** True at most once per {@link #LOG_INTERVAL} for {@code logged}. */
     private static boolean due(AtomicLong logged) {
-        return due(logged, LOG_INTERVAL);
-    }
-
-    private static boolean due(AtomicLong logged, long interval) {
-        long now = System.nanoTime();
-        long last = logged.get();
-        return now - last >= interval && logged.compareAndSet(last, now);
+        return LogLimit.due(logged, LOG_INTERVAL);
     }
 
     /** The current xid, the premade ranges, {@code retained} ones and the tail: one snapshot and one catalog read. */

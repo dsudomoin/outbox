@@ -8,6 +8,7 @@ import io.github.dsudomoin.outbox.OutboxDeadLetterHandler;
 import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.Outcome;
+import io.github.dsudomoin.outbox.internal.LogLimit;
 import jakarta.annotation.Nullable;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -17,8 +18,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import org.apache.kafka.common.KafkaException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -176,21 +175,17 @@ public final class KafkaDeadLetterHandler implements OutboxDeadLetterHandler {
 
         private static final long INTERVAL = TimeUnit.MINUTES.toNanos(1);
 
-        /** When it was last logged ({@code nanoTime}), and how many went unlogged since. */
-        private final AtomicLong logged = new AtomicLong(System.nanoTime() - INTERVAL);
-        private final AtomicInteger suppressed = new AtomicInteger();
+        private final LogLimit limit = new LogLimit(INTERVAL);
 
         void warn(String what, @Nullable Throwable error) {
-            long now = System.nanoTime();
-            long last = logged.get();
-            if (now - last < INTERVAL || !logged.compareAndSet(last, now)) {
-                suppressed.incrementAndGet();
+            int suppressed = limit.pass();
+            if (suppressed < 0) {
                 return;
             }
             if (error == null) {
-                log.warn("{} ({} more since the previous report not logged)", what, suppressed.getAndSet(0));
+                log.warn("{} ({} more since the previous report not logged)", what, suppressed);
             } else {
-                log.warn("{} ({} more since the previous report not logged)", what, suppressed.getAndSet(0), error);
+                log.warn("{} ({} more since the previous report not logged)", what, suppressed, error);
             }
         }
     }

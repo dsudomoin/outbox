@@ -1,5 +1,7 @@
 package io.github.dsudomoin.outbox.internal;
 
+import static io.github.dsudomoin.outbox.internal.LogLimit.due;
+
 import io.github.dsudomoin.outbox.ConnectionSource;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
@@ -264,12 +266,6 @@ final class HeartbeatConnections implements ConnectionSource {
                 + heartbeat + ", application " + application;
     }
 
-    /** Whether a log line last logged at {@code at} may log now, at most once an {@code interval} (nanos). */
-    private static boolean due(AtomicLong at, long interval) {
-        long now = System.nanoTime();
-        long last = at.get();
-        return now - last >= interval && at.compareAndSet(last, now);
-    }
 
     private static void close(Connection c, Throwable cause) {
         try {

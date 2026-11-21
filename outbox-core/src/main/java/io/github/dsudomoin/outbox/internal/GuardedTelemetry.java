@@ -278,10 +278,8 @@ public final class GuardedTelemetry implements OutboxTelemetry {
         if (error instanceof VirtualMachineError v && !(error instanceof StackOverflowError)) {
             throw v;
         }
-        long now = System.nanoTime();
-        var last = warned.computeIfAbsent(hook, h -> new AtomicLong(now - WARN_INTERVAL));
-        long at = last.get();
-        if (now - at >= WARN_INTERVAL && last.compareAndSet(at, now)) {
+        var last = warned.computeIfAbsent(hook, h -> new AtomicLong(System.nanoTime() - WARN_INTERVAL));
+        if (LogLimit.due(last, WARN_INTERVAL)) {
             log.warn("outbox telemetry hook {} failed and is ignored: {}; failures of it in the next 10 s are not logged",
                     hook, RetryStore.describe(error));
         }

@@ -7,6 +7,7 @@ import io.github.dsudomoin.outbox.internal.Cursors;
 import io.github.dsudomoin.outbox.internal.DatabaseClock;
 import io.github.dsudomoin.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.outbox.internal.Heartbeat;
+import io.github.dsudomoin.outbox.internal.LogLimit;
 import io.github.dsudomoin.outbox.internal.Maintenance;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.ShardProcessor.ShardResult;
@@ -899,8 +900,7 @@ public final class OutboxRelay implements AutoCloseable {
         private long covered;
         /** The wake-ups the previous run saw. */
         private long previous;
-        private long lastWarn = System.nanoTime() - TICKER_WARN_INTERVAL;
-        private int suppressed;
+        private final LogLimit warnings = new LogLimit(TICKER_WARN_INTERVAL);
 
         Ticker(Duration every) {
             this.every = every;
@@ -958,17 +958,14 @@ public final class OutboxRelay implements AutoCloseable {
         }
 
         private void warn(Throwable t) {
-            long now = System.nanoTime();
-            if (now - lastWarn < TICKER_WARN_INTERVAL) {
-                suppressed++;
+            int suppressed = warnings.pass();
+            if (suppressed < 0) {
                 return;
             }
             var denied = denied(t) ? ": the role needs the grants OutboxSql.outbox(config, role) gives, or set"
                     + " outbox.relay.ticksWithoutRelay = 0" : "";
             log.warn("outbox tick of an instance with the relay disabled failed{}, tried again in {} ({} failures since"
                     + " the previous report not logged)", denied, every, suppressed, t);
-            lastWarn = now;
-            suppressed = 0;
         }
 
         private static boolean denied(Throwable t) {
@@ -983,8 +980,7 @@ public final class OutboxRelay implements AutoCloseable {
 
     private final class Worker implements Runnable {
 
-        private long lastWarn = System.nanoTime() - WARN_INTERVAL;
-        private int suppressed;
+        private final LogLimit warnings = new LogLimit(WARN_INTERVAL);
         /** Fatal errors in a row: each pauses the worker twice as long, from retry.initialDelay up to maxDelay. */
         private int fatal;
 
@@ -1306,14 +1302,11 @@ public final class OutboxRelay implements AutoCloseable {
         }
 
         private void warn(String what, Throwable t) {
-            long now = System.nanoTime();
-            if (now - lastWarn < WARN_INTERVAL) {
-                suppressed++;
+            int suppressed = warnings.pass();
+            if (suppressed < 0) {
                 return;
             }
             log.warn("{} ({} failures since the previous report not logged)", what, suppressed, t);
-            lastWarn = now;
-            suppressed = 0;
         }
     }
 

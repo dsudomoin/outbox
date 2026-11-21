@@ -56,7 +56,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerArray;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -241,8 +240,7 @@ public final class ShardProcessor implements AutoCloseable {
     private final AtomicLongArray busyUntil;
     private final long fullCheckInterval;
     /** When a handler bug was last logged ({@code nanoTime}), and how many went unlogged since. */
-    private final AtomicLong bugReported = new AtomicLong(System.nanoTime() - BUG_REPORT_INTERVAL);
-    private final AtomicInteger bugsSuppressed = new AtomicInteger();
+    private final LogLimit bugReports = new LogLimit(BUG_REPORT_INTERVAL);
 
     /** {@code deadLetterHook}: a dead-letter hook is active, so every dead row is written pending for it. */
     public ShardProcessor(TableNames names, OutboxConfig config, OutboxHandler handler, OutboxTelemetry telemetry,
@@ -2398,13 +2396,10 @@ public final class ShardProcessor implements AutoCloseable {
 
     /** A handler bug at ERROR, at most one per 10 s for this processor. */
     private void handlerBug(String what, Throwable error) {
-        long now = System.nanoTime();
-        long last = bugReported.get();
-        if (now - last < BUG_REPORT_INTERVAL || !bugReported.compareAndSet(last, now)) {
-            bugsSuppressed.incrementAndGet();
+        int suppressed = bugReports.pass();
+        if (suppressed < 0) {
             return;
         }
-        long suppressed = bugsSuppressed.getAndSet(0);
         try {
             log.error("{} ({} more since the previous report not logged)", what, suppressed, error);
         } catch (Throwable e) {

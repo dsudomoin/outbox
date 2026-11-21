@@ -322,9 +322,7 @@ final class ContractGuard {
 
     /** Whether the WARN that {@code warned} limits may log now, at most once a {@link #WARN_INTERVAL}. */
     private static boolean due(AtomicLong warned) {
-        long now = System.nanoTime();
-        long last = warned.get();
-        return now - last >= WARN_INTERVAL && warned.compareAndSet(last, now);
+        return LogLimit.due(warned, WARN_INTERVAL);
     }
 
     /** One read of the live relay instances' reports; {@code readAt}: {@link #nanoTime} before it ran. */

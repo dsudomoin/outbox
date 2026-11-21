@@ -1,10 +1,9 @@
 package io.github.dsudomoin.outbox;
 
+import io.github.dsudomoin.outbox.internal.LogLimit;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.LoggerFactory;
 
 /**
@@ -17,9 +16,8 @@ final class RouteCalls {
 
     /** What the ERROR calls the handlers behind it. */
     private final String what;
-    /** When an invalid answer was last logged ({@code nanoTime}), and how many went unlogged since. */
-    private final AtomicLong reported = new AtomicLong(System.nanoTime() - REPORT_INTERVAL);
-    private final AtomicInteger suppressed = new AtomicInteger();
+    /** At most one invalid answer logged per interval, the rest counted. */
+    private final LogLimit reports = new LogLimit(REPORT_INTERVAL);
 
     RouteCalls(String what) {
         this.what = what;
@@ -61,13 +59,11 @@ final class RouteCalls {
     }
 
     private void report(IllegalStateException error) {
-        long now = System.nanoTime();
-        long last = reported.get();
-        if (now - last < REPORT_INTERVAL || !reported.compareAndSet(last, now)) {
-            suppressed.incrementAndGet();
+        int suppressed = reports.pass();
+        if (suppressed < 0) {
             return;
         }
         LoggerFactory.getLogger(OutboxHandler.class).error("outbox " + what + " failed; its records are retried ({}"
-                + " more since the previous report not logged)", suppressed.getAndSet(0), error);
+                + " more since the previous report not logged)", suppressed, error);
     }
 }

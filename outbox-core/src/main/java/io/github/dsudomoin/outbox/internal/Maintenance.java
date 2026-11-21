@@ -625,9 +625,7 @@ public final class Maintenance {
 
     /** True at most once per {@code LOG_INTERVAL} for {@code logged}. */
     private static boolean due(AtomicLong logged) {
-        long now = System.nanoTime();
-        long last = logged.get();
-        return now - last >= LOG_INTERVAL && logged.compareAndSet(last, now);
+        return LogLimit.due(logged, LOG_INTERVAL);
     }
 
     /**

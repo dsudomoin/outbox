@@ -16,8 +16,6 @@ import java.util.Map;
 import java.util.NavigableMap;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -174,8 +172,7 @@ public final class Ticks {
     @Nullable
     private volatile String unprobedTick;
     /** When a failed probe was last logged ({@code nanoTime}), and how many went unlogged since. */
-    private final AtomicLong probeWarned = new AtomicLong(System.nanoTime() - WARN_INTERVAL);
-    private final AtomicInteger probeUnwarned = new AtomicInteger();
+    private final LogLimit probeWarnings = new LogLimit(WARN_INTERVAL);
 
     /** {@code shards}: {@code outbox.shards}, the length of a tick's {@code dirty} bitmap. */
     public Ticks(TableNames names, int shards) {
@@ -508,16 +505,14 @@ public final class Ticks {
     }
 
     private void warnProbeFailed(SQLException e) {
-        long now = System.nanoTime();
-        long last = probeWarned.get();
-        if (now - last < WARN_INTERVAL || !probeWarned.compareAndSet(last, now)) {
-            probeUnwarned.incrementAndGet();
+        int unwarned = probeWarnings.pass();
+        if (unwarned < 0) {
             return;
         }
         log.warn("outbox tick made without its shard set, so the relay steps every shard behind it: the statement of"
                 + " its shard probe and its row failed with SQLState {}: {} ({} more since the previous report not"
                 + " logged)", e.getSQLState(),
-                e.getMessage(), probeUnwarned.getAndSet(0));
+                e.getMessage(), unwarned);
     }
 
     /**

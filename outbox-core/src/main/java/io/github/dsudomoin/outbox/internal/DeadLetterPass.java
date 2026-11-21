@@ -27,8 +27,6 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -575,21 +573,17 @@ public final class DeadLetterPass {
     /** One kind of WARN of this pass, at most once a minute, so a frequent kind never hides another. */
     private static final class Warnings {
 
-        /** When this WARN was last logged ({@code nanoTime}), and how many went unlogged since. */
-        private final AtomicLong warned = new AtomicLong(System.nanoTime() - WARN_INTERVAL);
-        private final AtomicInteger suppressed = new AtomicInteger();
+        private final LogLimit limit = new LogLimit(WARN_INTERVAL);
 
         void warn(String what, @Nullable Throwable error) {
-            long now = System.nanoTime();
-            long last = warned.get();
-            if (now - last < WARN_INTERVAL || !warned.compareAndSet(last, now)) {
-                suppressed.incrementAndGet();
+            int suppressed = limit.pass();
+            if (suppressed < 0) {
                 return;
             }
             if (error == null) {
-                log.warn("{} ({} more since the previous report not logged)", what, suppressed.getAndSet(0));
+                log.warn("{} ({} more since the previous report not logged)", what, suppressed);
             } else {
-                log.warn("{} ({} more since the previous report not logged)", what, suppressed.getAndSet(0), error);
+                log.warn("{} ({} more since the previous report not logged)", what, suppressed, error);
             }
         }
     }

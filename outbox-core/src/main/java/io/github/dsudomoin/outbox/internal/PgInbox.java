@@ -508,9 +508,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
 
     private void acceptedOutside(UUID id) {
         telemetry.inboxOutsideWindow();
-        long now = System.nanoTime();
-        long last = lastWarn.get();
-        if (now - last >= WARN_INTERVAL && lastWarn.compareAndSet(last, now)) {
+        if (LogLimit.due(lastWarn, WARN_INTERVAL)) {
             var w = window;
             var from = Instant.ofEpochMilli(dedupFrom(w));
             var reason = UuidV7.isV7(id)
