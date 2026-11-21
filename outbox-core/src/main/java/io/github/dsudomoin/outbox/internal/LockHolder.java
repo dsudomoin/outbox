@@ -11,7 +11,6 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -72,7 +71,7 @@ final class LockHolder implements AutoCloseable {
     private final long token;
     /** Serialises the holder's connection between its owner and the keepalive. */
     private final ReentrantLock use = new ReentrantLock();
-    private final AtomicInteger savepoints = new AtomicInteger();
+    private int savepoints; // under use
     private final ScheduledFuture<?> keepalive;
     /** The work's connection while {@link #bind} binds it: what a lost holder cancels and aborts. */
     @Nullable
@@ -159,7 +158,7 @@ final class LockHolder implements AutoCloseable {
         use.lock();
         try {
             requireOpen();
-            var savepoint = "outbox_lock_" + savepoints.incrementAndGet();
+            var savepoint = "outbox_lock_" + ++savepoints;
             Sql.execute(c, "savepoint " + savepoint);
             long deadline = System.nanoTime() + wait.toNanos();
             while (!take(ns, key)) {

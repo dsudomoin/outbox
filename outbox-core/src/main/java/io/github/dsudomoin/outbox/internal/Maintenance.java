@@ -19,7 +19,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
-import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
@@ -379,26 +378,11 @@ public final class Maintenance {
 
     private boolean checkHaltHoldingTheCheck() {
         try (var c = db.newConnection(); var bound = socket.on(c)) {
-            c.setAutoCommit(false);
-            try (var st = c.createStatement()) {
-                st.execute("set local lock_timeout = " + SHARDS_LOCK_TIMEOUT.toMillis() // a transaction's: no leak
-                        + "; set local idle_in_transaction_session_timeout = " + ABANDONED_AFTER.toMillis());
+            if (briefly(c, () -> {
                 checkXidCounter(c);
-                c.commit();
-            } catch (Throwable t) { // an Error or RuntimeException too: setAutoCommit(true) would commit a half check
-                try {
-                    c.rollback();
-                } catch (SQLException cleanup) {
-                    t.addSuppressed(cleanup);
-                }
-                if (!(t instanceof SQLException e) || !LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
-                    throw t;
-                }
-                if (!xidChecked) {
-                    unanswered = true;
-                }
-            } finally {
-                c.setAutoCommit(true);
+                return Boolean.TRUE;
+            }) == null && !xidChecked) {
+                unanswered = true;
             }
             checkShards(c);
             return halted();
@@ -414,24 +398,14 @@ public final class Maintenance {
      */
     @Nullable
     private Integer checkShards(Connection c) throws SQLException {
-        int present;
-        c.setAutoCommit(false);
-        try (var st = c.createStatement()) {
-            st.execute("set local lock_timeout = " + SHARDS_LOCK_TIMEOUT.toMillis() // a transaction's: no leak
-                    + "; set local idle_in_transaction_session_timeout = " + ABANDONED_AFTER.toMillis());
-            try (var rs = st.executeQuery(cursorShards)) {
+        var present = briefly(c, () -> {
+            try (var st = c.createStatement(); var rs = st.executeQuery(cursorShards)) {
                 rs.next();
-                present = rs.getInt(1);
+                return rs.getInt(1);
             }
-            c.commit();
-        } catch (SQLException e) {
-            c.rollback();
-            if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
-                throw e;
-            }
+        });
+        if (present == null) {
             return mismatch;
-        } finally {
-            c.setAutoCommit(true);
         }
         Integer found = present == 0 || present == shards ? null : present;
         var before = mismatch;
@@ -442,6 +416,35 @@ public final class Maintenance {
                     shards);
         }
         return found;
+    }
+
+    /**
+     * {@code body} in a short transaction of its own on {@code c}, which waits at most {@link #SHARDS_LOCK_TIMEOUT} for
+     * a lock and is ended by the server once abandoned for {@link #ABANDONED_AFTER}: its result, or null when a lock
+     * kept it from running. Leaves {@code c} in autocommit.
+     */
+    @Nullable
+    private static <T> T briefly(Connection c, SqlFunction0<T> body) throws SQLException {
+        c.setAutoCommit(false);
+        try {
+            execute(c, "set local lock_timeout = " + SHARDS_LOCK_TIMEOUT.toMillis() // a transaction's: no leak
+                    + "; set local idle_in_transaction_session_timeout = " + ABANDONED_AFTER.toMillis());
+            var result = body.apply();
+            c.commit();
+            return result;
+        } catch (Throwable t) { // an Error or RuntimeException too: setAutoCommit(true) would commit a half check
+            try {
+                c.rollback();
+            } catch (SQLException cleanup) {
+                t.addSuppressed(cleanup);
+            }
+            if (!(t instanceof SQLException e) || !LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
+                throw t;
+            }
+            return null;
+        } finally {
+            c.setAutoCommit(true);
+        }
     }
 
     private String mismatchText(int present) {
@@ -562,21 +565,12 @@ public final class Maintenance {
     private Read read(Connection c) throws SQLException {
         var latest = ticks.latest(c);
         var positions = cursors.positions(c, latest.id());
-        var wanted = new TreeSet<Long>();
-        for (var p : positions) {
-            if (checked(p, latest) && p.effectiveTickId() != latest.id()) {
-                wanted.add(p.effectiveTickId());
-            }
-            var target = p.cursor().targetTickId();
-            if (target != null && target != latest.id()) {
-                wanted.add(target);
-            }
-        }
+        var wanted = Cursors.ticksToRead(positions, latest.id());
         var found = ticks.get(c, wanted);
         var stranded = new TreeMap<Integer, Long>();
         for (var p : positions) {
             var target = p.cursor().targetTickId();
-            if (checked(p, latest) && wanted.contains(p.effectiveTickId())
+            if (Cursors.checked(p, latest.id()) && wanted.contains(p.effectiveTickId())
                     && !found.containsKey(p.effectiveTickId())) {
                 stranded.put(p.cursor().shard(), p.effectiveTickId());
             } else if (target != null && wanted.contains(target) && !found.containsKey(target)) {
@@ -594,15 +588,6 @@ public final class Maintenance {
                     names.base(), latest.id(), latest.createdAt(), lagFrom.id(), lagFrom.createdAt());
         }
         return new Read(latest, positions, slowest, stranded, lagFrom, cursors.ignoredCheckpointTick(c));
-    }
-
-    /**
-     * Whether {@link #read} looks up {@code p}'s effective tick: busy, or above the latest tick, as after a restore of
-     * the tick table that brought its sequence back (a cursor read after the latest tick may be on a newer one, which
-     * the look-up then finds).
-     */
-    private static boolean checked(Position p, Tick latest) {
-        return Cursors.busy(p) || p.effectiveTickId() > latest.id();
     }
 
     /**
@@ -913,13 +898,7 @@ public final class Maintenance {
     }
 
     /**
-     * The rows of a table older than an age, deleted by ranges of {@link #CLEANUP_BLOCKS} blocks (a TID range scan,
-     * each its own autocommit statement under {@link #cleanupTimeout}, whatever the role's {@code statement_timeout}):
-     * a backlog of millions never runs into a timeout, as one statement would on every run, and each row is deleted,
-     * and written to the WAL, once. A pass reads the table once, as one statement's scan would, and needs no index.
-     * Past the run's budget, after at least one range, it stops, not a failure, and this instance's next run goes on
-     * from there; a pass that reached the end starts the next from the first block. Rows that age out behind it
-     * meanwhile go in the next pass.
+     * {@link #CLEANUP_TIMEOUT}, kept below a set {@code networkTimeout} by the answer margin, at least 1 s.
      */
     static Duration cleanupTimeout(Duration networkTimeout) {
         if (networkTimeout.isZero()) {
@@ -930,6 +909,15 @@ public final class Maintenance {
                 : under.compareTo(CLEANUP_TIMEOUT) < 0 ? under : CLEANUP_TIMEOUT;
     }
 
+    /**
+     * The rows of a table older than an age, deleted by ranges of {@link #CLEANUP_BLOCKS} blocks (a TID range scan,
+     * each in a transaction of its own under {@link #cleanupTimeout}, whatever the role's {@code statement_timeout}):
+     * a backlog of millions never runs into a timeout, as one statement would on every run, and each row is deleted,
+     * and written to the WAL, once. A pass reads the table once, as one statement's scan would, and needs no index.
+     * Past the run's budget, after at least one range, it stops, not a failure, and this instance's next run goes on
+     * from there; a pass that reached the end starts the next from the first block. Rows that age out behind it
+     * meanwhile go in the next pass.
+     */
     private static final class AgedDelete {
 
         private final String table;

@@ -24,9 +24,6 @@ final class DeadLetters {
     /** The columns {@link #readRef} maps, in its order: what a redrive needs, the payload and headers left out. */
     static final String REF_COLUMNS = "id, message_id, topic, key, redrives";
 
-    /** A letter with its headers in the stored encoding. */
-    record Claimed(DeadLetter letter, @Nullable byte[] headers) {}
-
     /**
      * A letter as a redrive claims it: its payload and headers stay in the database, copied from there
      * ({@link Resender#insertFrom}), so a chunk of large letters never comes into the heap.
@@ -55,16 +52,15 @@ final class DeadLetters {
     }
 
     /** The row at {@code rs}, selected as {@link #COLUMNS}. */
-    static Claimed read(ResultSet rs) throws SQLException {
-        var headers = rs.getBytes(6);
+    static DeadLetter read(ResultSet rs) throws SQLException {
         var dueAt = rs.getObject(14, OffsetDateTime.class);
-        return new Claimed(new DeadLetter(
+        return new DeadLetter(
                 rs.getLong(1),
                 rs.getObject(2, UUID.class),
                 rs.getString(3),
                 rs.getBytes(4),
                 rs.getBytes(5),
-                HeaderCodec.decode(headers),
+                HeaderCodec.decode(rs.getBytes(6)),
                 rs.getObject(7, OffsetDateTime.class).toInstant(),
                 rs.getInt(8),
                 rs.getObject(9, OffsetDateTime.class).toInstant(),
@@ -72,7 +68,7 @@ final class DeadLetters {
                 DeadLetter.Status.valueOf(rs.getString(11).toUpperCase(Locale.ROOT)),
                 rs.getInt(12),
                 rs.getInt(13),
-                dueAt == null ? null : dueAt.toInstant()), headers);
+                dueAt == null ? null : dueAt.toInstant());
     }
 
     /** The row at {@code rs}, selected as {@link #REF_COLUMNS}. */

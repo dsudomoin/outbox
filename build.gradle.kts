@@ -1,4 +1,5 @@
 val koraVersion: String by project
+val junitVersion = "5.12.2" // with JUnit Platform 1.12.2
 
 val published = listOf(
     "outbox-core", "outbox-kafka", "outbox-micrometer", "outbox-kora", "outbox-kafka-kora", "outbox-admin-kora",
@@ -32,7 +33,7 @@ configure(published.map { project(":$it") }) {
     }
 
     dependencies {
-        "testImplementation"(platform("org.junit:junit-bom:5.12.2"))
+        "testImplementation"(platform("org.junit:junit-bom:$junitVersion"))
         "testImplementation"("org.junit.jupiter:junit-jupiter")
         "testRuntimeOnly"("org.junit.platform:junit-platform-launcher")
         "testImplementation"("org.assertj:assertj-core:3.27.6")
@@ -211,7 +212,7 @@ configure(springBootModules.map { project(":$it") }) {
     }
     // Boot 4.1 manages JUnit 6: the Boot 4.1 run stays on the repository's JUnit, as the Boot 3.5 one
     testBoot4RuntimeClasspath.resolutionStrategy.eachDependency {
-        if (requested.group == "org.junit.jupiter") useVersion("5.12.2")
+        if (requested.group == "org.junit.jupiter") useVersion(junitVersion)
         if (requested.group == "org.junit.platform") useVersion("1.12.2")
     }
     // The tests log through slf4j-simple (CapturedStderr reads it); with Logback present too, SpringApplication's

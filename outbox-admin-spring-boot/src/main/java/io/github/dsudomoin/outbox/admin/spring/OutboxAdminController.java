@@ -33,6 +33,7 @@ import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
 import org.slf4j.Logger;
@@ -160,9 +161,9 @@ class OutboxAdminController implements OutboxAdminApi {
 
     @Override
     public ResponseEntity<Count> restoreOrphan(String table, Long fromXid) {
-        var detail = new LinkedHashMap<String, String>(); // the table is in the path already
-        detail.put("fromXid", String.valueOf(fromXid));
-        RequestContextHolder.currentRequestAttributes().setAttribute(DETAIL, detail, RequestAttributes.SCOPE_REQUEST);
+        // the table is in the path already
+        RequestContextHolder.currentRequestAttributes().setAttribute(DETAIL, Map.of("fromXid", String.valueOf(fromXid)),
+            RequestAttributes.SCOPE_REQUEST);
         return ResponseEntity.ok(new Count(admin().restoreOrphan(table, fromXid)));
     }
 

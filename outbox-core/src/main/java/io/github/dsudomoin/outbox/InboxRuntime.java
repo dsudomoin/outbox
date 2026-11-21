@@ -51,9 +51,7 @@ public final class InboxRuntime implements AutoCloseable {
     /** Stops the inbox maintenance; nothing without {@link #start()}. */
     @Override
     public synchronized void close() {
-        if (started) {
-            inbox.close();
-        }
+        inbox.close(); // nothing while it has not started
     }
 
     public static final class Builder {

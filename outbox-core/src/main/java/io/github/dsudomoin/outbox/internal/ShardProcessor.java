@@ -656,14 +656,11 @@ public final class ShardProcessor implements AutoCloseable {
                 shardReads.add(new BatchReader.ShardRead(s.shard, s.prev.snapshot(), s.target.snapshot(),
                         s.cursor.lastId(), s.limit, s.checkBlocked));
             }
-            boolean budgeted = budgeted(reads.stream().map(s -> s.shard).toList());
-            var batch = budgeted ? reader.readMany(inTx, shardReads, relay.batchSize(), batchBytes, true)
-                    : plainRead(inTx, shardReads, relay.batchSize());
-            noteRowBytes(batch);
+            var batch = readChunk(inTx, shardReads, relay.batchSize(), batchBytes, true);
             // limits that fit in batchSize read all they asked for: a read of exactly batchSize rows then cuts nothing
             boolean rowCut = batch.cut() && reads.stream().mapToLong(s -> s.limit).sum() > relay.batchSize();
             // a byte cut is a cut whatever the limits: it stopped before a row the read would have returned
-            boolean cut = budgeted ? batch.bytesCut() || rowCut : rowCut;
+            boolean cut = batch.bytesCut() || rowCut;
             var shared = new ArrayList<Step>(reads.size());
             var alone = new ArrayList<Step>();
             // a cut read stops inside one shard at most, in the order of the reads (BatchReader.readMany): a shard
@@ -754,7 +751,9 @@ public final class ShardProcessor implements AutoCloseable {
                 }
             }
         } else if (!work.isEmpty()) {
-            fetched(observed.step, work);
+            for (var s : work) {
+                fetched(observed.step, s, true);
+            }
             observed.settle = observed.step.settleStarted(); // the retry passes made the step's calls
         }
 
@@ -809,12 +808,6 @@ public final class ShardProcessor implements AutoCloseable {
      * because the step's time is spent ({@code mainRead} false), its retry pass's records only: a later step reads the
      * rest again.
      */
-    private static void fetched(OutboxTelemetry.RelayStep step, List<Step> work) {
-        for (var s : work) {
-            fetched(step, s, true);
-        }
-    }
-
     private static void fetched(OutboxTelemetry.RelayStep step, Step s, boolean mainRead) {
         if (step == OutboxTelemetry.RelayStep.NONE) {
             return;
@@ -990,12 +983,9 @@ public final class ShardProcessor implements AutoCloseable {
             if (chained.isEmpty()) {
                 return;
             }
-            boolean budgeted = budgeted(chained.stream().map(s -> s.shard).toList());
-            var batch = budgeted ? reader.readMany(c, shardReads, (int) budget, bytesLeft, false)
-                    : plainRead(c, shardReads, (int) budget);
-            noteRowBytes(batch);
+            var batch = readChunk(c, shardReads, (int) budget, bytesLeft, false);
             boolean rowCut = batch.cut() && asked > budget;
-            boolean cut = budgeted ? batch.bytesCut() || rowCut : rowCut;
+            boolean cut = batch.bytesCut() || rowCut;
             bytesLeft -= batch.bytes();
             for (int i = 0; i < chained.size(); i++) {
                 var s = chained.get(i);
@@ -1058,9 +1048,7 @@ public final class ShardProcessor implements AutoCloseable {
     private boolean readBehindABlockedRow(Connection c, Step s) throws SQLException {
         var behind = List.of(new BatchReader.ShardRead(s.shard, s.prev.snapshot(), s.target.snapshot(),
                 s.rows.get(0).record().id(), relay.batchSize(), true));
-        var read = budgeted(List.of(s.shard)) ? reader.readMany(c, behind, relay.batchSize(), batchBytes, true)
-                : plainRead(c, behind, relay.batchSize());
-        noteRowBytes(read);
+        var read = readChunk(c, behind, relay.batchSize(), batchBytes, true);
         var rest = read.rows().get(s.shard);
         int head = 0;
         while (head < rest.size() && rest.get(head).blocked()) {
@@ -1311,13 +1299,13 @@ public final class ShardProcessor implements AutoCloseable {
      * {@link #PLAIN_READ_MARGIN}, may pass {@code batchBytes}. A shard whose rows suddenly grow is read once by the
      * plain statement, in full: the read after it is budgeted.
      */
-    private boolean budgeted(List<Integer> shards) {
+    private boolean budgeted(List<BatchReader.ShardRead> reads) {
         if (relay.batchBytes() == 0) {
             return false;
         }
         long largest = 0;
-        for (int shard : shards) {
-            long recent = recentRowBytes.get(shard);
+        for (var r : reads) {
+            long recent = recentRowBytes.get(r.shard());
             if (recent == UNKNOWN) {
                 return true;
             }
@@ -1342,21 +1330,30 @@ public final class ShardProcessor implements AutoCloseable {
     }
 
     /**
-     * {@link BatchReader#readMany(Connection, List, int)}, its shards' sizes forgotten when it throws: pgjdbc turns
-     * an {@code OutOfMemoryError} while reading rows into an {@code SQLException} (53200), an ordinary step failure
-     * that reaches no fatal-error handler, so without this each retry would go plain and fail the same way. Not
-     * before every plain read: one that returns no rows would then make sparse shards budgeted for good.
+     * {@code reads} within {@code totalBytes} when {@link #budgeted} says so, else by the plain statement, their row
+     * sizes noted ({@link #noteRowBytes}); only a budgeted read cuts by bytes. A plain read that throws forgets its
+     * shards' sizes: pgjdbc turns an {@code OutOfMemoryError} while reading rows into an {@code SQLException} (53200),
+     * an ordinary step failure that reaches no fatal-error handler, so without this each retry would go plain and fail
+     * the same way. Not before every plain read: one that returns no rows would then make sparse shards budgeted for
+     * good.
      */
-    private BatchReader.Batch plainRead(Connection c, List<BatchReader.ShardRead> reads, int totalLimit)
-            throws SQLException {
-        try {
-            return reader.readMany(c, reads, totalLimit);
-        } catch (Throwable t) {
-            for (var r : reads) {
-                recentRowBytes.set(r.shard(), UNKNOWN);
+    private BatchReader.Batch readChunk(Connection c, List<BatchReader.ShardRead> reads, int totalLimit,
+            long totalBytes, boolean oneAtLeast) throws SQLException {
+        BatchReader.Batch batch;
+        if (budgeted(reads)) {
+            batch = reader.readMany(c, reads, totalLimit, totalBytes, oneAtLeast);
+        } else {
+            try {
+                batch = reader.readMany(c, reads, totalLimit);
+            } catch (Throwable t) {
+                for (var r : reads) {
+                    recentRowBytes.set(r.shard(), UNKNOWN);
+                }
+                throw t;
             }
-            throw t;
         }
+        noteRowBytes(batch);
+        return batch;
     }
 
     /**

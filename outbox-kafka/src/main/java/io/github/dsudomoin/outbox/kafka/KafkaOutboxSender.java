@@ -262,18 +262,10 @@ public final class KafkaOutboxSender implements AutoCloseable {
     }
 
     /**
-     * For tests: {@code nanos} (the {@link System#nanoTime} scale) measures the cooldowns, the remembered records and
-     * the resolved topics, and {@code clock} dates the cooldowns' ends; {@code factory} makes the producers of both
-     * pools.
-     */
-    KafkaOutboxSender(Supplier<Producer<byte[], byte[]>> factory, Duration deliveryTimeout, Clock clock,
-            LongSupplier nanos) {
-        this(factory, factory, deliveryTimeout, Duration.ZERO, clock, nanos);
-    }
-
-    /**
      * For tests: {@code unbatched} makes the producers of calls that hold remembered records, {@code maxBlock} is the
-     * producers' {@code max.block.ms}; held calls use the same two pools.
+     * producers' {@code max.block.ms}; held calls use the same two pools. {@code nanos} (the {@link System#nanoTime}
+     * scale) measures the cooldowns, the remembered records and the resolved topics, and {@code clock} dates the
+     * cooldowns' ends.
      */
     KafkaOutboxSender(Supplier<Producer<byte[], byte[]>> factory,
             Supplier<Producer<byte[], byte[]>> unbatched, Duration deliveryTimeout, Duration maxBlock, Clock clock,

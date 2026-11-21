@@ -15,7 +15,6 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 
@@ -104,27 +103,14 @@ class QueueState {
     private List<ShardQueue> readIn(Connection c) throws SQLException {
         var latest = ticks.latest(c);
         var positions = cursors.positions(c, latest.id());
-        var wanted = new HashSet<Long>();
-        for (var p : positions) {
-            if ((Cursors.busy(p) || p.effectiveTickId() > latest.id()) && p.effectiveTickId() != latest.id()) {
-                wanted.add(p.effectiveTickId());
-            }
-            var targetId = p.cursor().targetTickId();
-            if (targetId != null && targetId != latest.id()) {
-                wanted.add(targetId);
-            }
-        }
-        var found = ticks.get(c, wanted);
+        var found = ticks.get(c, Cursors.ticksToRead(positions, latest.id()));
         var from = new Tick[shards];
         var target = new Tick[shards];
         var lastId = new long[shards];
         for (var p : positions) {
-            int s = p.cursor().shard();
-            if (s < 0 || s >= shards) {
-                continue;
-            }
+            int s = p.cursor().shard(); // 0..shards-1: positions reads generate_series(0, shards - 1)
             // a shard not busy has no row in the ticks between its effective tick and the latest
-            var e = !Cursors.busy(p) && p.effectiveTickId() <= latest.id() ? latest
+            var e = !Cursors.checked(p, latest.id()) ? latest
                     : tick(p.effectiveTickId(), latest, found);
             var targetId = p.cursor().targetTickId();
             var t = targetId == null ? null : tick(targetId, latest, found);

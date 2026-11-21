@@ -70,7 +70,8 @@ public final class PgOutbox implements Outbox, Contracts.TypedSend {
         this.clock = clock;
         this.db = db;
         this.notInTx = "Outbox.send must be called inside " + db.transactionHint();
-        this.keyNamespace = schema.names().keyNamespace();
+        this.names = schema.names();
+        this.keyNamespace = names.keyNamespace();
         this.shards = shards;
         this.telemetry = telemetry;
         this.wakeUpHook = () -> {
@@ -81,10 +82,9 @@ public final class PgOutbox implements Outbox, Contracts.TypedSend {
                 log.warn("outbox relay wake-up failed after commit; the relay's idle poll delivers instead", e);
             }
         };
-        var insert = "insert into " + schema.names().base() + " (shard, message_id, topic, key, payload, headers) ";
+        var insert = "insert into " + names.base() + " (shard, message_id, topic, key, payload, headers) ";
         this.insertKeyed = insert + "select ?, ?, ?, ?, ?, ? from (select pg_advisory_xact_lock(?, ?)) l";
         this.insertUnkeyed = insert + "values (?, ?, ?, ?, ?, ?)";
-        this.names = schema.names();
         this.guard = schema.shardGuard(); // the cursors' count as this instance's heartbeat last read it
         this.resender = new Resender(names, shards, guard);
         this.contracts = schema.contractGuard(); // the live relay instances' reports as its heartbeat last read them
@@ -129,10 +129,7 @@ public final class PgOutbox implements Outbox, Contracts.TypedSend {
         guard.require(names, shards); // before any handle: insertAll checks again
         var local = new boolean[n];
         for (int i = 0; i < n; i++) {
-            var m = messages.get(i);
-            requireClaimed(m.topic());
-            local[i] = contracts.routes().contains(m.topic());
-            contracts.require(names, m, UNKNOWN_TYPE, local[i], telemetry);
+            local[i] = admitted(messages.get(i), UNKNOWN_TYPE);
         }
         var enqueue = telemetry.enqueueStarted();
         var ids = new UUID[n];
@@ -188,12 +185,18 @@ public final class PgOutbox implements Outbox, Contracts.TypedSend {
         return List.of(ids);
     }
 
-    /** One message, one enqueue of the telemetry. */
-    private UUID insert(Connection c, OutboxMessage m, String type) {
-        guard.require(names, shards);
+    /** Refuses {@code m} as this writer must (unclaimed topic, contract), else whether a local route takes it. */
+    private boolean admitted(OutboxMessage m, String type) {
         requireClaimed(m.topic());
         boolean local = contracts.routes().contains(m.topic());
         contracts.require(names, m, type, local, telemetry);
+        return local;
+    }
+
+    /** One message, one enqueue of the telemetry. */
+    private UUID insert(Connection c, OutboxMessage m, String type) {
+        guard.require(names, shards);
+        boolean local = admitted(m, type);
         var enqueue = telemetry.enqueueStarted();
         var id = UuidV7.next(clock.millis());
         boolean keyed = m.key() != null;

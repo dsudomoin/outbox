@@ -5564,7 +5564,7 @@ retry и dead пусты. Прогон на более ранней версии
   `OutboxMissingRouteException`,
   `KafkaOutboxSender.warnAboveBatchTimeout` и `warnAboveDeadLetterTimeout`,
   `DefaultOutboxDeliveryObservationConvention.outcomeName`, фабрики `OutboxModule` и `OutboxAdminHttpModule` для
-  внутренних типов, классы `OutboxAdminDelegate`, `OutboxAdminInterceptor`, `KoraRecordScope` и `OutboxTracing`;
+  внутренних типов, классы `OutboxAdminDelegate`, `OutboxAdminInterceptor` и `KoraRecordScope`;
 - пакетов `io.github.dsudomoin.outbox.admin.kora.api`, `io.github.dsudomoin.outbox.admin.kora.model`,
   `io.github.dsudomoin.outbox.admin.spring.api` и `io.github.dsudomoin.outbox.admin.spring.model`, сгенерированных из
   OpenAPI админки. Контракт админки — её HTTP-API ([Админ-API и HTTP](#админ-api-и-http)).

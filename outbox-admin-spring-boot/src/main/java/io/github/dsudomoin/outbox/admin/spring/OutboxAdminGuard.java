@@ -79,7 +79,8 @@ final class OutboxAdminGuard implements HandlerInterceptor {
         }
         var call = call(request);
         var method = request.getMethod();
-        if (!method.equals("GET") && !method.equals("HEAD") && sentByAnotherSite(request)) {
+        if (AdminHttp.crossSite(method, request.getHeader("Sec-Fetch-Site"), checkOrigin, request.getHeader("Origin"),
+                origin -> AdminHttp.sameHost(origin, request.getServerName(), port(request)))) {
             log.info("outbox admin {} denied: 403", call);
             throw new Refused(403, "cross-site request refused");
         }
@@ -147,25 +148,6 @@ final class OutboxAdminGuard implements HandlerInterceptor {
     private static String call(HttpServletRequest request) {
         var path = request.getServletPath() + Objects.requireNonNullElse(request.getPathInfo(), "");
         return request.getMethod() + " \"" + AdminHttp.printable(path) + "\"";
-    }
-
-    /**
-     * Whether a browser says another site made it send {@code request} ({@code Sec-Fetch-Site}): such a request may
-     * carry what the browser adds by itself (a cookie, an SSO session, the operator's network address), which an
-     * authorizer cannot tell from the operator's own call. Without that header, which a browser sends only to a
-     * trustworthy origin (HTTPS or localhost), an {@code Origin} that is not this server's host and port says so.
-     * Clients other than browsers send neither header. {@link #checkOrigin} off leaves {@code Origin} unread.
-     */
-    private boolean sentByAnotherSite(HttpServletRequest request) {
-        var site = request.getHeader("Sec-Fetch-Site");
-        if (site != null) {
-            return !site.equals("same-origin") && !site.equals("none");
-        }
-        if (!checkOrigin) {
-            return false;
-        }
-        var origin = request.getHeader("Origin");
-        return origin != null && !AdminHttp.sameHost(origin, request.getServerName(), port(request));
     }
 
     /**

@@ -2,7 +2,6 @@ package io.github.dsudomoin.outbox.kora;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
-import io.github.dsudomoin.outbox.InternalApi;
 import io.github.dsudomoin.outbox.OutboxHeader;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
@@ -15,15 +14,11 @@ import java.util.concurrent.Callable;
 import ru.tinkoff.kora.common.Context;
 import ru.tinkoff.kora.opentelemetry.common.OpentelemetryContext;
 
-/**
- * W3C {@code traceparent}/{@code tracestate} headers, bridged to Kora's {@link OpentelemetryContext}. Internal type,
- * unstable: for the adapters of this repository.
- */
-@InternalApi
-public final class OutboxTracing {
+/** W3C {@code traceparent}/{@code tracestate} headers, bridged to Kora's {@link OpentelemetryContext}. */
+final class OutboxTracing {
 
-    public static final String TRACEPARENT = "traceparent";
-    public static final String TRACESTATE = "tracestate";
+    static final String TRACEPARENT = "traceparent";
+    private static final String TRACESTATE = "tracestate";
 
     private static final W3CTraceContextPropagator W3C = W3CTraceContextPropagator.getInstance();
 
@@ -54,7 +49,7 @@ public final class OutboxTracing {
     private OutboxTracing() {}
 
     /** Trace headers of the span in the current Kora context; empty without a valid span. */
-    public static List<OutboxHeader> currentHeaders() {
+    static List<OutboxHeader> currentHeaders() {
         return headers(current());
     }
 
@@ -74,7 +69,7 @@ public final class OutboxTracing {
         return headers;
     }
 
-    public static io.opentelemetry.context.Context extract(List<OutboxHeader> headers) {
+    static io.opentelemetry.context.Context extract(List<OutboxHeader> headers) {
         return W3C.extract(io.opentelemetry.context.Context.root(), headers, GETTER);
     }
 
@@ -82,7 +77,7 @@ public final class OutboxTracing {
      * {@code headers} without trace headers, followed by those of {@code ctx}; other headers keep their order. Without
      * a valid span in {@code ctx}, {@code headers} are returned unchanged.
      */
-    public static List<OutboxHeader> replaceTraceHeaders(
+    static List<OutboxHeader> replaceTraceHeaders(
             List<OutboxHeader> headers, io.opentelemetry.context.Context ctx) {
         if (!hasValidSpan(ctx)) {
             return headers;
@@ -98,20 +93,20 @@ public final class OutboxTracing {
     }
 
     /** Runs {@code call} in a forked Kora context carrying {@code otel}; the caller's context is restored after. */
-    public static <T> T withKoraContext(io.opentelemetry.context.Context otel, Callable<T> call) throws Exception {
-        var scope = open(otel);
+    static <T> T withKoraContext(io.opentelemetry.context.Context otel, Callable<T> call) throws Exception {
+        var previous = open(otel);
         try {
             return call.call();
         } finally {
-            scope.close();
+            previous.inject();
         }
     }
 
     /**
-     * Makes a forked Kora context carrying {@code otel} current on this thread until the returned scope closes; the
-     * context current before is restored then, exactly.
+     * Makes a forked Kora context carrying {@code otel} current on this thread and returns the context current before;
+     * the caller {@code inject()}s it, once and on this thread, to restore it exactly.
      */
-    static KoraScope open(io.opentelemetry.context.Context otel) {
+    static Context open(io.opentelemetry.context.Context otel) {
         var previous = Context.current();
         var forked = previous.fork();
         forked.inject(); // before set(): it writes trace ids into the MDC of the current context
@@ -121,22 +116,7 @@ public final class OutboxTracing {
             previous.inject();
             throw e;
         }
-        return new KoraScope(previous);
-    }
-
-    /** A Kora context made current by {@link #open}; closed once, on the thread that opened it. */
-    static final class KoraScope {
-
-        private final Context previous;
-
-        private KoraScope(Context previous) {
-            this.previous = previous;
-        }
-
-        /** Restores the thread's previous context; its owner closes it once. */
-        void close() {
-            previous.inject();
-        }
+        return previous;
     }
 
     static boolean hasValidSpan(@Nullable io.opentelemetry.context.Context ctx) {

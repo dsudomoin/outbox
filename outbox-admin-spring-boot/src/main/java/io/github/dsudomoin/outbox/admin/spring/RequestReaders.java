@@ -5,6 +5,7 @@ import io.github.dsudomoin.outbox.admin.spring.model.AbandonWaiting;
 import io.github.dsudomoin.outbox.admin.spring.model.DeadLetterStatus;
 import io.github.dsudomoin.outbox.admin.spring.model.Filter;
 import io.github.dsudomoin.outbox.admin.spring.model.Selection;
+import io.github.dsudomoin.outbox.internal.AdminHttp;
 import jakarta.annotation.Nullable;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -153,7 +154,8 @@ class RequestReaders extends RequestBodyAdviceAdapter {
     private static Filter filter(Map<?, ?> body) {
         known(body, "Filter", FILTER, "topic, key, error, failedFrom, failedTo, status");
         var status = string(body, "status");
-        return new Filter().topic(notBlank(body, "topic")).key(string(body, "key")).error(notBlank(body, "error"))
+        return new Filter().topic(AdminHttp.notBlank("topic", string(body, "topic"))).key(string(body, "key"))
+            .error(AdminHttp.notBlank("error", string(body, "error")))
             .failedFrom(string(body, "failedFrom")).failedTo(string(body, "failedTo"))
             .status(status == null ? null : DeadLetterStatus.fromValue(status));
     }
@@ -217,16 +219,5 @@ class RequestReaders extends RequestBodyAdviceAdapter {
             throw new IllegalArgumentException("Expecting a string for field '" + field + "', got " + value);
         }
         return (String) value;
-    }
-
-    /** A filter's {@code topic} or {@code error}: a blank one would match every letter the rest of it matches. */
-    @Nullable
-    private static String notBlank(Map<?, ?> body, String field) {
-        var value = string(body, field);
-        if (value != null && value.isBlank()) {
-            throw new IllegalArgumentException("a blank " + field + " in a filter matches every " + field
-                + ": leave it out, or name one");
-        }
-        return value;
     }
 }

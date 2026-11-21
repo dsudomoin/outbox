@@ -446,12 +446,9 @@ public final class OutboxRelay implements AutoCloseable {
         var stallAfter = Maintenance.stallTimeout(config);
         try {
             checkHaltWaiting(stallAfter);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("outbox drain interrupted", e);
-        }
-        try (var c = db.newConnection(); var bound = socket.on(c)) {
-            return drainOn(c, stallAfter);
+            try (var c = db.newConnection(); var bound = socket.on(c)) {
+                return drainOn(c, stallAfter);
+            }
         } catch (SQLException e) {
             throw db.translate(e);
         } catch (InterruptedException e) {
@@ -736,12 +733,11 @@ public final class OutboxRelay implements AutoCloseable {
     }
 
     /**
-     * Parks until {@code deadline}, release, or (when {@code wakeable}) a wake-up after {@code seen}, a tick of this
-     * relay after {@code seenTicks} or shards put back into a round after {@code seenRequeued}.
+     * Parks until {@code deadline}, release, or a wake-up after {@code seen}, a tick of this relay after
+     * {@code seenTicks} or shards put back into a round after {@code seenRequeued}.
      */
-    private void park(long deadline, boolean wakeable, long seen, long seenTicks, long seenRequeued) {
-        park(deadline, () -> wakeable && (wakeups.get() != seen || ticksMade.get() != seenTicks
-                || requeued.get() != seenRequeued));
+    private void park(long deadline, long seen, long seenTicks, long seenRequeued) {
+        park(deadline, () -> wakeups.get() != seen || ticksMade.get() != seenTicks || requeued.get() != seenRequeued);
     }
 
     /** Parks until {@code deadline}, release, or {@code woken}, which a waker makes true before it unparks. */
@@ -991,7 +987,7 @@ public final class OutboxRelay implements AutoCloseable {
                 long seenTicks = ticksMade.get();
                 long seenRequeued = requeued.get();
                 if (maintenance.halted()) { // xid regression: rows would be skipped, take no shards
-                    park(System.nanoTime() + idleNanos, false, seen, seenTicks, seenRequeued);
+                    sleepUntil(System.nanoTime() + idleNanos);
                     continue;
                 }
                 boolean worked;
@@ -1055,21 +1051,17 @@ public final class OutboxRelay implements AutoCloseable {
             var self = Thread.currentThread();
             awaiting.add(self);
             try {
-                awaitWork0(seen, seenTicks, seenRequeued);
+                while (true) {
+                    park(nextTickDue(), seen, seenTicks, seenRequeued);
+                    long woken = wakeups.get();
+                    if (stopping || ticksMade.get() != seenTicks || requeued.get() != seenRequeued || woken == seen
+                            || tickAttemptDue(woken)) {
+                        return;
+                    }
+                    seen = woken;
+                }
             } finally {
                 awaiting.remove(self);
-            }
-        }
-
-        private void awaitWork0(long seen, long seenTicks, long seenRequeued) {
-            while (true) {
-                park(nextTickDue(), true, seen, seenTicks, seenRequeued);
-                long woken = wakeups.get();
-                if (stopping || ticksMade.get() != seenTicks || requeued.get() != seenRequeued || woken == seen
-                        || tickAttemptDue(woken)) {
-                    return;
-                }
-                seen = woken;
             }
         }
 

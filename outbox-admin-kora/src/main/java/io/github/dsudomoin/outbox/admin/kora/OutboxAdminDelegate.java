@@ -70,6 +70,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
 import java.util.function.Function;
@@ -145,9 +146,8 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
     @Override
     public RestoreOrphanApiResponse restoreOrphan(String table, long fromXid) {
         return call(() -> {
-            var detail = new LinkedHashMap<String, String>(); // the table is in the path already
-            detail.put("fromXid", String.valueOf(fromXid));
-            Context.current().set(OutboxAdminInterceptor.DETAIL, detail);
+            // the table is in the path already
+            Context.current().set(OutboxAdminInterceptor.DETAIL, Map.of("fromXid", String.valueOf(fromXid)));
             return new RestoreOrphan200ApiResponse(new Count(admin.restoreOrphan(table, fromXid)));
         }, RestoreOrphan400ApiResponse::new, RestoreOrphan409ApiResponse::new);
     }
@@ -248,17 +248,8 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
      * refuses it too).
      */
     private static DeadLetterFilter filter(Filter f) {
-        return filter(notBlank("topic", f.topic()), f.key(), notBlank("error", f._error()), f.failedFrom(),
-                f.failedTo(), f.status());
-    }
-
-    @Nullable
-    private static String notBlank(String field, @Nullable String value) {
-        if (value != null && value.isBlank()) {
-            throw new IllegalArgumentException("a blank " + field + " in a filter matches every " + field
-                    + ": leave it out, or name one");
-        }
-        return value;
+        return filter(AdminHttp.notBlank("topic", f.topic()), f.key(), AdminHttp.notBlank("error", f._error()),
+                f.failedFrom(), f.failedTo(), f.status());
     }
 
     private static DeadLetterFilter filter(@Nullable String topic, @Nullable String key, @Nullable String error,

@@ -4,12 +4,14 @@ import io.github.dsudomoin.outbox.DeadLetterFilter;
 import jakarta.annotation.Nullable;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.StringJoiner;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 /**
@@ -45,9 +47,14 @@ public final class AdminHttp {
     public static Map<String, String> idsDetail(List<Long> ids) {
         var detail = new LinkedHashMap<String, String>();
         detail.put("count", String.valueOf(ids.size()));
-        detail.put("ids", ids.stream().limit(AUDIT_IDS).map(String::valueOf)
-                .collect(Collectors.joining(", ", "[", ids.size() > AUDIT_IDS ? ", ...]" : "]")));
+        detail.put("ids", firstIds(ids));
         return detail;
+    }
+
+    /** {@code [<the first {@value #AUDIT_IDS} ids>, ...]}: a thousand ids would make a log line huge. */
+    public static String firstIds(Collection<Long> ids) {
+        return ids.stream().limit(AUDIT_IDS).map(String::valueOf)
+                .collect(Collectors.joining(", ", "[", ids.size() > AUDIT_IDS ? ", ...]" : "]"));
     }
 
     /** The audit detail of a bulk call's filter, with the key and the status as the caller gave them. */
@@ -80,6 +87,35 @@ public final class AdminHttp {
      */
     public static String printable(String text) {
         return PgOutboxAdmin.printable(text.replace("\\", "\\\\").replace("\"", "\\\""));
+    }
+
+    /**
+     * Whether a browser says another site made it send a request other than GET or HEAD ({@code Sec-Fetch-Site}): such
+     * a request may carry what the browser adds by itself (a cookie, an SSO session, the operator's network address),
+     * which an authorizer cannot tell from the operator's own call. Without that header, which a browser sends only to
+     * a trustworthy origin (HTTPS or localhost), an {@code Origin} that is not this server's host and port says so
+     * ({@code sameServer}). Clients other than browsers send neither header. {@code checkOrigin} off leaves
+     * {@code Origin} unread.
+     */
+    public static boolean crossSite(String method, @Nullable String fetchSite, boolean checkOrigin,
+            @Nullable String origin, Predicate<String> sameServer) {
+        if (method.equals("GET") || method.equals("HEAD")) {
+            return false;
+        }
+        if (fetchSite != null) {
+            return !fetchSite.equals("same-origin") && !fetchSite.equals("none");
+        }
+        return checkOrigin && origin != null && !sameServer.test(origin);
+    }
+
+    /** {@code value}, refused when blank: a blank {@code field} of a bulk call's filter would match every letter. */
+    @Nullable
+    public static String notBlank(String field, @Nullable String value) {
+        if (value != null && value.isBlank()) {
+            throw new IllegalArgumentException("a blank " + field + " in a filter matches every " + field
+                    + ": leave it out, or name one");
+        }
+        return value;
     }
 
     /**

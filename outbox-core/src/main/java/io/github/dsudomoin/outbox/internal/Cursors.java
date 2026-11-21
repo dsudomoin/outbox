@@ -13,6 +13,8 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -158,7 +160,6 @@ public final class Cursors {
 
     private final TableNames names;
     private final int shards;
-    private final String latest;
     private final String latestMany;
     /** {@link #latestMany}'s FROM part, the shards an {@code int4[]}: their latest rows, the checkpoint, the ticks. */
     private final String latestFrom;
@@ -177,8 +178,6 @@ public final class Cursors {
         // every statement opens the cursor table, then the checkpoint, then the tick table, as XidRecovery locks them
         var withTick = " left join " + newestCheckpoint(names) + " k on true cross join lateral (select " + effective
                 + " eff) e left join " + names.tick() + " t on t.id = e.eff";
-        this.latest = "select c.*, e.eff, t.snapshot::text, t.created_at, t.max_id from " + latestRow(COLUMNS, "?")
-                + " c" + withTick;
         // the same per shard: one cursor probe each, the checkpoint read once
         this.latestFrom = " from unnest(?::int[]) s(shard) cross join lateral " + latestRow(COLUMNS, "s.shard") + " c"
                 + withTick;
@@ -354,6 +353,33 @@ public final class Cursors {
     }
 
     /**
+     * Whether a reader of the cursors at the latest tick {@code latestId} looks up {@code p}'s effective tick: busy, or
+     * above the latest tick, as after a restore of the tick table that brought its sequence back (a cursor read after
+     * the latest tick may be on a newer one, which the look-up then finds).
+     */
+    static boolean checked(Position p, long latestId) {
+        return busy(p) || p.effectiveTickId() > latestId;
+    }
+
+    /**
+     * The ticks a reader of {@code positions} at the latest tick {@code latestId} looks up, the latest itself left out:
+     * the {@link #checked} effective ticks and the targets of the batches in progress.
+     */
+    static Set<Long> ticksToRead(List<Position> positions, long latestId) {
+        var wanted = new TreeSet<Long>();
+        for (var p : positions) {
+            if (checked(p, latestId) && p.effectiveTickId() != latestId) {
+                wanted.add(p.effectiveTickId());
+            }
+            var target = p.cursor().targetTickId();
+            if (target != null && target != latestId) {
+                wanted.add(target);
+            }
+        }
+        return wanted;
+    }
+
+    /**
      * The {@code busy_tick_id} of a checkpoint of {@code positions} read at the tick {@code latestTickId}: the lowest
      * effective tick of the busy shards, {@code latestTickId} when none. Under that checkpoint it is the lowest
      * effective tick of all shards, and the tick {@code outbox.shard.lag} measures from.
@@ -393,15 +419,7 @@ public final class Cursors {
      * {@link IllegalStateException} when the shard has no cursor (bootstrap creates one per shard).
      */
     public Current latest(Connection c, int shard) throws SQLException {
-        try (var ps = c.prepareStatement(latest)) {
-            ps.setInt(1, shard);
-            try (var rs = ps.executeQuery()) {
-                if (!rs.next()) {
-                    throw new IllegalStateException("no cursor for shard " + shard + " in " + names.cursor());
-                }
-                return current(rs);
-            }
-        }
+        return latest(c, List.of(shard)).get(shard);
     }
 
     /**

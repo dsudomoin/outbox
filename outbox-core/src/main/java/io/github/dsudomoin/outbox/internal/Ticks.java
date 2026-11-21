@@ -84,8 +84,7 @@ public final class Ticks {
 
     /**
      * {@code maxId}: the last id the outbox's id sequence had handed out when the tick was made (0 before the first),
-     * null for a tick made before the column existed. {@code snapshot}: null only in the ticks of {@link #between},
-     * which leaves it unread.
+     * null for a tick made before the column existed. {@code snapshot}: null only in the ticks of {@link #fresh}.
      */
     public record Tick(long id, @Nullable PgSnapshot snapshot, Instant createdAt, @Nullable Long maxId) {}
 
@@ -630,7 +629,7 @@ public final class Ticks {
     /**
      * What a fresh batch of each shard chooses its target from: {@code skipped}, keyed by shard, and {@code ticks}, the
      * ticks after each shard's start, each once, keyed by id; all without their snapshots ({@link Tick#snapshot()}
-     * null), as {@link #between}'s.
+     * null), snapshots unread.
      */
     public record Fresh(Map<Integer, Tick> skipped, NavigableMap<Long, Tick> ticks) {}
 
@@ -710,27 +709,6 @@ public final class Ticks {
             }
         }
         return result;
-    }
-
-    /**
-     * The ticks with {@code afterId < id <= upToId}, in id order, without their snapshots ({@link Tick#snapshot()}
-     * null): choosing a batch's target needs only the ids and high-water marks, and a snapshot of a busy moment is a
-     * few KB of text; {@link #get} reads the one chosen.
-     */
-    public List<Tick> between(Connection c, long afterId, long upToId) throws SQLException {
-        try (var ps = c.prepareStatement("select id, created_at, max_id from " + names.tick()
-                + " where id > ? and id <= ? order by id")) {
-            ps.setLong(1, afterId);
-            ps.setLong(2, upToId);
-            try (var rs = ps.executeQuery()) {
-                var ticks = new ArrayList<Tick>();
-                while (rs.next()) {
-                    ticks.add(new Tick(rs.getLong(1), null, rs.getObject(2, OffsetDateTime.class).toInstant(),
-                            rs.getObject(3, Long.class)));
-                }
-                return ticks;
-            }
-        }
     }
 
     /** The oldest tick with {@code id > afterId}: bridges gaps in tick ids. */

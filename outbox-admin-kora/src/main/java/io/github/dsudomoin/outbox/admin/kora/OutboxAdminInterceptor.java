@@ -87,7 +87,9 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
     @Override
     public CompletionStage<HttpServerResponse> intercept(Context context, HttpServerRequest request, InterceptChain chain) {
         var call = request.method() + " \"" + AdminHttp.printable(request.path()) + "\"";
-        if (!request.method().equals("GET") && !request.method().equals("HEAD") && sentByAnotherSite(request)) {
+        var headers = request.headers();
+        if (AdminHttp.crossSite(request.method(), headers.getFirst("sec-fetch-site"), checkOrigin,
+                headers.getFirst("origin"), origin -> sameHost(origin, headers.getFirst("host")))) {
             log.info("outbox admin {} denied: 403", call);
             return CompletableFuture.completedFuture(error(context, 403, null, "cross-site request refused"));
         }
@@ -133,25 +135,6 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
         }
         log.warn("outbox admin {} failed, answered 500", caller, cause);
         return error(context, 500, null, Objects.requireNonNullElse(cause.getMessage(), cause.getClass().getName()));
-    }
-
-    /**
-     * Whether a browser says another site made it send {@code request} ({@code Sec-Fetch-Site}): such a request may
-     * carry what the browser adds by itself (a cookie, an SSO session, the operator's network address), which an
-     * authorizer cannot tell from the operator's own call. Without that header, which a browser sends only to a
-     * trustworthy origin (HTTPS or localhost), an {@code Origin} that is not this server's host and port says so.
-     * Clients other than browsers send neither header. {@link #checkOrigin} off leaves {@code Origin} unread.
-     */
-    private boolean sentByAnotherSite(HttpServerRequest request) {
-        var site = request.headers().getFirst("sec-fetch-site");
-        if (site != null) {
-            return !site.equals("same-origin") && !site.equals("none");
-        }
-        if (!checkOrigin) {
-            return false;
-        }
-        var origin = request.headers().getFirst("origin");
-        return origin != null && !sameHost(origin, request.headers().getFirst("host"));
     }
 
     /**

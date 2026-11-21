@@ -235,7 +235,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                     var page = new ArrayList<DeadLetter>();
                     try (var rs = ps.executeQuery()) {
                         while (rs.next()) {
-                            page.add(DeadLetters.read(rs).letter());
+                            page.add(DeadLetters.read(rs));
                         }
                     }
                     return page;
@@ -1039,10 +1039,9 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         }
     }
 
-    /** {@code <n> ids [<the first ten>, ...]}: a thousand ids would make the log line huge. */
+    /** {@code <n> ids [<the first ten>, ...]}. */
     private static String logged(Collection<Long> ids) {
-        return ids.size() + " ids " + ids.stream().limit(10).map(String::valueOf)
-                .collect(Collectors.joining(", ", "[", ids.size() > 10 ? ", ...]" : "]"));
+        return ids.size() + " ids " + AdminHttp.firstIds(ids);
     }
 
     /**
@@ -1213,20 +1212,13 @@ public final class PgOutboxAdmin implements OutboxAdmin {
 
     /** A bulk call's filter: one that names something, with no blank string, which would widen it. */
     private static DeadLetterFilter nonEmpty(DeadLetterFilter filter) {
-        notBlank("topic", filter.topic());
-        notBlank("errorContains", filter.errorContains());
+        AdminHttp.notBlank("topic", filter.topic());
+        AdminHttp.notBlank("errorContains", filter.errorContains());
         if (filter.isEmpty()) {
             throw new IllegalArgumentException("an empty DeadLetterFilter matches every dead letter: name what to"
                     + " act on (topic, key, errorContains, failedFrom, failedTo or status), or pass the ids");
         }
         return filter;
-    }
-
-    private static void notBlank(String field, @Nullable String value) {
-        if (value != null && value.isBlank()) {
-            throw new IllegalArgumentException("a blank " + field + " in a filter matches every " + field
-                    + ": leave it out, or name one");
-        }
     }
 
     private static boolean queryBoolean(Connection c, String sql) throws SQLException {

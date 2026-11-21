@@ -19,7 +19,8 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  *     bean fails the start. false: no Kafka fallback; the application's OutboxHandler takes those topics or, with none,
  *     a send to one of them is refused. Default true.
  * @param clientIdSuffix true: a set client.id gets a suffix per pooled producer, <client.id>-outbox-<n> and
- *     <client.id>-outbox-unbatched-<n>, so each has its own JMX metrics. false: every producer gets client.id as set,
+ *     <client.id>-outbox-unbatched-<n>, under relay.retry.holdPermanent <client.id>-outbox-held-<n> and
+ *     <client.id>-outbox-held-unbatched-<n>, so each has its own JMX metrics. false: every producer gets client.id as set,
  *     and their JMX metrics collide. Default true.
  */
 @ConfigurationProperties("outbox.kafka")

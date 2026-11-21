@@ -33,27 +33,28 @@ public final class TypedOutbox<T> {
 
     private final Outbox outbox;
     private final OutboxSerializer<T> serializer;
-    private final Class<T> type;
+    /** {@code T}'s name, for the writer guard. */
+    private final String type;
     private final int version;
 
     /** {@code type} is {@code T}; its {@link OutboxContract} is read once, here. */
     public TypedOutbox(Outbox outbox, OutboxSerializer<T> serializer, Class<T> type) {
         this.outbox = outbox;
         this.serializer = serializer;
-        this.type = Objects.requireNonNull(type, "type");
+        this.type = Objects.requireNonNull(type, "type").getName();
         this.version = Contracts.version(type);
     }
 
     public UUID send(String topic, @Nullable String key, @Nullable T value) {
-        return Contracts.send(outbox, message(topic, key, value), typeName());
+        return Contracts.send(outbox, message(topic, key, value), type);
     }
 
     public UUID send(String topic, @Nullable String key, @Nullable T value, List<OutboxHeader> headers) {
-        return Contracts.send(outbox, message(topic, key, value, headers), typeName());
+        return Contracts.send(outbox, message(topic, key, value, headers), type);
     }
 
     public UUID send(String topic, @Nullable byte[] key, @Nullable T value, List<OutboxHeader> headers) {
-        return Contracts.send(outbox, message(topic, key, value, headers), typeName());
+        return Contracts.send(outbox, message(topic, key, value, headers), type);
     }
 
     /** The message {@code send} would write, for {@link Outbox#sendAll}. */
@@ -81,10 +82,5 @@ public final class TypedOutbox<T> {
             }
         }
         return new OutboxMessage(topic, key, payload, Contracts.stamp(headers, version));
-    }
-
-    /** The declared type's name, for the writer guard. */
-    String typeName() {
-        return type.getName();
     }
 }

@@ -120,14 +120,17 @@ public final class KoraOutboxTelemetry implements OutboxTelemetry {
         }
         var span = builder.startSpan();
         var context = parent.with(span);
-        OutboxTracing.KoraScope scope;
+        return new SpanStep(tracer, span, context, open(context, span));
+    }
+
+    /** {@link OutboxTracing#open}, ending {@code span} if it fails: the caller gets nothing to end the span with. */
+    private static Context open(io.opentelemetry.context.Context otel, Span span) {
         try {
-            scope = OutboxTracing.open(context);
+            return OutboxTracing.open(otel);
         } catch (Throwable e) {
             span.end();
             throw e;
         }
-        return new SpanStep(tracer, span, context, scope);
     }
 
     /** Nothing a call set in the Kora context leaks into the next call on the thread. */
@@ -295,18 +298,18 @@ public final class KoraOutboxTelemetry implements OutboxTelemetry {
         private final Tracer tracer;
         private final Span span;
         private final io.opentelemetry.context.Context context;
-        private final OutboxTracing.KoraScope scope;
+        private final Context previous;
         /** The fields below: on the thread that steps. */
         private long records;
         @Nullable
         private SpanSettle settle;
         private boolean ended;
 
-        SpanStep(Tracer tracer, Span span, io.opentelemetry.context.Context context, OutboxTracing.KoraScope scope) {
+        SpanStep(Tracer tracer, Span span, io.opentelemetry.context.Context context, Context previous) {
             this.tracer = tracer;
             this.span = span;
             this.context = context;
-            this.scope = scope;
+            this.previous = previous;
         }
 
         @Override
@@ -322,14 +325,7 @@ public final class KoraOutboxTelemetry implements OutboxTelemetry {
                     .setParent(context)
                     .setAttribute(SYSTEM, OUTBOX)
                     .startSpan();
-            OutboxTracing.KoraScope settleScope;
-            try {
-                settleScope = OutboxTracing.open(context.with(started));
-            } catch (Throwable e) {
-                started.end();
-                throw e;
-            }
-            settle = new SpanSettle(started, settleScope);
+            settle = new SpanSettle(started, open(context.with(started), started));
             return settle;
         }
 
@@ -353,7 +349,7 @@ public final class KoraOutboxTelemetry implements OutboxTelemetry {
                     settle.end(-1, error);
                 }
             } finally {
-                scope.close();
+                previous.inject();
                 span.setAttribute(RECORDS, records);
                 if (error != null) {
                     fail(span, error);
@@ -367,12 +363,12 @@ public final class KoraOutboxTelemetry implements OutboxTelemetry {
     private static final class SpanSettle implements Settle {
 
         private final Span span;
-        private final OutboxTracing.KoraScope scope;
+        private final Context previous;
         private boolean ended;
 
-        SpanSettle(Span span, OutboxTracing.KoraScope scope) {
+        SpanSettle(Span span, Context previous) {
             this.span = span;
-            this.scope = scope;
+            this.previous = previous;
         }
 
         @Override
@@ -391,7 +387,7 @@ public final class KoraOutboxTelemetry implements OutboxTelemetry {
                 return;
             }
             ended = true;
-            scope.close();
+            previous.inject();
             if (records >= 0) {
                 span.setAttribute(RECORDS, (long) records);
             }

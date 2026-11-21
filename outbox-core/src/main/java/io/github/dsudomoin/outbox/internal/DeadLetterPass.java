@@ -287,13 +287,13 @@ public final class DeadLetterPass {
     /** {@code ids} gets the claimed letters' ids, for {@link #deferStillDue} should the transaction fail later. */
     private Batch handOverBatch(Connection tx, List<Long> ids) throws SQLException {
         var claimed = claim(tx);
-        claimed.forEach(c -> ids.add(c.letter().id()));
+        claimed.forEach(c -> ids.add(c.id()));
         if (claimed.isEmpty()) {
             return new Batch(0, null, List.of());
         }
         List<DeadLetterDecision> decisions;
         try {
-            decisions = call(claimed.stream().map(DeadLetters.Claimed::letter).toList());
+            decisions = call(claimed);
         } catch (ExecutionException | TimeoutException e) {
             if (closed) { // cut by close(), most likely by its interrupt: no failure of the hook
                 throw new IllegalStateException("outbox dead-letter pass closed during a hook call", e);
@@ -309,7 +309,7 @@ public final class DeadLetterPass {
         }
         var kept = new ArrayList<Long>();
         var discarded = new ArrayList<Long>();
-        var retried = new ArrayList<DeadLetters.Claimed>();
+        var retried = new ArrayList<DeadLetter>();
         var retryErrors = new ArrayList<Throwable>();
         int scheduled = 0;
         try (var ps = tx.prepareStatement(schedule)) {
@@ -317,9 +317,9 @@ public final class DeadLetterPass {
                 var decision = decisions.get(i);
                 var letter = claimed.get(i);
                 if (decision instanceof DeadLetterDecision.Keep) {
-                    kept.add(letter.letter().id());
+                    kept.add(letter.id());
                 } else if (decision instanceof DeadLetterDecision.Discard) {
-                    discarded.add(letter.letter().id());
+                    discarded.add(letter.id());
                 } else if (decision instanceof DeadLetterDecision.RetryLater r) {
                     retried.add(letter);
                     retryErrors.add(r.error());
@@ -331,7 +331,7 @@ public final class DeadLetterPass {
                     var ceiling = jvmNow.plus(8, ChronoUnit.DAYS);
                     ps.setDouble(1, Duration.between(jvmNow, at.isAfter(ceiling) ? ceiling
                             : at.isBefore(Instant.EPOCH) ? Instant.EPOCH : at).toNanos() / 1e9);
-                    ps.setLong(2, letter.letter().id());
+                    ps.setLong(2, letter.id());
                     ps.addBatch();
                     scheduled++;
                 }
@@ -486,19 +486,19 @@ public final class DeadLetterPass {
     }
 
     /** Every letter of a failed call stays pending, due after a backoff by its failed calls so far. */
-    private Batch failed(Connection tx, List<DeadLetters.Claimed> claimed, Throwable failure) throws SQLException {
+    private Batch failed(Connection tx, List<DeadLetter> claimed, Throwable failure) throws SQLException {
         backOff(tx, claimed, Collections.nCopies(claimed.size(), failure));
         return new Batch(claimed.size(), failure, List.of());
     }
 
     /** These letters stay pending, due after a backoff by their failed calls so far; {@code errors} in their order. */
-    private void backOff(Connection tx, List<DeadLetters.Claimed> letters, List<Throwable> errors)
+    private void backOff(Connection tx, List<DeadLetter> letters, List<Throwable> errors)
             throws SQLException {
         try (var ps = tx.prepareStatement(fail)) {
             String text = null;
             Throwable last = null;
             for (int i = 0; i < letters.size(); i++) {
-                var letter = letters.get(i).letter();
+                var letter = letters.get(i);
                 var e = errors.get(i);
                 if (e != last) { // a failed call's one error is rendered once
                     text = RetryStore.errorText(RetryStore.describe(e), asciiText);
@@ -513,15 +513,15 @@ public final class DeadLetterPass {
         }
     }
 
-    private List<DeadLetters.Claimed> claim(Connection tx) throws SQLException {
+    private List<DeadLetter> claim(Connection tx) throws SQLException {
         try (var ps = tx.prepareStatement(claim)) {
             ps.setInt(1, batchSize);
             try (var rs = ps.executeQuery()) {
-                var claimed = new ArrayList<DeadLetters.Claimed>();
+                var claimed = new ArrayList<DeadLetter>();
                 while (rs.next()) {
                     claimed.add(DeadLetters.read(rs));
                 }
-                return claimed;
+                return List.copyOf(claimed); // the hook gets it: it cannot change what the pass decides on
             }
         }
     }
