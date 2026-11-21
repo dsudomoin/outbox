@@ -249,7 +249,8 @@ final class HeartbeatConnections implements ConnectionSource {
         }
 
         String mismatch() {
-            return HeartbeatConnections.mismatch(own, app);
+            return "outbox heartbeat connection source reaches another database than the application's: heartbeat "
+                    + own + ", application " + app;
         }
     }
 
@@ -259,11 +260,6 @@ final class HeartbeatConnections implements ConnectionSource {
             log.warn("outbox heartbeat connection source of {} failed, this beat uses the application's connections;"
                     + " this WARN repeats at most once a minute: {}", table, e.toString());
         }
-    }
-
-    private static String mismatch(String heartbeat, String application) {
-        return "outbox heartbeat connection source reaches another database than the application's: heartbeat "
-                + heartbeat + ", application " + application;
     }
 
 

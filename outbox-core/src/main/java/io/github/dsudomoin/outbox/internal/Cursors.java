@@ -5,11 +5,9 @@ import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Types;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
-import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -162,6 +160,8 @@ public final class Cursors {
     private final int shards;
     private final String latest;
     private final String latestMany;
+    /** {@link #latestMany}'s FROM part, the shards an {@code int4[]}: their latest rows, the checkpoint, the ticks. */
+    private final String latestFrom;
     private final String appendAll;
     private final String appendAllCommit;
     private final String positions;
@@ -177,12 +177,12 @@ public final class Cursors {
         // every statement opens the cursor table, then the checkpoint, then the tick table, as XidRecovery locks them
         var withTick = " left join " + newestCheckpoint(names) + " k on true cross join lateral (select " + effective
                 + " eff) e left join " + names.tick() + " t on t.id = e.eff";
-        this.latest = "select c.*, e.eff, t.snapshot::text, t.created_at, t.max_id from (select " + COLUMNS + " from "
-                + names.cursor() + " where shard = ? order by seq desc limit 1) c" + withTick;
+        this.latest = "select c.*, e.eff, t.snapshot::text, t.created_at, t.max_id from " + latestRow(COLUMNS, "?")
+                + " c" + withTick;
         // the same per shard: one cursor probe each, the checkpoint read once
-        this.latestMany = "select c.*, e.eff, t.snapshot::text, t.created_at, t.max_id from unnest(?::int[]) s(shard)"
-                + " cross join lateral (select " + COLUMNS + " from " + names.cursor()
-                + " where shard = s.shard order by seq desc limit 1) c" + withTick;
+        this.latestFrom = " from unnest(?::int[]) s(shard) cross join lateral " + latestRow(COLUMNS, "s.shard") + " c"
+                + withTick;
+        this.latestMany = "select c.*, e.eff, t.snapshot::text, t.created_at, t.max_id" + latestFrom;
         this.appendAll = "insert into " + names.cursor() + " (" + COLUMNS + ") select * from unnest(?::smallint[],"
                 + " ?::int8[], ?::int8[], ?::int8[], ?::timestamptz[], ?::int[], ?::timestamptz[], ?::timestamptz[])";
         this.appendAllCommit = appendAll + "; commit";
@@ -190,8 +190,8 @@ public final class Cursors {
         // one pass over the ticks after the lowest effective tick (not below the checkpoint's): for each tick, the
         // shards that any tick after it up to the latest may hold rows of (a window bit_or, newest first); each shard
         // looks up its effective tick's row. A shard below the window finds none: behind
-        this.positions = "with c0 as (select c.* from generate_series(0, " + shards + " - 1) s cross join lateral"
-                + " (select " + COLUMNS + " from " + names.cursor() + " where shard = s order by seq desc limit 1) c),"
+        this.positions = "with c0 as (select c.* from generate_series(0, " + shards + " - 1) s cross join lateral "
+                + latestRow(COLUMNS, "s") + " c),"
                 + " k as " + newestCheckpoint(names) + ","
                 + " c as (select c.*, " + effective + " eff from c0 c left join k on true),"
                 + " w as (select id, bit_or(d) over (order by id desc rows between unbounded preceding and 1 preceding)"
@@ -215,9 +215,9 @@ public final class Cursors {
                 + " case when not a.anchor then c.target_tick_id end, case when not a.anchor then c.last_id else 0 end,"
                 + " c.paused_until, c.failures, d.retry_due, d.parked_due from (select c.*, " + effective + " eff,"
                 + " case when length(k.busy) = " + shards + " then get_bit(k.busy, c.shard) = 0 else false end idle"
-                + " from unnest(?::int[]) s(shard) cross join lateral (select " + COLUMNS + " from " + names.cursor()
-                + " where shard = s.shard order by seq desc limit 1) c left join " + newestCheckpoint(names)
-                + " k on true) c left join " + names.tick() + " t on t.id = c.tick_id"
+                + " from unnest(?::int[]) s(shard) cross join lateral " + latestRow(COLUMNS, "s.shard")
+                + " c left join " + newestCheckpoint(names) + " k on true) c left join " + names.tick()
+                + " t on t.id = c.tick_id"
                 + " cross join lateral (select (select min(next_attempt_at) from " + names.retry()
                 + " where shard = c.shard and next_attempt_at is not null) retry_due, (select min(due_at) from "
                 + names.parked() + " where shard = c.shard) parked_due) d"
@@ -230,8 +230,14 @@ public final class Cursors {
                 + " or c.tick_id < (select max(id) from " + names.tick() + ") - " + ANCHOR_TICKS + ") anchor) a"
                 + " where a.anchor or c.retry_due_at is null and d.retry_due is not null"
                 + " or c.parked_due_at is null and d.parked_due is not null order by c.shard";
-        this.lowestTick = "select min(c.tick_id) from generate_series(0, " + shards + " - 1) s cross join lateral"
-                + " (select tick_id from " + names.cursor() + " where shard = s order by seq desc limit 1) c";
+        this.lowestTick = "select min(c.tick_id) from generate_series(0, " + shards + " - 1) s cross join lateral "
+                + latestRow("tick_id", "s") + " c";
+    }
+
+    /** The latest cursor row's {@code columns} of the shard {@code shard} names (SQL), a subquery. */
+    private String latestRow(String columns, String shard) {
+        return "(select " + columns + " from " + names.cursor() + " where shard = " + shard
+                + " order by seq desc limit 1)";
     }
 
     /**
@@ -336,8 +342,8 @@ public final class Cursors {
                 + " from " + names.checkpoint() + " order by seq desc limit 1) n where not exists (select 1 from "
                 + names.tick() + " v where v.id = n.tick_id and v.created_at <= n.created_at) and (exists (select 1"
                 + " from " + names.tick() + " v where v.id = n.tick_id) or exists (select 1 from generate_series(0, "
-                + shards + " - 1) s cross join lateral (select tick_id from " + names.cursor() + " where shard = s"
-                + " order by seq desc limit 1) l where l.tick_id < n.tick_id))")) {
+                + shards + " - 1) s cross join lateral " + latestRow("tick_id", "s")
+                + " l where l.tick_id < n.tick_id))")) {
             return rs.next() ? rs.getLong(1) : null;
         }
     }
@@ -441,10 +447,7 @@ public final class Cursors {
         var tick = names.tick();
         return "select c.*, e.eff, t.snapshot::text, t.created_at, t.max_id,"
                 + " f.id, f.snapshot::text, f.created_at, f.max_id, g.id, g.snapshot::text, g.created_at, g.max_id"
-                + " from unnest(?::int[]) s(shard) cross join lateral (select " + COLUMNS + " from " + names.cursor()
-                + " where shard = s.shard order by seq desc limit 1) c left join " + newestCheckpoint(names)
-                + " k on true cross join lateral (select " + effective(shards) + " eff) e"
-                + " left join " + tick + " t on t.id = e.eff"
+                + latestFrom
                 // a fresh batch skips the leading ticks that do not mark the shard (Ticks.fresh)
                 + " left join " + tick + " f on c.target_tick_id is null and e.eff < ?::int8 and f.id = "
                 + Ticks.skippedTo(names, shards, "e.eff", "c.shard", "?::int8")
@@ -473,37 +476,26 @@ public final class Cursors {
         return result;
     }
 
-    /** The tick of columns {@code from} (id) to {@code from + 3} (snapshot, created_at, max_id), null without an id. */
+    /**
+     * The tick of columns {@code from} (id) to {@code from + 3} (snapshot, created_at, max_id), null without its row:
+     * a tick's snapshot is never null.
+     */
     @Nullable
     private static Tick tickAt(ResultSet rs, int from) throws SQLException {
-        long id = rs.getLong(from);
-        if (rs.wasNull()) {
+        var snapshot = rs.getString(from + 1);
+        if (snapshot == null) {
             return null;
         }
-        return new Tick(id, PgSnapshot.parse(rs.getString(from + 1)),
+        return new Tick(rs.getLong(from), PgSnapshot.parse(snapshot),
                 rs.getObject(from + 2, OffsetDateTime.class).toInstant(), rs.getObject(from + 3, Long.class));
     }
 
     private static Current current(ResultSet rs) throws SQLException {
-        var snapshot = rs.getString(10);
-        return new Current(cursor(rs), rs.getLong(9), snapshot == null ? null : new Tick(rs.getLong(9),
-                PgSnapshot.parse(snapshot), rs.getObject(11, OffsetDateTime.class).toInstant(),
-                rs.getObject(12, Long.class)));
+        return new Current(cursor(rs), rs.getLong(9), tickAt(rs, 9));
     }
 
     public void append(Connection c, Cursor cursor) throws SQLException {
-        try (var ps = c.prepareStatement(
-                "insert into " + names.cursor() + " (" + COLUMNS + ") values (?, ?, ?, ?, ?, ?, ?, ?)")) {
-            ps.setInt(1, cursor.shard());
-            ps.setLong(2, cursor.tickId());
-            ps.setObject(3, cursor.targetTickId(), Types.BIGINT);
-            ps.setLong(4, cursor.lastId());
-            ps.setObject(5, utc(cursor.pausedUntil()), Types.TIMESTAMP_WITH_TIMEZONE);
-            ps.setInt(6, cursor.failures());
-            ps.setObject(7, utc(cursor.retryDueAt()), Types.TIMESTAMP_WITH_TIMEZONE);
-            ps.setObject(8, utc(cursor.parkedDueAt()), Types.TIMESTAMP_WITH_TIMEZONE);
-            ps.executeUpdate();
-        }
+        appendAll(c, List.of(cursor));
     }
 
     /** {@link #append} of each of {@code cursors}, in order, in one statement. */
@@ -580,10 +572,5 @@ public final class Cursors {
     @Nullable
     private static Instant instant(@Nullable OffsetDateTime t) {
         return t == null ? null : t.toInstant();
-    }
-
-    @Nullable
-    private static OffsetDateTime utc(@Nullable Instant t) {
-        return t == null ? null : t.atOffset(ZoneOffset.UTC);
     }
 }
