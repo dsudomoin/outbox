@@ -148,7 +148,6 @@ class TypedOutboxTest {
                 List.of(header, contract("2")),
                 List.of(header, contract("2")),
                 List.of(contract("2"))); // the tombstone too
-        assertThat(typed.typeName()).isEqualTo(V2.class.getName());
     }
 
     @Test

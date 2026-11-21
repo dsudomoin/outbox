@@ -10,6 +10,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicReference;
@@ -19,6 +20,22 @@ import org.junit.jupiter.api.Test;
 class OutboxHandlerTest {
 
     private static final Duration BATCH_TIMEOUT = Duration.ofSeconds(30);
+    private static final OutboxPermanentException BAD = new OutboxPermanentException("bad");
+
+    private final OutboxHandler handler = record -> {
+        if (new String(record.payload(), UTF_8).equals("bad")) {
+            throw BAD;
+        }
+    };
+    private final List<OutboxRecord> records = List.of(record(1, "k", "bad"), record(2, "k", "next"),
+            record(3, "other", "ok"));
+    private final List<Outcome> reported = new CopyOnWriteArrayList<>();
+    private final OutboxTelemetry.Delivery delivery = new OutboxTelemetry.Delivery() {
+        @Override
+        public void recordFinished(OutboxRecord record, Outcome outcome) {
+            reported.add(outcome);
+        }
+    };
 
     @Test
     void holdsPermanentIsTrueOnlyOnTheThreadOfACallWhoseRelayHoldsPermanentFailures() throws Exception {
@@ -41,13 +58,6 @@ class OutboxHandlerTest {
 
     @Test
     void theDefaultHandleBatchSkipsTheRestOfAKeyAfterAPermanentOnlyWhenItIsHeld() throws Exception {
-        OutboxHandler handler = record -> {
-            if (new String(record.payload(), UTF_8).equals("bad")) {
-                throw new OutboxPermanentException("bad");
-            }
-        };
-        var records = List.of(record(1, "k", "bad"), record(2, "k", "next"), record(3, "other", "ok"));
-
         var held = new AtomicReference<List<Outcome>>();
         TestHandlerCall.holdingPermanent(BATCH_TIMEOUT, () -> {
             held.set(handler.handleBatch(records));
@@ -72,21 +82,6 @@ class OutboxHandlerTest {
      */
     @Test
     void aHeldPermanentIsReportedAsTheRetryTheRelayMakesOfIt() throws Exception {
-        var error = new OutboxPermanentException("bad");
-        OutboxHandler handler = record -> {
-            if (new String(record.payload(), UTF_8).equals("bad")) {
-                throw error;
-            }
-        };
-        var records = List.of(record(1, "k", "bad"), record(2, "k", "next"), record(3, "other", "ok"));
-        var reported = new CopyOnWriteArrayList<Outcome>();
-        var delivery = new OutboxTelemetry.Delivery() {
-            @Override
-            public void recordFinished(OutboxRecord record, Outcome outcome) {
-                reported.add(outcome);
-            }
-        };
-
         TestHandlerCall.holdingPermanent(BATCH_TIMEOUT, () -> RecordScope.bound(delivery,
                 () -> handler.handleBatch(records))).call();
         var held = List.copyOf(reported);
@@ -95,12 +90,12 @@ class OutboxHandlerTest {
                 .call();
 
         assertThat(held).hasSize(2);
-        assertThat(held.get(0)).isInstanceOfSatisfying(Outcome.Retry.class, r -> assertThat(r.error()).isSameAs(error));
+        assertThat(held.get(0)).isInstanceOfSatisfying(Outcome.Retry.class, r -> assertThat(r.error()).isSameAs(BAD));
         assertThat(held.get(1)).as("the other key's record; the skipped one is not reported")
                 .isEqualTo(Outcome.delivered());
         assertThat(reported).hasSize(3);
         assertThat(reported.get(0)).isInstanceOfSatisfying(Outcome.Permanent.class,
-                p -> assertThat(p.error()).isSameAs(error));
+                p -> assertThat(p.error()).isSameAs(BAD));
     }
 
     /**
@@ -110,17 +105,10 @@ class OutboxHandlerTest {
     @Test
     void aReportedFailureCarryingAWaitIsReportedAsTheWaitingTheRelayMakesOfIt() throws Exception {
         var wait = new OutboxWaitException("not yet");
-        var records = List.of(record(1, "k", "a"), record(2, "l", "b"));
-        var reported = new CopyOnWriteArrayList<Outcome>();
-        var delivery = new OutboxTelemetry.Delivery() {
-            @Override
-            public void recordFinished(OutboxRecord record, Outcome outcome) {
-                reported.add(outcome);
-            }
-        };
-        java.util.concurrent.Callable<List<Outcome>> body = () -> RecordScope.bound(delivery, () -> {
-            OutboxHandler.recordFinished(records.get(0), Outcome.retry(wait));
-            OutboxHandler.recordFinished(records.get(1), Outcome.permanent(wait));
+        var pair = List.of(record(1, "k", "a"), record(2, "l", "b"));
+        Callable<List<Outcome>> body = () -> RecordScope.bound(delivery, () -> {
+            OutboxHandler.recordFinished(pair.get(0), Outcome.retry(wait));
+            OutboxHandler.recordFinished(pair.get(1), Outcome.permanent(wait));
             return List.of();
         });
 

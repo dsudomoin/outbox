@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox.internal;
 import static io.github.dsudomoin.outbox.testing.Intercepting.intercepting;
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
+import static io.github.dsudomoin.outbox.testing.TestSql.queryStrings;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -19,6 +20,7 @@ import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.ShardKeys;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -37,6 +39,8 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -167,7 +171,12 @@ class StrandedShardsIT {
         deleteTheirTick();
         startRelay();
 
-        assertThat(admin().recoverStrandedShards()).isEqualTo(5);
+        try (var err = new CapturedStderr()) {
+            assertThat(admin().recoverStrandedShards()).isEqualTo(5);
+
+            assertThat(err.text()).contains("outbox admin recoverStrandedShards() on " + names.base()
+                    + " returned 5, the rows re-sent, for shards [1, 2]");
+        }
 
         await(() -> delivered.containsAll(rows));
         Thread.sleep(300);
@@ -207,10 +216,8 @@ class StrandedShardsIT {
         var inDead = send(keyOfShard(1));
         var plain = send(keyOfShard(1));
         try (var c = direct.getConnection()) {
+            toRetry(c, inRetry);
             var columns = RetryStore.COLUMNS;
-            execute(c, "insert into " + names.retry() + " (" + columns + ", attempts, next_attempt_at, last_error)"
-                    + " select " + columns + ", 1, now() + interval '1 hour', 'down' from " + names.base()
-                    + " where message_id = '" + inRetry + "'");
             execute(c, "insert into " + names.parked() + " (" + columns + ", requeues, due_at) select " + columns
                     + ", 1, now() + interval '2 hours' from " + names.base() + " where message_id = '" + inParked
                     + "'");
@@ -271,7 +278,7 @@ class StrandedShardsIT {
     void aCallRepeatedAfterAFailureMidwayKeepsAKeysOrder() throws Exception {
         leaveTheOtherShardsOnANewerTick();
         var key = keyOfShard(1);
-        var sent = sendOfKey(key, 1500); // over a chunk of 1 000 rows, one key
+        var sent = sendMany(1500, () -> key); // over a chunk of 1 000 rows, one key
         makeATick();
         deleteTheirTick();
         startRelay();
@@ -297,17 +304,14 @@ class StrandedShardsIT {
     void aCursorRowWithNewDueTimesAloneKeepsTheTickACallRepeatedAfterAFailureGoesTo() throws Exception {
         leaveTheOtherShardsOnANewerTick();
         var key = keyOfShard(1);
-        var sent = sendOfKey(key, 1500); // over a chunk of 1 000 rows, one key
+        var sent = sendMany(1500, () -> key); // over a chunk of 1 000 rows, one key
         // two keys in the retry table, after the key's rows: the first call's chunk is of that key alone
         var abandoned = keyOfShard(1);
         var waiting = keyOfShard(1);
         var inRetry = List.of(send(abandoned), send(waiting));
         try (var c = direct.getConnection()) {
-            var columns = RetryStore.COLUMNS;
             for (var id : inRetry) {
-                execute(c, "insert into " + names.retry() + " (" + columns + ", attempts, next_attempt_at,"
-                        + " last_error) select " + columns + ", 1, now() + interval '1 hour', 'down' from "
-                        + names.base() + " where message_id = '" + id + "'");
+                toRetry(c, id);
             }
         }
         makeATick();
@@ -586,19 +590,6 @@ class StrandedShardsIT {
                 .noneMatch(failure -> failure.contains("before any query"));
     }
 
-    /** {@code rows} messages of {@code key}, 500 per transaction, in send order. */
-    private List<UUID> sendOfKey(String key, int rows) {
-        var sent = new ArrayList<UUID>();
-        for (int i = 0; i < rows; i += 500) {
-            var messages = new ArrayList<OutboxMessage>();
-            for (int j = i; j < Math.min(rows, i + 500); j++) {
-                messages.add(OutboxMessage.of(TOPIC, key, "p".getBytes(UTF_8)));
-            }
-            sent.addAll(transactions.inTx(c -> writer.outbox().sendAll(messages)));
-        }
-        return sent;
-    }
-
     /** A recovery that loses its connection after its first chunk, then a new tick. */
     private void failAfterTheFirstChunk() throws Exception {
         var once = new AtomicBoolean();
@@ -775,36 +766,20 @@ class StrandedShardsIT {
         await(() -> delivered.containsAll(rows));
     }
 
-    @Test
-    void logsItsResultInOneLine() throws Exception {
-        leaveTheOtherShardsOnANewerTick();
-        sendMany(1, 2);
-        makeATick();
-        deleteTheirTick();
-        startRelay();
-
-        try (var err = new CapturedStderr()) {
-            admin().recoverStrandedShards();
-
-            assertThat(err.text()).contains("outbox admin recoverStrandedShards() on " + names.base()
-                    + " returned 2, the rows re-sent, for shards [1, 2]");
+    /** The message id, topic, key and the md5 of the payload and headers of each row of {@code messageIds}. */
+    private Set<String> contents(List<UUID> messageIds) throws Exception {
+        var ids = messageIds.stream().map(UUID::toString).collect(Collectors.joining(",", "{", "}"));
+        try (var c = direct.getConnection()) {
+            return new HashSet<>(queryStrings(c, "select concat_ws(' ', message_id, topic, encode(key, 'hex'),"
+                    + " md5(payload), md5(headers)) from " + names.base() + " where message_id = any(?::uuid[])", ids));
         }
     }
 
-    /** The message id, topic, key and the md5 of the payload and headers of each row of {@code messageIds}. */
-    private Set<String> contents(List<UUID> messageIds) throws Exception {
-        var all = new HashSet<String>();
-        try (var c = direct.getConnection(); var ps = c.prepareStatement("select concat_ws(' ', message_id, topic,"
-                + " encode(key, 'hex'), md5(payload), md5(headers)) from " + names.base()
-                + " where message_id = any(?)")) {
-            ps.setArray(1, c.createArrayOf("uuid", messageIds.toArray()));
-            try (var rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    all.add(rs.getString(1));
-                }
-            }
-        }
-        return all;
+    /** Copies the outbox row of {@code messageId} into the retry table, due in an hour. */
+    private void toRetry(Connection c, UUID messageId) throws SQLException {
+        execute(c, "insert into " + names.retry() + " (" + RetryStore.COLUMNS + ", attempts, next_attempt_at,"
+                + " last_error) select " + RetryStore.COLUMNS + ", 1, now() + interval '1 hour', 'down' from "
+                + names.base() + " where message_id = '" + messageId + "'");
     }
 
     private long idOf(UUID messageId) throws Exception {
@@ -860,11 +835,16 @@ class StrandedShardsIT {
     }
 
     private List<UUID> sendMany(int shard, int rows) {
+        return sendMany(rows, () -> keyOfShard(shard));
+    }
+
+    /** {@code rows} messages, each of the next {@code key}, 500 per transaction, in send order. */
+    private List<UUID> sendMany(int rows, Supplier<String> key) {
         var ids = new ArrayList<UUID>();
         for (int sent = 0; sent < rows; sent += 500) { // as many key locks as a test's Postgres has room for
             var messages = new ArrayList<OutboxMessage>();
             for (int i = 0; i < Math.min(500, rows - sent); i++) {
-                messages.add(OutboxMessage.of(TOPIC, keyOfShard(shard), "p".getBytes(UTF_8)));
+                messages.add(OutboxMessage.of(TOPIC, key.get(), "p".getBytes(UTF_8)));
             }
             ids.addAll(transactions.inTx(c -> writer.outbox().sendAll(messages)));
         }

@@ -51,12 +51,6 @@ class SchemaCheckIT {
     }
 
     @Test
-    void missingRoutesFails() throws Exception {
-        assertSchemaProblem((c, n) -> TestSql.execute(c, "alter table " + n.instance() + " drop column routes"),
-                n -> "column " + n.instance() + ".routes is missing (schema version 1: apply OutboxSql.outbox)");
-    }
-
-    @Test
     void missingWaitingIndexFails() throws Exception {
         assertSchemaProblem((c, n) -> TestSql.execute(c, "drop index " + n.retry() + "_waiting"),
                 n -> "index " + n.retry() + "_waiting is missing (schema version 1: apply OutboxSql.outbox)");

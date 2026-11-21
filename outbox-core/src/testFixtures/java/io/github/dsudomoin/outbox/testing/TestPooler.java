@@ -16,9 +16,8 @@ import org.testcontainers.images.builder.Transferable;
  * out round robin ({@code server_round_robin = 1}), so consecutive autocommit statements of one client land in
  * different server sessions once the pool is warm ({@link #warm}); whatever a statement leaves in its session reaches
  * other clients. {@code maxPreparedStatements} 0 keeps no prepared statement across server sessions (pgbouncer before
- * 1.21, or one configured so), which needs {@code prepareThreshold=0} on the client. Logins of any role: pgbouncer
- * reads its password from the server as the container's superuser. {@code -Doutbox.test.pgbouncer} names another
- * image.
+ * 1.21, or one configured so), which needs {@code prepareThreshold=0} on the client. {@code -Doutbox.test.pgbouncer}
+ * names another image.
  */
 public final class TestPooler implements AutoCloseable {
 
@@ -84,16 +83,12 @@ public final class TestPooler implements AutoCloseable {
                 + TestDataSources.databaseName();
     }
 
-    public int serverConnections() {
-        return serverConnections;
-    }
-
-    /** A new connection through pgbouncer as {@code user}, whose password is {@code password}. */
-    public Connection connect(String user, String password, Properties properties) throws SQLException {
+    /** A new connection through pgbouncer as {@link TestDataSources#user()}. */
+    public Connection connect(Properties properties) throws SQLException {
         var p = new Properties();
         p.putAll(properties);
-        p.setProperty("user", user);
-        p.setProperty("password", password);
+        p.setProperty("user", TestDataSources.user());
+        p.setProperty("password", TestDataSources.password());
         p.setProperty("connectTimeout", "30");
         p.setProperty("socketTimeout", "60");
         p.setProperty("prepareThreshold", p.getProperty("prepareThreshold", "0"));
@@ -101,21 +96,21 @@ public final class TestPooler implements AutoCloseable {
     }
 
     /**
-     * Opens every server session of {@code user}'s pool, so round robin has them all to hand out from then on: as many
-     * clients as the pool has sessions each hold a transaction at once.
+     * Opens every server session of the pool, so round robin has them all to hand out from then on: as many clients as
+     * the pool has sessions each hold a transaction at once.
      */
-    public void warm(String user, String password) throws SQLException {
-        sessions(user, password, c -> {}, false);
+    public void warm() throws SQLException {
+        sessions(c -> {}, false);
     }
 
     /**
-     * What clients left in the server sessions of {@code user}'s pool, empty when nothing: session advisory locks and
-     * settings set for the session (not pgbouncer's own), read in each session by as many clients holding a transaction
-     * at once as the pool has sessions. The caller must have no transaction of its own open through the pool.
+     * What clients left in the server sessions of the pool, empty when nothing: session advisory locks and settings set
+     * for the session (not pgbouncer's own), read in each session by as many clients holding a transaction at once as
+     * the pool has sessions. The caller must have no transaction of its own open through the pool.
      */
-    public List<String> leftovers(String user, String password) throws SQLException {
+    public List<String> leftovers() throws SQLException {
         var found = new ArrayList<String>();
-        sessions(user, password, c -> {
+        sessions(c -> {
             try (var st = c.createStatement(); var rs = st.executeQuery("select pg_backend_pid(),"
                     + " (select string_agg(format('advisory lock (%s, %s, %s) %s', classid, objid, objsubid, mode), ', ')"
                     + " from pg_locks where locktype = 'advisory' and pid = pg_backend_pid()),"
@@ -142,11 +137,11 @@ public final class TestPooler implements AutoCloseable {
     }
 
     /**
-     * Takes back what clients left in the server sessions of {@code user}'s pool: settings set for the session and
-     * session advisory locks.
+     * Takes back what clients left in the server sessions of the pool: settings set for the session and session
+     * advisory locks.
      */
-    public void scrub(String user, String password) throws SQLException {
-        sessions(user, password, c -> {
+    public void scrub() throws SQLException {
+        sessions(c -> {
             try (var st = c.createStatement()) {
                 st.execute("reset all; select pg_advisory_unlock_all()");
                 for (var name : OWN_SETTINGS) {
@@ -161,16 +156,16 @@ public final class TestPooler implements AutoCloseable {
     }
 
     /**
-     * {@code check} in each server session of {@code user}'s pool, as many clients holding a transaction at once as it
-     * has; ended together after the last, committed with {@code commit}, else rolled back, so none of them hands its
-     * session back to the next client before every session has been seen.
+     * {@code check} in each server session of the pool, as many clients holding a transaction at once as it has; ended
+     * together after the last, committed with {@code commit}, else rolled back, so none of them hands its session back
+     * to the next client before every session has been seen.
      */
-    private void sessions(String user, String password, SessionCheck check, boolean commit) throws SQLException {
+    private void sessions(SessionCheck check, boolean commit) throws SQLException {
         var open = new ArrayList<Connection>();
         try {
             var seen = new java.util.HashSet<Integer>();
             for (int i = 0; i < serverConnections; i++) {
-                var c = connect(user, password, new Properties());
+                var c = connect(new Properties());
                 open.add(c);
                 c.setAutoCommit(false); // holds its server session until the commit below
                 try (var st = c.createStatement(); var rs = st.executeQuery("select pg_backend_pid()")) {

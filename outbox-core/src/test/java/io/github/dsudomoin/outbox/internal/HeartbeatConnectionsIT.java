@@ -79,16 +79,11 @@ class HeartbeatConnectionsIT {
                 long seen = TestSql.queryLong(holder, lastSeen);
                 holder.commit();
 
-                long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
-                while (true) {
+                await("a beat gets through once the lock is gone", Duration.ofSeconds(10), () -> {
                     boolean moved = TestSql.queryLong(holder, lastSeen) > seen;
                     holder.commit();
-                    if (moved) {
-                        break;
-                    }
-                    assertThat(System.nanoTime()).as("a beat gets through once the lock is gone").isLessThan(deadline);
-                    Thread.sleep(20);
-                }
+                    return moved;
+                });
             } finally {
                 runtime.close();
             }
@@ -139,11 +134,8 @@ class HeartbeatConnectionsIT {
                 try {
                     var lastSeen = "select (extract(epoch from last_seen) * 1000000)::bigint from " + row;
                     long seen = TestSql.queryLong(holder, lastSeen);
-                    long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-                    while (TestSql.queryLong(holder, lastSeen) <= seen) {
-                        assertThat(System.nanoTime()).as("a beat refreshes the row").isLessThan(deadline);
-                        Thread.sleep(20);
-                    }
+                    await("a beat refreshes the row", Duration.ofSeconds(5),
+                            () -> TestSql.queryLong(holder, lastSeen) > seen);
                 } finally {
                     runtime.close();
                 }
@@ -192,14 +184,10 @@ class HeartbeatConnectionsIT {
             runtime.start();
             try {
                 readOnly.set(true);
-                awaitLog(log, logged);
+                await("logged: " + logged, Duration.ofSeconds(5), () -> log.text().contains(logged));
                 readOnly.set(false);
                 int at = own.get();
-                long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-                while (own.get() < at + 2) {
-                    assertThat(System.nanoTime()).as("the beats are back on the lane").isLessThan(deadline);
-                    Thread.sleep(20);
-                }
+                await("the beats are back on the lane", Duration.ofSeconds(5), () -> own.get() >= at + 2);
             } finally {
                 runtime.close();
             }
@@ -207,12 +195,20 @@ class HeartbeatConnectionsIT {
         }
     }
 
-    private static void awaitLog(CapturedStderr log, String text) throws InterruptedException {
-        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-        while (!log.text().contains(text)) {
-            assertThat(System.nanoTime()).as("logged: " + text).isLessThan(deadline);
+    /** Polls {@code condition} every 20 ms until it is met; fails naming {@code as} once {@code within} is out. */
+    private static void await(String as, Duration within, Check condition) throws Exception {
+        long deadline = System.nanoTime() + within.toNanos();
+        while (!condition.met()) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError(as + ": not met within " + within.toSeconds() + " s");
+            }
             Thread.sleep(20);
         }
+    }
+
+    @FunctionalInterface
+    private interface Check {
+        boolean met() throws Exception;
     }
 
     /** Connections of the main database whose transactions default to read-only while {@code readOnly} is set. */

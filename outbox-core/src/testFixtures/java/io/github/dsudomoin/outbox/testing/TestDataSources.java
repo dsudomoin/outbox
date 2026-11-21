@@ -1,6 +1,7 @@
 package io.github.dsudomoin.outbox.testing;
 
 import java.sql.Connection;
+import java.sql.DriverManager;
 import java.sql.SQLException;
 import javax.sql.DataSource;
 import org.postgresql.ds.PGSimpleDataSource;
@@ -33,6 +34,16 @@ public final class TestDataSources {
         }
     }
 
+    /** Postgres 17, the first with {@code transaction_timeout}; started by the first test that needs it. */
+    private static final class Pg17 {
+        static final PostgreSQLContainer INSTANCE = new PostgreSQLContainer("postgres:17-alpine")
+                .withCommand("postgres", "-c", "fsync=off", "-c", "max_connections=300");
+
+        static {
+            INSTANCE.start();
+        }
+    }
+
     public static String jdbcUrl() {
         return Pg.INSTANCE.getJdbcUrl();
     }
@@ -43,6 +54,24 @@ public final class TestDataSources {
 
     public static String password() {
         return Pg.INSTANCE.getPassword();
+    }
+
+    /** The JDBC URL of the Postgres 17 server, for tests of what only 17 has. */
+    public static String pg17JdbcUrl() {
+        return Pg17.INSTANCE.getJdbcUrl();
+    }
+
+    public static String pg17User() {
+        return Pg17.INSTANCE.getUsername();
+    }
+
+    public static String pg17Password() {
+        return Pg17.INSTANCE.getPassword();
+    }
+
+    /** A new connection to the Postgres 17 server's database. */
+    public static Connection pg17Connection() throws SQLException {
+        return DriverManager.getConnection(pg17JdbcUrl(), pg17User(), pg17Password());
     }
 
     /** The container's address on its Docker network, where another container reaches it on port 5432. */

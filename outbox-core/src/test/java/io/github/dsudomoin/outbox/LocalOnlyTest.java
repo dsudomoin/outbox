@@ -100,7 +100,7 @@ class LocalOnlyTest {
                 records -> null,
                 records -> Arrays.asList(new Outcome[records.size()]));
         for (var answer : answers) {
-            var wrapped = new LocalOnly(answering(records -> answer.apply(records)));
+            var wrapped = new LocalOnly(answering(answer));
             var records = List.of(record("billing", "k"), record("billing", "j", MARKER), record("billing", null));
 
             try (var err = new CapturedStderr()) {

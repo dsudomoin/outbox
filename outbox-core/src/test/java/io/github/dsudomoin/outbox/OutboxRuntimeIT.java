@@ -259,10 +259,9 @@ class OutboxRuntimeIT {
         assertThatThrownBy(runtime::start).hasStackTraceContaining("no connection for the halt check");
 
         Thread.sleep(500);
-        try (var c = ds.getConnection(); var rs = c.createStatement().executeQuery(
-                "select count(*) from " + config.table() + "_instance")) {
-            rs.next();
-            assertThat(rs.getInt(1)).as("instance rows five beats after the failed start").isZero();
+        try (var c = ds.getConnection()) {
+            assertThat(TestSql.queryLong(c, "select count(*) from " + config.table() + "_instance"))
+                    .as("instance rows five beats after the failed start").isZero();
         }
     }
 
@@ -285,10 +284,10 @@ class OutboxRuntimeIT {
 
         assertThatThrownBy(runtime::start).hasStackTraceContaining("no answer to the contract read");
 
-        try (var c = ds.getConnection(); var rs = c.createStatement().executeQuery(
-                "select count(*) from " + config.table() + "_instance where expires_at > now()")) {
-            rs.next();
-            assertThat(rs.getInt(1)).as("live instance rows after the failed bootstrap").isZero();
+        try (var c = ds.getConnection()) {
+            assertThat(TestSql.queryLong(c, "select count(*) from " + config.table()
+                    + "_instance where expires_at > now()"))
+                    .as("live instance rows after the failed bootstrap").isZero();
         }
     }
 
@@ -325,7 +324,7 @@ class OutboxRuntimeIT {
     }
 
     /** The headers stored for the message {@code id}. */
-    private static List<OutboxHeader> headers(JdbcTransactions transactions, TestOutboxConfig config, UUID id) {
+    static List<OutboxHeader> headers(JdbcTransactions transactions, TestOutboxConfig config, UUID id) {
         return transactions.inTx(c -> {
             try (var ps = c.prepareStatement("select headers from " + config.table() + " where message_id = ?")) {
                 ps.setObject(1, id);

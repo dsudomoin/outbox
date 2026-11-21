@@ -209,7 +209,7 @@ class ClockSkewIT {
         runtimes.add(writer);
         writer.start();
 
-        var id = transactions.inTx(c -> writer.outbox().send(OutboxMessage.of(TOPIC, "k", "p".getBytes(UTF_8))));
+        var id = send(writer, "k");
 
         assertThat(Math.abs(UuidV7.timestampMillis(id) - databaseMillis())).isLessThan(60_000);
     }
@@ -236,7 +236,7 @@ class ClockSkewIT {
         var id = UuidV7.next(databaseMillis());
         assertThat(accepted(first, id)).isTrue();
 
-        var ahead = InboxRuntime.builder(new TestOutboxConfig().table(config.table()).inboxTable(config.inbox().table())
+        var ahead = InboxRuntime.builder(new TestOutboxConfig().sameTablesAs(config)
                 .maintenanceInterval(Duration.ofMillis(100)), transactions).jvmClock(clock(3 * 86400)).build();
         inboxes.add(ahead);
         ahead.start();
@@ -246,14 +246,11 @@ class ClockSkewIT {
     }
 
     private boolean accepted(InboxRuntime inbox, UUID id) {
-        Boolean accepted = transactions.inTx(c -> inbox.inbox().tryAccept(id));
-        return accepted;
+        return transactions.inTx(c -> inbox.inbox().tryAccept(id));
     }
 
-    private static long databaseMillis() throws Exception {
-        try (var c = TestDataSources.newDataSource().getConnection()) {
-            return TestSql.queryLong(c, "select (extract(epoch from now()) * 1000)::bigint");
-        }
+    private long databaseMillis() throws Exception {
+        return count("select (extract(epoch from now()) * 1000)::bigint");
     }
 
     private OutboxRuntime runtime(long skew, OutboxHandler handler) {

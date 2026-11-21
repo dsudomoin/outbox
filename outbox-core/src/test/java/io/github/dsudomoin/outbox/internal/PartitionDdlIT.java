@@ -5,29 +5,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.SQLException;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.postgresql.PostgreSQLContainer;
 
 class PartitionDdlIT {
-
-    /** Postgres 17, the first with {@code transaction_timeout}; started by the first test that needs it. */
-    private static final class Pg17 {
-        static final PostgreSQLContainer INSTANCE =
-                new PostgreSQLContainer("postgres:17-alpine").withCommand("postgres", "-c", "fsync=off");
-
-        static {
-            INSTANCE.start();
-        }
-
-        static Connection connect() throws SQLException {
-            return DriverManager.getConnection(INSTANCE.getJdbcUrl(), INSTANCE.getUsername(), INSTANCE.getPassword());
-        }
-    }
 
     /**
      * A snapshot taken before another session dropped a range still lists it in {@code pg_inherits}, while
@@ -80,7 +63,7 @@ class PartitionDdlIT {
     @Test
     void aDropWaitsForItsLockPastTheSessionTransactionTimeout() throws Exception {
         var parent = TestSql.uniqueTable();
-        try (var c = Pg17.connect(); var reader = Pg17.connect()) {
+        try (var c = TestDataSources.pg17Connection(); var reader = TestDataSources.pg17Connection()) {
             TestSql.execute(c, "create table " + parent + " (xid xid8 not null) partition by range (xid)");
             TestSql.execute(c, "create table " + parent + "_a (like " + parent + ")");
             TestSql.execute(c, "create table " + parent + "_b (like " + parent + ")");

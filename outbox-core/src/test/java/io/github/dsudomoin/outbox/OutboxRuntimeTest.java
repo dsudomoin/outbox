@@ -54,6 +54,8 @@ class OutboxRuntimeTest {
     void noHandlerMessageNamesBothFrameworks() {
         assertThatThrownBy(() -> OutboxRuntime.builder(new TestOutboxConfig(), transactions, null).build())
                 .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("OutboxHandler")
+                .hasMessageContaining("OutboxTopicHandler")
                 .hasMessageContaining("outbox-kafka-spring-boot")
                 .hasMessageContaining("KafkaOutboxModule");
     }

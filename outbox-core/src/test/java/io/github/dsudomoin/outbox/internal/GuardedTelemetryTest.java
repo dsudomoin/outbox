@@ -577,11 +577,6 @@ class GuardedTelemetryTest {
         }
 
         @Override
-        public void deadLettered(String topic) {
-            throw bug();
-        }
-
-        @Override
         public void deadLettered(OutboxRecord record, String errorType) {
             throw bug();
         }
@@ -655,11 +650,6 @@ class GuardedTelemetryTest {
     private static final class ThrowingStart implements OutboxTelemetry {
         @Override
         public Enqueue enqueueStarted() {
-            throw new IllegalStateException("telemetry bug");
-        }
-
-        @Override
-        public Delivery deliveryStarted(List<OutboxRecord> records, Instant now) {
             throw new IllegalStateException("telemetry bug");
         }
 

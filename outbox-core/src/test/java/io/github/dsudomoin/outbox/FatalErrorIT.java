@@ -4,8 +4,8 @@ import static io.github.dsudomoin.outbox.testing.Intercepting.intercepting;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
-import io.github.dsudomoin.outbox.internal.Hashing;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
+import io.github.dsudomoin.outbox.testing.ShardKeys;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import java.io.OutputStream;
@@ -13,13 +13,13 @@ import java.io.PrintStream;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.IntStream;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
 
@@ -96,7 +96,7 @@ class FatalErrorIT {
         var transactions = new JdbcTransactions(DIRECT);
         var config = new TestOutboxConfig().shards(4).workers(1)
                 .retry(Duration.ofMillis(50), Duration.ofMillis(400), 0);
-        var keys = keysOnEachShard(4);
+        var keys = IntStream.range(0, 4).mapToObj(s -> ShardKeys.first("t", "k", s, 4)).toList();
         var poison = keys.get(0);
         var thrown = new AtomicInteger();
         Map<UUID, AtomicInteger> calls = new ConcurrentHashMap<>();
@@ -194,18 +194,6 @@ class FatalErrorIT {
     }
 
     /** Topic "t" keys, one on each of {@code shards} shards. */
-    private static List<String> keysOnEachShard(int shards) {
-        var keys = new String[shards];
-        for (int i = 0; Arrays.asList(keys).contains(null); i++) {
-            var key = "k" + i;
-            int shard = Hashing.shard(Hashing.keyHash("t", bytes(key)), shards);
-            if (keys[shard] == null) {
-                keys[shard] = key;
-            }
-        }
-        return List.of(keys);
-    }
-
     private static long workersAlive() {
         return Thread.getAllStackTraces().keySet().stream().map(Thread::getName)
                 .filter(n -> n.startsWith("outbox-relay-")).count();

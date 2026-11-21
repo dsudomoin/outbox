@@ -35,7 +35,7 @@ public final class Intercepting {
                 });
     }
 
-    private static Object invoke(Object target, Method method, Object[] args) throws Throwable {
+    public static Object invoke(Object target, Method method, Object[] args) throws Throwable {
         try {
             return method.invoke(target, args);
         } catch (InvocationTargetException e) {

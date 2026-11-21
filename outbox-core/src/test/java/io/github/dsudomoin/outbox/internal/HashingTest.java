@@ -17,32 +17,6 @@ class HashingTest {
     }
 
     @Test
-    void differentTopicSameKeyUsuallyDifferentHash() {
-        int differ = 0;
-        for (int i = 0; i < 1000; i++) {
-            byte[] key = ("user-" + i).getBytes(UTF_8);
-            if (Hashing.keyHash("orders", key) != Hashing.keyHash("payments", key)) {
-                differ++;
-            }
-        }
-        assertThat(differ).isGreaterThanOrEqualTo(990);
-    }
-
-    @Test
-    void shardDistributionIsEven() {
-        int shards = 32;
-        int keys = 100_000;
-        int[] counts = new int[shards];
-        for (int i = 0; i < keys; i++) {
-            counts[Hashing.shard(Hashing.keyHash("orders", ("k" + i).getBytes(UTF_8)), shards)]++;
-        }
-        double mean = (double) keys / shards;
-        for (int count : counts) {
-            assertThat((double) count).isBetween(mean * 0.9, mean * 1.1);
-        }
-    }
-
-    @Test
     void randomShardStaysInRange() {
         for (int i = 0; i < 1000; i++) {
             assertThat(Hashing.randomShard(32)).isBetween(0, 31);

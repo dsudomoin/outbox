@@ -59,9 +59,7 @@ class JdbcTransactionsIT {
         var later = new AtomicInteger();
 
         var result = transactions.inTx(c -> {
-            try (var st = c.createStatement()) {
-                st.execute("create table " + table + " (id int)");
-            }
+            TestSql.execute(c, "create table " + table + " (id int)");
             transactions.afterCommit(() -> {
                 throw new IllegalStateException("after commit");
             });
@@ -285,23 +283,19 @@ class JdbcTransactionsIT {
 
     private static String table() throws SQLException {
         var table = TestSql.uniqueTable();
-        try (var c = TestDataSources.newDataSource().getConnection(); var st = c.createStatement()) {
-            st.execute("create table " + table + " (id int)");
+        try (var c = TestDataSources.newDataSource().getConnection()) {
+            TestSql.execute(c, "create table " + table + " (id int)");
         }
         return table;
     }
 
     private static void insert(Connection c, String table) throws SQLException {
-        try (var st = c.createStatement()) {
-            st.execute("insert into " + table + " values (1)");
-        }
+        TestSql.execute(c, "insert into " + table + " values (1)");
     }
 
-    private static int rows(String table) throws SQLException {
-        try (var c = TestDataSources.newDataSource().getConnection(); var st = c.createStatement();
-                var rs = st.executeQuery("select count(*) from " + table)) {
-            rs.next();
-            return rs.getInt(1);
+    private static long rows(String table) throws SQLException {
+        try (var c = TestDataSources.newDataSource().getConnection()) {
+            return TestSql.queryLong(c, "select count(*) from " + table);
         }
     }
 

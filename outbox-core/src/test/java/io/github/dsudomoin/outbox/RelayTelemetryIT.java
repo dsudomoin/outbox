@@ -7,6 +7,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.internal.Hashing;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.ShardKeys;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
@@ -29,6 +30,7 @@ class RelayTelemetryIT {
 
     private final JdbcTransactions transactions = new JdbcTransactions(TestDataSources.newDataSource());
     private final RecordingTelemetry telemetry = new RecordingTelemetry();
+    private final ShardKeys keys = new ShardKeys("orders", 4);
     @Nullable
     private OutboxRuntime runtime;
 
@@ -64,16 +66,17 @@ class RelayTelemetryIT {
     void aFailingShardIsCountedOncePerSingleShardFailure() throws Exception {
         // 4 shards, the relay running; one worker steps both shards of the send together first
         var config = new TestOutboxConfig().workers(1);
-        int goodShard = shard("good");
-        String bad = keyOffShard("bad", goodShard);
-        int badShard = shard(bad);
+        String good = keys.next(0);
+        String bad = keys.next(1);
+        int goodShard = 0;
+        int badShard = 1;
         var handler = new RecordingHandler();
         var outbox = start(config, handler);
         failCursorAppends(config, badShard);
 
         var messages = new ArrayList<OutboxMessage>();
         for (int i = 0; i < 5; i++) {
-            messages.add(OutboxMessage.of("orders", "good", bytes("g" + i)));
+            messages.add(OutboxMessage.of("orders", good, bytes("g" + i)));
             messages.add(OutboxMessage.of("orders", bad, bytes("b" + i)));
         }
         var ids = transactions.inTx(c -> outbox.sendAll(messages));
@@ -100,8 +103,9 @@ class RelayTelemetryIT {
         // the next tick, 1 s and 3 s later, not once per tick
         var config = new TestOutboxConfig().workers(1).minTickInterval(Duration.ofMillis(50))
                 .idlePollInterval(Duration.ofMillis(200)).retry(Duration.ofSeconds(1), Duration.ofMinutes(5), 0);
-        String bad = keyOffShard("bad", shard("good"));
-        int badShard = shard(bad);
+        String good = keys.next(0);
+        String bad = keys.next(1);
+        int badShard = 1;
         var handler = new RecordingHandler();
         var outbox = start(config, handler);
         failCursorAppends(config, badShard);
@@ -116,7 +120,7 @@ class RelayTelemetryIT {
         long until = System.nanoTime() + Duration.ofSeconds(6).toNanos();
         int i = 0;
         while (System.nanoTime() < until) {
-            var message = OutboxMessage.of("orders", "good", bytes("g" + i++));
+            var message = OutboxMessage.of("orders", good, bytes("g" + i++));
             goodIds.add(transactions.inTx(c -> outbox.send(message)));
             Thread.sleep(100);
         }
@@ -306,8 +310,8 @@ class RelayTelemetryIT {
 
     @Test
     void fetchedCountsEveryRowReadPerShard() throws Exception {
-        String a = "a";
-        String b = keyOffShard("b", shard(a));
+        String a = keys.next(0);
+        String b = keys.next(1);
         var config = new TestOutboxConfig();
         var events = new Events(transactions, config.table() + "_cursor");
         var handler = new RecordingHandler();
@@ -324,8 +328,8 @@ class RelayTelemetryIT {
         await(Duration.ofSeconds(10), () -> handler.delivered().size() >= 5);
         runtime.close();
 
-        assertThat(events.fetched(shard(a))).isEqualTo(3);
-        assertThat(events.fetched(shard(b))).isEqualTo(2);
+        assertThat(events.fetched(0)).isEqualTo(3);
+        assertThat(events.fetched(1)).isEqualTo(2);
         assertThat(events.ended()).allSatisfy(step -> assertThat(step.log.stream()
                 .filter(e -> e.startsWith("fetched(")).map(e -> e.substring(0, e.indexOf(','))))
                 .as("one fetched per shard of a step").doesNotHaveDuplicates());
@@ -336,12 +340,8 @@ class RelayTelemetryIT {
         // two keys of each of two shards fail in one call: no single failing key, so both shards pause and then probe
         // their head alone in one step; the first probe outlives batchTimeout, so the step skips the other shard,
         // whose head a later step reads and counts again
-        var byShard = new java.util.TreeMap<Integer, List<String>>();
-        for (int i = 0; byShard.values().stream().filter(keys -> keys.size() >= 2).count() < 2; i++) {
-            byShard.computeIfAbsent(shard("k" + i), x -> new ArrayList<>()).add("k" + i);
-        }
-        var messages = byShard.values().stream().filter(keys -> keys.size() >= 2).limit(2)
-                .flatMap(keys -> keys.stream().limit(2)).map(k -> OutboxMessage.of("orders", k, bytes(k))).toList();
+        var messages = List.of(keys.next(0), keys.next(0), keys.next(1), keys.next(1)).stream()
+                .map(k -> OutboxMessage.of("orders", k, bytes(k))).toList();
         var timeout = Duration.ofSeconds(1);
         var config = new TestOutboxConfig().workers(1).batchTimeout(timeout).headFailuresBeforeDivert(1)
                 .retry(Duration.ofMillis(100), Duration.ofMillis(200), 100);
@@ -384,7 +384,7 @@ class RelayTelemetryIT {
 
     @Test
     void settledCountsTheRowsTheCommitMoves() throws Exception {
-        var keys = sameShardKeys(3);
+        var sameShard = List.of(keys.next(0), keys.next(0), keys.next(0));
         var config = new TestOutboxConfig();
         var events = new Events(transactions, config.table() + "_cursor");
         var first = new java.util.concurrent.atomic.AtomicBoolean(true);
@@ -396,7 +396,7 @@ class RelayTelemetryIT {
             return java.util.Collections.nCopies(records.size(), Outcome.delivered());
         });
         var outbox = start(config, handler, events);
-        var messages = keys.stream().map(k -> OutboxMessage.of("orders", k, bytes(k))).toList();
+        var messages = sameShard.stream().map(k -> OutboxMessage.of("orders", k, bytes(k))).toList();
 
         transactions.inTx(c -> outbox.sendAll(messages));
         await(Duration.ofSeconds(10), () -> !first.get() && events.ended().stream().anyMatch(s -> s.handed == 3));
@@ -435,19 +435,20 @@ class RelayTelemetryIT {
 
     @Test
     void defaultHandleBatchReportsEachAttempt() throws Exception {
-        var keys = sameShardKeys(2);
+        var sameShard = List.of(keys.next(0), keys.next(0));
         var config = new TestOutboxConfig();
         var events = new Events(transactions, config.table() + "_cursor");
         var failed = new java.util.concurrent.atomic.AtomicBoolean();
         OutboxHandler handler = record -> {
-            if (new String(record.key(), UTF_8).equals(keys.get(1)) && failed.compareAndSet(false, true)) {
+            if (new String(record.key(), UTF_8).equals(sameShard.get(1)) && failed.compareAndSet(false, true)) {
                 throw new IllegalStateException("down");
             }
         };
         var outbox = start(config, handler, events);
-        var ids = transactions.inTx(c -> outbox.sendAll(List.of(OutboxMessage.of("orders", keys.get(0), bytes("1")),
-                OutboxMessage.of("orders", keys.get(1), bytes("2")), OutboxMessage.of("orders", keys.get(1),
-                        bytes("3")))));
+        var ids = transactions.inTx(c -> outbox.sendAll(List.of(
+                OutboxMessage.of("orders", sameShard.get(0), bytes("1")),
+                OutboxMessage.of("orders", sameShard.get(1), bytes("2")),
+                OutboxMessage.of("orders", sameShard.get(1), bytes("3")))));
         await(Duration.ofSeconds(10), () -> events.ended().stream().anyMatch(s -> s.handed == 3));
         runtime.close();
 
@@ -483,15 +484,15 @@ class RelayTelemetryIT {
         // probes its head alone, in a call of its own
         var config = new TestOutboxConfig().headFailuresBeforeDivert(1);
         var events = new Events(transactions, config.table() + "_cursor");
-        var keys = sameShardKeys(2);
-        var handler = new RecordingHandler().failNext(r -> new String(r.key(), UTF_8).equals(keys.get(0)),
+        var sameShard = List.of(keys.next(0), keys.next(0));
+        var handler = new RecordingHandler().failNext(r -> new String(r.key(), UTF_8).equals(sameShard.get(0)),
                 () -> new IllegalStateException("once"));
         var outbox = start(config, handler, events);
 
-        var failing = transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", keys.get(0), bytes("f"))));
+        var failing = transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", sameShard.get(0), bytes("f"))));
         await(Duration.ofSeconds(10), () -> handler.batches().stream().flatMap(List::stream)
                 .anyMatch(Outcome.Retry.class::isInstance));
-        var next = transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", keys.get(1), bytes("n"))));
+        var next = transactions.inTx(c -> outbox.send(OutboxMessage.of("orders", sameShard.get(1), bytes("n"))));
         await(Duration.ofSeconds(10), () -> delivered(handler).containsAll(List.of(failing, next)));
         runtime.close();
 
@@ -549,15 +550,6 @@ class RelayTelemetryIT {
         return start(config, handler, telemetry);
     }
 
-    /** {@code prefix}, or {@code prefix<i>} for the first i that is, of a key on another shard than {@code shard}. */
-    private static String keyOffShard(String prefix, int shard) {
-        String key = prefix;
-        for (int i = 0; shard(key) == shard; i++) {
-            key = prefix + i;
-        }
-        return key;
-    }
-
     /**
      * The step's own SQL failing for {@code shard}, not its handler call (a handler failure is an outcome): every
      * cursor append of the shard raises, failing each step that holds it.
@@ -587,18 +579,6 @@ class RelayTelemetryIT {
 
     private static int shard(String key) {
         return Hashing.shard(Hashing.keyHash("orders", bytes(key)), 4);
-    }
-
-    /** {@code count} distinct keys on one shard. */
-    private static List<String> sameShardKeys(int count) {
-        var keys = new ArrayList<String>();
-        int shard = shard("s0");
-        for (int i = 0; keys.size() < count; i++) {
-            if (shard("s" + i) == shard) {
-                keys.add("s" + i);
-            }
-        }
-        return keys;
     }
 
     private static List<UUID> delivered(RecordingHandler handler) {

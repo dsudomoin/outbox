@@ -7,6 +7,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import io.github.dsudomoin.outbox.internal.TableNames;
+import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import java.sql.Connection;
@@ -26,7 +27,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.postgresql.PostgreSQLContainer;
 
 /**
  * What a DBA sets on the server, not the application: limits on the role shorter than a handler call, and a node that
@@ -34,15 +34,6 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
  * Postgres 17, the first with {@code transaction_timeout}.
  */
 class DatabaseSettingsIT {
-
-    private static final class Pg {
-        static final PostgreSQLContainer INSTANCE = new PostgreSQLContainer("postgres:17-alpine")
-                .withCommand("postgres", "-c", "fsync=off", "-c", "max_connections=300");
-
-        static {
-            INSTANCE.start();
-        }
-    }
 
     private final List<AutoCloseable> closing = new ArrayList<>();
 
@@ -54,12 +45,12 @@ class DatabaseSettingsIT {
     }
 
     private static Connection superuser(String database) throws SQLException {
-        return DriverManager.getConnection(url(database), Pg.INSTANCE.getUsername(), Pg.INSTANCE.getPassword());
+        return DriverManager.getConnection(url(database), TestDataSources.pg17User(), TestDataSources.pg17Password());
     }
 
     /** The test server's JDBC URL with {@code database} in place of its own. */
     private static String url(String database) {
-        return Pg.INSTANCE.getJdbcUrl().replaceFirst("/[^/?]+(\\?|$)", "/" + database + "$1");
+        return TestDataSources.pg17JdbcUrl().replaceFirst("/[^/?]+(\\?|$)", "/" + database + "$1");
     }
 
     private HikariDataSource pool(String database, String user, String password, int size) {
@@ -218,7 +209,7 @@ class DatabaseSettingsIT {
         try (var c = superuser("test")) {
             TestSql.execute(c, "create database " + database);
         }
-        var ds = pool(database, Pg.INSTANCE.getUsername(), Pg.INSTANCE.getPassword(), 12);
+        var ds = pool(database, TestDataSources.pg17User(), TestDataSources.pg17Password(), 12);
         var transactions = new JdbcTransactions(ds);
         var config = new TestOutboxConfig().shards(4).maintenanceInterval(Duration.ofMillis(500));
         Set<UUID> delivered = ConcurrentHashMap.newKeySet();
@@ -302,7 +293,7 @@ class DatabaseSettingsIT {
         try (var c = superuser("test")) {
             TestSql.execute(c, "create database " + database + " " + options);
         }
-        var ds = pool(database, Pg.INSTANCE.getUsername(), Pg.INSTANCE.getPassword(), 8);
+        var ds = pool(database, TestDataSources.pg17User(), TestDataSources.pg17Password(), 8);
         var transactions = new JdbcTransactions(ds);
         var config = new TestOutboxConfig().shards(1).retry(Duration.ofMillis(100), Duration.ofMillis(200), 0);
         Map<String, AtomicInteger> calls = new ConcurrentHashMap<>();

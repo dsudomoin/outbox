@@ -75,6 +75,9 @@ class QueueStateIT {
         assertThat(state.get(2).oldestSeconds()).as("the parked row aged by three hours")
                 .isGreaterThanOrEqualTo(10800);
         assertThat(state.get(3).oldestSeconds()).isZero();
+        assertThat(telemetry.gauge(OutboxGauge.PENDING)).isEqualTo(11);
+        assertThat(telemetry.gauge(OutboxGauge.PENDING_OLDEST))
+                .isEqualTo(state.stream().mapToDouble(ShardQueue::oldestSeconds).max().orElseThrow());
     }
 
     @Test
@@ -199,7 +202,6 @@ class QueueStateIT {
 
     @Test
     void noTelemetryNoQuery() throws Exception {
-        assertThat(GuardedTelemetry.of(OutboxTelemetry.NONE)).isSameAs(OutboxTelemetry.NONE);
         start(OutboxTelemetry.NONE);
         send(0);
         var reads = new AtomicInteger();
@@ -214,19 +216,6 @@ class QueueStateIT {
         assertThat(writer.maintenance().runOnce()).isTrue();
 
         assertThat(reads).hasValue(0);
-    }
-
-    @Test
-    void gaugesSumAndMax() throws Exception {
-        start(telemetry);
-        fillElevenPending();
-
-        assertThat(writer.maintenance().runOnce()).isTrue();
-
-        var state = telemetry.lastState();
-        assertThat(telemetry.gauge(OutboxGauge.PENDING)).isEqualTo(11);
-        assertThat(telemetry.gauge(OutboxGauge.PENDING_OLDEST))
-                .isEqualTo(state.stream().mapToDouble(ShardQueue::oldestSeconds).max().orElseThrow());
     }
 
     /**

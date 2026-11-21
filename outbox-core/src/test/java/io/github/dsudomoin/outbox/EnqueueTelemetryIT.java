@@ -4,7 +4,6 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import io.github.dsudomoin.outbox.internal.HeaderCodec;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -56,7 +55,8 @@ class EnqueueTelemetryIT {
         assertThat(m.topic).isEqualTo("orders");
         assertThat(m.shard).isEqualTo(storedShard(id));
         assertThat(telemetry.events).containsSubsequence("message orders", "inserted orders");
-        assertThat(storedHeaders(id)).as("the headers Message.headers returned").containsExactly(TRACE);
+        assertThat(OutboxRuntimeIT.headers(transactions, config, id)).as("the headers Message.headers returned")
+                .containsExactly(TRACE);
     }
 
     @Test
@@ -72,7 +72,7 @@ class EnqueueTelemetryIT {
         for (var m : telemetry.messages) {
             assertThat(m.shard).as("the stored shard of %s", m.id).isEqualTo(storedShard(m.id));
             assertThat(m.inserted).isTrue();
-            assertThat(storedHeaders(m.id)).containsExactly(TRACE);
+            assertThat(OutboxRuntimeIT.headers(transactions, config, m.id)).containsExactly(TRACE);
         }
     }
 
@@ -240,17 +240,6 @@ class EnqueueTelemetryIT {
             try (var rs = ps.executeQuery()) {
                 assertThat(rs.next()).as("row of %s", id).isTrue();
                 return rs.getInt(1);
-            }
-        }
-    }
-
-    private List<OutboxHeader> storedHeaders(UUID id) throws SQLException {
-        try (var c = transactions.newConnection();
-                var ps = c.prepareStatement("select headers from " + config.table() + " where message_id = ?")) {
-            ps.setObject(1, id);
-            try (var rs = ps.executeQuery()) {
-                assertThat(rs.next()).as("row of %s", id).isTrue();
-                return HeaderCodec.decode(rs.getBytes(1));
             }
         }
     }

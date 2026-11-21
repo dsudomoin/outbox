@@ -177,17 +177,11 @@ class OwnerSourceIT {
         var members = memberRoles();
         migrate();
         config.xidsPerPartition(1000).premake(2);
-        try (var first = new OutboxSchema(new JdbcTransactions(as(app)), new JdbcTransactions(as(members[0])),
-                config)) {
-            first.start();
-        }
+        startSchema(new JdbcTransactions(as(members[0])));
         assertThat(foreignTables()).as("tables owned by another role than " + owner).isEmpty();
         sql("do $$ begin for i in 1..1000 loop perform pg_current_xact_id(); commit; end loop; end $$");
 
-        try (var second = new OutboxSchema(new JdbcTransactions(as(app)), new JdbcTransactions(as(members[1])),
-                config)) {
-            second.start(); // an extension is due: it reads the tail and swaps it
-        }
+        startSchema(new JdbcTransactions(as(members[1]))); // an extension is due: it reads the tail and swaps it
         assertThat(foreignTables()).as("tables owned by another role than " + owner).isEmpty();
     }
 
@@ -201,17 +195,13 @@ class OwnerSourceIT {
         migrate();
         config.xidsPerPartition(1000).premake(2);
         var member = new JdbcTransactions(as(members[0]));
-        try (var first = new OutboxSchema(new JdbcTransactions(as(app)), member, config)) {
-            first.start();
-        }
+        startSchema(member);
         var inbox = new PgInbox(new JdbcTransactions(as(app)), member, config, OutboxTelemetry.NONE);
         inbox.start();
         var made = "^(outbox_(tail|tail_next|[xo][0-9]+)|inbox_t[0-9]+)$";
         assertThat(giveTo(members[0], made)).as("partitions").hasSizeGreaterThan(4);
 
-        try (var again = new OutboxSchema(new JdbcTransactions(as(app)), member, config)) {
-            again.start();
-        }
+        startSchema(member);
         new PgInbox(new JdbcTransactions(as(app)), member, config, OutboxTelemetry.NONE).start();
         assertThat(foreignTables()).as("tables owned by another role than " + owner + " after a start").isEmpty();
 
@@ -232,9 +222,7 @@ class OwnerSourceIT {
         migrate();
         config.xidsPerPartition(1000).premake(2);
         var member = new JdbcTransactions(as(members[0]));
-        try (var first = new OutboxSchema(new JdbcTransactions(as(app)), member, config)) {
-            first.start();
-        }
+        startSchema(member);
         var made = "^outbox_(tail|tail_next|[xo][0-9]+)$";
         var given = giveTo(members[0], made);
         assertThat(given).as("partitions").hasSizeGreaterThan(2);
@@ -245,8 +233,8 @@ class OwnerSourceIT {
             TestSql.queryLong(reader, "select count(*) from " + config.table()); // ACCESS SHARE on every partition
             var start = new CompletableFuture<Void>();
             var thread = new Thread(() -> {
-                try (var again = new OutboxSchema(new JdbcTransactions(as(app)), member, config)) {
-                    again.start();
+                try {
+                    startSchema(member);
                     start.complete(null);
                 } catch (Throwable e) {
                     start.completeExceptionally(e);
@@ -265,10 +253,15 @@ class OwnerSourceIT {
             reader.rollback();
         }
 
-        try (var again = new OutboxSchema(new JdbcTransactions(as(app)), member, config)) {
-            again.start();
-        }
+        startSchema(member);
         assertThat(foreignTables()).as("tables owned by another role than " + owner + " once free").isEmpty();
+    }
+
+    /** Starts and closes the schema with the application's connections and {@code owner}'s DDL ones. */
+    private void startSchema(JdbcTransactions owner) throws SQLException {
+        try (var outbox = new OutboxSchema(new JdbcTransactions(as(app)), owner, config)) {
+            outbox.start();
+        }
     }
 
     /** Gives the schema's tables named like {@code regex} to {@code role}, as an earlier release left them. */

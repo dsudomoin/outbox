@@ -324,14 +324,7 @@ class NetworkBlackholeIT {
         try (var holder = DIRECT.getConnection()) {
             holder.setAutoCommit(false);
             TestSql.execute(holder, "lock table " + names.cursor() + " in access exclusive mode");
-            var release = CompletableFuture.runAsync(() -> {
-                try {
-                    Thread.sleep(2500);
-                    holder.rollback();
-                } catch (Exception e) {
-                    throw new IllegalStateException(e);
-                }
-            });
+            var release = rollbackAfter(holder, 2500);
 
             assertThat(runtime.admin().recoverXidRegression()).as("re-sent, not cut at 1 s").isEqualTo(1);
 
@@ -355,14 +348,7 @@ class NetworkBlackholeIT {
         try (var holder = DIRECT.getConnection()) {
             holder.setAutoCommit(false);
             TestSql.execute(holder, "lock table " + orphan + " in access exclusive mode");
-            var release = CompletableFuture.runAsync(() -> {
-                try {
-                    Thread.sleep(2500);
-                    holder.rollback();
-                } catch (Exception e) {
-                    throw new IllegalStateException(e);
-                }
-            });
+            var release = rollbackAfter(holder, 2500);
 
             assertThat(runtime.admin().restoreOrphan(orphan, 0)).as("moved, not cut at 1 s").isEqualTo(1);
 
@@ -1071,6 +1057,18 @@ class NetworkBlackholeIT {
 
     private static UUID send(OutboxRuntime runtime, JdbcTransactions transactions, String key) {
         return transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", key, "p".getBytes(UTF_8))));
+    }
+
+    /** Rolls {@code holder} back, releasing its locks, {@code millis} from now. */
+    private static CompletableFuture<Void> rollbackAfter(Connection holder, long millis) {
+        return CompletableFuture.runAsync(() -> {
+            try {
+                Thread.sleep(millis);
+                holder.rollback();
+            } catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+        });
     }
 
     /** A writer-only instance on {@link #DIRECT} for {@code table}, started; closed after the test. */

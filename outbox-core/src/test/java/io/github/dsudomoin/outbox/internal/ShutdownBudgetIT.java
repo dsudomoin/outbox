@@ -6,11 +6,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import io.github.dsudomoin.outbox.ConnectionSource;
 import io.github.dsudomoin.outbox.JdbcTransactions;
 import io.github.dsudomoin.outbox.OutboxRuntime;
+import io.github.dsudomoin.outbox.testing.Intercepting;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -210,7 +210,7 @@ class ShutdownBudgetIT {
     private static DataSource counting(AtomicInteger deletes, AtomicInteger beats) {
         return (DataSource) Proxy.newProxyInstance(DataSource.class.getClassLoader(), new Class<?>[] {DataSource.class},
                 (proxy, method, args) -> {
-                    var result = invoke(method, DIRECT, args);
+                    var result = Intercepting.invoke(DIRECT, method, args);
                     return result instanceof Connection c ? counting(c, deletes, beats) : result;
                 });
     }
@@ -223,19 +223,11 @@ class ShutdownBudgetIT {
                             && ((String) args[0]).contains("_instance where instance_id")) {
                         deletes.incrementAndGet();
                     }
-                    var result = invoke(method, c, args);
+                    var result = Intercepting.invoke(c, method, args);
                     if (beat && method.getName().equals("close")) {
                         beats.incrementAndGet();
                     }
                     return result;
                 });
-    }
-
-    private static Object invoke(java.lang.reflect.Method method, Object on, Object[] args) throws Throwable {
-        try {
-            return method.invoke(on, args);
-        } catch (InvocationTargetException e) {
-            throw e.getCause();
-        }
     }
 }

@@ -10,7 +10,6 @@ import io.github.dsudomoin.outbox.internal.TableNames;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.time.ZoneOffset;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
@@ -186,25 +185,18 @@ public final class AdminRows {
     }
 
     public List<Long> deadIds() throws SQLException {
-        var all = new ArrayList<Long>();
-        try (var c = connections.newConnection(); var st = c.createStatement();
-                var rs = st.executeQuery("select id from " + names.dead() + " order by id")) {
-            while (rs.next()) {
-                all.add(rs.getLong(1));
-            }
+        try (var c = connections.newConnection()) {
+            // named v: an output column named id would make "order by id" sort the text
+            return TestSql.queryStrings(c, "select id::text as v from " + names.dead() + " order by id").stream()
+                    .map(Long::valueOf).toList();
         }
-        return all;
     }
 
     public List<UUID> outboxMessageIds() throws SQLException {
-        var all = new ArrayList<UUID>();
-        try (var c = connections.newConnection(); var st = c.createStatement();
-                var rs = st.executeQuery("select message_id from " + names.base() + " order by id")) {
-            while (rs.next()) {
-                all.add(rs.getObject(1, UUID.class));
-            }
+        try (var c = connections.newConnection()) {
+            return TestSql.queryStrings(c, "select message_id::text from " + names.base() + " order by id").stream()
+                    .map(UUID::fromString).toList();
         }
-        return all;
     }
 
     public boolean exists(String table) throws SQLException {

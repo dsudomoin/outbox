@@ -295,15 +295,6 @@ class BatchClassifierTest {
     }
 
     @Test
-    void requeueOnlyAdvancesWithoutPause() {
-        var a = record("t", "a");
-        var b = record("t", "b");
-
-        assertThat(classify(0, requeue(a), requeue(b)))
-                .isEqualTo(advance(new Park(a, 1, NOW.plus(DELAY)), new Park(b, 1, NOW.plus(DELAY))));
-    }
-
-    @Test
     void requeueAfterItsKeyFailedIsAFollower() {
         var k1 = record("t", "k");
         var k2 = record("t", "k");

@@ -51,16 +51,19 @@ public final class TestSql {
         }
     }
 
-    public static String queryString(Connection c, String sql, String... args) throws SQLException {
-        try (var ps = c.prepareStatement(sql)) {
-            for (int i = 0; i < args.length; i++) {
-                ps.setString(i + 1, args[i]);
+    /** The first column of every row of {@code sql}, in order, as longs. */
+    public static List<Long> queryLongs(Connection c, String sql) throws SQLException {
+        try (var st = c.createStatement(); var rs = st.executeQuery(sql)) {
+            var all = new ArrayList<Long>();
+            while (rs.next()) {
+                all.add(rs.getLong(1));
             }
-            try (var rs = ps.executeQuery()) {
-                rs.next();
-                return rs.getString(1);
-            }
+            return all;
         }
+    }
+
+    public static String queryString(Connection c, String sql, String... args) throws SQLException {
+        return queryStrings(c, sql, args).get(0);
     }
 
     /**
