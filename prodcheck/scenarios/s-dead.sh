@@ -82,7 +82,8 @@ s_hook() { # every decision of the hook, its failures and a kill -9 in the middl
   pc_shop 1003 -Dprodcheck.hook=policy -Doutbox.deadLetters.timeout=2s
   sleep 5
   for i in 1001 1002 1003; do pc_unload "$i"; done
-  check "$(passes wait_for 60 sh -c "[ \"\$(docker exec $PG psql -U outbox -d outbox -Atq -c \"select count(*) from outbox_dead where status <> 'kept'\")\" = 0 ]")" "ни одного письма pending и scheduled не осталось: все решены"
+  decided() { [ "$(psql_q "select count(*) from outbox_dead where status <> 'kept'")" = 0 ]; }
+  check "$(passes wait_for 60 decided)" "ни одного письма pending и scheduled не осталось: все решены"
   local kept discarded
   kept=$(psql_q "select count(*) from outbox_dead d join pc_sent s using (message_id) where s.tag in ('hook-redrive', 'hook-redrive-at') and d.redrives >= 1")
   check "$(passes gt "$kept" 0)" "переотправленные снова умерли и несут redrives ≥ 1: $kept"
@@ -107,7 +108,8 @@ s_hook_mixed_fleet() { # a fleet with and without the hook: letters wait for the
   sleep 5
   check "$(passes pending_now)" "инстанс без хука не забирает их у него"
   pc_kill 1001
-  check "$(passes wait_for 40 sh -c "[ \"\$(docker exec $PG psql -U outbox -d outbox -Atq -c \"select count(*) from outbox_dead where status = 'pending'\")\" = 0 ]")" "инстанс с хуком умер, heartbeat истёк: письма стали kept"
+  none_pending() { ! pending_now; }
+  check "$(passes wait_for 40 none_pending)" "инстанс с хуком умер, heartbeat истёк: письма стали kept"
   pc_finish --dead-tags hook-keep --exempt-tags hook-keep --allow-left dead-pending
 }
 
@@ -126,6 +128,7 @@ s_dead_retention() { # kept letters older than retention go, pending ones never
   psql_q "update outbox_dead set failed_at = now() - interval '2 days'" > /dev/null
   sleep 5
   psql_q "update outbox_dead set failed_at = now() - interval '2 days'" > /dev/null
-  check "$(passes wait_for 20 sh -c "[ \"\$(docker exec $PG psql -U outbox -d outbox -Atq -c 'select count(*) from outbox_dead')\" = 0 ]")" "оставленные письма старше retention удалены обслуживанием"
+  no_dead() { [ "$(psql_q 'select count(*) from outbox_dead')" = 0 ]; }
+  check "$(passes wait_for 20 no_dead)" "оставленные письма старше retention удалены обслуживанием"
   pc_finish --discard-tags hook-keep --exempt-tags hook-keep
 }

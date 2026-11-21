@@ -43,8 +43,8 @@ s_lock_table_full() { # bulk sendAll past max_locks_per_transaction × max_conne
   local i
   for i in 1001 1002 1003; do pc_shop "$i"; pc_load "$i" 'rate=0&writers=3&topics=payments&bulk=true&txMessages=20000&holdMs=6000'; done
   sleep 14
-  local failed=0
-  for i in 1001 1002 1003; do failed=$((failed + $(stats "$i" | j 'sum(d["failedByClass"].values())'))); done
+  local failed
+  failed=$(writers_failed 1001 1002 1003)
   check "$(passes gt "$failed" 0)" "писатели падают с out of shared memory, а не зависают: $failed отказов"
   for i in 1001 1002 1003; do pc_unload "$i"; done
   sleep 5

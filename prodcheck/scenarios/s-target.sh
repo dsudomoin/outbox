@@ -31,7 +31,8 @@ s_target_long_outage() { # a long outage: retries back off to maxDelay and come 
   pc_target
   local t=$(now) before
   before=$(target_q "select count(*) from pc_effect where sink = 'payments'")
-  check "$(passes wait_for 40 sh -c "[ \"\$(docker exec $TGT psql -U outbox -d outbox -Atq -c \"select count(*) from pc_effect where sink = 'payments'\")\" -gt $before ]")" "доставка возобновилась через $(($(now) - t)) с после возврата цели (maxDelay 20 с)"
+  resumed() { [ "$(target_q "select count(*) from pc_effect where sink = 'payments'")" -gt "$before" ]; }
+  check "$(passes wait_for 40 resumed)" "доставка возобновилась через $(($(now) - t)) с после возврата цели (maxDelay 20 с)"
   pc_finish
 }
 

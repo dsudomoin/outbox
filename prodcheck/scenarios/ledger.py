@@ -61,11 +61,10 @@ def left():
         retry += one(args.source, f"select count(*) from {b}_retry")
         parked += one(args.source, f"select count(*) from {b}_parked")
         pending += one(args.source, f"select count(*) from {b}_dead where status <> 'kept'")
-    return sent - done - dead - discarded_count, retry, parked, pending
+    return sent - done - dead - len(discarded), retry, parked, pending
 
 
 discarded = set(open(args.discarded_file).read().split()) if args.discarded_file else set()
-discarded_count = len(discarded)
 result = {"violations": []}
 deadline = time.time() + args.timeout
 started, prev, drained = time.time(), None, False
@@ -115,7 +114,6 @@ seen = {}
 for e in effects:
     seen[(e["sink"], e["id"])] = seen.get((e["sink"], e["id"]), 0) + 1
 double_effects = sum(1 for v in seen.values() if v > 1)
-wrong_sink = 0
 
 
 def by_key(events, only_tag=None):

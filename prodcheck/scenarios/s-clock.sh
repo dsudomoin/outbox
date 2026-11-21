@@ -1,6 +1,5 @@
 # Clock skew. The README: partitions do not depend on clocks; times in the retry and parked tables are the database's;
 # message ids are UUIDv7 of the writer's clock, and the inbox window goes by them.
-FAKE=/usr/lib/aarch64-linux-gnu/faketime/libfaketime.so.1
 ftime() { docker exec "$PG" sh -c "echo '$1' > /tmp/faketime.rc"; fault "часы базы: $1"; }
 
 s_db_clock() { # the database's clock jumps forward and back under load, with a failing key in the retry table
@@ -14,7 +13,7 @@ s_db_clock() { # the database's clock jumps forward and back under load, with a 
   docker stop -t 5 "$PG" > /dev/null
   docker rm "$PG" > /dev/null
   docker run -d --name "$PG" --cpus 2 --memory 2g --shm-size 512m -p 127.0.0.1:55434:5432 -v "$volume:/var/lib/postgresql/data" --entrypoint sh "$PG_IMAGE" \
-    -c "echo '+0' > /tmp/faketime.rc; chmod 644 /tmp/faketime.rc; exec gosu postgres env LD_PRELOAD=$FAKE FAKETIME_TIMESTAMP_FILE=/tmp/faketime.rc FAKETIME_CACHE_DURATION=1 FAKETIME_DONT_FAKE_MONOTONIC=1 postgres -c max_connections=300 -c shared_buffers=512MB -c max_locks_per_transaction=256" > /dev/null
+    -c "echo '+0' > /tmp/faketime.rc; chmod 644 /tmp/faketime.rc; exec gosu postgres env LD_PRELOAD=$FAKETIME_LIB/libfaketime.so.1 FAKETIME_TIMESTAMP_FILE=/tmp/faketime.rc FAKETIME_CACHE_DURATION=1 FAKETIME_DONT_FAKE_MONOTONIC=1 postgres -c max_connections=300 -c shared_buffers=512MB -c max_locks_per_transaction=256" > /dev/null
   ready() { docker exec "$PG" pg_isready -U outbox -d outbox -q; }
   wait_for 60 ready
   sleep 2
@@ -42,20 +41,10 @@ s_app_clock() { # an instance's clock is off by hours (and past the inbox window
   trio "$MIX"
   sleep 5
   local name=kora-outbox-prodcheck-skewed
-  skewed_up() { # skewed_up OFFSET: the instance in a Linux container on ports 9083 and 9088
-    docker rm -f "$name" > /dev/null 2>&1 || true
-    docker run -d --name "$name" -p 127.0.0.1:9083:9083 -p 127.0.0.1:9088:9088 -v "$PC/shop/build/install/shop-n:/app:ro" \
-      -e HTTP_PORT=9083 -e METRICS_PORT=9088 -e INSTANCE_NAME=app-skewed \
-      -e POSTGRES_URL=jdbc:postgresql://host.docker.internal:55432/outbox \
-      -e TARGET_DB_URL=jdbc:postgresql://host.docker.internal:55433/outbox -e TARGET_URL=http://host.docker.internal:9090 \
-      -e LD_PRELOAD=/usr/lib/aarch64-linux-gnu/faketime/libfaketimeMT.so.1 -e FAKETIME="$1" -e FAKETIME_DONT_FAKE_MONOTONIC=1 \
-      -e JAVA_OPTS=-Xmx768m kora-outbox-prodcheck-app /app/bin/shop > /dev/null
-    wait_for 90 curl -sf localhost:9088/system/readiness
-    pc_load 1004 "$MIX"
-  }
   local offset
   for offset in +2h -2h +3d; do
-    skewed_up "$offset"
+    skewed_shop "$offset" app-skewed
+    pc_load 1004 "$MIX"
     fault "экземпляр с часами $offset"
     sleep 15
     pc_unload 1004
@@ -71,14 +60,7 @@ s_app_clock_retry() { # an instance whose clock runs ahead schedules retries and
   pc_begin app-clock-retry
   pc_target
   local name=kora-outbox-prodcheck-skewed
-  docker rm -f "$name" > /dev/null 2>&1 || true
-  docker run -d --name "$name" -p 127.0.0.1:9083:9083 -p 127.0.0.1:9088:9088 -v "$PC/shop/build/install/shop-n:/app:ro" \
-    -e HTTP_PORT=9083 -e METRICS_PORT=9088 -e INSTANCE_NAME=app-skewed \
-    -e POSTGRES_URL=jdbc:postgresql://host.docker.internal:55432/outbox \
-    -e TARGET_DB_URL=jdbc:postgresql://host.docker.internal:55433/outbox -e TARGET_URL=http://host.docker.internal:9090 \
-    -e LD_PRELOAD=/usr/lib/aarch64-linux-gnu/faketime/libfaketimeMT.so.1 -e FAKETIME=+2h -e FAKETIME_DONT_FAKE_MONOTONIC=1 \
-    -e JAVA_OPTS=-Xmx768m kora-outbox-prodcheck-app /app/bin/shop > /dev/null
-  wait_for 90 curl -sf localhost:9088/system/readiness
+  skewed_shop +2h app-skewed
   pc_load 1004 'rate=100&writers=2&keys=30&topics=payments'
   sleep 3
   tfault 'mode=error'
@@ -99,11 +81,11 @@ s_app_clock_retry() { # an instance whose clock runs ahead schedules retries and
 
 # The inbox window goes by the JVM clocks of the sender (the id's time) and the receiver (its partitions): every lost
 # response makes a second delivery, which only the inbox can stop. The target counts a second effect instead of failing.
-skewed_shop() { # skewed_shop OFFSET: the sender in a container on ports 9083 and 9088
+skewed_shop() { # skewed_shop OFFSET [INSTANCE]: the sender in a container on ports 9083 and 9088, app-skewedOFFSET by default
   local name=kora-outbox-prodcheck-skewed
   docker rm -f "$name" > /dev/null 2>&1 || true
   docker run -d --name "$name" -p 127.0.0.1:9083:9083 -p 127.0.0.1:9088:9088 -v "$PC/shop/build/install/shop-n:/app:ro" \
-    -e HTTP_PORT=9083 -e METRICS_PORT=9088 -e INSTANCE_NAME="app-skewed$1" \
+    -e HTTP_PORT=9083 -e METRICS_PORT=9088 -e INSTANCE_NAME="${2:-app-skewed$1}" \
     -e POSTGRES_URL=jdbc:postgresql://host.docker.internal:55432/outbox \
     -e TARGET_DB_URL=jdbc:postgresql://host.docker.internal:55433/outbox -e TARGET_URL=http://host.docker.internal:9090 \
     -e LD_PRELOAD="$FAKETIME_LIB/libfaketimeMT.so.1" -e FAKETIME="$1" -e FAKETIME_DONT_FAKE_MONOTONIC=1 \

@@ -62,8 +62,7 @@ s_pg_conn_kill() { # every backend of the apps killed, again and again
 
 s_pg_blackhole() { # the network goes silent for 25 s, then comes back; socketTimeout bounds every wait
   pc_begin pg-blackhole
-  proxy_up 55440 55432
-  PC_PG_URL=jdbc:postgresql://localhost:55440/outbox
+  proxied_source
   trio "$MIX" -Ddb.dsProperties.socketTimeout=5 -Doutbox.relay.shutdownTimeout=5s
   sleep 10
   proxy blackhole
@@ -83,8 +82,7 @@ s_pg_blackhole() { # the network goes silent for 25 s, then comes back; socketTi
 
 s_pg_silent_drop() { # a firewall forgets the connections: open sockets are dead for good, new ones work. Self-heal with socketTimeout
   pc_begin pg-silent-drop
-  proxy_up 55440 55432
-  PC_PG_URL=jdbc:postgresql://localhost:55440/outbox
+  proxied_source
   trio "$MIX" -Ddb.dsProperties.socketTimeout=5
   sleep 10
   proxy drop
@@ -98,8 +96,7 @@ s_pg_silent_drop() { # a firewall forgets the connections: open sockets are dead
 
 s_pg_silent_drop_no_timeout() { # the same with pgjdbc's default socketTimeout = 0: the relay heals by outbox.networkTimeout
   pc_begin pg-silent-drop-no-timeout
-  proxy_up 55440 55432
-  PC_PG_URL=jdbc:postgresql://localhost:55440/outbox
+  proxied_source
   local opts='-Ddb.dsProperties.socketTimeout=0 -Doutbox.networkTimeout=10s'
   trio "$MIX" $opts
   sleep 10

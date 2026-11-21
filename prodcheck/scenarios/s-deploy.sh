@@ -127,15 +127,7 @@ s_rollback_for_good() { # the same, but the rollback is final: abandon by admin 
   check "$(passes is "$(admin_code 1001 POST waiting/abandon '{"topic":"orders","key":"k1","reason":"x","nope":1}')" = 400)" "поле не из контракта: 400"
   roll "$SHOP" 1001 1002
   sleep 6
-  local left=1
-  n=0
-  until [ "$left" = 0 ] || [ "$n" -gt 20 ]; do
-    admin 1001 POST dead-letters/redrive '{"filter":{"topic":"orders","error":"abandoned"}}' > /dev/null
-    left=$(admin_body 1001 GET 'dead-letters/count?topic=orders&error=abandoned' | j 'd["count"]')
-    n=$((n + 1))
-    sleep 2
-  done
-  check "$(passes is "$left" = 0)" "все отданные письма переотправлены фильтром"
+  redrive_until_empty 1001 '{"filter":{"topic":"orders","error":"abandoned"}}' 'topic=orders&error=abandoned'
   REPAIRED="POST waiting/abandon, после возврата читателя POST dead-letters/redrive"
   pc_finish --exempt-topics orders
 }

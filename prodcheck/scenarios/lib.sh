@@ -25,8 +25,7 @@ READER_KEY=prodcheck-reader
 SHOP=${SHOP_BIN:-$PC/shop/build/install/shop-n/bin/shop} # SHOP_BIN: another app in shop-n's place, the store say
 SHOP_N1=$PC/shop/build/install/shop-n1/bin/shop
 SHOP_N2=$PC/shop/build/install/shop-n2/bin/shop
-STORE35=$PC/store/build/install/store-boot35/bin/store # the Spring Boot twin of shop-n, Boot 3.5
-STORE41=$PC/store/build/install/store-boot41/bin/store # and Boot 4.1
+STORE41=$PC/store/build/install/store-boot41/bin/store # the Spring Boot twin of shop-n, Boot 4.1
 COURIER=$PC/courier/build/install/courier/bin/courier
 TARGET=$PC/target/build/install/target/bin/target
 ACCOUNTS=$PC/accounts/build/install/accounts/bin/accounts
@@ -94,7 +93,6 @@ pc_app() {
   if [ -n "${LOADS[$i]:-}" ]; then pc_load "$i" "${LOADS[$i]}"; fi
 }
 pc_shop() { pc_app "$SHOP" "$@"; }
-pc_store() { pc_app "${STORE:-$STORE41}" "$@"; } # STORE picks the Boot line, 4.1 by default
 pc_courier() { pc_app "$COURIER" "$@"; }
 
 # thread_dump I LABEL: the instance's stacks into build/results, and the outbox threads' top frames to the log.
@@ -177,6 +175,8 @@ proxy_up() {
   sleep 1
 }
 proxy() { echo "$*" > "$PROXY_CTL"; fault "сеть: $*"; }
+# proxied_source: the apps started after it reach the source through tcpfault on 55440.
+proxied_source() { proxy_up 55440 55432; PC_PG_URL=jdbc:postgresql://localhost:55440/outbox; }
 
 # pc_finish [ledger args]: stops the loads, waits for the drain, runs the ledger and /status checks, writes the result.
 pc_finish() {
@@ -193,7 +193,7 @@ pc_finish() {
   elif [ -n "$alive" ]; then
     status=$(admin_body "$alive" GET status)
     local bad
-    bad=$(echo "$status" | j '[k for k, v in {"halted": d["halted"], "orphans": d["orphans"], "tailOverflow": False}.items() if v]') || bad="status unreadable"
+    bad=$(echo "$status" | j '[k for k, v in {"halted": d["halted"], "orphans": d["orphans"]}.items() if v]') || bad="status unreadable"
     [ "$bad" = "[]" ] || CHECKS="$CHECKS
 - **НЕ ПРОЙДЕНА**: /status после сверки: $bad"
     [ "$bad" = "[]" ] || CHECK_FAILED=1

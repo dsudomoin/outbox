@@ -26,8 +26,7 @@ xid_begin() { # xid_begin NAME [-Dkey=value...]: three shops behind the proxy, a
   local name=$1
   shift
   pc_begin "$name"
-  proxy_up 55440 55432
-  PC_PG_URL=jdbc:postgresql://localhost:55440/outbox
+  proxied_source
   trio "$MIX" "$@"
   sleep 15
 }

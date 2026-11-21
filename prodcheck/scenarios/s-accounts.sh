@@ -133,19 +133,23 @@ s_accounts_start_check() { # the migration without SELECT on the sequence: a ref
   acc_end
 }
 
-s_accounts_kill() { # kill -9 while a call is in flight and records are parked; the business commit went, the relay's did not
-  acc_begin accounts-kill
+acc_kills() { # acc_kills [-Dkey=value...]: three instances under load, four rounds of kill -9 and a restart with the same options
   local n i
-  for i in 1001 1002 1003; do acc "$i"; acc_load "$i"; done
+  for i in 1001 1002 1003; do acc "$i" "$@"; acc_load "$i"; done
   for n in 1 2 3 4; do
     sleep 8
     i=$((1001 + n % 3))
     pc_kill "$i"
     sleep 4
-    acc "$i"
+    acc "$i" "$@"
   done
   sleep 5
   acc_end --min-dups 1
+}
+
+s_accounts_kill() { # kill -9 while a call is in flight and records are parked; the business commit went, the relay's did not
+  acc_begin accounts-kill
+  acc_kills
 }
 
 s_accounts_conn_kill() { # the backends die under the step: the failure of the relay's commit right after a business commit
@@ -166,32 +170,25 @@ row_lock() { # row_lock SECONDS: someone holds the account's row as a synchronou
   fault "строка счёта k3 заблокирована на $1 с"
 }
 
-s_accounts_row_lock() { # the handler waits for an account's row past the batch budget, with the service's socketTimeout = batchTimeout
-  acc_begin accounts-row-lock
+row_lock_run() { # row_lock_run NAME [-Dkey=value...]: k3's row held for 70 s under load; the other accounts' latency in the result
+  acc_begin "$1"
+  shift
   local i
-  for i in 1001 1002; do acc "$i"; acc_load "$i" 'rate=50&writers=2&keys=30'; done
+  for i in 1001 1002; do acc "$i" "$@"; acc_load "$i" 'rate=50&writers=2&keys=30'; done
   sleep 5
   local from=$(now)
   row_lock 70
   sleep 75
   local to=$(now)
   sleep 5
-  log "see latency of the other accounts in the result"
   acc_end --slow-keys k3 --slow-from "$from" --slow-to "$to"
 }
 
-s_accounts_row_lock_fixed() { # the same with lock_timeout below the budget: the wait ends in a Retry of one key, the worker stays free
-  acc_begin accounts-row-lock-fixed
-  local i
-  for i in 1001 1002; do acc "$i" -Daccounts.lockTimeoutMs=2000; acc_load "$i" 'rate=50&writers=2&keys=30'; done
-  sleep 5
-  local from=$(now)
-  row_lock 70
-  sleep 75
-  local to=$(now)
-  sleep 5
-  acc_end --slow-keys k3 --slow-from "$from" --slow-to "$to"
-}
+# the handler waits for an account's row past the batch budget, with the service's socketTimeout = batchTimeout
+s_accounts_row_lock() { row_lock_run accounts-row-lock; }
+
+# the same with lock_timeout below the budget: the wait ends in a Retry of one key, the worker stays free
+s_accounts_row_lock_fixed() { row_lock_run accounts-row-lock-fixed -Daccounts.lockTimeoutMs=2000; }
 
 s_accounts_zombie() { # the JDBC wait outlives the hard timeout: the abandoned call commits after its retry began; one effect
   acc_begin accounts-zombie
@@ -322,7 +319,8 @@ s_accounts_pg_restart() { # Postgres 17 restarts and goes away for a minute: wit
   local t=$(now) before
   wait_for 30 docker exec "$PG" pg_isready -U outbox -d outbox -q || true
   before=$(effects)
-  check "$(passes wait_for 120 sh -c "[ \"\$(docker exec $PG psql -U outbox -d outbox -Atq -c 'select count(*) from accounts.pc_effect')\" -gt $before ]")" "доставка вернулась сама через $(($(now) - t)) с после возврата базы"
+  back() { [ "$(acc_q 'select count(*) from pc_effect')" -gt "$before" ]; }
+  check "$(passes wait_for 120 back)" "доставка вернулась сама через $(($(now) - t)) с после возврата базы"
   sleep 5
   acc_end
 }
@@ -331,17 +329,7 @@ s_accounts_same_type_held() { # with the README's rule in the handler (hold a ke
   acc_begin accounts-same-type-held
   parked_watch
   ACC_FINISH=(--exempt-tags wait --order-within-tag wait --timeout 120)
-  local n i
-  for i in 1001 1002 1003; do acc "$i" -Daccounts.holdSameType=true; acc_load "$i"; done
-  for n in 1 2 3 4; do
-    sleep 8
-    i=$((1001 + n % 3))
-    pc_kill "$i"
-    sleep 4
-    acc "$i" -Daccounts.holdSameType=true
-  done
-  sleep 5
-  acc_end --min-dups 1
+  acc_kills -Daccounts.holdSameType=true
 }
 
 # The service's recommendations, each with the plain form it replaces. The defaults stay the service's.
@@ -360,7 +348,7 @@ s_accounts_unknown_source_ack() { # as the service has it: a source it does not 
   arrived=$(acc_q "select count(*) from pc_arrival where tag = 'unknown-source'")
   applied=$(acc_q "select count(*) from pc_effect where tag = 'unknown-source'")
   dead=$(acc_q "select count(*) from account_events_dead")
-  left=$(acc_q "select (select count(*) from account_events_retry) + (select count(*) from account_events_parked where convert_from(key, 'UTF8') = 'k7' and false)")
+  left=$(acc_q "select count(*) from account_events_retry")
   check "$(passes is "$arrived" = 5)" "все пять дошли до обработчика"
   check "$(passes is "$applied" = 0)" "эффекта нет: событие подтверждено и исчезло, потеря по коду сервиса ($applied эффектов)"
   check "$(passes is "$dead" = 0)" "и следов нет: в dead $dead, ждущих $left"

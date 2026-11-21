@@ -1,7 +1,6 @@
 # The threads beside the relay and OutboxRelay.drain(): «Алерты» (route_unchecked), «Порядок запуска и остановки»,
 # «Таймауты и зависания».
 route_unchecked() { on "$1" metric outbox_messages_route_unchecked_total; }
-silent_url() { proxy_up 55440 55432; PC_PG_URL=jdbc:postgresql://localhost:55440/outbox; }
 
 s_route_unchecked() { # the heartbeat cannot read the others' reports past 3 × maintenanceInterval: sends go through unchecked, counted, and it heals by itself
   pc_begin route-unchecked
@@ -16,7 +15,7 @@ s_route_unchecked() { # the heartbeat cannot read the others' reports past 3 × 
   check "$(passes logs_have 'outbox heartbeat of instance .* failed')" "WARN из строки алерта: $(cat "$LOGS/pc-$SCN-"100*.log | grep -m1 'heartbeat of instance' | cut -d' ' -f3- | cut -c1-140)"
   check "$(passes logs_have 'through unchecked')" "WARN: $(cat "$LOGS/pc-$SCN-"100*.log | grep -m1 'through unchecked' | cut -d' ' -f3- | cut -c1-180)"
   local failed
-  failed=$(stats 1001 | j 'sum(d["failedByClass"].values())')
+  failed=$(writers_failed 1001)
   check "$(passes is "$failed" = 0)" "ни одна отправка не отвергнута: последнее чтение их допускало, ничего не теряется"
   sleep $((t + 34 - $(now)))
   local a b
@@ -104,7 +103,7 @@ hung_drain() { # hung_drain I LABEL BOUND: /drain must return within BOUND, or t
 s_drain_silent_drop() { # socketTimeout = 0: a drop under each part of drain. outbox.networkTimeout bounds the shards' connection; and the rest?
   pc_begin drain-silent-drop
   pc_target
-  silent_url
+  proxied_source
   local opts='-Ddb.dsProperties.socketTimeout=0 -Doutbox.networkTimeout=10s -Doutbox.relay.enabled=false -Dprodcheck.hook=policy -Doutbox.deadLetters.timeout=3s'
   local bound=60 i=1001
   tfault 'delayMs=30'
@@ -151,7 +150,7 @@ s_drain_silent_drop() { # socketTimeout = 0: a drop under each part of drain. ou
 s_silent_drop_background() { # socketTimeout = 0: maintenance, the dead-letter pass and the heartbeat each lose their connection in the middle of a statement
   pc_begin silent-drop-background
   pc_target
-  silent_url
+  proxied_source
   local opts='-Ddb.dsProperties.socketTimeout=0 -Doutbox.networkTimeout=10s -Dprodcheck.hook=policy -Doutbox.deadLetters.timeout=30s -Doutbox.partitions.maintenanceInterval=2s -Doutbox.partitions.xidsPerPartition=1000 -Doutbox.partitions.premake=4'
   local i=1001
   pc_shop "$i" $opts

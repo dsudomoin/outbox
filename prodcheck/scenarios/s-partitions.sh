@@ -91,15 +91,20 @@ fullest_range() { # the range holding the most rows, below the one being written
     order by t.n desc limit 1"
 }
 
-s_orphan_foreign() { # an operator detaches a range with rows nobody delivered: ERROR, gauge, /status; one admin call returns them
-  pc_begin orphan-foreign
+# orphan_begin NAME: the target fails under a load of tiny ranges; ORPHAN is the fullest range below the written one
+orphan_begin() {
+  pc_begin "$1"
   PC_OPTS=$TINY trio 'rate=200&writers=4&keys=3000&topics=payments' # several keys per shard: the shard pauses, its rows stay in their range; one key per shard goes to the retry table
   sleep 3
   tfault 'mode=error'
   sleep 12
-  local part
-  part=$(fullest_range)
-  [ -n "$part" ] || { check 1 "нет диапазона со строками"; pc_finish; return 1; }
+  ORPHAN=$(fullest_range)
+  [ -n "$ORPHAN" ] || { check 1 "нет диапазона со строками"; pc_finish; return 1; }
+}
+
+s_orphan_foreign() { # an operator detaches a range with rows nobody delivered: ERROR, gauge, /status; one admin call returns them
+  orphan_begin orphan-foreign || return 1
+  local part=$ORPHAN
   psql_q "alter table outbox detach partition $part" > /dev/null
   fault "диапазон $part со строками отсоединён вручную"
   sleep 4
@@ -120,14 +125,8 @@ s_orphan_foreign() { # an operator detaches a range with rows nobody delivered: 
 }
 
 s_orphan_own() { # a crash between the library's own detach and drop: maintenance moves the rows back by itself
-  pc_begin orphan-own
-  PC_OPTS=$TINY trio 'rate=200&writers=4&keys=3000&topics=payments' # several keys per shard: the shard pauses, its rows stay in their range; one key per shard goes to the retry table
-  sleep 3
-  tfault 'mode=error'
-  sleep 12
-  local part
-  part=$(fullest_range)
-  [ -n "$part" ] || { check 1 "нет диапазона со строками"; pc_finish; return 1; }
+  orphan_begin orphan-own || return 1
+  local part=$ORPHAN
   psql_q "insert into outbox_dropping (table_name) values ('$part'); alter table outbox detach partition $part" > /dev/null
   fault "как падение между detach и drop: $part отсоединён с отметкой"
   tfault 'mode=ok'
