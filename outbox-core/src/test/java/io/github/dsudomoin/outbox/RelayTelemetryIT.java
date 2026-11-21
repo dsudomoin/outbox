@@ -230,15 +230,17 @@ class RelayTelemetryIT {
 
     @Test
     void aRollbackThatThrowsAnErrorStillEndsTheSettleAndTheStep() throws Exception {
-        // the commit fails (a deferred trigger on the cursor table), then the rollback of that connection throws an
-        // Error after rolling back
+        // the step's COMMIT goes with its cursor rows; the commit() after it, which sends nothing, then throws, and
+        // the rollback of that connection throws an Error after rolling back
+        var config = new TestOutboxConfig().workers(1);
+        var cursor = config.table() + "_cursor";
         var direct = TestDataSources.newDataSource();
         var rollbackErrors = new AtomicInteger();
         var failing = (javax.sql.DataSource) java.lang.reflect.Proxy.newProxyInstance(
                 javax.sql.DataSource.class.getClassLoader(), new Class<?>[] {javax.sql.DataSource.class},
                 (proxy, method, args) -> {
                     var target = method.getName().equals("getConnection") && (args == null || args.length == 0)
-                            ? rollbackFailing(direct.getConnection(), rollbackErrors) : null;
+                            ? commitAndRollbackFailing(direct.getConnection(), cursor, rollbackErrors) : null;
                     if (target != null) {
                         return target;
                     }
@@ -248,32 +250,21 @@ class RelayTelemetryIT {
                         throw e.getCause();
                     }
                 });
-        var config = new TestOutboxConfig().workers(1);
-        var cursor = config.table() + "_cursor";
         var events = new Events(transactions, cursor);
         var failingTransactions = new JdbcTransactions(failing);
         var r = OutboxRuntime.builder(config, failingTransactions, new RecordingHandler()).telemetry(events).build();
         runtime = r;
         r.start();
-        var function = config.table() + "_refuse";
-        try (var c = transactions.newConnection()) {
-            TestSql.execute(c, "create function " + function + "() returns trigger language plpgsql as $$ begin"
-                    + " raise exception 'commit refused'; end $$");
-            TestSql.execute(c, "create constraint trigger refuse after insert on " + cursor
-                    + " deferrable initially deferred for each row execute function " + function + "()");
-        }
 
         failingTransactions.inTx(c -> r.outbox().send(OutboxMessage.of("orders", "k", bytes("m"))));
         await(Duration.ofSeconds(10), () -> rollbackErrors.get() > 0
                 && events.ended().stream().anyMatch(s -> s.log.contains("failed")));
         runtime.close();
-        try (var c = transactions.newConnection()) {
-            TestSql.execute(c, "drop trigger refuse on " + cursor);
-        }
 
         var failed = events.ended().stream().filter(s -> s.log.contains("failed")).findFirst().orElseThrow();
-        assertThat(failed.log).endsWith("settleStarted", "settleFailed(1)", "failed");
-        assertThat(failed.errors.get(0)).hasMessageContaining("commit refused");
+        assertThat(failed.log).endsWith("settleStarted", "settleFailed(1)", "failed").doesNotContain("finished",
+                "committed(1)");
+        assertThat(failed.errors.get(0)).hasMessageContaining("commit failed (test)");
     }
 
     @Test
@@ -293,25 +284,48 @@ class RelayTelemetryIT {
         assertThat(step.log).endsWith("committed(1)", "finished");
     }
 
-    /** {@code c}, whose rollback right after a failed commit rolls back and then throws an Error. */
-    private static java.sql.Connection rollbackFailing(java.sql.Connection c, AtomicInteger errors) {
+    /**
+     * {@code c}, whose first relay step that sends its COMMIT with its rows for {@code cursor} (an insert into it ending
+     * in {@code ; commit}) is followed by a {@code commit()} that throws, the step committed, and whose rollback after
+     * that rolls back and then throws an Error.
+     */
+    private static java.sql.Connection commitAndRollbackFailing(java.sql.Connection c, String cursor,
+            AtomicInteger errors) {
+        var once = new java.util.concurrent.atomic.AtomicBoolean();
+        var stepSent = new java.util.concurrent.atomic.AtomicBoolean();
         var commitFailed = new java.util.concurrent.atomic.AtomicBoolean();
         return (java.sql.Connection) java.lang.reflect.Proxy.newProxyInstance(
                 java.sql.Connection.class.getClassLoader(), new Class<?>[] {java.sql.Connection.class},
                 (proxy, method, args) -> {
+                    Object result;
                     try {
-                        var result = method.invoke(c, args);
-                        if (method.getName().equals("rollback") && args == null && commitFailed.getAndSet(false)) {
-                            errors.incrementAndGet();
-                            throw new AssertionError("rollback failed (test)");
-                        }
-                        return result;
+                        result = method.invoke(c, args);
                     } catch (java.lang.reflect.InvocationTargetException e) {
-                        if (method.getName().equals("commit")) {
-                            commitFailed.set(true);
-                        }
                         throw e.getCause();
                     }
+                    switch (method.getName()) {
+                        case "prepareStatement" -> {
+                            var sql = (String) args[0];
+                            if (sql.startsWith("insert into") && sql.contains(cursor) && sql.endsWith("; commit")
+                                    && once.compareAndSet(false, true)) {
+                                stepSent.set(true);
+                            }
+                        }
+                        case "commit" -> {
+                            if (stepSent.getAndSet(false)) {
+                                commitFailed.set(true);
+                                throw new java.sql.SQLException("commit failed (test)");
+                            }
+                        }
+                        case "rollback" -> {
+                            if (args == null && commitFailed.getAndSet(false)) {
+                                errors.incrementAndGet();
+                                throw new AssertionError("rollback failed (test)");
+                            }
+                        }
+                        default -> { }
+                    }
+                    return result;
                 });
     }
 
