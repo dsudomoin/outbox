@@ -4,12 +4,12 @@ import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.internal.BatchReader.ShardRead;
+import io.github.dsudomoin.outbox.testing.Intercepting;
+import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
@@ -89,7 +89,7 @@ class ChunkReadBenchmark {
                     latest = ticks.latest(c).id();
                 }
                 var prepared = new ArrayList<String>();
-                try (var c = recording(TestDb.connect(), prepared)) {
+                try (var c = recording(prepared)) {
                     ShardProcessor.prepareTransaction(c, config.batchTimeout());
                     processor.tryProcess(c, group, latest, Instant.now());
                     c.commit();
@@ -185,19 +185,13 @@ class ChunkReadBenchmark {
         }
     }
 
-    /** {@code c}, adding the SQL of each statement it prepares to {@code prepared}. */
-    private static Connection recording(Connection c, List<String> prepared) {
-        return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[] {Connection.class},
-                (proxy, method, args) -> {
-                    if (method.getName().startsWith("prepare") && args != null && args[0] instanceof String sql) {
-                        prepared.add(sql);
-                    }
-                    try {
-                        return method.invoke(c, args);
-                    } catch (InvocationTargetException e) {
-                        throw e.getCause();
-                    }
-                });
+    /** A new connection, adding the SQL of each statement it prepares to {@code prepared}. */
+    private static Connection recording(List<String> prepared) throws SQLException {
+        return Intercepting.intercepting(TestDataSources.newDataSource(), (real, method, args) -> {
+            if (method.getName().startsWith("prepare") && args != null && args[0] instanceof String sql) {
+                prepared.add(sql);
+            }
+        }).getConnection();
     }
 
     private static PgSnapshot tick(Ticks ticks) throws SQLException {

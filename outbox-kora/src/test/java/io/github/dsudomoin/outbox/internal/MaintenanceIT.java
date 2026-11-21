@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox.internal;
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
+import static io.github.dsudomoin.outbox.testing.TestSql.queryStrings;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -47,6 +48,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Tag;
@@ -87,7 +89,7 @@ class MaintenanceIT {
         assertThat(relay.drain()).isEqualTo(2);
         long xmin = horizonXmin();
         var before = ranges();
-        var processed = before.stream().filter(b -> b.to() != null && Long.parseLong(b.to()) <= xmin).toList();
+        var processed = before.stream().filter(endingBy(xmin)).toList();
         assertThat(processed).as("ranges below the cursors' xmin").hasSizeGreaterThanOrEqualTo(2);
 
         assertThat(maintenance().runOnce()).isTrue();
@@ -150,7 +152,7 @@ class MaintenanceIT {
         TestDb.burnXids(3000);
         relay.drain();
         long xmin = horizonXmin();
-        var processed = ranges().stream().filter(b -> b.to() != null && Long.parseLong(b.to()) <= xmin).toList();
+        var processed = ranges().stream().filter(endingBy(xmin)).toList();
         assertThat(processed).isNotEmpty();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null), Duration.ofMillis(300));
 
@@ -205,13 +207,8 @@ class MaintenanceIT {
         assertThat(List.of(runA.get(10, TimeUnit.SECONDS), runB.get(10, TimeUnit.SECONDS)))
                 .containsExactlyInAnyOrder(true, false);
         // the lock is free again
-        try (var c = TestDb.connect(); var ps = c.prepareStatement("select pg_try_advisory_lock(?, ?)")) {
-            ps.setInt(1, names.internalNamespace());
-            ps.setInt(2, TableNames.LOCK_MAINTENANCE);
-            try (var rs = ps.executeQuery()) {
-                rs.next();
-                assertThat(rs.getBoolean(1)).isTrue();
-            }
+        try (var c = TestDb.connect()) {
+            assertThat(queryString(c, "select pg_try_advisory_lock" + maintenanceLock() + "::text")).isEqualTo("true");
         }
     }
 
@@ -243,19 +240,11 @@ class MaintenanceIT {
         try (err) {
             try (var otherRunner = TestDb.connect()) {
                 // another instance is mid-run: the check needs no maintenance lock, so every instance halts
-                try (var ps = otherRunner.prepareStatement("select pg_advisory_lock(?, ?)")) {
-                    ps.setInt(1, names.internalNamespace());
-                    ps.setInt(2, TableNames.LOCK_MAINTENANCE);
-                    ps.execute();
-                }
+                execute(otherRunner, "select pg_advisory_lock" + maintenanceLock());
 
                 maintenance.runOnce();
                 assertThat(maintenance.halted()).isTrue();
-                try (var ps = otherRunner.prepareStatement("select pg_advisory_unlock(?, ?)")) { // close does not wait
-                    ps.setInt(1, names.internalNamespace());
-                    ps.setInt(2, TableNames.LOCK_MAINTENANCE);
-                    ps.execute();
-                }
+                execute(otherRunner, "select pg_advisory_unlock" + maintenanceLock()); // close does not wait
             }
             long cursorRows;
             try (var c = TestDb.connect()) {
@@ -468,7 +457,7 @@ class MaintenanceIT {
         try (var c = TestDb.connect()) {
             xmin = new Ticks(names, config.shards()).get(c, drained).snapshot().xmin();
         }
-        var processed = ranges().stream().filter(b -> b.to() != null && Long.parseLong(b.to()) <= xmin).toList();
+        var processed = ranges().stream().filter(endingBy(xmin)).toList();
         assertThat(processed).as("ranges below the drain tick's xmin").hasSizeGreaterThanOrEqualTo(2);
 
         assertThat(maintenance().runOnce()).isTrue();
@@ -485,12 +474,7 @@ class MaintenanceIT {
         }
 
         // idle ticks later, the next run moves on again, and shards whose cursor ticks are long gone deliver
-        long later;
-        try (var c = TestDb.connect()) {
-            var ticks = new Ticks(names, config.shards());
-            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
-            later = ticks.latest(c).id();
-        }
+        long later = makeTick();
         assertThat(maintenance().runOnce()).isTrue();
         assertThat(tickIds()).startsWith(bootstrapTick).endsWith(later);
         assertThat(tickIds()).containsAll(latestCursors().stream().map(Cursor::tickId).toList());
@@ -668,7 +652,7 @@ class MaintenanceIT {
     void anObsoleteCheckpointIsReplacedWithoutAnAlarm() throws Exception {
         bootstrap(); // 4 shards, every cursor on the bootstrap tick
         var maintenance = maintenance();
-        long checkpointed = makeTick();
+        makeTick();
         assertThat(maintenance.runOnce()).isTrue(); // the checkpoint on it
         long ahead = makeTick();
         try (var c = TestDb.connect()) { // every shard steps past it, then the previous release's cleanup in a mixed
@@ -690,7 +674,6 @@ class MaintenanceIT {
             assertThat(queryString(c, "select string_agg(tick_id::text, ',') from " + names.checkpoint()))
                     .as("replaced by the run's").isEqualTo(Long.toString(latest));
         }
-        assertThat(checkpointed).isLessThan(ahead);
     }
 
     @Test
@@ -728,12 +711,7 @@ class MaintenanceIT {
     @Test
     void shardsStrandedByAnIgnoredCheckpointAreReportedNotAFailedRead() throws Exception {
         bootstrap(); // 4 shards, every cursor on the bootstrap tick
-        long latest;
-        try (var c = TestDb.connect()) {
-            var ticks = new Ticks(names, config.shards());
-            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
-            latest = ticks.latest(c).id();
-        }
+        long latest = makeTick();
         var maintenance = maintenance();
         assertThat(maintenance.runOnce()).isTrue(); // the checkpoint moves every shard on
         long bootstrapTick = latestCursors().get(0).tickId();
@@ -823,10 +801,7 @@ class MaintenanceIT {
     void runsExtendWhenHalfOfPremakeIsUsed() throws Exception {
         bootstrap();
         try (var c = TestDb.connect()) {
-            var partitions = new XidPartitions(names, config.partitions());
-            while (partitions.premadeAhead(c) > config.premake() / 2) {
-                TestDb.burnXids(200);
-            }
+            burnIntoExtensionWindow(c);
             long offset = queryLong(c, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint % 1000");
             if (offset > 900) { // the run's own xids must not carry the counter into the next range
                 TestDb.burnXids((int) (1000 - offset) + 10);
@@ -857,10 +832,7 @@ class MaintenanceIT {
     void rangesMadeForASwapThatTimedOutAreKeptForTheNextRun() throws Exception {
         bootstrap();
         try (var c = TestDb.connect()) {
-            var partitions = new XidPartitions(names, config.partitions());
-            while (partitions.premadeAhead(c) > config.premake() / 2) {
-                TestDb.burnXids(200);
-            }
+            burnIntoExtensionWindow(c);
         }
         var maintenance = maintenance();
         List<String> made;
@@ -897,31 +869,15 @@ class MaintenanceIT {
     void pendingRangeDetachDoesNotJamExtension() throws Exception {
         bootstrap();
         var relay = relay(new RecordingHandler(), maintenance());
-        send(msg("t", "k", "a"));
-        TestDb.burnXids(3000);
-        relay.drain();
-        long xmin = horizonXmin();
-        var pending = ranges().stream()
-                .filter(b -> b.to() != null && Long.parseLong(b.to()) <= xmin)
-                .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
-                .orElseThrow();
         var registry = new SimpleMeterRegistry();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry), Duration.ofMillis(300));
-        try (var reader = TestDb.connect()) {
-            reader.setAutoCommit(false);
-            queryLong(reader, "select count(*) from " + names.base()); // the drop's detach times out waiting for it
-            assertThat(maintenance.runOnce()).isTrue();
-            reader.commit();
-        }
+        var pending = leavePending(relay, maintenance);
         try (var c = TestDb.connect()) {
             assertThat(queryString(c, "select inhdetachpending::text from pg_inherits where inhrelid = to_regclass(?)",
                             pending.name()))
                     .isEqualTo("true");
             // into the extension window (at most premake / 2 ahead): the same run also extends beside the range
-            var partitions = new XidPartitions(names, config.partitions());
-            while (partitions.premadeAhead(c) > config.premake() / 2) {
-                TestDb.burnXids(200);
-            }
+            burnIntoExtensionWindow(c);
         }
 
         assertThat(maintenance.runOnce()).isTrue();
@@ -938,21 +894,8 @@ class MaintenanceIT {
     void relayedRangeLeftPendingIsDroppedPastAnUnrelatedSnapshot() throws Exception {
         bootstrap();
         var relay = relay(new RecordingHandler(), maintenance());
-        send(msg("t", "k", "a"));
-        TestDb.burnXids(3000);
-        relay.drain();
-        long xmin = horizonXmin();
-        var pending = ranges().stream()
-                .filter(b -> b.to() != null && Long.parseLong(b.to()) <= xmin)
-                .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
-                .orElseThrow();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null), Duration.ofMillis(300));
-        try (var reader = TestDb.connect()) {
-            reader.setAutoCommit(false);
-            queryLong(reader, "select count(*) from " + names.base()); // the drop's detach times out waiting for it
-            assertThat(maintenance.runOnce()).isTrue();
-            reader.commit();
-        }
+        var pending = leavePending(relay, maintenance);
         var unrelated = TestDb.uniqueTable();
         try (var c = TestDb.connect(); var report = TestDb.connect(); var err = new CapturedStderr()) {
             assertThat(queryString(c, "select inhdetachpending::text from pg_inherits where inhrelid = to_regclass(?)",
@@ -966,10 +909,7 @@ class MaintenanceIT {
             TestDb.burnXids(3000);
             relay.drain();
             long horizon = horizonXmin();
-            var next = ranges().stream()
-                    .filter(b -> b.to() != null && Long.parseLong(b.to()) <= horizon && !b.equals(pending))
-                    .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
-                    .orElseThrow();
+            var next = lowest(endingBy(horizon).and(b -> !b.equals(pending)));
 
             assertThat(maintenance.runOnce()).isTrue();
             assertThat(maintenance.runOnce()).isTrue();
@@ -989,21 +929,8 @@ class MaintenanceIT {
     void relayedRangeLeftPendingWithADependentViewIsFinalizedSoOtherRangesStillDrop() throws Exception {
         bootstrap();
         var relay = relay(new RecordingHandler(), maintenance());
-        send(msg("t", "k", "a"));
-        TestDb.burnXids(3000);
-        relay.drain();
-        long xmin = horizonXmin();
-        var pending = ranges().stream()
-                .filter(b -> b.to() != null && Long.parseLong(b.to()) <= xmin)
-                .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
-                .orElseThrow();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null), Duration.ofMillis(300));
-        try (var reader = TestDb.connect()) {
-            reader.setAutoCommit(false);
-            queryLong(reader, "select count(*) from " + names.base()); // the drop's detach times out waiting for it
-            assertThat(maintenance.runOnce()).isTrue();
-            reader.commit();
-        }
+        var pending = leavePending(relay, maintenance);
         var view = TestDb.uniqueTable();
         try (var c = TestDb.connect(); var err = new CapturedStderr()) {
             assertThat(queryString(c, "select inhdetachpending::text from pg_inherits where inhrelid = to_regclass(?)",
@@ -1014,10 +941,7 @@ class MaintenanceIT {
             TestDb.burnXids(3000);
             relay.drain();
             long horizon = horizonXmin();
-            var next = ranges().stream()
-                    .filter(b -> b.to() != null && Long.parseLong(b.to()) <= horizon && !b.equals(pending))
-                    .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
-                    .orElseThrow();
+            var next = lowest(endingBy(horizon).and(b -> !b.equals(pending)));
 
             maintenance.runOnce();
             maintenance.runOnce();
@@ -1041,21 +965,14 @@ class MaintenanceIT {
     void someoneElsesPendingRangeIsFinalizedAndItsWaitNamesTheOldestSnapshots() throws Exception {
         bootstrap();
         TestDb.burnXids(1100); // the lowest range below the current xid's: one holding it would be attached back
-        var range = ranges().stream()
-                .filter(b -> b.to() != null)
-                .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
-                .orElseThrow();
+        var range = lowest(b -> b.to() != null);
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null), Duration.ofMillis(300));
         var unrelated = TestDb.uniqueTable();
         try (var c = TestDb.connect(); var reader = TestDb.connect(); var report = TestDb.connect()) {
             // an operator's detach that timed out: not recorded as relayed, so its rows may be undelivered
             reader.setAutoCommit(false);
             queryLong(reader, "select count(*) from " + names.base());
-            execute(c, "set lock_timeout = '300ms'");
-            assertThatThrownBy(() -> execute(c, "alter table " + names.base() + " detach partition " + range.name()
-                            + " concurrently"))
-                    .isInstanceOf(SQLException.class);
-            execute(c, "reset lock_timeout");
+            failedDetach(c, range.name());
             reader.commit();
             execute(c, "create table " + unrelated + " (a int)");
             report.setAutoCommit(false);
@@ -1097,11 +1014,7 @@ class MaintenanceIT {
             execute(holder, "set transaction isolation level repeatable read");
             queryLong(holder, "select count(*) from " + names.base());
             // a tail detach that timed out waiting for it: the tail is pending, and FINALIZE waits for the snapshot
-            execute(c, "set lock_timeout = '300ms'");
-            assertThatThrownBy(() -> execute(c, "alter table " + names.base() + " detach partition " + names.tail()
-                            + " concurrently"))
-                    .isInstanceOf(SQLException.class);
-            execute(c, "reset lock_timeout");
+            failedDetach(c, names.tail());
             long top = ranges().stream().filter(b -> b.to() != null).mapToLong(b -> Long.parseLong(b.to())).max()
                     .orElseThrow();
             long before = currentXid();
@@ -1139,11 +1052,7 @@ class MaintenanceIT {
             holder.setAutoCommit(false); // a pg_dump
             execute(holder, "set transaction isolation level repeatable read");
             queryLong(holder, "select count(*) from " + names.base());
-            execute(c, "set lock_timeout = '300ms'"); // the tail is left detach-pending, as above
-            assertThatThrownBy(() -> execute(c, "alter table " + names.base() + " detach partition " + names.tail()
-                            + " concurrently"))
-                    .isInstanceOf(SQLException.class);
-            execute(c, "reset lock_timeout");
+            failedDetach(c, names.tail()); // the tail is left detach-pending, as above
 
             assertThat(maintenance.runOnce()).isTrue();
 
@@ -1253,10 +1162,7 @@ class MaintenanceIT {
         TestDb.burnXids(3000);
         relay.drain();
         long xmin = horizonXmin();
-        var orphan = ranges().stream()
-                .filter(b -> b.to() != null && Long.parseLong(b.to()) <= xmin)
-                .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
-                .orElseThrow();
+        var orphan = lowest(endingBy(xmin));
         try (var c = TestDb.connect()) { // a run killed after its DETACH went through, before its DROP
             markDropping(c, orphan.name());
             execute(c, "alter table " + names.base() + " detach partition " + orphan.name() + " concurrently");
@@ -1274,19 +1180,7 @@ class MaintenanceIT {
     void foreignOrphanIsKeptAndNamesTheAdminCall() throws Exception {
         bootstrap(); // restoreOrphans on: it covers only the ranges maintenance detached
         var relay = relay(new RecordingHandler(), maintenance());
-        var orphan = ranges().stream() // a range with rows, detached before the relay got to them
-                .filter(b -> b.to() != null)
-                .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
-                .orElseThrow();
-        try (var c = TestDb.connect()) {
-            // overriding: from Postgres 17 a partition has the outbox's identity column
-            execute(c, "insert into " + orphan.name() + " (id, shard, xid, message_id, topic) overriding system value"
-                    + " values (1000000, 0, '" + orphan.from() + "', gen_random_uuid(), 't')");
-            while (currentXid() < Long.parseLong(orphan.to())) { // writers have moved on to the next range
-                TestDb.burnXids(200);
-            }
-            execute(c, "alter table " + names.base() + " detach partition " + orphan.name() + " concurrently");
-        }
+        var orphan = foreignOrphan(); // a range with rows, detached before the relay got to them
         send(msg("t", "k", "a"));
         TestDb.burnXids(3000);
         relay.drain();
@@ -1312,10 +1206,7 @@ class MaintenanceIT {
     void operatorsPendingDetachIsNeverTakenOverAsRelayed() throws Exception {
         bootstrap();
         var relay = relay(new RecordingHandler(), maintenance());
-        var range = ranges().stream()
-                .filter(b -> b.to() != null)
-                .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
-                .orElseThrow();
+        var range = lowest(b -> b.to() != null);
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null), Duration.ofMillis(300));
         try (var reader = TestDb.connect(); var operator = TestDb.connect()) {
             execute(operator, "insert into " + range.name() + " (id, shard, xid, message_id, topic)"
@@ -1399,18 +1290,7 @@ class MaintenanceIT {
     @Test
     void theOrphanGaugeKeepsItsLastValueWhileTheStepRuns() throws Exception {
         bootstrap();
-        var range = ranges().stream()
-                .filter(b -> b.to() != null)
-                .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
-                .orElseThrow();
-        try (var c = TestDb.connect()) {
-            execute(c, "insert into " + range.name() + " (id, shard, xid, message_id, topic) overriding system value"
-                    + " values (1000000, 0, '" + range.from() + "', gen_random_uuid(), 't')");
-            while (currentXid() < Long.parseLong(range.to())) {
-                TestDb.burnXids(200);
-            }
-            execute(c, "alter table " + names.base() + " detach partition " + range.name() + " concurrently");
-        }
+        var range = foreignOrphan();
         var registry = new SimpleMeterRegistry();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry), Duration.ofSeconds(30));
         assertThat(maintenance.runOnce()).isTrue();
@@ -1440,18 +1320,7 @@ class MaintenanceIT {
     @Test
     void keptOrphanIsNotLockedExclusivelyAndAFailedSweepIsUnknown() throws Exception {
         bootstrap();
-        var range = ranges().stream()
-                .filter(b -> b.to() != null)
-                .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
-                .orElseThrow();
-        try (var c = TestDb.connect()) {
-            execute(c, "insert into " + range.name() + " (id, shard, xid, message_id, topic) overriding system value"
-                    + " values (1000000, 0, '" + range.from() + "', gen_random_uuid(), 't')");
-            while (currentXid() < Long.parseLong(range.to())) {
-                TestDb.burnXids(200);
-            }
-            execute(c, "alter table " + names.base() + " detach partition " + range.name() + " concurrently");
-        }
+        var range = foreignOrphan();
         var registry = new SimpleMeterRegistry();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry), Duration.ofSeconds(5));
         try (var operator = TestDb.connect()) {
@@ -1611,21 +1480,10 @@ class MaintenanceIT {
         assertThat(gauge(registry, "outbox.partitions.orphaned")).as("the foreign one").isEqualTo(1);
     }
 
-    /** Orphans of ours are restored by their lower bound, not by name: {@code _x99993} before {@code _x100007}. */
-    @Test
-    void oursOrphansAreRestoredInXidOrderAcrossADigitBoundary() throws Exception {
-        bootstrap();
-        var orphans = keyedOrphans(relay(new RecordingHandler(), maintenance()));
-
-        assertThat(maintenance().runOnce()).isTrue();
-
-        assertThat(keyedPayloads()).as("the key's rows in their order").containsExactly("a", "b", "c", "d");
-        for (var orphan : orphans) {
-            assertThat(exists(orphan)).as(orphan).isFalse();
-        }
-    }
-
-    /** A restore that fails leaves the later orphans of ours for the next run, so a key's later rows don't pass it. */
+    /**
+     * A restore that fails leaves the later orphans of ours for the next run, so a key's later rows don't pass it.
+     * Orphans of ours are restored by their lower bound, not by name: {@code _x99993} before {@code _x100007}.
+     */
     @Test
     void aFailedRestoreHoldsBackTheLaterOursOrphans() throws Exception {
         bootstrap();
@@ -1647,6 +1505,9 @@ class MaintenanceIT {
 
         assertThat(keyedPayloads()).containsExactly("a", "b", "c", "d");
         assertThat(gauge(registry, "outbox.partitions.orphaned")).isZero();
+        for (var orphan : orphans) {
+            assertThat(exists(orphan)).as(orphan).isFalse();
+        }
     }
 
     /**
@@ -1680,15 +1541,10 @@ class MaintenanceIT {
 
     /** The payloads of key K's rows in the outbox, in id order. */
     private List<String> keyedPayloads() throws SQLException {
-        var payloads = new ArrayList<String>();
-        try (var c = TestDb.connect(); var st = c.createStatement(); var rs = st.executeQuery("select"
-                + " convert_from(payload, 'UTF8') from " + names.base() + " where key = convert_to('K', 'UTF8')"
-                + " order by id")) {
-            while (rs.next()) {
-                payloads.add(rs.getString(1));
-            }
+        try (var c = TestDb.connect()) {
+            return queryStrings(c, "select convert_from(payload, 'UTF8') from " + names.base()
+                    + " where key = convert_to('K', 'UTF8') order by id");
         }
-        return payloads;
     }
 
     /**
@@ -1836,12 +1692,9 @@ class MaintenanceIT {
     void dropDoesNotBlockConcurrentInserts() throws Exception {
         config.xidsPerPartition(10_000).premake(8);
         bootstrap();
-        var relay = relay(noop(), maintenance());
+        var relay = relay(record -> {}, maintenance());
         var maintenance = maintenance();
-        var lowest = ranges().stream()
-                .filter(b -> b.to() != null)
-                .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
-                .orElseThrow();
+        var lowest = lowest(b -> b.to() != null);
         var done = new AtomicBoolean();
         var maxLatency = new AtomicLong();
         var errors = new ConcurrentLinkedQueue<Throwable>();
@@ -1898,11 +1751,7 @@ class MaintenanceIT {
         assertThat(maintenance().runOnce()).isTrue();
 
         try (var holder = TestDb.connect(); var err = new CapturedStderr()) {
-            try (var ps = holder.prepareStatement("select pg_advisory_lock(?, ?)")) { // a stuck holder
-                ps.setInt(1, names.internalNamespace());
-                ps.setInt(2, TableNames.LOCK_MAINTENANCE);
-                ps.execute();
-            }
+            execute(holder, "select pg_advisory_lock" + maintenanceLock()); // a stuck holder
             assertThat(other.runOnce()).isFalse();
             assertThat(gauge(registry, "outbox.maintenance.since_success")).as("the other instance's run")
                     .isLessThan(1.0);
@@ -1914,11 +1763,7 @@ class MaintenanceIT {
             assertThat(other.runOnce()).isFalse();
 
             assertThat(err.text()).contains("WARN").contains("has not completed");
-            try (var ps = holder.prepareStatement("select pg_advisory_unlock(?, ?)")) { // close does not wait
-                ps.setInt(1, names.internalNamespace());
-                ps.setInt(2, TableNames.LOCK_MAINTENANCE);
-                ps.execute();
-            }
+            execute(holder, "select pg_advisory_unlock" + maintenanceLock()); // close does not wait
         }
         assertThat(other.runOnce()).isTrue();
         assertThat(gauge(registry, "outbox.maintenance.since_success")).isLessThan(1.0);
@@ -1972,7 +1817,7 @@ class MaintenanceIT {
                     .isEqualTo(new XidPartitions(names, config.partitions()).premadeAhead(c));
         }
         assertThat(gauge(registry, "outbox.partitions.overflow")).isZero();
-        assertThat(registry.get("outbox.shard.lag").gauge().value()).isBetween(10.0, 20.0);
+        assertThat(gauge(registry, "outbox.shard.lag")).isBetween(10.0, 20.0);
         assertThat(gauge(registry, "outbox.pending")).as("the row not relayed, both retry rows and the parked one")
                 .isEqualTo(4);
     }
@@ -2108,8 +1953,8 @@ class MaintenanceIT {
                     .filter(b -> b.to() != null && Long.parseLong(b.from()) <= current
                             && current < Long.parseLong(b.to()))
                     .mapToLong(b -> Long.parseLong(b.from())).findFirst().orElseThrow();
-            assertThat(ranges()).as("kept: the retention rule").filteredOn(
-                    b -> b.to() != null && Long.parseLong(b.to()) <= currentLower).hasSizeGreaterThanOrEqualTo(2);
+            assertThat(ranges()).as("kept: the retention rule").filteredOn(endingBy(currentLower))
+                    .hasSizeGreaterThanOrEqualTo(2);
             assertThat(gauge(registry, "outbox.partitions.retained")).isGreaterThanOrEqualTo(2);
             assertThat(log).contains("ranges of " + names.base()).contains("pid " + pid);
             holder.commit();
@@ -2120,7 +1965,7 @@ class MaintenanceIT {
 
         assertThat(gauge(registry, "outbox.partitions.retained")).isZero();
         long current = currentXid();
-        assertThat(ranges()).filteredOn(b -> b.to() != null && Long.parseLong(b.to()) <= current).isEmpty();
+        assertThat(ranges()).filteredOn(endingBy(current)).isEmpty();
     }
 
     @Test
@@ -2520,8 +2365,7 @@ class MaintenanceIT {
 
             // another maintenance run in progress; a startup waits for it, trying the lock again and again: no
             // statement of it waits holding a snapshot, which the build would wait for
-            String lock = "(" + names.internalNamespace() + ", " + TableNames.LOCK_MAINTENANCE + ")";
-            execute(run, "select pg_advisory_lock" + lock);
+            execute(run, "select pg_advisory_lock" + maintenanceLock());
             var startup = CompletableFuture.runAsync(() -> {
                 try {
                     new OutboxSchema(db, config).start();
@@ -2535,7 +2379,7 @@ class MaintenanceIT {
             awaitBuildEnd(maintenance);
             assertThat(indexState()).as("built while the startup still waits").endsWith(":true");
             assertThat(startup).isNotDone();
-            execute(run, "select pg_advisory_unlock" + lock);
+            execute(run, "select pg_advisory_unlock" + maintenanceLock());
             startup.get(20, TimeUnit.SECONDS);
             assertThat(err.text()).doesNotContain("40P01").doesNotContain("deadlock");
         }
@@ -2657,10 +2501,6 @@ class MaintenanceIT {
         return relay;
     }
 
-    private static OutboxHandler noop() {
-        return record -> {};
-    }
-
     private List<UUID> send(OutboxMessage... messages) {
         return send(new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora()), messages);
     }
@@ -2710,6 +2550,71 @@ class MaintenanceIT {
             assertThat(ticks.make(c, Duration.ZERO)).isTrue();
             return ticks.latest(c).id();
         }
+    }
+
+    /** A range, not the tail, that ends at or below {@code xid}. */
+    private static Predicate<Bound> endingBy(long xid) {
+        return b -> b.to() != null && Long.parseLong(b.to()) <= xid;
+    }
+
+    /** The lowest range {@code which} takes. */
+    private Bound lowest(Predicate<Bound> which) throws SQLException {
+        return ranges().stream().filter(which).min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
+                .orElseThrow();
+    }
+
+    /**
+     * Relays a message, burns past a range and has {@code maintenance} drop the lowest relayed range while a reader
+     * holds it: its detach times out and leaves it detach-pending. Returns that range.
+     */
+    private Bound leavePending(OutboxRelay relay, Maintenance maintenance) throws Exception {
+        send(msg("t", "k", "a"));
+        TestDb.burnXids(3000);
+        relay.drain();
+        var pending = lowest(endingBy(horizonXmin()));
+        try (var reader = TestDb.connect()) {
+            reader.setAutoCommit(false);
+            queryLong(reader, "select count(*) from " + names.base()); // the drop's detach times out waiting for it
+            assertThat(maintenance.runOnce()).isTrue();
+            reader.commit();
+        }
+        return pending;
+    }
+
+    /** The lowest range with a row, detached by someone else once the writers moved on: not ours to drop. */
+    private Bound foreignOrphan() throws SQLException {
+        var orphan = lowest(b -> b.to() != null);
+        try (var c = TestDb.connect()) {
+            // overriding: from Postgres 17 a partition has the outbox's identity column
+            execute(c, "insert into " + orphan.name() + " (id, shard, xid, message_id, topic) overriding system value"
+                    + " values (1000000, 0, '" + orphan.from() + "', gen_random_uuid(), 't')");
+            while (currentXid() < Long.parseLong(orphan.to())) { // writers have moved on to the next range
+                TestDb.burnXids(200);
+            }
+            execute(c, "alter table " + names.base() + " detach partition " + orphan.name() + " concurrently");
+        }
+        return orphan;
+    }
+
+    /** A DETACH CONCURRENTLY of {@code partition} that times out on its wait, leaving it detach-pending. */
+    private void failedDetach(Connection c, String partition) throws SQLException {
+        execute(c, "set lock_timeout = '300ms'");
+        assertThatThrownBy(() -> execute(c, "alter table " + names.base() + " detach partition " + partition
+                + " concurrently")).isInstanceOf(SQLException.class);
+        execute(c, "reset lock_timeout");
+    }
+
+    /** Burns xids until at most premake / 2 ranges lie ahead: the next run extends. */
+    private void burnIntoExtensionWindow(Connection c) throws SQLException {
+        var partitions = new XidPartitions(names, config.partitions());
+        while (partitions.premadeAhead(c) > config.premake() / 2) {
+            TestDb.burnXids(200);
+        }
+    }
+
+    /** The maintenance lock's {@code (namespace, key)}, for {@code pg_advisory_lock} and its kin. */
+    private String maintenanceLock() {
+        return "(" + names.internalNamespace() + ", " + TableNames.LOCK_MAINTENANCE + ")";
     }
 
     private long maxCursorSeq() throws SQLException {
@@ -2769,10 +2674,7 @@ class MaintenanceIT {
         TestDb.burnXids(3000);
         relay.drain();
         long horizon = horizonXmin();
-        var range = ranges().stream()
-                .filter(b -> b.to() != null && Long.parseLong(b.to()) <= horizon)
-                .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
-                .orElseThrow();
+        var range = lowest(endingBy(horizon));
         var above = new ArrayList<UUID>();
         try (var c = TestDb.connect()) {
             markDropping(c, range.name());
@@ -2826,14 +2728,8 @@ class MaintenanceIT {
     }
 
     private List<String> droppingMarkers() throws SQLException {
-        try (var c = TestDb.connect();
-                var st = c.createStatement();
-                var rs = st.executeQuery("select table_name from " + names.dropping())) {
-            var markers = new ArrayList<String>();
-            while (rs.next()) {
-                markers.add(rs.getString(1));
-            }
-            return markers;
+        try (var c = TestDb.connect()) {
+            return queryStrings(c, "select table_name from " + names.dropping());
         }
     }
 

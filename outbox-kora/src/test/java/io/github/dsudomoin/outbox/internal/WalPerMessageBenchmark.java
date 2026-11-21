@@ -2,6 +2,7 @@ package io.github.dsudomoin.outbox.internal;
 
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
+import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import io.github.dsudomoin.outbox.OutboxConfig;
@@ -10,10 +11,8 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
-import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import java.sql.Connection;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -28,9 +27,10 @@ import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 
 /**
  * WAL per delivered message with one message per transaction: writers each bump a business row of their key under its
- * row lock and send one message, at a fixed total rate, while the relay runs on the library's defaults with a handler
- * that delivers at once. Prints the WAL bytes per message over the measured window and where they went, by relation
- * and record type ({@code pg_walinspect}), plus cursor rows and ticks per message.
+ * row lock and send one message, at a fixed total rate, while the relay runs on {@link Bench#relay} (the library's
+ * defaults but a 30 s {@code batchTimeout}) with a handler that delivers at once. Prints the WAL bytes per message over
+ * the measured window and where they went, by relation and record type ({@code pg_walinspect}), plus cursor rows and
+ * ticks per message.
  *
  * <p>Not part of the build: {@code ./gradlew :outbox-kora:test -Pbenchmark --tests '*WalPerMessageBenchmark'};
  * properties {@code bench.shards} (256), {@code bench.rate} (2200 tx/s), {@code bench.writers} (16), {@code bench.keys}
@@ -57,12 +57,7 @@ class WalPerMessageBenchmark {
 
     @Test
     void oneMessagePerTransaction() throws Exception {
-        // the library's defaults, as a service that sets none runs them
-        var config = new TestOutboxConfig().shards(SHARDS).workers(4)
-                .batchSize(new OutboxConfig.RelayConfig() {}.batchSize())
-                .minTickInterval(Duration.ofMillis(MIN_TICK_MS)).idlePollInterval(Duration.ofMillis(200))
-                .batchTimeout(Duration.ofSeconds(30)).maintenanceInterval(Duration.ofSeconds(30))
-                .xidsPerPartition(16_777_216L).premake(64).retry(Duration.ofSeconds(1), Duration.ofMinutes(5), 0);
+        var config = Bench.relay(SHARDS, 4, new OutboxConfig.RelayConfig() {}.batchSize(), MIN_TICK_MS);
         var business = TestDb.uniqueTable();
         try (var c = TestDb.connect()) {
             execute(c, "create extension if not exists pg_walinspect");
@@ -76,7 +71,7 @@ class WalPerMessageBenchmark {
             var outbox = runtime.outbox();
             var payload = new byte[PAYLOAD];
             new Random(1).nextBytes(payload);
-            var traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".getBytes(UTF_8);
+            var traceparent = Bench.TRACEPARENT.getBytes(UTF_8);
             var update = "update " + business + " set v = v + 1 where k = ?";
             var running = new AtomicBoolean(true);
             var committed = new AtomicLong();
@@ -147,10 +142,7 @@ class WalPerMessageBenchmark {
     }
 
     private static String lsn(Connection c) throws Exception {
-        try (var st = c.createStatement(); var rs = st.executeQuery("select pg_current_wal_insert_lsn()::text")) {
-            rs.next();
-            return rs.getString(1);
-        }
+        return queryString(c, "select pg_current_wal_insert_lsn()::text");
     }
 
     private static long inserted(Connection c, String table) throws Exception {

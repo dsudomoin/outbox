@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox.internal;
 import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
+import static io.github.dsudomoin.outbox.testing.TestSql.queryStrings;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -127,7 +128,6 @@ class TicksIT {
                     ids.add(rs.getLong(1));
                 }
             }
-            int compared = 0;
             for (int round = 0; round < 40; round++) {
                 long latest = ids.get(ids.size() / 2 + random.nextInt(ids.size() - ids.size() / 2));
                 for (int shard = 0; shard < SHARDS; shard++) {
@@ -174,9 +174,7 @@ class TicksIT {
                     }
                 }
                 assertThat(actual).as("round %d, latest %d", round, latest).isEqualTo(expected);
-                compared += SHARDS;
             }
-            assertThat(compared).isEqualTo(40 * SHARDS);
         }
     }
 
@@ -273,7 +271,7 @@ class TicksIT {
                     try (var c = TestDb.connect()) {
                         c.setAutoCommit(false);
                         while (!stop.get()) {
-                            xids.add(queryLong(c, "select pg_current_xact_id()::text::bigint"));
+                            xids.add(xid(c));
                             execute(c, "insert into " + names.base()
                                     + " (shard, message_id, topic) values (0, gen_random_uuid(), 't')");
                             c.commit();
@@ -408,7 +406,7 @@ class TicksIT {
             var madeThrottled = pool.submit(() -> ticks.make(throttled, Duration.ofSeconds(1)));
             awaitLockWait(observer, throttledPid);
             writer.setAutoCommit(false);
-            long xid = queryLong(writer, "select pg_current_xact_id()::text::bigint");
+            long xid = xid(writer);
             writer.commit();
             holder.commit();
 
@@ -451,14 +449,8 @@ class TicksIT {
                 assertThat(ticks.make(maker, Duration.ZERO)).isTrue();
                 assertThat(queryString(maker, "show synchronous_commit")).as("transaction-scoped").isEqualTo(setting);
             }
-            try (var rs = observer.createStatement().executeQuery("select v from sc_probe order by n")) {
-                var seen = new ArrayList<String>();
-                while (rs.next()) {
-                    seen.add(rs.getString(1));
-                }
-                assertThat(seen).as("the tick transaction's synchronous_commit")
-                        .containsExactly("local", "on", "remote_apply");
-            }
+            assertThat(queryStrings(observer, "select v from sc_probe order by n"))
+                    .as("the tick transaction's synchronous_commit").containsExactly("local", "on", "remote_apply");
         }
     }
 
@@ -602,8 +594,8 @@ class TicksIT {
         try (var writer = TestDb.connect(); var c = TestDb.connect()) {
             writer.setAutoCommit(false);
             insertRow(writer, 5);
-            long xid = queryLong(writer, "select pg_current_xact_id()::text::bigint");
-            queryLong(c, "select pg_current_xact_id()::text::bigint"); // a later xid completes: the writer is below xmax
+            long xid = xid(writer);
+            xid(c); // a later xid completes: the writer is below xmax
             assertThat(ticks.make(c, Duration.ZERO)).isTrue();
             assertThat(ticks.latest(c).snapshot().xip()).as("in flight at P").contains(xid);
             assertThat(shards(c)).doesNotContain(5);
@@ -826,15 +818,7 @@ class TicksIT {
 
     @Test
     void aProbeThatFailsFallsBackToATickWithoutAShardSetAndWarnsOnce() throws Exception {
-        var role = TestDb.newLoginRole();
-        try (var c = TestDb.connect()) { // the role may make ticks but not read the outbox: its probe fails (42501)
-            execute(c, "grant select, insert on " + names.tick() + " to " + role);
-            execute(c, "grant select on sequence "
-                    + queryString(c, "select pg_get_serial_sequence('" + names.base() + "', 'id')") + " to " + role);
-        }
-        var login = new Properties();
-        login.setProperty("user", role);
-        login.setProperty("password", role);
+        var login = probelessLogin();
         try (var err = new CapturedStderr(); var asRole = TestDb.connect(login); var c = TestDb.connect()) {
             var roleTicks = new Ticks(names, SHARDS);
             insertRow(c, 3);
@@ -851,15 +835,7 @@ class TicksIT {
 
     @Test
     void aSnapshotBelowTheNewestTicksXmaxMakesNoTickAndRecordsTheHalt() throws Exception {
-        var role = TestDb.newLoginRole();
-        try (var c = TestDb.connect()) { // a role whose probe fails (42501), so it inserts without one
-            execute(c, "grant select, insert on " + names.tick() + " to " + role);
-            execute(c, "grant select on sequence "
-                    + queryString(c, "select pg_get_serial_sequence('" + names.base() + "', 'id')") + " to " + role);
-        }
-        var login = new Properties();
-        login.setProperty("user", role);
-        login.setProperty("password", role);
+        var login = probelessLogin(); // a role whose probe fails, so it inserts without one
         try (var asRole = TestDb.connect(login); var c = TestDb.connect()) {
             // the newest tick from a history 10 000 xids ahead, as a logical cutover onto a younger cluster leaves it
             long shifted = queryLong(c, "insert into " + names.tick() + " (snapshot, max_id) select ("
@@ -935,6 +911,20 @@ class TicksIT {
     @Nullable
     private String dirty(Connection c) throws Exception {
         return queryString(c, "select dirty::text from " + names.tick() + " order by id desc limit 1");
+    }
+
+    /** A new role's login that may make ticks but not read the outbox: its probe fails (42501). */
+    private Properties probelessLogin() throws Exception {
+        var role = TestDb.newLoginRole();
+        try (var c = TestDb.connect()) {
+            execute(c, "grant select, insert on " + names.tick() + " to " + role);
+            execute(c, "grant select on sequence "
+                    + queryString(c, "select pg_get_serial_sequence('" + names.base() + "', 'id')") + " to " + role);
+        }
+        var login = new Properties();
+        login.setProperty("user", role);
+        login.setProperty("password", role);
+        return login;
     }
 
     private static long xid(Connection c) throws Exception {

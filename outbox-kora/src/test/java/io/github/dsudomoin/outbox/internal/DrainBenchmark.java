@@ -25,10 +25,10 @@ import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 
 /**
  * Draining a backlog: {@code bench.rows} messages are written with the relay off (4 writers, 1000 messages a
- * transaction, random keys, {@code bench.payload}-byte payloads), then a relay on the library's defaults (but {@code bench.batchSize})
- * starts and delivers them to a handler that delivers at once. {@code bench.tickEveryMs} > 0 makes a tick that often
- * during the fill, as a running relay would; 0 leaves the whole backlog to the relay's first tick. Prints the fill and
- * drain rates.
+ * transaction, random keys, {@code bench.payload}-byte payloads), then a relay on {@link Bench#relay} (the library's
+ * defaults but {@code bench.batchSize} and a 30 s {@code batchTimeout}) starts and delivers them to a handler that
+ * delivers at once. {@code bench.tickEveryMs} > 0 makes a tick that often during the fill, as a running relay would; 0
+ * leaves the whole backlog to the relay's first tick. Prints the fill and drain rates.
  *
  * <p>Not part of the build: {@code ./gradlew :outbox-kora:test -Pbenchmark --tests '*DrainBenchmark'}; properties
  * {@code bench.rows} (2 000 000), {@code bench.shards} (256), {@code bench.batchSize} (the library's, 10 000),
@@ -47,16 +47,7 @@ class DrainBenchmark {
     private static final int WRITERS = 4;
     private static final int PER_TX = 1000;
 
-    /** {@code bench.jdbcUrl}, {@code bench.user}, {@code bench.password}: a Postgres of your own, else the tests' one. */
-    private static final String URL = System.getProperty("bench.jdbcUrl");
-
-    private final TestDatabase db = URL == null ? TestDb.newDatabase(24)
-            : TestDb.newDatabase(URL, System.getProperty("bench.user"), System.getProperty("bench.password"), 24);
-
-    private static java.sql.Connection connect() throws java.sql.SQLException {
-        return URL == null ? TestDb.connect() : java.sql.DriverManager.getConnection(URL,
-                System.getProperty("bench.user"), System.getProperty("bench.password"));
-    }
+    private final TestDatabase db = Bench.database(24);
 
     @AfterEach
     void release() {
@@ -69,7 +60,7 @@ class DrainBenchmark {
         var writerConfig = config(table).relayEnabled(false);
         var payload = new byte[PAYLOAD];
         new Random(1).nextBytes(payload);
-        var traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".getBytes(UTF_8);
+        var traceparent = Bench.TRACEPARENT.getBytes(UTF_8);
         long fillStarted;
         long fillNanos;
         try (var writer = OutboxRuntime.builder(writerConfig, db, record -> {}).telemetry(TestTelemetry.kora())
@@ -84,7 +75,7 @@ class DrainBenchmark {
             if (TICK_EVERY_MS > 0) {
                 ticker = new Thread(() -> {
                     while (filling.get()) {
-                        try (var c = connect()) {
+                        try (var c = Bench.connect()) {
                             ticks.make(c, Duration.ZERO);
                         } catch (Exception e) {
                             throw new IllegalStateException(e);
@@ -130,8 +121,8 @@ class DrainBenchmark {
         }
         long rows = ((ROWS + PER_TX - 1) / PER_TX) * (long) PER_TX;
         var delivered = new AtomicLong();
-        if (URL != null) {
-            try (var c = connect(); var st = c.createStatement()) {
+        if (Bench.URL != null) {
+            try (var c = Bench.connect(); var st = c.createStatement()) {
                 st.execute("select pg_stat_statements_reset()");
             }
         }
@@ -153,8 +144,8 @@ class DrainBenchmark {
             }
         }
         long drainNanos = System.nanoTime() - drainStarted;
-        if (URL != null) {
-            try (var c = connect(); var st = c.createStatement(); var rs = st.executeQuery("select calls,"
+        if (Bench.URL != null) {
+            try (var c = Bench.connect(); var st = c.createStatement(); var rs = st.executeQuery("select calls,"
                     + " round(total_exec_time::numeric, 0), round(total_exec_time::numeric * 1000 / " + rows
                     + ", 2), rows, left(regexp_replace(query, '\\s+', ' ', 'g'), 110) from pg_stat_statements"
                     + " where query not like '%pg_stat_statements%' order by total_exec_time desc limit 25")) {
@@ -171,9 +162,6 @@ class DrainBenchmark {
     }
 
     private static TestOutboxConfig config(String table) {
-        return new TestOutboxConfig().table(table).shards(SHARDS).workers(WORKERS).batchSize(BATCH)
-                .minTickInterval(Duration.ofMillis(50)).idlePollInterval(Duration.ofMillis(200))
-                .batchTimeout(Duration.ofSeconds(30)).maintenanceInterval(Duration.ofSeconds(30))
-                .xidsPerPartition(16_777_216L).premake(64).retry(Duration.ofSeconds(1), Duration.ofMinutes(5), 0);
+        return Bench.relay(SHARDS, WORKERS, BATCH, 50).table(table);
     }
 }

@@ -1,5 +1,7 @@
 package io.github.dsudomoin.outbox.internal;
 
+import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
+import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import io.github.dsudomoin.outbox.OutboxConfig;
@@ -8,12 +10,9 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
-import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.SQLException;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -30,12 +29,13 @@ import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 
 /**
- * Latency and writer throughput under load, the relay on the library's defaults and a handler that delivers at once:
- * {@code bench.writers} threads each commit transactions of {@code bench.perTx} messages, at {@code bench.rate}
- * transactions a second in all (0: as fast as they go). With one message a transaction each bumps the business row of
- * a key among {@code bench.keys} under its row lock first, as an order service does; with more, it sends them in one
- * {@code sendAll}, each with a random key. Prints committed transactions a second, delivered messages a second, the
- * latency from a writer's commit to the handler's call (p50, p90, p99, max, sampled messages) and WAL per message.
+ * Latency and writer throughput under load, the relay on {@link Bench#relay} (the library's defaults but a 30 s
+ * {@code batchTimeout}) and a handler that delivers at once: {@code bench.writers} threads each commit transactions of
+ * {@code bench.perTx} messages, at {@code bench.rate} transactions a second in all (0: as fast as they go). With one
+ * message a transaction each bumps the business row of a key among {@code bench.keys} under its row lock first, as an
+ * order service does; with more, it sends them in one {@code sendAll}, each with a random key. Prints committed
+ * transactions a second, delivered messages a second, the latency from a writer's commit to the handler's call (p50,
+ * p90, p99, max, sampled messages) and WAL per message.
  *
  * <p>Not part of the build: {@code ./gradlew :outbox-kora:test -Pbenchmark --tests '*LoadBenchmark'}; properties
  * {@code bench.shards} (256), {@code bench.writers} (16), {@code bench.perTx} (1), {@code bench.rate} (2200),
@@ -56,32 +56,21 @@ class LoadBenchmark {
     private static final int MIN_TICK_MS = Integer.getInteger("bench.minTickMs", 50);
     private static final int WARMUP = Integer.getInteger("bench.warmup", 15);
     private static final int SECONDS = Integer.getInteger("bench.seconds", 30);
-    private static final String URL = System.getProperty("bench.jdbcUrl");
     /** Messages of a sendAll whose latency is sampled. */
     private static final int SAMPLED_PER_TX = 10;
 
-    private final TestDatabase db = URL == null ? TestDb.newDatabase(WRITERS + 16)
-            : TestDb.newDatabase(URL, System.getProperty("bench.user"), System.getProperty("bench.password"),
-                    WRITERS + 16);
+    private final TestDatabase db = Bench.database(WRITERS + 16);
 
     @AfterEach
     void release() {
         db.release();
     }
 
-    private static Connection connect() throws SQLException {
-        return URL == null ? TestDb.connect() : DriverManager.getConnection(URL, System.getProperty("bench.user"),
-                System.getProperty("bench.password"));
-    }
-
     @Test
     void load() throws Exception {
-        var config = new TestOutboxConfig().shards(SHARDS).workers(4).batchSize(BATCH)
-                .minTickInterval(Duration.ofMillis(MIN_TICK_MS)).idlePollInterval(Duration.ofMillis(200))
-                .batchTimeout(Duration.ofSeconds(30)).maintenanceInterval(Duration.ofSeconds(30))
-                .xidsPerPartition(16_777_216L).premake(64).retry(Duration.ofSeconds(1), Duration.ofMinutes(5), 0);
+        var config = Bench.relay(SHARDS, 4, BATCH, MIN_TICK_MS);
         var business = TestDb.uniqueTable();
-        try (var c = connect(); var st = c.createStatement()) {
+        try (var c = Bench.connect(); var st = c.createStatement()) {
             st.execute("create table " + business + " (k int primary key, v bigint not null)");
             st.execute("insert into " + business + " select g, 0 from generate_series(0, " + (KEYS - 1) + ") g");
         }
@@ -105,7 +94,7 @@ class LoadBenchmark {
             var outbox = runtime.outbox();
             var payload = new byte[300];
             new Random(1).nextBytes(payload);
-            var traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".getBytes(UTF_8);
+            var traceparent = Bench.TRACEPARENT.getBytes(UTF_8);
             var headers = List.of(new OutboxHeader("traceparent", traceparent));
             var update = "update " + business + " set v = v + 1 where k = ?";
             var running = new AtomicBoolean(true);
@@ -155,7 +144,7 @@ class LoadBenchmark {
                 threads.add(t);
             }
             Thread.sleep(WARMUP * 1000L);
-            try (var c = connect()) {
+            try (var c = Bench.connect()) {
                 String lsn0 = lsn(c);
                 long d0 = delivered.get();
                 long w0 = committed.get();
@@ -169,12 +158,7 @@ class LoadBenchmark {
                 for (var t : threads) {
                     t.join();
                 }
-                long wal;
-                try (var st = c.createStatement(); var rs = st.executeQuery("select '" + lsn1 + "'::pg_lsn - '" + lsn0
-                        + "'::pg_lsn")) {
-                    rs.next();
-                    wal = rs.getLong(1);
-                }
+                long wal = queryLong(c, "select '" + lsn1 + "'::pg_lsn - '" + lsn0 + "'::pg_lsn");
                 int n = (int) Math.min(latencyCount.get(), latencies.length);
                 var sorted = Arrays.copyOf(latencies, n);
                 Arrays.sort(sorted);
@@ -199,9 +183,6 @@ class LoadBenchmark {
     }
 
     private static String lsn(Connection c) throws SQLException {
-        try (var st = c.createStatement(); var rs = st.executeQuery("select pg_current_wal_insert_lsn()::text")) {
-            rs.next();
-            return rs.getString(1);
-        }
+        return queryString(c, "select pg_current_wal_insert_lsn()::text");
     }
 }
