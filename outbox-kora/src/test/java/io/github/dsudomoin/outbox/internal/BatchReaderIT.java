@@ -325,7 +325,7 @@ class BatchReaderIT {
             conn.commit();
         }
         assertThat(prepared).as("read's own statement, not the group one").contains(reader.sql(true))
-                .doesNotContain(reader.manySql());
+                .doesNotContain(reader.manySql(true));
         assertThat(rowKeys(whole.rows().get(shard))).isEqualTo(rowKeys(all));
         assertThat(whole.cut()).isFalse();
         assertThat(readMany(one, all.size()).cut()).as("exactly the limit counts as cut").isTrue();
@@ -607,7 +607,7 @@ class BatchReaderIT {
         var used = new TreeSet<String>();
         var partition = Pattern.compile(Pattern.quote(names.unqualified(names.partitionPrefix())) + "\\d+");
         c.setAutoCommit(false);
-        try (var ps = c.prepareStatement("explain (analyze) " + reader.manySql())) {
+        try (var ps = c.prepareStatement("explain (analyze) " + reader.manySql(true))) {
             reader.bindMany(ps, reads, 1000);
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
@@ -635,7 +635,7 @@ class BatchReaderIT {
         var planned = new TreeSet<String>();
         var partition = Pattern.compile(Pattern.quote(names.unqualified(names.partitionPrefix())) + "\\d+");
         c.setAutoCommit(false);
-        try (var ps = c.prepareStatement("explain " + (budgeted ? reader.budgetedManySql(true) : reader.manySql()))) {
+        try (var ps = c.prepareStatement("explain " + (budgeted ? reader.budgetedManySql(true) : reader.manySql(true)))) {
             execute(c, "set local plan_cache_mode = force_custom_plan");
             if (budgeted) {
                 reader.bindBudgetedMany(ps, reads, 1000, 16L << 20, true);

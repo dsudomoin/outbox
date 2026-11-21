@@ -40,6 +40,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
 import java.util.Objects;
 import java.util.OptionalLong;
 import java.util.RandomAccess;
@@ -159,9 +160,8 @@ public final class ShardProcessor implements AutoCloseable {
     static final long SPAN_PER_SHARD = 1000;
     /** {@link #recentRowBytes} of a shard not read yet, or forgotten. */
     private static final long UNKNOWN = -1;
-    /** The {@code errorType}s of a dead letter whose attempts ran out, and of one past {@code maxRequeues}. */
+    /** The {@code errorType} of a dead letter whose attempts ran out. */
     private static final String MAX_ATTEMPTS = "max_attempts";
-    private static final String REQUEUE_LIMIT = BatchClassifier.REQUEUE_LIMIT_TYPE;
 
     private final int internalNamespace;
     private final OutboxConfig.RelayConfig relay;
@@ -944,8 +944,6 @@ public final class ShardProcessor implements AutoCloseable {
             var skipped = fresh.skipped();
             var from = new long[more.size()];
             var prevs = new Tick[more.size()];
-            var lo = new long[more.size()];
-            var hi = new long[more.size()];
             var wanted = new HashSet<Long>();
             for (int i = 0; i < more.size(); i++) {
                 var s = more.get(i);
@@ -956,18 +954,15 @@ public final class ShardProcessor implements AutoCloseable {
                     wanted.add(skip.id());
                 }
                 from[i] = prevs[i].id();
-                lo[i] = from[i];
-                hi[i] = Math.min(latestTickId, from[i] + relay.maxTicksPerBatch());
             }
             var between = fresh.ticks(); // read from the same starts, so it holds each range
             var targets = new Tick[more.size()];
             var targetIds = new long[more.size()];
             for (int i = 0; i < more.size(); i++) {
-                var candidates = List.copyOf(between.subMap(lo[i], false, hi[i], true).values());
-                if (candidates.isEmpty()) { // a gap in tick ids, as in chooseTargets
+                targetIds[i] = freshTargetId(between, from[i], prevs[i], latestTickId);
+                if (targetIds[i] == 0) { // a gap in tick ids, as in chooseTargets
                     targets[i] = ticks.oldestAfter(c, from[i]);
                 } else {
-                    targetIds[i] = chooseTarget(prevs[i].maxId(), candidates, batchIds).id();
                     wanted.add(targetIds[i]);
                 }
             }
@@ -1147,10 +1142,7 @@ public final class ShardProcessor implements AutoCloseable {
         if (!fresh.isEmpty()) {
             var starts = ticks.fresh(c, afterIds, latestTickId, relay.maxTicksPerBatch());
             var skipped = starts.skipped();
-            var lo = new long[fresh.size()];
-            var hi = new long[fresh.size()];
-            for (int i = 0; i < fresh.size(); i++) {
-                var s = fresh.get(i);
+            for (var s : fresh) {
                 var skip = skipped.get(s.shard);
                 if (skip != null) { // the ticks up to it hold no row of the shard: the position moves there too
                     s.prev = skip; // its snapshot is read below
@@ -1158,18 +1150,15 @@ public final class ShardProcessor implements AutoCloseable {
                     s.next = s.cursor;
                     wanted.add(skip.id());
                 }
-                lo[i] = s.cursor.tickId();
-                hi[i] = Math.min(latestTickId, s.cursor.tickId() + relay.maxTicksPerBatch());
             }
             var between = starts.ticks(); // read from the same starts, so it holds each range
-            for (int i = 0; i < fresh.size(); i++) {
-                var s = fresh.get(i);
-                var candidates = List.copyOf(between.subMap(lo[i], false, hi[i], true).values());
-                if (candidates.isEmpty()) {
+            for (var s : fresh) {
+                long id = freshTargetId(between, s.cursor.tickId(), s.prev, latestTickId);
+                if (id == 0) {
                     // a gap in tick ids (e.g. a rolled-back tick insert) must not stop the shard
                     s.target = ticks.oldestAfter(c, s.cursor.tickId());
                 } else { // below the latest tick, above the effective one: it exists
-                    targetIds.put(s, chooseTarget(s.prev.maxId(), candidates, batchIds).id());
+                    targetIds.put(s, id);
                 }
             }
         }
@@ -1284,6 +1273,16 @@ public final class ShardProcessor implements AutoCloseable {
                     + current.cursor().shard() + ": its effective tick was deleted");
         }
         return current.tick();
+    }
+
+    /**
+     * The id of a fresh batch's target from tick {@code from}: {@link #chooseTarget} among {@code between}'s ticks past
+     * it, up to {@code maxTicksPerBatch} on and not past the latest; 0 when none lies there (a gap in tick ids).
+     */
+    private long freshTargetId(NavigableMap<Long, Tick> between, long from, Tick prev, long latestTickId) {
+        var candidates = List.copyOf(between.subMap(from, false,
+                Math.min(latestTickId, from + relay.maxTicksPerBatch()), true).values());
+        return candidates.isEmpty() ? 0 : chooseTarget(prev.maxId(), candidates, batchIds).id();
     }
 
     /**
@@ -1912,7 +1911,8 @@ public final class ShardProcessor implements AutoCloseable {
                 done.add(row);
             } else if (outcome instanceof Outcome.Requeue q) { // the rows of its key before it have all left the table
                 if (BatchClassifier.requeueLimitReached(row, requeue.maxRequeues())) {
-                    dead(c, pass, row, row.attempts(), BatchClassifier.REQUEUE_LIMIT, REQUEUE_LIMIT);
+                    dead(c, pass, row, row.attempts(), BatchClassifier.REQUEUE_LIMIT,
+                            BatchClassifier.REQUEUE_LIMIT_TYPE);
                 } else {
                     var due = requeueDue(q.notBefore(), now);
                     parked.fromRetry(c, row, row.requeues() + 1, due);
@@ -2002,7 +2002,8 @@ public final class ShardProcessor implements AutoCloseable {
                 pass.parkedWrites.add(new Unpark(row));
             } else if (outcome instanceof Outcome.Requeue q) {
                 if (BatchClassifier.requeueLimitReached(row, requeue.maxRequeues())) {
-                    deadFromParked(c, pass, row, row.attempts(), BatchClassifier.REQUEUE_LIMIT, REQUEUE_LIMIT);
+                    deadFromParked(c, pass, row, row.attempts(), BatchClassifier.REQUEUE_LIMIT,
+                            BatchClassifier.REQUEUE_LIMIT_TYPE);
                 } else {
                     pass.parkedWrites.add(new Park(row, row.requeues() + 1, requeueDue(q.notBefore(), now)));
                     telemetry.requeued(row.topic());
@@ -2057,7 +2058,7 @@ public final class ShardProcessor implements AutoCloseable {
             String errorType) throws SQLException {
         retries.deadFromRetry(c, row, attempts, error);
         pass.deadLettered = true;
-        deadLettered(row, errorType);
+        telemetry.deadLettered(row, errorType);
         logDead(row, attempts, error != null ? error : "maxAttempts reached");
     }
 
@@ -2066,18 +2067,8 @@ public final class ShardProcessor implements AutoCloseable {
         parked.toDead(c, row, attempts, error);
         pass.deadLettered = true;
         pass.wroteParked = true;
-        deadLettered(row, errorType);
+        telemetry.deadLettered(row, errorType);
         logDead(row, attempts, error);
-    }
-
-    /**
-     * {@link OutboxTelemetry#deadLettered(OutboxRecord, String)} of {@code row}: {@code max_attempts},
-     * {@code requeue_limit} or the class name of its permanent failure's error ({@link BatchClassifier#errorType}).
-     */
-    private void deadLettered(OutboxRecord row, String errorType) {
-        if (telemetry != OutboxTelemetry.NONE) {
-            telemetry.deadLettered(row, errorType);
-        }
     }
 
     /**
@@ -2156,7 +2147,7 @@ public final class ShardProcessor implements AutoCloseable {
                 firstHead = firstHead == null ? h : firstHead;
                 heads++;
             } else if (action instanceof Dead d) {
-                deadLettered(d.r(), d.errorType());
+                telemetry.deadLettered(d.r(), d.errorType());
                 logDead(d.r(), d.attempts(), d.error());
             } else if (action instanceof Park p) {
                 telemetry.requeued(p.r().topic());

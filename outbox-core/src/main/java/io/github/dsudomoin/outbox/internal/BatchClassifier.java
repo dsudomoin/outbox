@@ -196,25 +196,37 @@ public final class BatchClassifier {
      * and the rows after it were not attempted because of it.
      */
     static Set<Object> failingKeys(List<Item> items) {
-        var seen = new HashSet<Object>();
         var failing = new HashSet<Object>();
+        for (var item : firstUnsettled(items)) {
+            if (!(item.outcome() instanceof Outcome.Waiting)) {
+                failing.add(orderingKey(item.record()));
+            }
+        }
+        return failing;
+    }
+
+    /**
+     * The first Retry, NotAttempted or Waiting item of each (topic, key) pair of {@code items}, in order: the rows not
+     * handed and those whose key goes on (Delivered, Permanent, Requeue) are passed over.
+     */
+    private static List<Item> firstUnsettled(List<Item> items) {
+        var seen = new HashSet<Object>();
+        var first = new ArrayList<Item>();
         for (var item : items) {
             var outcome = item.outcome();
             if (item.dbBlocked() || outcome instanceof Outcome.Delivered || outcome instanceof Outcome.Permanent
                     || outcome instanceof Outcome.Requeue) {
                 continue; // not handed, or its key goes on
-            } else if (outcome instanceof Outcome.Retry || outcome instanceof Outcome.NotAttempted) {
-                var key = orderingKey(item.record());
-                if (seen.add(key)) {
-                    failing.add(key);
-                }
-            } else if (outcome instanceof Outcome.Waiting) {
-                seen.add(orderingKey(item.record()));
-            } else {
+            }
+            if (!(outcome instanceof Outcome.Retry || outcome instanceof Outcome.NotAttempted
+                    || outcome instanceof Outcome.Waiting)) {
                 throw new IllegalStateException("unknown outcome " + outcome);
             }
+            if (seen.add(orderingKey(item.record()))) {
+                first.add(item);
+            }
         }
-        return failing;
+        return first;
     }
 
     /**
@@ -225,14 +237,11 @@ public final class BatchClassifier {
      */
     @Nullable
     static Instant askedToComeBack(List<Item> items) {
-        var seen = new HashSet<Object>();
         Instant earliest = null;
-        for (var item : items) {
+        for (var item : firstUnsettled(items)) {
             var outcome = item.outcome();
-            if (item.dbBlocked() || outcome instanceof Outcome.Delivered || outcome instanceof Outcome.Permanent
-                    || outcome instanceof Outcome.Requeue || !seen.add(orderingKey(item.record()))
-                    || outcome instanceof Outcome.Waiting) {
-                continue; // as failingKeys: not handed, its key goes on, a later row of the pair, or a wait
+            if (outcome instanceof Outcome.Waiting) {
+                continue; // a pair whose first such row waits is not failing
             }
             if (!(outcome instanceof Outcome.NotAttempted skipped) || skipped.notBefore() == null) {
                 return null;

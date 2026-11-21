@@ -74,7 +74,7 @@ class ChunkReadBenchmark {
         var ticks = new Ticks(names, shards);
         var outbox = new PgOutbox(db, schema, shards, () -> {}, TestTelemetry.kora());
         var reader = new BatchReader(names);
-        var plain = List.of(reader.manySql(), reader.uncheckedManySql(), reader.sql(true), reader.sql(false));
+        var plain = List.of(reader.manySql(true), reader.manySql(false), reader.sql(true), reader.sql(false));
         var budgeted = List.of(reader.budgetedManySql(true), reader.budgetedManySql(false), reader.budgetedSql(true),
                 reader.budgetedSql(false));
         try (var processor = new ShardProcessor(names, config, record -> {}, TestTelemetry.kora(), false)) {
@@ -148,7 +148,7 @@ class ChunkReadBenchmark {
                 execute(conn, "set local plan_cache_mode = force_custom_plan");
                 var r = reads.get(0);
                 String sql = shards == 1 ? (budgeted ? reader.budgetedSql(false) : reader.sql(false))
-                        : (budgeted ? reader.budgetedManySql(false) : reader.uncheckedManySql());
+                        : (budgeted ? reader.budgetedManySql(false) : reader.manySql(false));
                 try (var ps = conn.prepareStatement("explain (analyze, buffers) " + sql)) {
                     if (shards == 1 && budgeted) {
                         reader.bindBudgeted(ps, r.shard(), r.prev(), r.target(), r.lastId(), r.limit(), BATCH_BYTES,

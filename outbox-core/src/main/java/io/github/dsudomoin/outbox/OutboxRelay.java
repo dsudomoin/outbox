@@ -1221,12 +1221,7 @@ public final class OutboxRelay implements AutoCloseable {
                     isolated.set(group.get(i), 1);
                 }
                 if (group.size() == 1) {
-                    int shard = group.get(0);
-                    int failures = failedAlone.incrementAndGet(shard);
-                    if (failures > 1) {
-                        retryAfter.set(shard,
-                                System.nanoTime() + Backoff.delayNanos(failures - 2, retryInitialNanos, retryMaxNanos));
-                    }
+                    markFailedAlone(group.get(0));
                 }
                 throw e;
             } catch (Throwable e) { // rolled back
@@ -1234,13 +1229,7 @@ public final class OutboxRelay implements AutoCloseable {
                     throw e;
                 }
                 if (group.size() == 1) {
-                    int shard = group.get(0);
-                    isolated.set(shard, 1);
-                    int failures = failedAlone.incrementAndGet(shard);
-                    if (failures > 1) { // the first is retried at the next tick (a deadlock, a lock timeout)
-                        var delay = Backoff.delay(failures - 2, relay.retry().initialDelay(), relay.retry().maxDelay());
-                        retryAfter.set(shard, System.nanoTime() + delay.toNanos());
-                    }
+                    markFailedAlone(group.get(0));
                     warn("outbox shard " + group.get(0) + " step failed, retried in a later pass", e);
                     telemetry.relayFailed(e);
                     return false;
@@ -1290,6 +1279,20 @@ public final class OutboxRelay implements AutoCloseable {
                             .thenComparingInt(p -> Math.floorMod(p.cursor().shard() - offset, shards)))
                     .map(p -> p.cursor().shard())
                     .toList();
+        }
+
+        /**
+         * {@code shard}, stepped alone, failed: it goes alone again, and from its second such failure on it backs off,
+         * the first retried at the next tick (a deadlock, a lock timeout). Allocates nothing, for the
+         * {@code OutOfMemoryError} path.
+         */
+        private void markFailedAlone(int shard) {
+            isolated.set(shard, 1);
+            int failures = failedAlone.incrementAndGet(shard);
+            if (failures > 1) {
+                retryAfter.set(shard,
+                        System.nanoTime() + Backoff.delayNanos(failures - 2, retryInitialNanos, retryMaxNanos));
+            }
         }
 
         /**

@@ -4882,7 +4882,7 @@ class ShardProcessorIT {
     /** The chunk reads among {@link #statements}, in order: {@code plain} or {@code budgeted} each. */
     private List<String> chunkReads() {
         var reader = new BatchReader(names);
-        var plain = List.of(reader.sql(true), reader.sql(false), reader.manySql(), reader.uncheckedManySql());
+        var plain = List.of(reader.sql(true), reader.sql(false), reader.manySql(true), reader.manySql(false));
         var budgeted = List.of(reader.budgetedSql(true), reader.budgetedSql(false), reader.budgetedManySql(true),
                 reader.budgetedManySql(false));
         return statements.stream().filter(sql -> plain.contains(sql) || budgeted.contains(sql))

@@ -206,9 +206,9 @@ public final class BatchReader {
         return Arrays.stream(prev.xip()).filter(x -> !running.contains(x)).toArray();
     }
 
-    /** The statement {@link #readMany} runs. */
-    String manySql() {
-        return selectMany;
+    /** The statement {@link #readMany} runs, with or without the read checks. */
+    String manySql(boolean checkBlocked) {
+        return checkBlocked ? selectMany : selectManyUnchecked;
     }
 
     /** The statement a budgeted {@link #readMany} runs. */
@@ -216,12 +216,7 @@ public final class BatchReader {
         return checkBlocked ? budgetedMany : budgetedManyUnchecked;
     }
 
-    /** The statement {@link #readMany} runs without read checks. */
-    String uncheckedManySql() {
-        return selectManyUnchecked;
-    }
-
-    /** Binds the parameters of {@link #manySql()}. */
+    /** Binds the parameters of {@link #manySql(boolean)}. */
     void bindMany(PreparedStatement ps, List<ShardRead> reads, int totalLimit) throws SQLException {
         bindMany(ps, 0, reads, totalLimit);
     }
@@ -235,7 +230,7 @@ public final class BatchReader {
         ps.setLong(18, totalBytes);
     }
 
-    /** The parameters of {@link #manySql()}, each {@code at} places on. */
+    /** The parameters of {@link #manySql(boolean)}, each {@code at} places on. */
     private static void bindMany(PreparedStatement ps, int at, List<ShardRead> reads, int totalLimit)
             throws SQLException {
         int n = reads.size();
@@ -249,14 +244,21 @@ public final class BatchReader {
         var lastId = new Long[n];
         var limit = new Integer[n];
         var check = new Boolean[n];
+        // every shard's rows lie in [min(prev xmax, its lowest candidate xip), max(target xmax)): a candidate xip is
+        // in prev's xip, so at or above prev's xmin and below prev's xmax, which is at most target's
+        long low = Long.MAX_VALUE;
+        long high = Long.MIN_VALUE;
         for (int i = 0; i < n; i++) {
             var r = reads.get(i);
             var candidates = candidateXip(r.prev(), r.target());
+            long min = candidates.length == 0 ? Long.MAX_VALUE : Arrays.stream(candidates).min().getAsLong();
+            low = Math.min(low, Math.min(r.prev().xmax(), min));
+            high = Math.max(high, r.target().xmax());
             shard[i] = r.shard();
             pmax[i] = Long.toString(r.prev().xmax());
             tmax[i] = Long.toString(r.target().xmax());
             // null bounds when none: the branch then matches nothing and prunes every partition
-            lo[i] = candidates.length == 0 ? null : Long.toString(Arrays.stream(candidates).min().getAsLong());
+            lo[i] = candidates.length == 0 ? null : Long.toString(min);
             hi[i] = candidates.length == 0 ? null : Long.toString(Arrays.stream(candidates).max().getAsLong());
             xip[i] = Arrays.stream(candidates).mapToObj(Long::toString).collect(Collectors.joining(",", "{", "}"));
             snap[i] = r.target().text();
@@ -275,15 +277,6 @@ public final class BatchReader {
         ps.setArray(at + 8, c.createArrayOf("int8", lastId));
         ps.setArray(at + 9, c.createArrayOf("int4", limit));
         ps.setArray(at + 10, c.createArrayOf("bool", check));
-        // every shard's rows lie in [min(prev xmax, its lowest candidate xip), max(target xmax)): a candidate xip is
-        // in prev's xip, so at or above prev's xmin and below prev's xmax, which is at most target's
-        long low = Long.MAX_VALUE;
-        long high = Long.MIN_VALUE;
-        for (var r : reads) {
-            low = Math.min(low, Math.min(r.prev().xmax(), Arrays.stream(candidateXip(r.prev(), r.target())).min()
-                    .orElse(Long.MAX_VALUE)));
-            high = Math.max(high, r.target().xmax());
-        }
         for (int i : new int[] {at + 11, at + 13}) {
             ps.setString(i, Long.toString(low));
             ps.setString(i + 1, Long.toString(high));
@@ -337,7 +330,7 @@ public final class BatchReader {
         boolean check = reads.stream().anyMatch(ShardRead::checkBlocked);
         boolean bytesCut = false;
         long bytes = 0;
-        String sql = budget == null ? (check ? selectMany : selectManyUnchecked) : budgetedManySql(check);
+        String sql = budget == null ? manySql(check) : budgetedManySql(check);
         try (var ps = inTx.prepareStatement(sql)) {
             ps.setFetchSize(Math.min(totalLimit, MAX_FETCH));
             if (budget == null) {
