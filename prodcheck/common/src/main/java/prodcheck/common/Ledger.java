@@ -82,9 +82,17 @@ public final class Ledger {
     }
 
     public static void effect(Connection c, Event e) throws SQLException {
-        try (var ps = c.prepareStatement("""
-                insert into pc_effect (sink, message_id, topic, key, seq, tag, contract)
-                values (?, ?, ?, ?, ?, ?, ?)""")) {
+        insertEffect(c, e, "");
+    }
+
+    /** The effect unless {@code e}'s sink has it already; whether it was new. */
+    public static boolean effectOnce(Connection c, Event e) throws SQLException {
+        return insertEffect(c, e, " on conflict (sink, message_id) do nothing") == 1;
+    }
+
+    private static int insertEffect(Connection c, Event e, String onConflict) throws SQLException {
+        try (var ps = c.prepareStatement("insert into pc_effect (sink, message_id, topic, key, seq, tag, contract)"
+                + " values (?, ?, ?, ?, ?, ?, ?)" + onConflict)) {
             ps.setString(1, e.sink());
             ps.setObject(2, e.id());
             ps.setString(3, e.topic());
@@ -92,7 +100,7 @@ public final class Ledger {
             ps.setLong(5, e.seq());
             ps.setString(6, e.tag());
             ps.setInt(7, e.contract());
-            ps.executeUpdate();
+            return ps.executeUpdate();
         }
     }
 

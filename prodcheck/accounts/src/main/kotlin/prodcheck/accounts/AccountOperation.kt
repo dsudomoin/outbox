@@ -69,7 +69,7 @@ class AccountOperation(
             it.executeQuery().use { rs -> rs.next() }
         }
         if (!subscribed) {
-            effect(c, event)
+            Ledger.effectOnce(c, event)
             return AccountEventResult.ACKNOWLEDGE
         }
         when (event.tag()) {
@@ -94,7 +94,7 @@ class AccountOperation(
                 if (blocked(c, account)) return AccountEventResult.REQUEUE
             }
         }
-        effect(c, event)
+        Ledger.effectOnce(c, event)
         return AccountEventResult.ACKNOWLEDGE
     }
 
@@ -107,22 +107,6 @@ class AccountOperation(
     private fun update(c: Connection, sql: String, account: String?) {
         c.prepareStatement(sql).use {
             it.setString(1, account)
-            it.executeUpdate()
-        }
-    }
-
-    private fun effect(c: Connection, e: Event) {
-        c.prepareStatement(
-            """insert into accounts.pc_effect (sink, message_id, topic, key, seq, tag, contract)
-               values (?, ?, ?, ?, ?, ?, ?) on conflict (sink, message_id) do nothing"""
-        ).use {
-            it.setString(1, e.sink())
-            it.setObject(2, e.id())
-            it.setString(3, e.topic())
-            it.setString(4, e.key())
-            it.setLong(5, e.seq())
-            it.setString(6, e.tag())
-            it.setInt(7, e.contract())
             it.executeUpdate()
         }
     }

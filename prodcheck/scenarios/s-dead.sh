@@ -72,10 +72,10 @@ s_hook() { # every decision of the hook, its failures and a kill -9 in the middl
   sleep 15
   local i mode
   for mode in throw hang bad-list; do
-    for i in 1001 1002 1003; do curl -sf -XPUT "$(pub "$i")/hook?mode=$mode" > /dev/null; done
+    for i in 1001 1002 1003; do hook_mode "$i" "$mode"; done
     fault "хук: $mode"
     sleep 7
-    for i in 1001 1002 1003; do curl -sf -XPUT "$(pub "$i")/hook?mode=ok" > /dev/null; done
+    for i in 1001 1002 1003; do hook_mode "$i" ok; done
     sleep 2
   done
   check "$(passes gt "$(on 1001 metric outbox_dead_hook_failures_total)" 0)" "растёт outbox.dead.hook.failures"
@@ -102,7 +102,7 @@ s_hook_mixed_fleet() { # a fleet with and without the hook: letters wait for the
   pc_target
   pc_shop 1001 -Dprodcheck.hook=policy -Doutbox.partitions.maintenanceInterval=1s
   pc_shop 1002 -Doutbox.partitions.maintenanceInterval=1s
-  curl -sf -XPUT "$(pub 1001)/hook?mode=throw" > /dev/null
+  hook_mode 1001 throw
   # load on the hook's instance: a relay writes a letter by its own hook, so the one without it would write kept at once
   pc_load 1001 'rate=100&writers=2&keys=20&topics=payments&tags=hook-keep:20'
   check "$(passes wait_for 30 pending_now)" "пока жив инстанс с хуком, письма ждут его (pending)"
@@ -117,14 +117,14 @@ s_dead_retention() { # kept letters older than retention go, pending ones never
   pc_begin dead-retention
   pc_target
   pc_shop 1001 -Dprodcheck.hook=policy -Doutbox.deadLetters.retention=1d -Doutbox.partitions.maintenanceInterval=1s
-  curl -sf -XPUT "$(pub 1001)/hook?mode=throw" > /dev/null
+  hook_mode 1001 throw
   pc_load 1001 'rate=100&writers=2&keys=20&topics=payments&tags=hook-keep:10'
   sleep 8
   pc_unload 1001
   psql_q "update outbox_dead set failed_at = now() - interval '2 days'" > /dev/null
   sleep 5
-  check "$(passes gt "$(psql_q "select count(*) from outbox_dead where status = 'pending'")" 0)" "старые письма pending не удаляются"
-  curl -sf -XPUT "$(pub 1001)/hook?mode=ok" > /dev/null # now the hook keeps them; maintenance removes the old kept ones
+  check "$(passes pending_now)" "старые письма pending не удаляются"
+  hook_mode 1001 ok # now the hook keeps them; maintenance removes the old kept ones
   psql_q "update outbox_dead set failed_at = now() - interval '2 days'" > /dev/null
   sleep 5
   psql_q "update outbox_dead set failed_at = now() - interval '2 days'" > /dev/null

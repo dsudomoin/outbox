@@ -44,6 +44,7 @@ export JAVA_HOME=${JAVA_HOME:-$(/usr/libexec/java_home -v 21)}
 
 target_q() { PG=$TGT psql_q "$1"; }
 pub() { echo "http://localhost:$((8079 + $1))"; }
+fresh_db() { docker exec "$1" psql -U outbox -d postgres -Atq -c "drop database if exists outbox with (force)" -c "create database outbox"; } # fresh_db CONTAINER: an empty outbox database
 
 # pc_begin NAME: both databases empty, ledger tables in place.
 pc_begin() {
@@ -60,7 +61,7 @@ pc_begin() {
   "${COMPOSE[@]}" up -d --wait > /dev/null 2>&1
   local c
   for c in "$PG" "$TGT"; do
-    docker exec "$c" psql -U outbox -d postgres -Atq -c "drop database if exists outbox with (force)" -c "create database outbox"
+    fresh_db "$c"
     docker exec -i "$c" psql -U outbox -d outbox -q < "$PC/scenarios/ledger.sql"
   done
   rm -f "${LOGS:?}/pc-${SCN:?}-"*.log
@@ -75,8 +76,7 @@ source_replace() {
   docker run -d --name "$PG" -e POSTGRES_DB=outbox -e POSTGRES_USER=outbox -e POSTGRES_PASSWORD=outbox --cpus 2 --memory 2g \
     --shm-size 512m -p "127.0.0.1:${2:-55432}:5432" $1 "${3:-$PG_IMAGE}" \
     postgres -c max_connections=300 -c shared_buffers=512MB -c max_locks_per_transaction=256 -c synchronous_commit=on > /dev/null
-  ready() { docker exec "$PG" pg_isready -U outbox -d outbox -q; }
-  wait_for 60 ready
+  wait_for 60 docker exec "$PG" pg_isready -U outbox -d outbox -q
   sleep 2
 }
 
@@ -111,6 +111,8 @@ pc_load() { LOADS[$1]=$2; curl -sf --max-time 10 -XPOST "$(pub "$1")/load?$2" > 
 pc_unload() { LOADS[$1]=""; curl -sf --max-time 60 -XDELETE "$(pub "$1")/load" > /dev/null || true; }
 tfault() { curl -sf --max-time 10 -XPUT "$(pub "$T")/fault?$1" > /dev/null; }
 hctl() { curl -sf --max-time 10 -XPUT "$(pub "$1")/handler?$2" > /dev/null; }
+hook_mode() { curl -sf -XPUT "$(pub "$1")/hook?mode=$2" > /dev/null; } # hook_mode I MODE: the dead-letter hook of instance I
+tx_hold() { curl -sf -XPOST "$(pub 1001)/tx/hold?ms=$1&topic=payments&key=held&tag=held" > /dev/null; } # tx_hold MS: 1001 holds a transaction open
 tx_send() { curl -s --max-time 20 -XPOST "$(pub "$1")/tx/send?$2"; }
 stats() { curl -sf --max-time 10 "$(pub "$1")/stats"; }
 
@@ -162,6 +164,7 @@ bounded() {
 effects_grow() { local a b; a=$(effects "${2:-}"); sleep "$1"; b=$(effects "${2:-}"); [ "$b" -gt "$a" ]; }
 
 pc_kill() { inst_kill9 "$1"; fault "kill -9 экземпляра $1"; }
+conn_kill() { fault "pg_terminate_backend всех соединений приложений"; psql_q "select count(pg_terminate_backend(pid)) from pg_stat_activity where application_name like 'app-%'" > /dev/null; }
 # pc_term I: SIGTERM, prints how long the stop took.
 pc_term() { local t=$(now); inst_stop "$1"; echo $(($(now) - t)); }
 
@@ -194,13 +197,9 @@ pc_finish() {
     status=$(admin_body "$alive" GET status)
     local bad
     bad=$(echo "$status" | j '[k for k, v in {"halted": d["halted"], "orphans": d["orphans"]}.items() if v]') || bad="status unreadable"
-    [ "$bad" = "[]" ] || CHECKS="$CHECKS
-- **НЕ ПРОЙДЕНА**: /status после сверки: $bad"
-    [ "$bad" = "[]" ] || CHECK_FAILED=1
+    [ "$bad" = "[]" ] || check 1 "/status после сверки: $bad"
   else
-    CHECKS="$CHECKS
-- **НЕ ПРОЙДЕНА**: к концу не осталось живых инстансов: /status не прочитан"
-    CHECK_FAILED=1
+    check 1 "к концу не осталось живых инстансов: /status не прочитан"
   fi
   [ -z "${CHECK_FAILED:-}" ] || [ "$rc" != 0 ] || rc=1
   LEDGER=$led STATUS=$status CHECKS=$CHECKS FAULTS=$FAULTS REPAIRED=$REPAIRED RC=$rc SCN=$SCN SECONDS_TOTAL=$(($(now) - T0)) python3 - > "$RESULT_DIR/$SCN.json" << 'PY'

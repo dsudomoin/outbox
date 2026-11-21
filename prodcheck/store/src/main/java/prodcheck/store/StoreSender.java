@@ -18,7 +18,6 @@ import prodcheck.common.Sender;
 @Component
 final class StoreSender implements Sender {
 
-    static final int ORDERS_CONTRACT = 1;
     static final List<String> TOPICS = List.of("payments", "ledger", "projection", "orders", "audit");
 
     private final Outbox outbox;
@@ -46,11 +45,6 @@ final class StoreSender implements Sender {
     @Override
     public Outbox outbox() {
         return outbox;
-    }
-
-    @Override
-    public int contract(String topic) {
-        return topic.equals("orders") ? ORDERS_CONTRACT : 1;
     }
 
     @Override

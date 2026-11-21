@@ -3,7 +3,7 @@ s_long_tx() {
   pc_begin long-tx
   trio "$MIX"
   sleep 5
-  curl -sf -XPOST "$(pub 1001)/tx/hold?ms=40000&topic=payments&key=held&tag=held" > /dev/null
+  tx_hold 40000
   fault "транзакция с send открыта 40 с, ключ held"
   sleep 3
   # a writer of the same key waits for the holder's key lock, everyone else goes by

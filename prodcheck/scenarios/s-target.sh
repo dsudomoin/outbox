@@ -1,10 +1,4 @@
 # The target's outage: «Недоступная цель приостанавливает доставку и ничего не теряет», «Обработчик перед продом».
-writers_clean() { # no writer failed so far on the given instances
-  local i n=0
-  for i in "$@"; do n=$((n + $(stats "$i" | j 'len(d["failedByClass"])'))); done
-  [ "$n" = 0 ]
-}
-
 s_target_down() { # kill -9 of the target under load: writes and the other routes go on, HTTP records wait, none dead
   pc_begin target-down
   trio "$MIX"
@@ -13,7 +7,7 @@ s_target_down() { # kill -9 of the target under load: writes and the other route
   fault "kill -9 цели на 30 с"
   check "$(passes effects_grow 10 projection)" "другие маршруты идут, пока цель лежит"
   sleep 20
-  check "$(passes writers_clean 1001 1002 1003)" "писатели не падали"
+  check "$(passes is "$(writers_failed 1001 1002 1003)" = 0)" "писатели не падали"
   check "$(passes gt "$(on 1001 metric outbox_shard_paused_total)" 0)" "растёт outbox.shard.paused"
   check "$(passes is "$(psql_q 'select count(*) from outbox_dead')" = 0)" "в dead letters ничего"
   pc_target
@@ -45,7 +39,7 @@ s_target_db_down() { # the DB target's database goes away and returns
   source_grows() { local a b; a=$(psql_q "select count(*) from pc_effect"); sleep 10; b=$(psql_q "select count(*) from pc_effect"); [ "$b" -gt "$a" ]; }
   check "$(passes source_grows)" "маршрут на базе-источнике идёт"
   sleep 15
-  check "$(passes writers_clean 1001 1002 1003)" "писатели не падали"
+  check "$(passes is "$(writers_failed 1001 1002 1003)" = 0)" "писатели не падали"
   docker start "$TGT" > /dev/null
   pc_finish
 }

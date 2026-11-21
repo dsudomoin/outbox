@@ -106,8 +106,7 @@ soak_pg_pause() {
 soak_conn_kills() {
   local n
   for n in 1 2 3; do
-    fault "pg_terminate_backend всех соединений приложений"
-    psql_q "select count(pg_terminate_backend(pid)) from pg_stat_activity where application_name like 'app-%'" > /dev/null
+    conn_kill
     sleep 5
   done
 }

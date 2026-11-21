@@ -50,7 +50,7 @@ s_kill_all_but_one() {
   pc_kill 1002
   pc_kill 1003
   check "$(passes effects_grow 10)" "выживший доставляет один за всех, пока двух других нет"
-  check "$(passes is "$(stats 1001 | j 'len(d["failedByClass"])')" = 0)" "писатели выжившего не падали"
+  check "$(passes is "$(writers_failed 1001)" = 0)" "писатели выжившего не падали"
   pc_shop 1002
   pc_shop 1003
   sleep 10

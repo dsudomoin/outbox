@@ -134,19 +134,8 @@ public final class EventsController {
 
     /** The inbox let a known message through, which an effect's own key would stop: a row instead of an error, so it can be counted. */
     private static void effectOrDouble(Connection c, Event e) throws SQLException {
-        try (var ps = c.prepareStatement("""
-                insert into pc_effect (sink, message_id, topic, key, seq, tag, contract)
-                values (?, ?, ?, ?, ?, ?, ?) on conflict (sink, message_id) do nothing""")) {
-            ps.setString(1, e.sink());
-            ps.setObject(2, e.id());
-            ps.setString(3, e.topic());
-            ps.setString(4, e.key());
-            ps.setLong(5, e.seq());
-            ps.setString(6, e.tag());
-            ps.setInt(7, e.contract());
-            if (ps.executeUpdate() == 1) {
-                return;
-            }
+        if (Ledger.effectOnce(c, e)) {
+            return;
         }
         try (var ps = c.prepareStatement("insert into pc_double_effect (sink, message_id) values (?, ?)")) {
             ps.setString(1, e.sink());

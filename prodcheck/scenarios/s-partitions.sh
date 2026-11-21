@@ -35,7 +35,7 @@ s_tail_overflow() { # a transaction left open defers the swap, the ranges run ou
   # small enough for the tail to stay under maxTailScan: a bigger one waits for the night window, see tail-big
   PC_OPTS=$TINY trio 'rate=70&writers=4&keys=30&topics=payments'
   sleep 5
-  curl -sf -XPOST "$(pub 1001)/tx/hold?ms=60000&topic=payments&key=held&tag=held" > /dev/null
+  tx_hold 60000
   fault "транзакция с send открыта 60 с: своп откладывается"
   check "$(passes wait_for 55 overflow)" "строки ушли в хвост (tailOverflow)"
   sleep 3
@@ -62,7 +62,7 @@ s_tail_big() { # the tail outgrows maxTailScan: stays hot, ERROR names the windo
   local opts="$TINY -Doutbox.partitions.maxTailScan=65536 -Doutbox.partitions.tailConversion.window=$from-$to -Doutbox.partitions.tailConversion.zone=UTC"
   PC_OPTS=$opts trio 'rate=300&writers=4&keys=30&topics=payments'
   sleep 3
-  curl -sf -XPOST "$(pub 1001)/tx/hold?ms=45000&topic=payments&key=held&tag=held" > /dev/null
+  tx_hold 45000
   check "$(passes wait_for 60 overflow)" "строки ушли в хвост"
   sleep 45
   check "$(passes overflow)" "держатель закончил, но хвост больше maxTailScan и остаётся горячим"

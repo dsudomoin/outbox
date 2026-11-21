@@ -132,13 +132,13 @@ s_drain_silent_drop() { # socketTimeout = 0: a drop under each part of drain. ou
   # 3. in the dead-letter run at the end: the hook hangs past its timeout, the rollback goes to a dead socket
   pc_shop "$i" $opts
   tx_send "$i" 'topic=payments&key=dl&tag=hook-keep' > /dev/null
-  curl -sf -XPUT "$(pub "$i")/hook?mode=hang" > /dev/null
+  hook_mode "$i" hang
   ( sleep 2; echo drop > "$PROXY_CTL" ) &
   hung_drain "$i" dead-letters "$bound"
   fault "сеть: drop, пока проход dead letters держит письмо"
   wait $! 2> /dev/null || true
   echo pass > "$PROXY_CTL"
-  curl -sf -XPUT "$(pub "$i")/hook?mode=ok" > /dev/null || true
+  hook_mode "$i" ok || true
   inst_kill9 "$i"
   # afterwards: relay on, plain URL
   PC_PG_URL=jdbc:postgresql://localhost:55432/outbox
@@ -156,7 +156,7 @@ s_silent_drop_background() { # socketTimeout = 0: maintenance, the dead-letter p
   pc_shop "$i" $opts
   sleep 3
   # the dead-letter pass: inside the hook, on a hanging call
-  curl -sf -XPUT "$(pub "$i")/hook?mode=hang" > /dev/null
+  hook_mode "$i" hang
   tx_send "$i" 'topic=payments&key=dl&tag=hook-keep' > /dev/null
   # maintenance and the heartbeat: each waits on a row lock when the network drops it
   docker exec -d "$PG" psql -U outbox -d outbox -Atq -c "begin; select 1 from outbox_maintenance for update; select 1 from outbox_instance for update; select pg_sleep(12); commit"
@@ -168,7 +168,7 @@ s_silent_drop_background() { # socketTimeout = 0: maintenance, the dead-letter p
   sleep 5
   proxy drop
   sleep 8
-  curl -sf -XPUT "$(pub "$i")/hook?mode=ok" > /dev/null
+  hook_mode "$i" ok
   echo pass > "$PROXY_CTL"
   local started=$(now)
   beat() { [ "$(psql_q "select count(*) from outbox_instance where expires_at > now() and last_seen > now() - interval '10 seconds'")" = 1 ]; }

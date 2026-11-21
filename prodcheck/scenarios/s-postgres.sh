@@ -52,8 +52,7 @@ s_pg_conn_kill() { # every backend of the apps killed, again and again
   sleep 8
   local n
   for n in 1 2 3 4 5; do
-    fault "pg_terminate_backend всех соединений приложений"
-    psql_q "select count(pg_terminate_backend(pid)) from pg_stat_activity where application_name like 'app-%'" > /dev/null
+    conn_kill
     sleep 6
   done
   progress 1001 1002 1003

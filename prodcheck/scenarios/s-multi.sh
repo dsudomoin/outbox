@@ -85,7 +85,7 @@ s_everything() { # all at once: writers with rollbacks, two apps, poison, requeu
   for i in 1001 1002; do pc_shop "$i"; pc_load "$i" 'rate=100&writers=4&keys=30&topics=payments,ledger,projection&rollbackPercent=5&tags=poison:60'; done
   for i in 1003 1004; do pc_courier "$i" -Doutbox.table=courier_main -Doutbox.inbox.table=courier_inbox; pc_load "$i" 'rate=100&writers=4&keys=30&topics=deliveries,receipts,routed&rollbackPercent=5&tags=requeue:40,retry3:50'; done
   tfault 'failPercent=10&dropPercent=5'
-  curl -sf -XPOST "$(pub 1001)/tx/hold?ms=45000&topic=payments&key=held&tag=held" > /dev/null
+  tx_hold 45000
   local n
   for n in 1 2 3 4 5 6; do
     sleep 10
@@ -93,7 +93,7 @@ s_everything() { # all at once: writers with rollbacks, two apps, poison, requeu
       0) pc_kill 1001; sleep 3; pc_shop 1001 ;;
       1) pc_kill 1003; sleep 3; pc_courier 1003 -Doutbox.table=courier_main -Doutbox.inbox.table=courier_inbox ;;
       2) inst_kill9 "$T"; fault "kill -9 цели"; sleep 5; pc_target; tfault 'failPercent=10&dropPercent=5' ;;
-      3) fault "pg_terminate_backend всех приложений"; psql_q "select count(pg_terminate_backend(pid)) from pg_stat_activity where application_name like 'app-%'" > /dev/null ;;
+      3) conn_kill ;;
     esac
   done
   tfault 'failPercent=0&dropPercent=0'

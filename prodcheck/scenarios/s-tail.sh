@@ -100,7 +100,7 @@ seqs = [int(l) for l in sys.stdin if l.strip()]
 seen, blocks, i, late_total = [], [], 0, 0
 while i < len(seqs):
     bisect.insort(seen, seqs[i])
-    if i and seqs[i] < max(seqs[:1] + [seen[-1]]) and seen[-1] != seqs[i]:
+    if seqs[i] != seen[-1]:
         overtakers = len(seen) - bisect.bisect_right(seen, seqs[i])
         n = 1
         while i + 1 < len(seqs) and seqs[i + 1] < seen[-1]:

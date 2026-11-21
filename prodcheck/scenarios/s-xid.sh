@@ -13,7 +13,7 @@ migrate() { # writers stopped, backlog undelivered: pg_dump, a new cluster, pg_r
   proxy refuse
   docker stop -t 5 "$PG" > /dev/null
   source_replace "" 55434
-  docker exec "$PG" psql -U outbox -d postgres -Atq -c "drop database if exists outbox with (force)" -c "create database outbox"
+  fresh_db "$PG"
   docker exec -i "$PG" pg_restore -U outbox -d outbox --no-owner < "$dump"
   local new
   new=$(psql_q 'select pg_current_xact_id()')
