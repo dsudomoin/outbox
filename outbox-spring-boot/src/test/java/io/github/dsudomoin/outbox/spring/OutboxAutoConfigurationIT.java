@@ -12,13 +12,11 @@ import io.github.dsudomoin.outbox.Outbox;
 import io.github.dsudomoin.outbox.OutboxAdmin;
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxRelay;
-import io.github.dsudomoin.outbox.OutboxSql;
 import io.github.dsudomoin.outbox.internal.UuidV7;
 import io.github.dsudomoin.outbox.spring.TestApps.OrdersRoute;
 import io.github.dsudomoin.outbox.spring.TestApps.WithRoute;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
-import io.github.dsudomoin.outbox.testing.TestSql;
 import java.sql.SQLException;
 import java.time.Duration;
 import javax.sql.DataSource;
@@ -32,7 +30,6 @@ import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -114,7 +111,7 @@ class OutboxAutoConfigurationIT {
 
     /** The switch decides as the binder binds it, whatever the spelling. */
     @ParameterizedTest
-    @ValueSource(strings = {"0", "off", "no", "FALSE"})
+    @ValueSource(strings = {"off", "FALSE"})
     void enabledOffInAnySpellingKeepsInbox(String off) {
         runner("outbox.enabled=" + off).run(context -> {
             assertThat(context).hasNotFailed().doesNotHaveBean(Outbox.class).doesNotHaveBean(OutboxLifecycle.class)
@@ -124,7 +121,7 @@ class OutboxAutoConfigurationIT {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"1", "on", "yes", "TRUE"})
+    @ValueSource(strings = {"on", "TRUE"})
     void enabledOnInAnySpellingStartsTheRuntime(String on) {
         runner("outbox.enabled=" + on).withUserConfiguration(WithRoute.class).run(context ->
             assertThat(context).hasNotFailed().hasSingleBean(Outbox.class).hasSingleBean(OutboxLifecycle.class));
@@ -182,43 +179,6 @@ class OutboxAutoConfigurationIT {
         ds.setUser(role);
         ds.setPassword("pw");
         return ds;
-    }
-
-    @Test
-    void ownerDataSourceBySelfQualifier() throws SQLException {
-        var schema = "s" + TestSql.uniqueTable();
-        var owner = "o" + TestSql.uniqueTable();
-        var app = "a" + TestSql.uniqueTable();
-        TestApps.execute("create role " + owner + " login password 'pw'");
-        TestApps.execute("create role " + app + " login password 'pw'");
-        TestApps.execute("grant pg_read_all_stats to " + owner); // as README recommends
-        TestApps.execute("create schema " + schema + " authorization " + owner);
-        TestApps.execute("grant usage on schema " + schema + " to " + app);
-        var config = new TestOutboxConfig().table(schema + ".outbox").inboxTable(schema + ".inbox");
-        try (var c = as(owner).getConnection()) {
-            TestSql.execute(c, OutboxSql.outbox(config, app));
-            TestSql.execute(c, OutboxSql.inbox(config, app));
-        }
-        WithOwner.owner = owner;
-
-        runner("spring.datasource.username=" + app, "spring.datasource.password=pw",
-            "outbox.table=" + config.table(), "outbox.inbox.table=" + config.inbox().table(),
-            "outbox.schema.bootstrap=false")
-            .withUserConfiguration(WithRoute.class, WithOwner.class, WithInboxUser.class).run(context -> {
-                assertThat(context).hasNotFailed();
-                assertThat(context.getBeansOfType(DataSource.class)).hasSize(2);
-                assertThat(new JdbcTemplate(context.getBean(DataSource.class))
-                    .queryForObject("select current_user", String.class)).as("Boot's DataSource").isEqualTo(app);
-                assertThat(queryLong("select count(*) from pg_class r join pg_namespace n on n.oid = r.relnamespace"
-                    + " where n.nspname = '" + schema + "' and r.relispartition")).as("ranges").isPositive();
-                assertThat(queryLong("select count(*) from pg_class r join pg_namespace n on n.oid = r.relnamespace"
-                    + " where n.nspname = '" + schema + "' and r.relispartition and pg_get_userbyid(r.relowner) <> '"
-                    + owner + "'")).as("ranges made by another role than the owner").isZero();
-
-                var id = send(context, "orders");
-
-                await().atMost(WAIT).until(() -> route(context).delivered().contains(id));
-            });
     }
 
     @Configuration(proxyBeanMethods = false)

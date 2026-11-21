@@ -18,7 +18,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.SQLException;
 import java.time.Duration;
-import java.util.stream.Stream;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -93,6 +92,7 @@ class MigrationsIT {
 
     private void startedOnTheMigratedSchema(AssertableApplicationContext context) throws SQLException {
         assertThat(context).hasNotFailed();
+        assertThat(context.getBeansOfType(DataSource.class)).as("Boot's and the owner's").hasSize(2);
         assertThat(new JdbcTemplate(context.getBean(DataSource.class))
             .queryForObject("select current_user", String.class)).as("Boot's DataSource").isEqualTo(app);
         assertThat(queryLong("select count(*) from pg_class where oid = to_regclass('" + config.table()
@@ -185,9 +185,9 @@ class MigrationsIT {
 
     /** The application role's Boot DataSource, the owner's beside it, no bootstrap, no migration tool yet. */
     private ApplicationContextRunner app(String... more) {
-        return runner(Stream.concat(Stream.of("spring.datasource.username=" + app, "spring.datasource.password=pw",
+        return runner("spring.datasource.username=" + app, "spring.datasource.password=pw",
             "outbox.table=" + config.table(), "outbox.inbox.table=" + config.inbox().table(),
-            "outbox.schema.bootstrap=false"), Stream.of(more)).toArray(String[]::new))
+            "outbox.schema.bootstrap=false").withPropertyValues(more)
             .withUserConfiguration(WithRoute.class, WithOwner.class);
     }
 }

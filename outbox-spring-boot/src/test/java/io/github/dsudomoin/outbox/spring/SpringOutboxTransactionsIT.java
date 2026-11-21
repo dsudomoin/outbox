@@ -123,15 +123,9 @@ class SpringOutboxTransactionsIT {
         static Ctx of(AssertableApplicationContext context) throws SQLException {
             assertThat(context).hasNotFailed();
             var business = TestSql.uniqueTable();
-            ddl("create table " + business + " (id uuid primary key, xid xid8 not null default pg_current_xact_id())");
+            TestApps.execute("create table " + business
+                + " (id uuid primary key, xid xid8 not null default pg_current_xact_id())");
             return new Ctx(context, business);
-        }
-
-        /** On a connection of its own: the pool's may come without autocommit. */
-        static void ddl(String sql) throws SQLException {
-            try (var c = TestDataSources.newDataSource().getConnection()) {
-                TestSql.execute(c, sql);
-            }
         }
 
         DataSource dataSource() {
@@ -271,7 +265,7 @@ class SpringOutboxTransactionsIT {
     void jpaTransactionJoins() {
         runner().run(context -> {
             var ctx = Ctx.of(context);
-            Ctx.ddl("create table if not exists spring_jpa_order"
+            TestApps.execute("create table if not exists spring_jpa_order"
                 + " (id uuid primary key, xid xid8 not null default pg_current_xact_id())");
             var manager = context.getBean(PlatformTransactionManager.class);
             assertThat(manager).isInstanceOf(JpaTransactionManager.class);

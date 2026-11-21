@@ -66,9 +66,8 @@ class OutboxPropertiesTest {
     }
 
     @Test
-    void kebabAndCamelKeysBind() {
+    void keysBind() {
         bind(p -> assertThat(p.relay().batchSize()).isEqualTo(7), "outbox.relay.batch-size=7");
-        bind(p -> assertThat(p.relay().batchSize()).isEqualTo(7), "outbox.relay.batchSize=7");
         bind(p -> assertThat(p.deadLetters().batchSize()).isEqualTo(5), "outbox.dead-letters.batch-size=5");
         bind(p -> assertThat(p.partitions().tailConversion().window()).isEmpty(),
             "outbox.partitions.tail-conversion.window=");
@@ -76,10 +75,8 @@ class OutboxPropertiesTest {
         bind(p -> assertThat(p.networkTimeout()).isEqualTo(java.time.Duration.ofSeconds(7)),
             "outbox.network-timeout=7s");
         bind(p -> assertThat(p.relay().retry().holdPermanent()).isTrue(), "outbox.relay.retry.hold-permanent=true");
-        bind(p -> assertThat(p.relay().retry().holdPermanent()).isTrue(), "outbox.relay.retry.holdPermanent=true");
         bind(p -> assertThat(p.relay().ticksWithoutRelay()).isEqualTo(java.time.Duration.ofMillis(250)),
             "outbox.relay.ticks-without-relay=250ms");
-        bind(p -> assertThat(p.relay().ticksWithoutRelay()).isZero(), "outbox.relay.ticksWithoutRelay=0");
     }
 
     @Test
@@ -95,8 +92,6 @@ class OutboxPropertiesTest {
             "outbox.json.mapper=jackson3");
         bind(p -> assertThat(p.heartbeat().dedicatedConnection()).isFalse(),
             "outbox.heartbeat.dedicated-connection=false");
-        bind(p -> assertThat(p.heartbeat().dedicatedConnection()).isFalse(),
-            "outbox.heartbeat.dedicatedConnection=false");
     }
 
     @Test

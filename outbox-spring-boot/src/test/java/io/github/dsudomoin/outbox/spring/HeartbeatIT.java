@@ -15,9 +15,10 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Stream;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.context.FilteredClassLoader;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.ApplicationContext;
@@ -43,10 +44,9 @@ class HeartbeatIT {
 
     /** Boot's Hikari pool of two connections, a one-second heartbeat, no relay. */
     private ApplicationContextRunner runner(String... more) {
-        return TestApps.runner(Stream.concat(Stream.of("outbox.partitions.maintenance-interval=1s",
-                "outbox.relay.enabled=false", "spring.datasource.hikari.maximum-pool-size=2",
-                "spring.datasource.hikari.pool-name=" + pool), Stream.of(more)).toArray(String[]::new))
-            .withUserConfiguration(WithRoute.class);
+        return TestApps.runner("outbox.partitions.maintenance-interval=1s", "outbox.relay.enabled=false",
+                "spring.datasource.hikari.maximum-pool-size=2", "spring.datasource.hikari.pool-name=" + pool)
+            .withPropertyValues(more).withUserConfiguration(WithRoute.class);
     }
 
     @Test
@@ -102,31 +102,28 @@ class HeartbeatIT {
         }
     }
 
-    @Test
-    void aQualifiedDataSourceWinsOverTheKeyOff() {
-        qualifiedDataSourceServesTheBeats(false);
-    }
-
-    @Test
-    void aQualifiedDataSourceWinsOverTheKeyOn() {
-        qualifiedDataSourceServesTheBeats(true);
-    }
-
     /** Beats on the qualified DataSource, with no pool derived whatever the key says. */
-    private void qualifiedDataSourceServesTheBeats(boolean dedicated) {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void aQualifiedDataSourceWinsOverTheKey(boolean dedicated) {
         runner("outbox.heartbeat.dedicated-connection=" + dedicated)
             .withUserConfiguration(WithHeartbeatDataSource.class).run(context -> {
                 assertThat(context).hasNotFailed();
-                var taken = context.getBean("heartbeatDataSource", CountingDataSource.class).taken;
-                var names = names(context);
-                int before = taken.get();
-                awaitBeat(names);
-                awaitBeat(names);
-
-                assertThat(taken.get()).as("connections the qualified DataSource gave across two beats")
-                    .isGreaterThan(before);
+                assertBeatsTakeConnections(context, context.getBean("heartbeatDataSource", CountingDataSource.class),
+                    "connections the qualified DataSource gave across two beats");
                 assertThat(poolRuns()).as("a pool derived from the app's").isFalse();
             });
+    }
+
+    /** Two beats take connections of {@code source}. */
+    private static void assertBeatsTakeConnections(ApplicationContext context, CountingDataSource source,
+            String what) throws SQLException {
+        var names = names(context);
+        int before = source.taken.get();
+        awaitBeat(names);
+        awaitBeat(names);
+
+        assertThat(source.taken.get()).as(what).isGreaterThan(before);
     }
 
     /** Claims to wrap a HikariDataSource that is not started and has no URL: a pool derived from it fails to build. */
@@ -163,13 +160,8 @@ class HeartbeatIT {
         try (var log = new CapturedStderr()) {
             runner().withUserConfiguration(WithBrokenHikari.class).run(context -> {
                 assertThat(context).hasNotFailed();
-                var taken = context.getBean(BrokenHikariWrapper.class).taken;
-                var names = names(context);
-                int before = taken.get();
-                awaitBeat(names);
-                awaitBeat(names);
-
-                assertThat(taken.get()).as("app connections across two beats").isGreaterThan(before);
+                assertBeatsTakeConnections(context, context.getBean(BrokenHikariWrapper.class),
+                    "app connections across two beats");
             });
             assertThat(log.text()).containsOnlyOnce("could not derive a pool of its own")
                 .containsOnlyOnce("outbox heartbeat shares the application's connections");

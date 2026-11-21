@@ -62,7 +62,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
-import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.annotation.Order;
@@ -273,29 +272,9 @@ class TelemetryIT {
         });
     }
 
-    @Test
-    void enqueueIsParentOfDeliver() {
-        traced().withUserConfiguration(TestApps.WithRoute.class).run(context -> {
-            assertThat(context).hasNotFailed();
-            var spans = context.getBean(InMemorySpanExporter.class);
-
-            Observation.createNotStarted("test.parent", context.getBean(ObservationRegistry.class))
-                .observe(() -> send(context, "orders"));
-
-            var delivery = awaitSpan(spans, "outbox deliver orders");
-            var enqueue = span(spans, "outbox enqueue orders");
-            var parent = span(spans, "test.parent");
-            assertThat(enqueue.getParentSpanId()).isEqualTo(parent.getSpanId());
-            assertThat(enqueue.getKind()).isEqualTo(SpanKind.PRODUCER);
-            assertThat(delivery.getParentSpanId()).isEqualTo(enqueue.getSpanId());
-            assertThat(delivery.getKind()).isEqualTo(SpanKind.CONSUMER);
-            assertThat(delivery.getTraceId()).isEqualTo(parent.getTraceId());
-        });
-    }
-
     /**
      * Ours goes ahead of Boot's receiver handler in its first-matching group, Boot's stays for every other receiver;
-     * the delivery keeps its stored parent and links to the step that delivered it.
+     * the enqueue is a child of the caller's span, the delivery of the enqueue, linked to the step that delivered it.
      */
     @Test
     void deliverySpanLinksToTheStepSpan() {
@@ -309,7 +288,13 @@ class TelemetryIT {
                 .observe(() -> send(context, "orders"));
 
             var delivery = awaitSpan(spans, "outbox deliver orders");
-            assertThat(delivery.getParentSpanId()).isEqualTo(span(spans, "outbox enqueue orders").getSpanId());
+            var enqueue = span(spans, "outbox enqueue orders");
+            var parent = span(spans, "test.parent");
+            assertThat(enqueue.getParentSpanId()).isEqualTo(parent.getSpanId());
+            assertThat(enqueue.getKind()).isEqualTo(SpanKind.PRODUCER);
+            assertThat(delivery.getParentSpanId()).isEqualTo(enqueue.getSpanId());
+            assertThat(delivery.getKind()).isEqualTo(SpanKind.CONSUMER);
+            assertThat(delivery.getTraceId()).isEqualTo(parent.getTraceId());
             var link = assertThat(delivery.getLinks()).singleElement().actual().getSpanContext();
             // the step ends after its settle, so after the delivery
             await().atMost(WAIT).until(() -> spans.getFinishedSpanItems().stream()
@@ -385,28 +370,18 @@ class TelemetryIT {
         });
     }
 
-    @Test
-    void observeUnsampledProperty() {
-        traced(UNSAMPLED, OBSERVE_UNSAMPLED).withUserConfiguration(TestApps.WithRoute.class)
-            .run(TelemetryIT::assertUnsampledDeliveryObserved);
-    }
-
+    /** The key is bound on its own, so it holds with the app's own OutboxConfig too. */
     @Test
     void observeUnsampledPropertyWithTheAppsOwnConfig() {
         traced(UNSAMPLED, OBSERVE_UNSAMPLED).withUserConfiguration(TestApps.WithRoute.class)
             .withBean(TestOutboxConfig.class, TestOutboxConfig::new).run(context -> {
                 assertThat(context).doesNotHaveBean(OutboxProperties.class);
-                assertUnsampledDeliveryObserved(context);
+                var meters = context.getBean(MeterRegistry.class);
+
+                send(context, "orders");
+
+                await().atMost(WAIT).untilAsserted(() -> assertThat(timerCount(meters, "outbox.deliver")).isOne());
             });
-    }
-
-    private static void assertUnsampledDeliveryObserved(ApplicationContext context) {
-        var meters = context.getBean(MeterRegistry.class);
-
-        send(context, "orders");
-
-        await().atMost(WAIT).untilAsserted(
-            () -> assertThat(timerCount(meters, "outbox.deliver")).isOne());
     }
 
     /** The telemetry bean outlives the runtime: a stop and a start build a new one around it. */
