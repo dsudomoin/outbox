@@ -340,15 +340,13 @@ public final class Ticks {
      * tick lock, then the probe, the tick row and the commit ({@link #insert}); a failed probe costs three more.
      */
     public Made tick(Connection autocommit, Duration minInterval) throws SQLException {
-        return attempt(autocommit, minInterval).made();
+        return attempt(autocommit, minInterval, null).made();
     }
 
-    /** {@link #tick}, with the id of the tick inserted: its maker reads it from there, not from the table. */
-    public Attempt attempt(Connection autocommit, Duration minInterval) throws SQLException {
-        return attempt(autocommit, minInterval, null);
-    }
-
-    /** {@link #attempt(Connection, Duration)}; {@code clock}, when given, gets a reading from the tick's statement. */
+    /**
+     * {@link #tick}, with the id of the tick inserted: its maker reads it from there, not from the table;
+     * {@code clock}, when given, gets a reading from the tick's statement.
+     */
     public Attempt attempt(Connection autocommit, Duration minInterval, @Nullable DatabaseClock clock)
             throws SQLException {
         var c = autocommit;

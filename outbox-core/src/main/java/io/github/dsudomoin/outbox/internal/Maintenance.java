@@ -833,12 +833,7 @@ public final class Maintenance {
     private int anchor(Connection c) throws SQLException {
         var wanted = cursors.anchors(c, IntStream.range(0, shards).boxed().toList(), anchorInterval).stream()
                 .map(Cursor::shard).toList();
-        int appended = 0;
-        for (int from = 0; from < wanted.size(); from += ANCHOR_CHUNK) {
-            appended += anchor(c, wanted.subList(from, Math.min(wanted.size(), from + ANCHOR_CHUNK)),
-                    locked -> cursors.anchors(c, locked, anchorInterval));
-        }
-        return appended;
+        return anchor(c, wanted, locked -> cursors.anchors(c, locked, anchorInterval));
     }
 
     /**
@@ -859,23 +854,31 @@ public final class Maintenance {
                 .filter(p -> Cursors.busy(p) && !read.stranded().containsKey(p.cursor().shard())
                         && p.cursor().tickId() < lowest)
                 .map(p -> p.cursor().shard()).toList();
-        for (int from = 0; from < below.size(); from += ANCHOR_CHUNK) {
-            anchor(c, below.subList(from, Math.min(below.size(), from + ANCHOR_CHUNK)), locked -> {
-                var rows = new ArrayList<Cursor>();
-                for (var current : cursors.latest(c, locked).values()) {
-                    if (current.effectiveTickId() > current.cursor().tickId()) {
-                        rows.add(current.cursor().withProgress(current.effectiveTickId(),
-                                current.cursor().targetTickId(), current.cursor().lastId()));
-                    }
+        anchor(c, below, locked -> {
+            var rows = new ArrayList<Cursor>();
+            for (var current : cursors.latest(c, locked).values()) {
+                if (current.effectiveTickId() > current.cursor().tickId()) {
+                    rows.add(current.cursor().withProgress(current.effectiveTickId(),
+                            current.cursor().targetTickId(), current.cursor().lastId()));
                 }
-                return rows;
-            });
-        }
+            }
+            return rows;
+        });
         return cursors.latest(c, below).values().stream().allMatch(current -> current.cursor().tickId() >= lowest);
     }
 
-    /** One transaction of {@link #anchor}: {@code rows}, given the shards it locked, read after the lock. */
+    /** {@code shards}, {@link #ANCHOR_CHUNK} at a time, each in a transaction of {@link #anchorChunk}. */
     private int anchor(Connection c, List<Integer> shards, SqlFunction1<List<Integer>, List<Cursor>> rowsOf)
+            throws SQLException {
+        int appended = 0;
+        for (int from = 0; from < shards.size(); from += ANCHOR_CHUNK) {
+            appended += anchorChunk(c, shards.subList(from, Math.min(shards.size(), from + ANCHOR_CHUNK)), rowsOf);
+        }
+        return appended;
+    }
+
+    /** One transaction of {@link #anchor}: {@code rows}, given the shards it locked, read after the lock. */
+    private int anchorChunk(Connection c, List<Integer> shards, SqlFunction1<List<Integer>, List<Cursor>> rowsOf)
             throws SQLException {
         c.setAutoCommit(false);
         try {
@@ -1126,33 +1129,29 @@ public final class Maintenance {
     private XidRecovery.Check checkXidCounter(Connection c) throws SQLException {
         checking.lock();
         try {
-            return checkXidCounterHoldingTheCheck(c);
+            var check = recovery.check(c);
+            xidChecked = true;
+            unanswered = false;
+            if (!check.halted()) {
+                if (check.recorded() != null) { // ticks repaired: the regressed ones are gone
+                    execute(c, "delete from " + names.halt());
+                }
+                if (halted) {
+                    halted = false;
+                    haltLogged.set(System.nanoTime() - LOG_INTERVAL); // a later halt is logged at once
+                    log.info("outbox relay resumed: no xid-regression halt recorded in {} and the xid counter is"
+                            + " above every tick", names.halt());
+                }
+                return null;
+            }
+            if (check.recorded() == null || check.tickXmax() > check.recorded()) {
+                recovery.recordHalt(c, check.tickXmax());
+            }
+            halted = true;
+            return check;
         } finally {
             checking.unlock();
         }
-    }
-
-    private XidRecovery.Check checkXidCounterHoldingTheCheck(Connection c) throws SQLException {
-        var check = recovery.check(c);
-        xidChecked = true;
-        unanswered = false;
-        if (!check.halted()) {
-            if (check.recorded() != null) { // ticks repaired: the regressed ones are gone
-                execute(c, "delete from " + names.halt());
-            }
-            if (halted) {
-                halted = false;
-                haltLogged.set(System.nanoTime() - LOG_INTERVAL); // a later halt is logged at once
-                log.info("outbox relay resumed: no xid-regression halt recorded in {} and the xid counter is above"
-                        + " every tick", names.halt());
-            }
-            return null;
-        }
-        if (check.recorded() == null || check.tickXmax() > check.recorded()) {
-            recovery.recordHalt(c, check.tickXmax());
-        }
-        halted = true;
-        return check;
     }
 
     /** The halt ERROR, at most once a minute. */

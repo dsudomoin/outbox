@@ -64,13 +64,14 @@ final class DeadIndexBuilder {
     private final Duration lockTimeout;
     /** The most {@link #close} waits for a connection and the cancel of a build, on top of its timeout. */
     private static final Duration CANCEL_WAIT = Duration.ofSeconds(1);
-    /** Guards {@link #closed}, {@link #thread} and {@link #inDdl}, so a close either sees the DDL or prevents it. */
+    /**
+     * Guards {@link #closed}, {@link #thread} and {@link #ddlConnection} (set while a drop or build runs), so a close
+     * either sees the DDL or prevents it.
+     */
     private final Object monitor = new Object();
     private boolean closed;
     @Nullable
     private Thread thread;
-    /** Whether a drop or build runs. */
-    private boolean inDdl;
     /** Its statement once it runs, null otherwise: what {@link #close} cancels. */
     @Nullable
     private Statement ddlStatement;
@@ -105,7 +106,7 @@ final class DeadIndexBuilder {
             }
             if (thread != null && thread.isAlive()) {
                 on = ddlConnection;
-                if (!inDdl || on == null) {
+                if (on == null) {
                     silentRuns = 0;
                     return;
                 }
@@ -294,11 +295,10 @@ final class DeadIndexBuilder {
         }
     }
 
-    /** Closes {@code c}'s session at once; false when that failed, added to {@code cause} if any, else logged. */
-    private boolean abort(Connection c, @Nullable Exception cause) {
+    /** Closes {@code c}'s session at once; a failure is added to {@code cause} if any, else logged. */
+    private void abort(Connection c, @Nullable Exception cause) {
         try {
             c.abort(Runnable::run);
-            return true;
         } catch (SQLException e) {
             if (cause != null) {
                 cause.addSuppressed(e);
@@ -306,7 +306,6 @@ final class DeadIndexBuilder {
                 log.warn("outbox could not abort the connection of the build of {} at shutdown: {}", index,
                         e.toString());
             }
-            return false;
         }
     }
 
@@ -356,7 +355,6 @@ final class DeadIndexBuilder {
             if (closed) {
                 return false;
             }
-            inDdl = true;
             waitCut = false;
             ddlConnection = c;
         }
@@ -381,7 +379,6 @@ final class DeadIndexBuilder {
             throw e;
         } finally {
             synchronized (monitor) {
-                inDdl = false;
                 ddlStatement = null;
                 ddlConnection = null;
             }

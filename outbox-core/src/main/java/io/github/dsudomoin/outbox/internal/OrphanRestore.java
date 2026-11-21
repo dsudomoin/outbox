@@ -3,10 +3,12 @@ package io.github.dsudomoin.outbox.internal;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.regex.Pattern;
 import io.github.dsudomoin.outbox.internal.Sql.SqlConsumer;
 import io.github.dsudomoin.outbox.internal.Sql.SqlRunnable;
@@ -184,36 +186,25 @@ public final class OrphanRestore {
         long left = 0;
         var c = autocommit;
         while (!last) {
-            var ids = new ArrayList<Long>(CHUNK);
             var rows = new ArrayList<Resender.Source>(CHUNK);
             int read;
             c.setAutoCommit(false);
             try (var st = c.createStatement()) {
-                // first in the transaction: read committed, so the read takes its snapshot after the lock
-                st.execute("set transaction isolation level read committed");
-                LockHolder.fenceCurrent(c); // the maintenance lock's holder of a restoreOrphan call is alive
-                st.execute("set local lock_timeout = " + lockTimeout.toMillis());
-                // as relay steps do: Postgres ends a frozen client's session, and with it the table's lock
-                st.execute("set local idle_in_transaction_session_timeout = "
-                        + PartitionDdl.workIdle(lockTimeout).toMillis());
-                // the first chunk's read walks the rows below fromXid
-                st.execute("set local statement_timeout = " + scan.toMillis() + Ticks.noTransactionTimeout(c));
-                st.execute("lock table " + table + " in access exclusive mode");
+                begin(c, st, table, lockTimeout, scan); // the first chunk's read walks the rows below fromXid
                 try (var ps = c.prepareStatement(chunk)) {
                     ps.setString(1, Long.toString(fromXid));
                     ps.setLong(2, after);
                     scanning(scan, () -> {
                         try (var rs = ps.executeQuery()) {
                             while (rs.next()) {
-                                ids.add(rs.getLong(1));
                                 rows.add(new Resender.Source(rs.getLong(1), rs.getString(2), rs.getBytes(3)));
                             }
                         }
                     });
                 }
                 read = rows.size();
-                if (!ids.isEmpty()) {
-                    after = ids.get(ids.size() - 1);
+                if (!rows.isEmpty()) {
+                    after = rows.get(rows.size() - 1).id();
                 }
                 // from here on, writers may queue behind this chunk's key locks: wait no longer than the swap may
                 st.execute("set local lock_timeout = " + keyLockTimeout.toMillis());
@@ -230,30 +221,22 @@ public final class OrphanRestore {
                             held.put(hash, kept = new ArrayList<>());
                         }
                         if (kept != null && kept.size() < CHUNK) {
-                            kept.add(ids.get(i));
+                            kept.add(rows.get(i).id());
                         }
                     }
                 }
                 for (int i = rows.size() - 1; i >= 0; i--) {
                     if (hashes.get(i) != null && busy.contains(hashes.get(i))) {
                         rows.remove(i);
-                        ids.remove(i);
                         left++;
                     }
                 }
                 resender.insertFrom(c, table, rows);
-                try (var ps = c.prepareStatement("delete from " + table + " where id = any(?)")) {
-                    ps.setArray(1, c.createArrayOf("int8", ids.toArray()));
-                    ps.executeUpdate();
-                }
+                deleteIds(c, table, rows.stream().map(Resender.Source::id).toList());
                 last = read < CHUNK;
                 // under the lock still: no row can reach the table between this read and the drop
                 if (last && left == 0) {
-                    st.execute("drop table " + table);
-                    try (var ps = c.prepareStatement(unmarkDropping)) {
-                        ps.setString(1, names.unqualified(table));
-                        ps.executeUpdate();
-                    }
+                    drop(c, st, table);
                 }
                 c.commit();
             } catch (Throwable e) { // an Error too: setAutoCommit(true) would commit the chunk so far
@@ -300,14 +283,7 @@ public final class OrphanRestore {
             throws SQLException {
         c.setAutoCommit(false);
         try (var st = c.createStatement()) {
-            st.execute("set transaction isolation level read committed");
-            LockHolder.fenceCurrent(c);
-            st.execute("set local lock_timeout = " + lockTimeout.toMillis());
-            st.execute("set local idle_in_transaction_session_timeout = "
-                    + PartitionDdl.workIdle(lockTimeout).toMillis());
-            st.execute("set local statement_timeout = " + lockTimeout.plus(margin).toMillis()
-                    + Ticks.noTransactionTimeout(c));
-            st.execute("lock table " + table + " in access exclusive mode");
+            begin(c, st, table, lockTimeout, lockTimeout.plus(margin));
             st.execute("set local lock_timeout = " + keyLockTimeout.toMillis());
             try (var ps = c.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {
                 ps.setInt(1, names.keyNamespace());
@@ -332,19 +308,12 @@ public final class OrphanRestore {
                 }
             }
             resender.insertFrom(c, table, rows); // the key's lock is ours: taken again without waiting
-            try (var ps = c.prepareStatement("delete from " + table + " where id = any(?)")) {
-                ps.setArray(1, c.createArrayOf("int8", ids.toArray()));
-                ps.executeUpdate();
-            }
+            deleteIds(c, table, ids);
             // nothing writes into a standalone range: the chunks counted every row they left, as the last chunk's drop
             // relies on, so no scan of the table under the key lock
             boolean empty = rows.size() == left;
             if (empty) {
-                st.execute("drop table " + table);
-                try (var ps = c.prepareStatement(unmarkDropping)) {
-                    ps.setString(1, names.unqualified(table));
-                    ps.executeUpdate();
-                }
+                drop(c, st, table);
             }
             c.commit();
             c.setAutoCommit(true);
@@ -357,6 +326,38 @@ public final class OrphanRestore {
                 e.addSuppressed(cleanup);
             }
             throw e;
+        }
+    }
+
+    /**
+     * The start of a chunk's or a held key's transaction on {@code table}: read committed first, so a read takes its
+     * snapshot after the lock; the maintenance lock's holder fenced; each lock wait at most {@code lockTimeout}, idle
+     * time bounded as relay steps bound it (Postgres ends a frozen client's session, and with it the table's lock),
+     * each statement at most {@code statementTimeout}; then the table's lock.
+     */
+    private static void begin(Connection c, Statement st, String table, Duration lockTimeout,
+            Duration statementTimeout) throws SQLException {
+        st.execute("set transaction isolation level read committed");
+        LockHolder.fenceCurrent(c);
+        st.execute("set local lock_timeout = " + lockTimeout.toMillis());
+        st.execute("set local idle_in_transaction_session_timeout = " + PartitionDdl.workIdle(lockTimeout).toMillis());
+        st.execute("set local statement_timeout = " + statementTimeout.toMillis() + Ticks.noTransactionTimeout(c));
+        st.execute("lock table " + table + " in access exclusive mode");
+    }
+
+    private static void deleteIds(Connection c, String table, List<Long> ids) throws SQLException {
+        try (var ps = c.prepareStatement("delete from " + table + " where id = any(?)")) {
+            ps.setArray(1, c.createArrayOf("int8", ids.toArray()));
+            ps.executeUpdate();
+        }
+    }
+
+    /** Drops the emptied {@code table} and its dropping mark. */
+    private void drop(Connection c, Statement st, String table) throws SQLException {
+        st.execute("drop table " + table);
+        try (var ps = c.prepareStatement(unmarkDropping)) {
+            ps.setString(1, names.unqualified(table));
+            ps.executeUpdate();
         }
     }
 

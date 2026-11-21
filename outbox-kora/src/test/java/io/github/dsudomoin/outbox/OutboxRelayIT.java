@@ -612,7 +612,7 @@ class OutboxRelayIT {
         var ticker = new Thread(() -> {
             try (var c = TestDb.connect()) {
                 while (!stop.get()) {
-                    var tick = other.attempt(c, Duration.ZERO);
+                    var tick = other.attempt(c, Duration.ZERO, null);
                     if (tick.made() == Ticks.Made.INSERTED) {
                         made.add(tick.id());
                     }

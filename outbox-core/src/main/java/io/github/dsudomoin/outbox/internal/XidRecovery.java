@@ -166,7 +166,7 @@ public final class XidRecovery {
         try (var st = c.createStatement()) {
             st.execute("set local statement_timeout = " + timeout.toMillis()
                     + "; set local idle_in_transaction_session_timeout = " + LOCK_TIMEOUT.toMillis()
-                    + Ticks.noTransactionTimeout(c) + Ticks.DURABLE_COMMIT); // it commits a tick
+                    + Ticks.noTransactionTimeout(c));
             long rows = queryLong(st, "select count(*) from (" + saved + ") s");
             c.commit();
             return rows;
