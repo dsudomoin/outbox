@@ -843,9 +843,7 @@ public final class XidPartitions {
         var sql = nowaitPipeline("table only " + base, swapLockTimeout, swapWork(lower, bound, first, top, maxBytes),
                 holdBound, SWAP_RESULT);
         var budget = NOWAIT_WINDOW.plus(swapLockTimeout).plus(holdBound).plus(TRIES_MARGIN).plus(TRY_MARGIN);
-        String result = SocketBound.atLeast(c, budget, () -> c.getAutoCommit()
-                ? PartitionDdl.transaction(c, Maintenance.ABANDONED_AFTER, () -> pipeline(c, sql, attachWarnings))
-                : pipeline(c, sql, attachWarnings));
+        String result = SocketBound.atLeast(c, budget, () -> pipelined(c, sql, attachWarnings));
         if (result.equals("busy")) {
             throw new WritersHeldTheLock(base, new SQLException("could not take ACCESS EXCLUSIVE on " + base + " in "
                     + NOWAIT_WINDOW.toMillis() + " ms of NOWAIT tries: a transaction held a lock on it at every try",
@@ -939,6 +937,16 @@ public final class XidPartitions {
     }
 
     /**
+     * {@link #pipeline} in the caller's transaction or, on an autocommit connection, in one of its own, ended by the
+     * server once abandoned for {@link Maintenance#ABANDONED_AFTER}.
+     */
+    static String pipelined(Connection c, String sql, @Nullable Consumer<SQLWarning> warnings) throws SQLException {
+        return c.getAutoCommit()
+                ? PartitionDdl.transaction(c, Maintenance.ABANDONED_AFTER, () -> pipeline(c, sql, warnings))
+                : pipeline(c, sql, warnings);
+    }
+
+    /**
      * Drops {@code partition}, detach-pending, of {@code parent} without {@code FINALIZE}, which waits for every
      * snapshot in the database older than its own, a report on another table included: ACCESS EXCLUSIVE on the parent,
      * {@code NOWAIT} as the swap takes it ({@link #nowaitPipeline}, tried every millisecond for {@link #NOWAIT_WINDOW}),
@@ -953,9 +961,7 @@ public final class XidPartitions {
         String result;
         try {
             var sql = dropPendingSql(parent, partition);
-            result = c.getAutoCommit()
-                    ? PartitionDdl.transaction(c, Maintenance.ABANDONED_AFTER, () -> pipeline(c, sql, null))
-                    : pipeline(c, sql, null);
+            result = pipelined(c, sql, null);
         } catch (SQLException e) {
             return droppedPending(e, parent, partition);
         }

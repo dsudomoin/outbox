@@ -1,5 +1,7 @@
 package io.github.dsudomoin.outbox.internal;
 
+import static io.github.dsudomoin.outbox.internal.Sql.queryLong;
+
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Attachment;
 import jakarta.annotation.Nullable;
@@ -548,12 +550,5 @@ public final class XidRecovery {
                     + " outbox.recovery.timeout " + timeout, "57014");
         }
         st.execute("set local statement_timeout = " + left);
-    }
-
-    private static long queryLong(Statement st, String sql) throws SQLException {
-        try (var rs = st.executeQuery(sql)) {
-            rs.next();
-            return rs.getLong(1);
-        }
     }
 }

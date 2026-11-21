@@ -344,10 +344,9 @@ public final class PgInbox implements Inbox, AutoCloseable {
                 c.setAutoCommit(true);
                 SocketBound.atLeast(c, LOCK_TIMEOUT.plus(PartitionDdl.DDL_MARGIN), () -> {
                     if (config.schema().bootstrap()) {
-                        PartitionDdl.execute(c, LOCK_TIMEOUT, "create table if not exists " + names.base()
-                                + " (message_id uuid not null, consumer text not null default '', received_at"
-                                + " timestamptz not null default now(), primary key (message_id, consumer))"
-                                + " partition by range (message_id)");
+                        for (var table : SchemaObjects.inbox(names).tables()) {
+                            PartitionDdl.execute(c, LOCK_TIMEOUT, table.createSql(true));
+                        }
                     }
                     partitions.reown(c);
                     partitions.ensurePremade(c, clock.millis());

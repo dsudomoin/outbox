@@ -1,6 +1,7 @@
 package io.github.dsudomoin.outbox.internal;
 
 import static io.github.dsudomoin.outbox.internal.Sql.execute;
+import static io.github.dsudomoin.outbox.internal.Sql.queryLong;
 
 import io.github.dsudomoin.outbox.ConnectionSource;
 import io.github.dsudomoin.outbox.OutboxConfig;
@@ -538,200 +539,63 @@ public final class OutboxSchema implements AutoCloseable {
 
     /** Creates the missing base objects ({@link SchemaObjects}) and upgrades the ones earlier versions made. */
     private void createBaseObjects(Connection c, TableNames n) throws SQLException {
-        try (var st = c.createStatement()) {
-            ddl(c, "create table if not exists " + n.base() + """
-                     (
-                      id          bigint generated always as identity,
-                      shard       smallint    not null,
-                      xid         xid8        not null default pg_current_xact_id(),
-                      created_at  timestamptz not null default clock_timestamp(),
-                      message_id  uuid        not null,
-                      topic       text        not null,
-                      key         bytea,
-                      payload     bytea,
-                      headers     bytea
-                    ) partition by range (xid)""");
-            createIndex(c, n.base() + "_shard_xid", n.base() + " (shard, xid)");
-            ddl(c, "create table if not exists " + n.tick() + """
-                     (
-                      id         bigint generated always as identity primary key,
-                      snapshot   pg_snapshot not null,
-                      created_at timestamptz not null default clock_timestamp(),
-                      max_id     bigint,
-                      dirty      bit varying,
-                      shards     smallint[]
-                    )""");
-            addColumn(c, n.tick(), "max_id", "bigint"); // a tick table made before max_id: a metadata-only change
-            addColumn(c, n.tick(), "dirty", "bit varying"); // made before dirty: likewise; its ticks stay null (all)
-            // the shard sets dirty replaces, kept for the previous release beside or after this one: it inserts them
-            // in every tick and reads them (null: every shard, as this version leaves them). Made again where an
-            // earlier build of this version dropped it
-            addColumn(c, n.tick(), "shards", "smallint[]");
-            createIndex(c, n.tick() + "_xmax", n.tick() + " ((pg_snapshot_xmax(snapshot)))"); // Maintenance's xid check
-            ddl(c, "create table if not exists " + n.cursor() + """
-                     (
-                      shard          smallint not null,
-                      seq            bigint generated always as identity,
-                      tick_id        bigint not null,
-                      target_tick_id bigint,
-                      last_id        bigint not null default 0,
-                      paused_until   timestamptz,
-                      failures       int not null default 0,
-                      retry_due_at   timestamptz,
-                      parked_due_at  timestamptz,
-                      primary key (shard, seq)
-                    )""");
-            // made before requeue: metadata-only, rows get null
-            addColumn(c, n.cursor(), "parked_due_at", "timestamptz");
-            // maintenance's checkpoint, which moves idle shards on without cursor rows (Cursors); none until its run
-            ddl(c, "create table if not exists " + n.checkpoint() + """
-                     (
-                      seq          bigint generated always as identity primary key,
-                      tick_id      bigint not null,
-                      busy         bit varying not null,
-                      busy_tick_id bigint not null,
-                      created_at   timestamptz not null default clock_timestamp()
-                    )""");
-            ddl(c, "create table if not exists " + n.retry() + """
-                     (
-                      id              bigint primary key,
-                      shard           smallint not null,
-                      message_id      uuid not null,
-                      topic           text not null,
-                      key             bytea,
-                      payload         bytea,
-                      headers         bytea,
-                      created_at      timestamptz not null,
-                      attempts        int not null default 0,
-                      next_attempt_at timestamptz,
-                      last_error      text,
-                      requeues        int not null default 0,
-                      waiting_since   timestamptz
-                    )""");
-            addColumn(c, n.retry(), "requeues", "int not null default 0"); // made before requeue: a constant default
-            addColumn(c, n.retry(), "waiting_since", "timestamptz"); // made before WAIT: rows get null, not waiting
-            createIndex(c, n.retry() + "_key", n.retry() + " (shard, topic, key, id)");
-            createIndex(c, n.retry() + "_due",
-                    n.retry() + " (shard, next_attempt_at) where next_attempt_at is not null");
-            createIndex(c, n.retry() + "_waiting", n.retry() + " (waiting_since) where waiting_since is not null");
-            // requeued records: unlike retry rows, they do not block their key
-            ddl(c, "create table if not exists " + n.parked() + """
-                     (
-                      id         bigint primary key,
-                      shard      smallint not null,
-                      message_id uuid not null,
-                      topic      text not null,
-                      key        bytea,
-                      payload    bytea,
-                      headers    bytea,
-                      created_at timestamptz not null,
-                      attempts   int not null default 0,
-                      requeues   int not null default 0,
-                      due_at     timestamptz not null
-                    )""");
-            createIndex(c, n.parked() + "_key", n.parked() + " (shard, topic, key, id)");
-            createIndex(c, n.parked() + "_due", n.parked() + " (shard, due_at)");
-            ddl(c, "create table if not exists " + n.dead() + """
-                     (
-                      id         bigint primary key,
-                      shard      smallint not null,
-                      message_id uuid not null,
-                      topic      text not null,
-                      key        bytea,
-                      payload    bytea,
-                      headers    bytea,
-                      created_at timestamptz not null,
-                      attempts   int not null,
-                      failed_at  timestamptz not null default now(),
-                      error      text
-                    )""");
-            // the dead-letter hook's columns, on a fresh table too, in one ALTER while any is missing (due_at: the next
-            // hook call of a pending letter, the redrive of a scheduled one); letters of a table made before them
-            // become kept, so the status check, added with its column, skips them (not valid)
-            boolean noStatus = !columnExists(c, n.dead(), "status");
-            boolean missing = noStatus;
-            for (var column : List.of("due_at", "handler_attempts", "last_handler_error", "redrives")) {
-                missing |= !columnExists(c, n.dead(), column);
-            }
-            if (missing) {
-                ddl(c, "alter table " + n.dead() + " add column if not exists status text not null default 'kept',"
-                        + " add column if not exists due_at timestamptz,"
-                        + " add column if not exists handler_attempts int not null default 0,"
-                        + " add column if not exists last_handler_error text,"
-                        + " add column if not exists redrives int not null default 0"
-                        + (noStatus ? ", add constraint " + n.unqualified(n.dead()) + "_status"
-                                + " check (status in ('pending', 'kept', 'scheduled')) not valid" : ""));
-            }
-            // on a dead table with rows (kept forever by default) the build would hold dead inserts and outlast the
-            // statement_timeout: Maintenance builds it concurrently, and the pass claims by a scan meanwhile
-            String deadDue = n.dead() + "_due";
-            if (!PartitionDdl.exists(c, deadDue)) {
-                if (PartitionDdl.hasRows(c, n.dead())) {
-                    log.info("outbox index {} is missing on {}, which holds rows: maintenance builds it concurrently"
-                            + " in its next run", deadDue, n.dead());
-                } else {
-                    createIndex(c, deadDue, n.dead() + " (due_at) where due_at is not null");
+        // the dead-letter hook's columns, on a fresh table too, in one ALTER while any is missing (due_at: the next
+        // hook call of a pending letter, the redrive of a scheduled one); letters of a table made before them become
+        // kept, so the status check, added with its column, skips them (not valid). Read before the tables are made:
+        // a fresh table has the columns, and still takes the check from the ALTER
+        boolean noStatus = !columnExists(c, n.dead(), "status");
+        boolean missing = noStatus;
+        for (var column : List.of("due_at", "handler_attempts", "last_handler_error", "redrives")) {
+            missing |= !columnExists(c, n.dead(), column);
+        }
+        var objects = SchemaObjects.outbox(n);
+        for (var table : objects.tables()) {
+            ddl(c, table.createSql(true));
+        }
+        addColumn(c, n.tick(), "max_id", "bigint"); // a tick table made before max_id: a metadata-only change
+        addColumn(c, n.tick(), "dirty", "bit varying"); // made before dirty: likewise; its ticks stay null (all)
+        // the shard sets dirty replaces, kept for the previous release beside or after this one: it inserts them in
+        // every tick and reads them (null: every shard, as this version leaves them). Made again where an earlier
+        // build of this version dropped it
+        addColumn(c, n.tick(), "shards", "smallint[]");
+        // made before requeue: metadata-only, rows get null
+        addColumn(c, n.cursor(), "parked_due_at", "timestamptz");
+        addColumn(c, n.retry(), "requeues", "int not null default 0"); // made before requeue: a constant default
+        addColumn(c, n.retry(), "waiting_since", "timestamptz"); // made before WAIT: rows get null, not waiting
+        if (missing) {
+            ddl(c, "alter table " + n.dead() + " add column if not exists status text not null default 'kept',"
+                    + " add column if not exists due_at timestamptz,"
+                    + " add column if not exists handler_attempts int not null default 0,"
+                    + " add column if not exists last_handler_error text,"
+                    + " add column if not exists redrives int not null default 0"
+                    + (noStatus ? ", add constraint " + n.unqualified(n.dead()) + "_status"
+                            + " check (status in ('pending', 'kept', 'scheduled')) not valid" : ""));
+        }
+        addColumn(c, n.halt(), "recovery_failed", "text"); // the previous release's table
+        // XidPartitions: when any instance first saw the hot tail over maxTailScan, null while none is
+        addColumn(c, n.maintenance(), "tail_oversized_since", "timestamptz"); // the previous release's table
+        addColumn(c, n.instance(), "expires_at", "timestamptz"); // made by an earlier build of this version
+        addColumn(c, n.instance(), "relay", "boolean not null default false"); // likewise
+        addColumn(c, n.instance(), "contracts", "jsonb"); // likewise; null: unknown
+        addColumn(c, n.instance(), "routes", "text[]"); // likewise; null: unknown
+        // after the upgrades, which add the columns some of them cover
+        String deadDue = n.dead() + "_due";
+        for (var table : objects.tables()) {
+            for (var index : table.indexes()) {
+                if (!index.name().equals(deadDue)) {
+                    createIndex(c, index.name(), table.name() + " " + index.definition());
+                } else if (!PartitionDdl.exists(c, deadDue)) {
+                    // on a dead table with rows (kept forever by default) the build would hold dead inserts and
+                    // outlast the statement_timeout: Maintenance builds it concurrently, and the pass claims by a
+                    // scan meanwhile
+                    if (PartitionDdl.hasRows(c, n.dead())) {
+                        log.info("outbox index {} is missing on {}, which holds rows: maintenance builds it"
+                                + " concurrently in its next run", deadDue, n.dead());
+                    } else {
+                        createIndex(c, deadDue, table.name() + " " + index.definition());
+                    }
                 }
             }
-            // how many times a message was redriven, read by its next dead row
-            ddl(c, "create table if not exists " + n.redriven() + """
-                     (
-                      message_id uuid primary key,
-                      redrives   int not null,
-                      at         timestamptz not null default now()
-                    )""");
-            // the xid-regression halt, persisted by Maintenance: one row while halted; recovery_failed: why the
-            // automatic recovery stopped trying (XidRecovery#autoRecover)
-            ddl(c, "create table if not exists " + n.halt() + """
-                     (
-                      id              int primary key default 1 check (id = 1),
-                      halted_at       timestamptz not null default now(),
-                      max_tick_xmax   xid8 not null,
-                      recovery_failed text
-                    )""");
-            addColumn(c, n.halt(), "recovery_failed", "text"); // the previous release's table
-            // when a maintenance run last completed every step, on any instance
-            ddl(c, "create table if not exists " + n.maintenance() + """
-                     (
-                      id           int primary key default 1 check (id = 1),
-                      succeeded_at timestamptz not null,
-                      tail_oversized_since timestamptz
-                    )""");
-            // PgOutboxAdmin#recoverStrandedShards: the tick each stranded shard's repair goes to, while it is stranded
-            // at stranded_tick_id with its latest cursor row on cursor_tick_id and cursor_target_tick_id
-            ddl(c, "create table if not exists " + n.stranded() + """
-                     (
-                      shard                 smallint primary key,
-                      stranded_tick_id      bigint not null,
-                      cursor_tick_id        bigint not null,
-                      cursor_target_tick_id bigint,
-                      tick_id               bigint not null
-                    )""");
-            // XidPartitions: when any instance first saw the hot tail over maxTailScan, null while none is
-            addColumn(c, n.maintenance(), "tail_oversized_since", "timestamptz"); // the previous release's table
-            // XidPartitions: the ranges it detaches as relayed, by unqualified name, until they are dropped
-            ddl(c, "create table if not exists " + n.dropping() + """
-                     (
-                      table_name text primary key,
-                      at         timestamptz not null default now()
-                    )""");
-            // Heartbeat: the instances running, by the database clock, for the reshard guard and the admin status; a
-            // row is live until its expires_at, which its writer sets from its own maintenanceInterval
-            ddl(c, "create table if not exists " + n.instance() + """
-                     (
-                      instance_id text primary key,
-                      shards      int not null,
-                      last_seen   timestamptz not null default now(),
-                      hook_active boolean not null default false,
-                      expires_at  timestamptz,
-                      relay       boolean not null default false,
-                      contracts   jsonb,
-                      routes      text[]
-                    )""");
-            addColumn(c, n.instance(), "expires_at", "timestamptz"); // made by an earlier build of this version
-            addColumn(c, n.instance(), "relay", "boolean not null default false"); // likewise
-            addColumn(c, n.instance(), "contracts", "jsonb"); // likewise; null: unknown
-            addColumn(c, n.instance(), "routes", "text[]"); // likewise; null: unknown
         }
     }
 
@@ -763,6 +627,7 @@ public final class OutboxSchema implements AutoCloseable {
      * start), which the first check already refuses before the tick guard.
      */
     private void reshard(Connection c, TableNames n, int from, int to) throws SQLException {
+        var refused = "outbox.shards = " + to + " but " + n.cursor() + " holds cursors for " + from + " shards";
         var keep = " To keep the current count, start with outbox.shards = " + from + " or leave it unset.";
         var live = new ArrayList<String>();
         try (var ps = c.prepareStatement("select instance_id, shards, round(extract(epoch from clock_timestamp()"
@@ -776,13 +641,12 @@ public final class OutboxSchema implements AutoCloseable {
             }
         }
         if (!live.isEmpty()) {
-            throw new IllegalStateException("outbox.shards = " + to + " but " + n.cursor() + " holds cursors for "
-                    + from + " shards, and instances with another shard count are running (their heartbeat has not"
-                    + " expired): " + String.join(", ", live) + ". A reshard needs every"
+            throw new IllegalStateException(refused + ", and instances with another shard count are running (their"
+                    + " heartbeat has not expired): " + String.join(", ", live) + ". A reshard needs every"
                     + " instance stopped: stop writers, wait for outbox.shard.lag 0, stop all instances, start with the"
                     + " new value." + keep);
         }
-        awaitNoTicks(c, n, from, to, keep);
+        awaitNoTicks(c, n, refused, keep);
         // read committed (PartitionDdl.transaction) whatever the session default: under repeatable read the lock
         // statement would fix the snapshot before SHARE is granted, so the checks and the new tick would miss a write
         // committed while the reshard waited for it, and its row would be read under its old shard. Cut off by the
@@ -805,24 +669,23 @@ public final class OutboxSchema implements AutoCloseable {
                 if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
                     throw e;
                 }
-                throw new IllegalStateException("outbox.shards = " + to + " but " + n.cursor() + " holds cursors for "
-                        + from + " shards, and the reshard waited " + LOCK_TIMEOUT.toSeconds() + " s for a lock that a"
-                        + " running relay, its maintenance or a writer of " + n.base() + " holds: " + e.getMessage()
+                throw new IllegalStateException(refused + ", and the reshard waited " + LOCK_TIMEOUT.toSeconds()
+                        + " s for a lock that a running relay, its maintenance or a writer of " + n.base() + " holds: "
+                        + e.getMessage()
                         + ". A reshard needs every instance stopped: stop writers, wait for outbox.shard.lag 0, stop"
                         + " all instances, start with the new value." + keep, e);
             }
             // an instance that ticked between the wait and the locks: no tick is made while LOCK_TICK is held
             var age = tickAge(c, n);
             if (age != null && age.ago() < age.bound()) {
-                throw relayRunning(n, from, to, keep, age);
+                throw relayRunning(refused, keep, age);
             }
             var failed = drainChecks(c, n, from);
             if (!failed.isEmpty()) {
-                throw new IllegalStateException("outbox.shards = " + to + " but " + n.cursor() + " holds cursors for "
-                        + from + " shards, and " + n.base() + " is not drained, so its rows would be skipped or read"
-                        + " under their old shard: " + String.join("; ", failed) + ". To reshard: stop writers, wait for"
-                        + " outbox.shard.lag 0, stop all instances, start with the new value (README «Решардинг»)."
-                        + keep);
+                throw new IllegalStateException(refused + ", and " + n.base() + " is not drained, so its rows would"
+                        + " be skipped or read under their old shard: " + String.join("; ", failed) + ". To reshard:"
+                        + " stop writers, wait for outbox.shard.lag 0, stop all instances, start with the new value"
+                        + " (README «Решардинг»)." + keep);
             }
             try (var st = c.createStatement()) {
                 st.execute("delete from " + n.cursor());
@@ -844,23 +707,21 @@ public final class OutboxSchema implements AutoCloseable {
      * Fails unless the newest tick is older than the tick guard's bound (see {@link #reshard}), after waiting for it
      * up to {@link #tickWait}, rechecking: a relay that stops meanwhile lets the reshard go on, not a restart loop.
      */
-    private void awaitNoTicks(Connection c, TableNames n, int from, int to, String keep) throws SQLException {
+    private void awaitNoTicks(Connection c, TableNames n, String refused, String keep) throws SQLException {
         long deadline = System.nanoTime() + tickWait.toNanos();
         while (true) {
             var age = tickAge(c, n);
             if (age == null || age.ago() >= age.bound()) {
                 return;
             }
-            long ago = age.ago();
-            long bound = age.bound();
             long left = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
-            if (bound - ago > left) {
-                throw relayRunning(n, from, to, keep, age);
+            if (age.bound() - age.ago() > left) {
+                throw relayRunning(refused, keep, age);
             }
             log.info("outbox reshard of {} waits {} ms for the latest tick to be {} ms old: an instance may still"
-                    + " tick", n.base(), bound - ago, bound);
+                    + " tick", n.base(), age.bound() - age.ago(), age.bound());
             try {
-                Thread.sleep(Math.min(bound - ago + 10, TICK_RECHECK));
+                Thread.sleep(Math.min(age.bound() - age.ago() + 10, TICK_RECHECK));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("outbox reshard of " + n.base() + " interrupted", e);
@@ -891,9 +752,8 @@ public final class OutboxSchema implements AutoCloseable {
         }
     }
 
-    private IllegalStateException relayRunning(TableNames n, int from, int to, String keep, TickAge age) {
-        return new IllegalStateException("outbox.shards = " + to + " but " + n.cursor() + " holds cursors for " + from
-                + " shards, and an instance is still ticking (a relay, or a writer with"
+    private IllegalStateException relayRunning(String refused, String keep, TickAge age) {
+        return new IllegalStateException(refused + ", and an instance is still ticking (a relay, or a writer with"
                 + " outbox.relay.ticksWithoutRelay; latest tick " + age.ago() + " ms ago): a reshard needs every"
                 + " instance stopped, those of releases without the heartbeat too, and no tick for " + age.bound()
                 + " ms (waited up to " + tickWait.toSeconds() + " s). Stop writers, wait for outbox.shard.lag 0, stop"
@@ -1226,13 +1086,6 @@ public final class OutboxSchema implements AutoCloseable {
             }
             log.warn("outbox bootstrap of {} waits for its schema lock {}, held by another session (attempt {} of"
                     + " {})", n.base(), lock, attempt, schemaLockAttempts);
-        }
-    }
-
-    private static long queryLong(Statement st, String sql) throws SQLException {
-        try (var rs = st.executeQuery(sql)) {
-            rs.next();
-            return rs.getLong(1);
         }
     }
 }

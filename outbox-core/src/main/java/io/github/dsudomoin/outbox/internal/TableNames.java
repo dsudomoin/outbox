@@ -74,7 +74,8 @@ public record TableNames(
      * name unquoted, and the grammar takes any keyword only as the table part after a schema.
      */
     public TableNames resolve(Connection c) throws SQLException {
-        String head = base.substring(0, base.indexOf('.') < 0 ? base.length() : base.indexOf('.'));
+        String head = head(base);
+        boolean unqualifiedBase = base.indexOf('.') < 0;
         try (var ps = c.prepareStatement("select current_schema(), (select n.nspname || '.' || r.relname"
                 + " from pg_class r join pg_namespace n on n.oid = r.relnamespace where r.oid = to_regclass(?)),"
                 + " exists (select 1 from pg_get_keywords() where word = ? and catcode in ('R', 'T'))")) {
@@ -87,11 +88,11 @@ public record TableNames(
                 if (rs.getBoolean(3)) {
                     throw new IllegalStateException(keywordMessage(base, head));
                 }
-                if (base.indexOf('.') < 0 && schema == null) {
+                if (unqualifiedBase && schema == null) {
                     throw new IllegalStateException("table " + base + " is unqualified, but the search_path names"
                             + " no existing schema; qualify it as schema." + base);
                 }
-                String canonical = base.indexOf('.') < 0 ? schema + "." + base : base;
+                String canonical = unqualifiedBase ? schema + "." + base : base;
                 if (existing != null && !existing.equals(canonical)) {
                     throw new IllegalStateException("table " + base + " resolves to " + existing + ", but it would be"
                             + " created as " + canonical + ", in current_schema(): the table exists only in a later"
@@ -182,11 +183,17 @@ public record TableNames(
             throw new IllegalArgumentException(
                     "table name must match [schema.]name with parts [A-Za-z_][A-Za-z0-9_]{0,40}: " + base);
         }
-        String head = base.substring(0, base.indexOf('.') < 0 ? base.length() : base.indexOf('.'));
+        String head = head(base);
         if (KEYWORDS.contains(head.toLowerCase(Locale.ROOT))) {
             throw new IllegalArgumentException(keywordMessage(base, head.toLowerCase(Locale.ROOT)));
         }
         return base;
+    }
+
+    /** The schema of a qualified {@code base}, else the whole name: the part a keyword must not be. */
+    private static String head(String base) {
+        int dot = base.indexOf('.');
+        return dot < 0 ? base : base.substring(0, dot);
     }
 
     private static String keywordMessage(String base, String head) {

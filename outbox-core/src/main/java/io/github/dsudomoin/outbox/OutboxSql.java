@@ -60,22 +60,13 @@ public final class OutboxSql {
         sql.append("-- ").append(what).append(", schema version ").append(SCHEMA_VERSION).append(", rendered by ")
                 .append(by).append("; the library makes its partitions at runtime\n");
         for (var table : objects.tables()) {
-            sql.append("\ncreate table ").append(table.name()).append(" (\n");
-            var lines = table.columns().stream().map(OutboxSql::column).collect(Collectors.toList());
-            lines.addAll(table.constraints());
-            sql.append(lines.stream().map(line -> "    " + line).collect(Collectors.joining(",\n")));
-            sql.append("\n)");
-            if (table.partitionKey() != null) {
-                sql.append(" partition by ").append(table.partitionKey());
-            }
-            sql.append(";\n");
+            sql.append('\n').append(table.createSql(false)).append(";\n");
             for (var check : table.checks()) { // as the bootstrap adds them: no row has been checked
                 sql.append("alter table ").append(table.name()).append(" add constraint ").append(check.name())
                         .append(' ').append(check.definition()).append(" not valid;\n");
             }
             for (var index : table.indexes()) {
-                sql.append("create index ").append(index.name().substring(index.name().indexOf('.') + 1))
-                        .append(" on ").append(table.name()).append(' ').append(index.definition()).append(";\n");
+                sql.append(table.indexSql(index)).append(";\n");
             }
         }
         if (role != null) {
@@ -83,18 +74,5 @@ public final class OutboxSql {
                     .append(objects.tables().stream().map(SchemaObjects.Table::name).collect(Collectors.joining(", ")))
                     .append(" to ").append(role).append(";\n");
         }
-    }
-
-    private static String column(SchemaObjects.Column column) {
-        var line = new StringBuilder(column.name()).append(' ').append(column.type());
-        if (column.identity()) {
-            line.append(" generated always as identity (cache 1)"); // cached ids break the order of a key's messages
-        } else if (column.notNull()) {
-            line.append(" not null");
-        }
-        if (column.defaultValue() != null) {
-            line.append(" default ").append(column.defaultValue());
-        }
-        return line.toString();
     }
 }

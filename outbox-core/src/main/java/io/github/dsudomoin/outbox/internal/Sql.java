@@ -2,8 +2,9 @@ package io.github.dsudomoin.outbox.internal;
 
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.sql.Statement;
 
-/** JDBC callbacks that may throw {@link SQLException}, and the one-statement {@link #execute}. */
+/** JDBC callbacks that may throw {@link SQLException}, the one-statement {@link #execute} and {@link #queryLong}. */
 public final class Sql {
 
     private Sql() {}
@@ -12,6 +13,14 @@ public final class Sql {
     public static void execute(Connection c, String sql) throws SQLException {
         try (var st = c.createStatement()) {
             st.execute(sql);
+        }
+    }
+
+    /** The first column of the first row {@code sql} returns on {@code st}, 0 when it is null. */
+    public static long queryLong(Statement st, String sql) throws SQLException {
+        try (var rs = st.executeQuery(sql)) {
+            rs.next();
+            return rs.getLong(1);
         }
     }
 

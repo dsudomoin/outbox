@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -74,7 +75,7 @@ public final class PartitionDdl {
     private static final String REOWN_RESULT = "kora_outbox.reown";
     private static final long HANDOFF_WARN_INTERVAL = TimeUnit.HOURS.toNanos(1);
     /** By parent: when {@link #foreignOwner} last warned that its partitions cannot go to its owner. */
-    private static final Map<String, Long> handoffWarned = new ConcurrentHashMap<>();
+    private static final Map<String, AtomicLong> handoffWarned = new ConcurrentHashMap<>();
     private static final Pattern NAME = Pattern.compile("(?:[A-Za-z_][A-Za-z0-9_]*\\.)?[A-Za-z_][A-Za-z0-9_]*");
     private static final Pattern VALUE = Pattern.compile("[0-9A-Za-z:.+ -]+");
     private static final Pattern BOUNDS = Pattern.compile("FOR VALUES FROM \\((.+)\\) TO \\((.+)\\)");
@@ -142,9 +143,8 @@ public final class PartitionDdl {
     private static String foreignOwner(Connection c, String parent, String table) throws SQLException {
         var problem = ownerProblem(c, parent, table);
         if (problem != null) {
-            long now = System.nanoTime();
-            if (handoffWarned.compute(parent, (p, last) -> last != null && now - last < HANDOFF_WARN_INTERVAL
-                    ? last : now) == now) {
+            if (LogLimit.due(handoffWarned.computeIfAbsent(parent,
+                    p -> new AtomicLong(System.nanoTime() - HANDOFF_WARN_INTERVAL)), HANDOFF_WARN_INTERVAL)) {
                 log.warn("outbox {}; this WARN repeats at most once an hour", problem);
             }
             return null;
@@ -176,7 +176,7 @@ public final class PartitionDdl {
                 + " t.relnamespace = p.relnamespace and t.relowner <> p.relowner where p.oid = to_regclass(?)"
                 + " and t.relkind = 'r' and t.relname ~ ? and pg_get_userbyid(t.relowner) = current_user")) {
             ps.setString(1, parent);
-            ps.setString(2, "^" + parent.substring(parent.indexOf('.') + 1) + suffix + "$");
+            ps.setString(2, rangePattern(parent, suffix));
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
                     if (!dropped(rs.getString(1))) {
@@ -232,11 +232,12 @@ public final class PartitionDdl {
                 }
                 var owner = rs.getString(1);
                 var schema = rs.getString(2);
-                var cannot = "role " + role(c) + " cannot make " + table + " belong to " + owner + ", the owner of "
+                var role = role(c);
+                var cannot = "role " + role + " cannot make " + table + " belong to " + owner + ", the owner of "
                         + parent + "; until it can, the tables it creates stay its own, and the owner's other members"
                         + " (per-instance credentials) cannot swap or drop them: ";
                 if (!rs.getBoolean(3)) {
-                    return cannot + "run GRANT " + owner + " TO " + role(c)
+                    return cannot + "run GRANT " + owner + " TO " + role
                             + (set.equals("SET") ? " WITH SET TRUE" : "");
                 }
                 if (!rs.getBoolean(4)) {
@@ -246,6 +247,11 @@ public final class PartitionDdl {
                 return null;
             }
         }
+    }
+
+    /** The regex of the tables in {@code parent}'s schema named {@code <parent><suffix>}. */
+    private static String rangePattern(String parent, String suffix) {
+        return "^" + parent.substring(parent.indexOf('.') + 1) + suffix + "$";
     }
 
     private static String role(Connection c) throws SQLException {
@@ -368,7 +374,7 @@ public final class PartitionDdl {
                     execute(c, lockTimeout, detach + " finalize"); // in a transaction block too, unlike CONCURRENTLY
                 }
             } catch (SQLException e) {
-                if (attachment != Attachment.DETACH_PENDING || !"55P03".equals(e.getSQLState())) {
+                if (attachment != Attachment.DETACH_PENDING || !LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
                     throw e;
                 }
                 throw new SQLException(e.getMessage() + "; FINALIZE of " + partition + " waits for every older"
@@ -444,7 +450,7 @@ public final class PartitionDdl {
                 + " and c.relname ~ ? and not exists (select 1 from pg_inherits i where i.inhrelid = c.oid)"
                 + " order by c.relname")) {
             ps.setString(1, parent);
-            ps.setString(2, "^" + parent.substring(parent.indexOf('.') + 1) + suffix + "$");
+            ps.setString(2, rangePattern(parent, suffix));
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
                     if (!dropped(rs.getString(1))) {

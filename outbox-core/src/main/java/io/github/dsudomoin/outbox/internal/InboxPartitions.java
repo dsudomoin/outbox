@@ -18,6 +18,7 @@ import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -37,6 +38,8 @@ final class InboxPartitions {
     private static final long HOUR = Duration.ofHours(1).toMillis();
     private static final long MINUTE = Duration.ofMinutes(1).toMillis();
     private static final long LOG_INTERVAL = TimeUnit.MINUTES.toNanos(1);
+    /** A range's name after the table's: its start, to the hour or the minute. */
+    private static final String RANGE_SUFFIX = "_t[0-9]{10}([0-9]{2})?";
     private static final DateTimeFormatter HOURS = DateTimeFormatter.ofPattern("yyyyMMddHH").withZone(ZoneOffset.UTC);
     private static final DateTimeFormatter MINUTES =
             DateTimeFormatter.ofPattern("yyyyMMddHHmm").withZone(ZoneOffset.UTC);
@@ -67,7 +70,7 @@ final class InboxPartitions {
     private final long retention;
     private final boolean wholeHours;
     /** Per table whose name is no valid time, when its WARN was last logged ({@code nanoTime}). */
-    private final Map<String, Long> unparsableLogged = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> unparsableLogged = new ConcurrentHashMap<>();
 
     /**
      * Validates the {@code outbox.inbox} keys against each other, so the window spans at least one interval (ids up
@@ -82,7 +85,7 @@ final class InboxPartitions {
         var maintenance = config.partitions().maintenanceInterval();
         require(interval.compareTo(Duration.ofMinutes(1)) >= 0,
                 "outbox.inbox.partitionInterval must be at least 1m: " + interval);
-        require(interval.toMillis() % Duration.ofMinutes(1).toMillis() == 0,
+        require(interval.toMillis() % MINUTE == 0,
                 "outbox.inbox.partitionInterval must be a whole number of minutes: " + interval);
         require(cfg.retention().compareTo(twice) >= 0, "outbox.inbox.retention must be at least 2 ×"
                 + " outbox.inbox.partitionInterval (" + twice + "): " + cfg.retention());
@@ -145,14 +148,12 @@ final class InboxPartitions {
      */
     List<Orphan> dropOrphans(Connection c, long now, Duration lockTimeout) throws SQLException {
         var named = new LinkedHashMap<String, Long>();
-        for (var t : PartitionDdl.standalone(c, table, "_t[0-9]{10}([0-9]{2})?")) {
+        for (var t : PartitionDdl.standalone(c, table, RANGE_SUFFIX)) {
             try {
                 named.put(t, namedFrom(t));
             } catch (DateTimeException e) { // a user table that only looks like a range
-                long nowNanos = System.nanoTime();
-                var last = unparsableLogged.get(t);
-                if (last == null || nowNanos - last >= LOG_INTERVAL) {
-                    unparsableLogged.put(t, nowNanos);
+                var last = unparsableLogged.computeIfAbsent(t, k -> new AtomicLong(System.nanoTime() - LOG_INTERVAL));
+                if (LogLimit.due(last, LOG_INTERVAL)) {
                     log.warn("outbox inbox table {} is named like a range of {} but its name is no valid time ({});"
                             + " skipped, this WARN repeats at most once a minute per table", t, table, e.getMessage());
                 }
@@ -226,7 +227,7 @@ final class InboxPartitions {
 
     /** {@link PartitionDdl#reown}: the ranges, attached or not. */
     void reown(Connection c) throws SQLException {
-        PartitionDdl.reown(c, table, "_t[0-9]{10}([0-9]{2})?");
+        PartitionDdl.reown(c, table, RANGE_SUFFIX);
     }
 
     /**
