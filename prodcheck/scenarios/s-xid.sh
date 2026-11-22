@@ -47,7 +47,7 @@ s_xid_auto() { # auto mode: the first maintenance run recovers, undelivered rows
 }
 
 s_xid_halt() { # halt mode: the relay stands until one admin call on a running instance
-  xid_begin xid-halt -Doutbox.recovery.xidRegression=halt
+  xid_begin xid-halt -Doutbox.xidRegression=halt
   check "$(passes is "$(admin_code 1001 POST recovery/xid-regression)" = 409)" "до регрессии вызов отвечает 409"
   migrate
   check "$(passes wait_for 60 halted)" "/status: halted, relay стоит"
@@ -66,8 +66,8 @@ s_xid_halt() { # halt mode: the relay stands until one admin call on a running i
   pc_finish --timeout 200
 }
 
-s_xid_max_rows() { # more rows than maxRows: relay halted, ERROR with the reason, one admin call
-  xid_begin xid-max-rows -Doutbox.recovery.maxRows=0
+s_xid_max_rows() { # more rows than recoveryMaxRows: relay halted, ERROR with the reason, one admin call
+  xid_begin xid-max-rows -Doutbox.recoveryMaxRows=0
   migrate
   check "$(passes wait_for 60 halted)" "/status: halted"
   stated() { logs_have 'relay halted'; }

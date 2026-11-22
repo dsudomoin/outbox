@@ -45,7 +45,8 @@ victim() {
 }
 
 chaos_begin partition-churn bench_chaos_churn 3 "Режим заказов, 3 экземпляра × $RATE msg/s в течение $DURATION с при \
-\`xidsPerPartition = $XIDS\` и \`maintenanceInterval = $MAINT\`; каждые ${KILL_MIN}–$KILL_MAX с \`kill -9\` \
+диапазонах по $XIDS xid и обслуживании раз в $MAINT (внутренние параметры библиотеки, у пользователя всегда 2^24 \
+и 30 с); каждые ${KILL_MIN}–$KILL_MAX с \`kill -9\` \
 экземпляра, выполняющего DDL партиций (такого ждут до 30 с, иначе берут случайный экземпляр), перезапуск через \
 ${DOWN_MIN}–$DOWN_MAX с" OUTBOX_XIDS_PER_PARTITION="$XIDS" OUTBOX_MAINTENANCE_INTERVAL="$MAINT"
 for i in 1 2 3; do chaos_load "$i" "$RATE" "$CHAOS_WRITERS"; done

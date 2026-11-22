@@ -7,6 +7,7 @@ import io.github.dsudomoin.outbox.kora.OutboxOwner
 import io.github.dsudomoin.outbox.protobuf.ProtobufOutbox
 import prodcheck.common.Controls
 import prodcheck.common.HandlerControl
+import prodcheck.common.ProdcheckOutboxModule
 import ru.tinkoff.kora.common.Tag
 import ru.tinkoff.kora.config.common.Config
 import ru.tinkoff.kora.config.common.annotation.ConfigSource
@@ -16,7 +17,7 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase
 import ru.tinkoff.kora.database.jdbc.JdbcDatabaseConfig
 
-interface AccountsOutboxModule : OutboxModule {
+interface AccountsOutboxModule : OutboxModule, ProdcheckOutboxModule {
     @Tag(OutboxOwner::class)
     fun ownerDatabaseConfig(
         config: Config,

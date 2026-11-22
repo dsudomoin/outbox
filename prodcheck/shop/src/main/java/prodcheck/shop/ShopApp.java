@@ -14,6 +14,7 @@ import prodcheck.common.Controls;
 import prodcheck.common.DeadLetterPolicy;
 import prodcheck.common.HandlerControl;
 import prodcheck.common.LedgerRoute;
+import prodcheck.common.ProdcheckOutboxModule;
 import ru.tinkoff.kora.application.graph.KoraApplication;
 import ru.tinkoff.kora.common.KoraApp;
 import ru.tinkoff.kora.common.Tag;
@@ -35,7 +36,7 @@ import ru.tinkoff.kora.micrometer.module.MetricsModule;
 @KoraApp
 public interface ShopApp extends HoconConfigModule, LogbackModule, JdbcDatabaseModule, JsonModule,
         UndertowHttpServerModule, MetricsModule, OkHttpClientModule, OutboxModule, OutboxJsonModule, InboxModule,
-        OutboxAdminHttpModule {
+        OutboxAdminHttpModule, ProdcheckOutboxModule {
 
     /** Tag of the pool on the target database, for the {@code ledger} route. */
     final class TargetDb {}

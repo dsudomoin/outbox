@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # low-load: delivery latency at low rates against the shard count. Order mode, Kafka handler and the bench consumer,
 # one instance, the relay at the library defaults (workers 4, minTickInterval 50 ms, idlePollInterval 200 ms) except
-# outbox.shards and batchSize 1000 (the default before 10 000, kept for comparison with earlier runs). Each run: fresh
+# the shard count (internal Tuning, 256 for users) and batchSize 1000 (the default before 10 000, kept for comparison with earlier runs). Each run: fresh
 # outbox table and topic, WARMUP s, then a STEADY s window with pg_stat_statements reset at its start.
 # RUNS="RATE:SHARDS ..." picks the runs. Appends its section (in Russian) to RESULTS.
 source "$(dirname "$0")/lib.sh"
@@ -27,9 +27,9 @@ out << EOF
 ## Задержка при малой нагрузке и число шардов
 
 Режим заказов (одно сообщение на транзакцию), обработчик Kafka и консьюмер бенча (12 потоков), один экземпляр. Relay на
-настройках библиотеки по умолчанию (workers 4, \`minTickInterval = 50ms\`, \`idlePollInterval = 200ms\`), кроме
-\`batchSize = 1000\` (прежнее значение по умолчанию, для сравнения с прошлыми прогонами); меняется только
-\`outbox.shards\`. На каждый прогон: новая таблица outbox и пустой топик, ${WARMUP} с прогрева, затем окно ${STEADY} с.
+настройках библиотеки по умолчанию (workers 4; под нагрузкой тик не чаще раза в 50 мс, без нагрузки раз в 200 мс),
+кроме \`batchSize = 1000\` (прежнее значение по умолчанию, для сравнения с прошлыми прогонами); меняется только число
+шардов новой таблицы: внутренний параметр библиотеки, у пользователя всегда 256. На каждый прогон: новая таблица outbox и пустой топик, ${WARMUP} с прогрева, затем окно ${STEADY} с.
 Задержка: от вставки строки до ack Kafka (гистограмма \`outbox.delivery.delay\`). Пакет relay: один вызов обработчика с
 чтением и записью курсора (\`outbox.batch.duration\`). Запросы relay в секунду: \`pg_stat_statements\` за окно; чтение
 пакета, тики и курсоры отдельно, «все» — все запросы БД, включая писателей, консьюмер и postgres-exporter. xid/с:

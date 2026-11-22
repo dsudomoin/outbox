@@ -1,4 +1,4 @@
-# Several outboxes, apps and shard numbers: «Независимые цели», «Несколько инстансов», «Решардинг».
+# Several outboxes and apps: «Независимые цели», «Несколько инстансов».
 s_two_outboxes() { # the second outbox's handler hangs: the first flows; both lose nothing under kill -9
   pc_begin two-outboxes
   BASES=(outbox courier_audit)
@@ -44,39 +44,6 @@ s_two_apps_one_db() { # two different apps with their own tables on one database
   pc_finish
 }
 
-s_shards_mismatch() { # a new instance with another outbox.shards does not start while the others run; they do not care
-  pc_begin shards-mismatch
-  trio "$PAY"
-  sleep 5
-  local log=$LOGS/pc-$SCN-1004.log rc=0
-  bounded 60 env HTTP_PORT=9083 METRICS_PORT=9088 POSTGRES_URL="$PC_PG_URL" TARGET_DB_URL="$PC_TARGET_DB_URL" TARGET_URL="$PC_TARGET_URL" \
-    INSTANCE_NAME=app-1004 "JAVA_OPTS=-Xmx768m -Doutbox.shards=64" "$SHOP" > "$log" 2>&1 || rc=$?
-  check "$(passes gt "$rc" 0)" "инстанс с другим числом шардов не стартует (код $rc)"
-  check "$(passes grep -qE 'shards' "$log")" "отказ называет причину: $(grep -m1 -E 'shards' "$log" | cut -c1-160)"
-  check "$(passes effects_grow 5)" "работающие инстансы этого не заметили"
-  pc_finish --max-dups 0
-}
-
-s_reshard() { # planned reshard: delivered, every instance stopped, one starts with the new number. Documented limit, not a repair
-  pc_begin reshard
-  trio "$PAY"
-  sleep 8
-  local i
-  for i in 1001 1002 1003; do pc_unload "$i"; done
-  python3 "$PC/scenarios/ledger.py" --source "$PG" --target "$TGT" --base outbox --timeout 60 > /dev/null
-  for i in 1001 1002 1003; do inst_stop "$i"; done
-  fault "запланированный решардинг: все инстансы остановлены"
-  sleep 70 # the newest tick must be older than a minute
-  pc_shop 1001 -Doutbox.shards=64
-  check "$(passes logs_have 'resharded .* from 256 to 64')" "INFO «outbox resharded»"
-  pc_shop 1002
-  pc_shop 1003
-  for i in 1001 1002 1003; do pc_load "$i" "$PAY"; done
-  sleep 10
-  REPAIRED="не сбой: документированная процедура со всеми остановленными"
-  pc_finish --max-dups 0
-}
-
 s_everything() { # all at once: writers with rollbacks, two apps, poison, requeue, flaky target, kills, a long transaction
   pc_begin everything
   BASES=(outbox courier_main)
@@ -100,36 +67,9 @@ s_everything() { # all at once: writers with rollbacks, two apps, poison, requeu
   pc_finish --min-dups 1 --dead-tags poison --exempt-tags poison,requeue --timeout 300
 }
 
-s_reshard_stale() { # a frozen instance sleeps through a reshard: thawed, its relay stands and its writes are refused until a restart
-  pc_begin reshard-stale
-  PC_OPTS=-Doutbox.partitions.maintenanceInterval=2s trio "$PAY"
-  sleep 8
-  local i pid=${APP_PIDS[1003]}
-  for i in 1001 1002 1003; do pc_unload "$i"; done
-  python3 "$PC/scenarios/ledger.py" --source "$PG" --target "$TGT" --base outbox --timeout 60 > /dev/null
-  kill -STOP "$pid"
-  fault "экземпляр 1003 заморожен; остальные остановлены для решардинга"
-  for i in 1001 1002; do inst_stop "$i"; done
-  sleep 70 # its heartbeat expired, the newest tick is older than a minute
-  PC_OPTS=-Doutbox.partitions.maintenanceInterval=2s pc_shop 1001 -Doutbox.shards=64
-  kill -CONT "$pid"
-  fault "заморозка кончилась: у экземпляра 1003 старое число шардов"
-  said() { logs_have 'holds cursors for'; }
-  check "$(passes wait_for 30 said)" "ERROR «holds cursors for N shards ...» на старом инстансе"
-  refused() { tx_send 1003 'topic=payments&key=k1&tag=normal' | grep -q 'refuses this write'; }
-  check "$(passes wait_for 30 refused)" "его запись получает отказ, а не застревает"
-  inst_stop 1003
-  PC_OPTS=-Doutbox.partitions.maintenanceInterval=2s pc_shop 1003
-  pc_load 1001 "$PAY"
-  pc_load 1003 "$PAY"
-  sleep 8
-  REPAIRED="рестарт одного устаревшего инстанса"
-  pc_finish --max-dups 0
-}
-
 s_inbox_rotation() { # inbox ranges made and dropped under load, on the target and in the source
   pc_begin inbox-rotation
-  local tiny='-Doutbox.inbox.partitionInterval=1m -Doutbox.inbox.retention=2m -Doutbox.inbox.premake=3m -Doutbox.partitions.maintenanceInterval=2s'
+  local tiny='-Doutbox.inboxPartitionInterval=1m -Doutbox.inbox.retention=2m -Doutbox.inboxPremake=3m -Doutbox.maintenanceInterval=2s'
   TARGET_OPTS=$tiny PC_OPTS=$tiny trio "$MIX"
   local first
   first=$(psql_q "select count(*) from pg_inherits where inhparent = 'inbox'::regclass")

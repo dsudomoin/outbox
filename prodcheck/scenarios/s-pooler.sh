@@ -14,7 +14,7 @@ s_pgbouncer_session() { # the supported pooler: everything through it, nothing i
   pc_begin pgbouncer-session
   pooler_up session outbox 120
   PC_PG_URL=$POOLER_URL
-  trio "$MIX" -Doutbox.partitions.maintenanceInterval=2s
+  trio "$MIX" -Doutbox.maintenanceInterval=2s
   sleep 15
   local i
   for i in 1001 1002 1003; do
@@ -23,7 +23,7 @@ s_pgbouncer_session() { # the supported pooler: everything through it, nothing i
   check "$(passes is "$(logs_count 'pg_backend_pid\(\) was')" = 0)" "ни одной строки о transaction pooling"
   check "$(passes is "$(st 1001 'int(d["maintenanceSinceSuccessSeconds"] or 999) < 10')" = True)" "обслуживание проходит: since_success < 10 с"
   pc_kill 1002
-  pc_shop 1002 -Doutbox.partitions.maintenanceInterval=2s
+  pc_shop 1002 -Doutbox.maintenanceInterval=2s
   sleep 5
   pc_finish
 }
@@ -37,7 +37,7 @@ s_pgbouncer_txn() { # the application's pool through transaction pooling, the ow
   local direct=$PC_PG_URL
   ACC_OWNER_URL=$direct
   PC_PG_URL=$POOLER_URL
-  local opts="$NO_PREPARE -Doutbox.partitions.maintenanceInterval=2s" i
+  local opts="$NO_PREPARE -Doutbox.maintenanceInterval=2s" i
   for i in 1001 1002; do acc "$i" $opts; done
   check 0 "старт проходит: проверка схемы и партиции через прямое соединение владельца"
   for i in 1001 1002; do acc_load "$i"; done
@@ -62,7 +62,7 @@ s_pgbouncer_txn_all() { # everything through transaction pooling, no direct conn
   pc_begin pgbouncer-txn-all
   pooler_up transaction outbox 40 # the size the formula asks for here: relay steps hold a server connection while a handler takes another
   PC_PG_URL=$POOLER_URL
-  local opts="$NO_PREPARE -Doutbox.partitions.maintenanceInterval=2s"
+  local opts="$NO_PREPARE -Doutbox.maintenanceInterval=2s"
   # a pool in use: three queries in a row land on different server sessions, which the start no longer minds
   local name=kora-outbox-prodcheck-pooler
   docker exec -d "$name" bash -c 'end=$((SECONDS + 25)); for n in $(seq 24); do (while [ $SECONDS -lt $end ]; do psql -h 127.0.0.1 -p 6432 -U outbox -d outbox -Atq -c "select pg_sleep(0.02)" > /dev/null 2>&1; done) & done; wait'

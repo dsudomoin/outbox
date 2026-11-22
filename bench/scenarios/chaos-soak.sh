@@ -17,7 +17,7 @@ DIAG=${DIAG:-0} # 1: soak-diag.sh captures statement, checkpoint, WAL, I/O, size
 if [ "$DIAG" = 1 ]; then source "$(dirname "$0")/soak-diag.sh"; fi
 
 chaos_begin soak bench_chaos_soak 2 "Soak: bench-1 в режиме заказов, $RATE msg/s; bench-2 в режиме bulk, $BULK_RATE msg/s \
-(писатели × сообщения на транзакцию: $BULK_WRITERS × $BULK_PER_TX); $DURATION с, \`xidsPerPartition = $XIDS\`" \
+(писатели × сообщения на транзакцию: $BULK_WRITERS × $BULK_PER_TX); $DURATION с, диапазоны по $XIDS xid (внутренний параметр библиотеки, у пользователя всегда 2^24)" \
   OUTBOX_XIDS_PER_PARTITION="$XIDS"
 chaos_load 1 "$RATE" "$CHAOS_WRITERS"
 chaos_load 2 "$BULK_RATE" "$BULK_WRITERS" "$BULK_PER_TX" 300

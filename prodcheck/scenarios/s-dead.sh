@@ -68,7 +68,7 @@ s_admin() { # each admin operation over HTTP on a live instance while the others
 s_hook() { # every decision of the hook, its failures and a kill -9 in the middle: no letter lost, each decided once
   pc_begin hook
   trio 'rate=100&writers=4&keys=30&topics=payments&tags=hook-keep:40,hook-discard:41,hook-redrive:42,hook-redrive-at:43' \
-    -Dprodcheck.hook=policy -Doutbox.deadLetters.timeout=2s
+    -Dprodcheck.hook=policy -Doutbox.deadLetterTimeout=2s
   sleep 15
   local i mode
   for mode in throw hang bad-list; do
@@ -80,7 +80,7 @@ s_hook() { # every decision of the hook, its failures and a kill -9 in the middl
   done
   check "$(passes gt "$(on 1001 metric outbox_dead_hook_failures_total)" 0)" "растёт outbox.dead.hook.failures"
   pc_kill 1003
-  pc_shop 1003 -Dprodcheck.hook=policy -Doutbox.deadLetters.timeout=2s
+  pc_shop 1003 -Dprodcheck.hook=policy -Doutbox.deadLetterTimeout=2s
   sleep 5
   for i in 1001 1002 1003; do pc_unload "$i"; done
   decided() { [ "$(psql_q "select count(*) from outbox_dead where status <> 'kept'")" = 0 ]; }
@@ -100,8 +100,8 @@ s_hook() { # every decision of the hook, its failures and a kill -9 in the middl
 s_hook_mixed_fleet() { # a fleet with and without the hook: letters wait for the hook while it lives, kept when it is gone
   pc_begin hook-mixed-fleet
   pc_target
-  pc_shop 1001 -Dprodcheck.hook=policy -Doutbox.partitions.maintenanceInterval=1s
-  pc_shop 1002 -Doutbox.partitions.maintenanceInterval=1s
+  pc_shop 1001 -Dprodcheck.hook=policy -Doutbox.maintenanceInterval=1s
+  pc_shop 1002 -Doutbox.maintenanceInterval=1s
   hook_mode 1001 throw
   # load on the hook's instance: a relay writes a letter by its own hook, so the one without it would write kept at once
   pc_load 1001 'rate=100&writers=2&keys=20&topics=payments&tags=hook-keep:20'
@@ -116,7 +116,7 @@ s_hook_mixed_fleet() { # a fleet with and without the hook: letters wait for the
 s_dead_retention() { # kept letters older than retention go, pending ones never
   pc_begin dead-retention
   pc_target
-  pc_shop 1001 -Dprodcheck.hook=policy -Doutbox.deadLetters.retention=1d -Doutbox.partitions.maintenanceInterval=1s
+  pc_shop 1001 -Dprodcheck.hook=policy -Doutbox.deadLetters.retention=1d -Doutbox.maintenanceInterval=1s
   hook_mode 1001 throw
   pc_load 1001 'rate=100&writers=2&keys=20&topics=payments&tags=hook-keep:10'
   sleep 8

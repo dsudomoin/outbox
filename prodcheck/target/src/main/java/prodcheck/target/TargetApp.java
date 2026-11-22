@@ -1,6 +1,7 @@
 package prodcheck.target;
 
 import io.github.dsudomoin.outbox.kora.InboxModule;
+import prodcheck.common.ProdcheckOutboxModule;
 import ru.tinkoff.kora.application.graph.KoraApplication;
 import ru.tinkoff.kora.common.KoraApp;
 import ru.tinkoff.kora.config.hocon.HoconConfigModule;
@@ -12,7 +13,7 @@ import ru.tinkoff.kora.micrometer.module.MetricsModule;
 
 @KoraApp
 public interface TargetApp extends HoconConfigModule, LogbackModule, JdbcDatabaseModule, JsonModule,
-        UndertowHttpServerModule, MetricsModule, InboxModule {
+        UndertowHttpServerModule, MetricsModule, InboxModule, ProdcheckOutboxModule {
 
     static void main(String[] args) {
         KoraApplication.run(TargetAppGraph::graph);

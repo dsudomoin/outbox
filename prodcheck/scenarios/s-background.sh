@@ -4,11 +4,11 @@ route_unchecked() { on "$1" metric outbox_messages_route_unchecked_total; }
 
 s_route_unchecked() { # the heartbeat cannot read the others' reports past 3 × maintenanceInterval: sends go through unchecked, counted, and it heals by itself
   pc_begin route-unchecked
-  trio "$PAY" -Doutbox.partitions.maintenanceInterval=2s
+  trio "$PAY" -Doutbox.maintenanceInterval=2s
   sleep 5
   check "$(passes is "$(route_unchecked 1001)" = 0)" "пока heartbeat читает отчёты, счётчик 0"
   docker exec -d "$PG" psql -U outbox -d outbox -Atq -c "begin; lock table outbox_instance in access exclusive mode; select pg_sleep(30); commit"
-  fault "таблицу отчётов инстансов держит чужая блокировка 30 с: heartbeat не читает, 3 × maintenanceInterval = 6 с"
+  fault "таблицу отчётов инстансов держит чужая блокировка 30 с: heartbeat не читает, три интервала обслуживания = 6 с"
   counted() { [ "$(route_unchecked 1001)" -gt 0 ]; }
   local t=$(now)
   check "$(passes wait_for 25 counted)" "outbox.messages.route_unchecked растёт: через $(($(now) - t)) с после начала, $(route_unchecked 1001)"
@@ -104,7 +104,7 @@ s_drain_silent_drop() { # socketTimeout = 0: a drop under each part of drain. ou
   pc_begin drain-silent-drop
   pc_target
   proxied_source
-  local opts='-Ddb.dsProperties.socketTimeout=0 -Doutbox.networkTimeout=10s -Doutbox.relay.enabled=false -Dprodcheck.hook=policy -Doutbox.deadLetters.timeout=3s'
+  local opts='-Ddb.dsProperties.socketTimeout=0 -Doutbox.networkTimeout=10s -Doutbox.relay.enabled=false -Dprodcheck.hook=policy -Doutbox.deadLetterTimeout=3s'
   local bound=60 i=1001
   tfault 'delayMs=30'
   # 1. in a step, on the connection drain binds itself
@@ -151,7 +151,7 @@ s_silent_drop_background() { # socketTimeout = 0: maintenance, the dead-letter p
   pc_begin silent-drop-background
   pc_target
   proxied_source
-  local opts='-Ddb.dsProperties.socketTimeout=0 -Doutbox.networkTimeout=10s -Dprodcheck.hook=policy -Doutbox.deadLetters.timeout=30s -Doutbox.partitions.maintenanceInterval=2s -Doutbox.partitions.xidsPerPartition=1000 -Doutbox.partitions.premake=4'
+  local opts='-Ddb.dsProperties.socketTimeout=0 -Doutbox.networkTimeout=10s -Dprodcheck.hook=policy -Doutbox.deadLetterTimeout=30s -Doutbox.maintenanceInterval=2s -Doutbox.xidsPerPartition=1000 -Doutbox.premake=4'
   local i=1001
   pc_shop "$i" $opts
   sleep 3

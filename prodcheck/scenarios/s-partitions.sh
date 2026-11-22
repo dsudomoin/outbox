@@ -1,5 +1,5 @@
 # Partitions: «Партиции», «Переполнение хвоста», «Осиротевшие партиции», «Застрявшие шарды», «Обслуживание работает там же, где relay».
-TINY='-Doutbox.partitions.xidsPerPartition=1000 -Doutbox.partitions.premake=4 -Doutbox.partitions.maintenanceInterval=1s'
+TINY='-Doutbox.xidsPerPartition=1000 -Doutbox.premake=4 -Doutbox.maintenanceInterval=1s'
 overflow() { [ "$(st 1001 'd["tailOverflow"]')" = True ]; }
 no_overflow() { [ "$(st 1001 'd["tailOverflow"]')" = False ]; }
 writers_failed() { # sum of failed transactions of the given instances
@@ -32,7 +32,7 @@ s_rotation() { # tiny ranges: partitions made and dropped constantly under load 
 
 s_tail_overflow() { # a transaction left open defers the swap, the ranges run out: rows go to the tail, no write fails; healed
   pc_begin tail-overflow
-  # small enough for the tail to stay under maxTailScan: a bigger one waits for the night window, see tail-big
+  # small enough for the tail to stay under the swap's scan limit: a bigger one waits for the night window, see tail-big
   PC_OPTS=$TINY trio 'rate=70&writers=4&keys=30&topics=payments'
   sleep 5
   tx_hold 60000
@@ -53,20 +53,20 @@ s_tail_overflow() { # a transaction left open defers the swap, the ranges run ou
   pc_finish --max-dups 0 --slow-keys held
 }
 
-s_tail_big() { # the tail outgrows maxTailScan: stays hot, ERROR names the window; the window converts it
+s_tail_big() { # the tail outgrows the swap's scan limit (Tuning maxTailScan): stays hot, ERROR names the window; the window converts it
   pc_begin tail-big
   # the window opens two minutes from now, in UTC
   local from to
   from=$(date -u -v+3M +%H:%M)
   to=$(date -u -v+8M +%H:%M)
-  local opts="$TINY -Doutbox.partitions.maxTailScan=65536 -Doutbox.partitions.tailConversion.window=$from-$to -Doutbox.partitions.tailConversion.zone=UTC"
+  local opts="$TINY -Doutbox.maxTailScan=65536 -Doutbox.partitions.tailConversion.window=$from-$to -Doutbox.partitions.tailConversion.zone=UTC"
   PC_OPTS=$opts trio 'rate=300&writers=4&keys=30&topics=payments'
   sleep 3
   tx_hold 45000
   check "$(passes wait_for 60 overflow)" "строки ушли в хвост"
   sleep 45
-  check "$(passes overflow)" "держатель закончил, но хвост больше maxTailScan и остаётся горячим"
-  check "$(passes logs_have 'over outbox.partitions.maxTailScan')" "ERROR «over outbox.partitions.maxTailScan» называет окно"
+  check "$(passes overflow)" "держатель закончил, но хвост больше предела сканирования при обмене и остаётся горячим"
+  check "$(passes logs_have 'MB, over the swap.s scan limit of [0-9.]+ MB: turning it')" "ERROR «over the swap's scan limit» называет окно"
   check "$(passes is "$(writers_failed 1001 1002 1003)" = 0)" "ни одна запись не упала"
   check "$(passes wait_for 300 no_overflow)" "окно tailConversion превратило его в диапазон"
   pc_finish --max-dups 0 --slow-keys held
@@ -138,7 +138,7 @@ s_orphan_own() { # a crash between the library's own detach and drop: maintenanc
 
 s_inbox_orphan() { # a range of the target's inbox detached inside its window: attached back, no double effect
   pc_begin inbox-orphan
-  TARGET_OPTS=-Doutbox.partitions.maintenanceInterval=1s trio "$PAY"
+  TARGET_OPTS=-Doutbox.maintenanceInterval=1s trio "$PAY"
   sleep 5
   local part
   part=$(target_q "select c.relname from pg_inherits i join pg_class c on c.oid = i.inhrelid where i.inhparent = 'inbox'::regclass order by c.relname desc" | while read -r p; do

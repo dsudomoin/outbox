@@ -52,7 +52,7 @@ start_old() { OLD_UP=1; chaos_start 2; fault "bench-2 started ($OLD_REV)"; chaos
 start_new() { chaos_start 1; fault "bench-1 started (new)"; chaos_load 1 "$RATE" "$CHAOS_WRITERS"; }
 
 chaos_begin rollback bench_rollback 2 "Откат на предыдущий релиз ($OLD_REV) и обратно: режим заказов, $RATE msg/s на \
-нагруженный экземпляр; новая версия $LOAD_S с под нагрузкой и $TAIL_S с простоя (cursorAnchorInterval ${ANCHOR_S} с), затем \
+нагруженный экземпляр; новая версия $LOAD_S с под нагрузкой и $TAIL_S с простоя (якорь курсора через ${ANCHOR_S} с: внутренний параметр библиотеки, у пользователя 1 ч), затем \
 старая рядом с новой $WINDOW с (rolling deploy), старая одна $LOAD_S с, новая рядом со старой $WINDOW с, новая одна \
 $LOAD_S с; старая запускается сразу после простоя, без нагрузки на новую" OUTBOX_CURSOR_ANCHOR_INTERVAL="${ANCHOR_S}s" \
   OUTBOX_SHARDS=32 # the previous release's default: the table the new version took over on an upgrade

@@ -86,18 +86,22 @@ Postgres нужны `max_locks_per_transaction=256` и `max_connections=300` (co
 | `BENCH_HANDLER` | `bench.handler`: `kafka` или `noop` (считает и выбрасывает: чистая пропускная способность outbox) | `kafka` |
 | `BENCH_TRACE_RATIO` | `bench.traceRatio`, доля сэмплирования корневых span; она же сэмплирует трассы, начатые HTTP-запросом, например `POST /orders` | 1.0 |
 | `BENCH_TELEMETRY` | `bench.telemetry`: `kora` (`KoraOutboxTelemetry` модуля), `observation` (`ObservationOutboxTelemetry`: наблюдения Micrometer Observation с таймерами `DefaultMeterObservationHandler` и span-ами через мост micrometer-tracing к трассировщику OpenTelemetry из Kora, с тем же сэмплером; доставки несэмплированных трасс не наблюдаются, как по умолчанию в библиотеке) или `observation-all` (то же с `observeUnsampled(true)`: наблюдается каждая доставка) | `kora` |
-| `OUTBOX_SHARDS` | `outbox.shards` | значение библиотеки по умолчанию: 256 для новой таблицы, существующая сохраняет своё число |
+| `OUTBOX_SHARDS` | `outbox.shards`, внутренний параметр (см. ниже): число шардов новой таблицы, существующая сохраняет своё | у пользователя всегда 256 |
 | `OUTBOX_RELAY_ENABLED` | `outbox.relay.enabled`: `false` — инстанс только пишет, relay не запускается | значение библиотеки по умолчанию, `true` |
 | `OUTBOX_RELAY_WORKERS` | `outbox.relay.workers` | 8 |
 | `OUTBOX_RELAY_BATCH_SIZE` | `outbox.relay.batchSize` | 2000 |
 | `OUTBOX_TABLE` | `outbox.table` | значение библиотеки по умолчанию, `outbox` |
-| `OUTBOX_RELAY_MAX_TICKS`, `OUTBOX_RELAY_MIN_TICK`, `OUTBOX_RELAY_IDLE_POLL` | `outbox.relay.maxTicksPerBatch`, `minTickInterval`, `idlePollInterval` | значения библиотеки по умолчанию |
-| `OUTBOX_XIDS_PER_PARTITION`, `OUTBOX_MAINTENANCE_INTERVAL` | `outbox.partitions.xidsPerPartition`, `maintenanceInterval` | значения библиотеки по умолчанию |
-| `OUTBOX_CURSOR_ANCHOR_INTERVAL` | `outbox.relay.cursorAnchorInterval` | значение библиотеки по умолчанию |
+| `OUTBOX_RELAY_MAX_TICKS`, `OUTBOX_RELAY_MIN_TICK`, `OUTBOX_RELAY_IDLE_POLL` | `outbox.maxTicksPerBatch`, `outbox.minTickInterval`, `outbox.idlePollInterval`, внутренние параметры | у пользователя всегда 100, 50 мс, 200 мс |
+| `OUTBOX_XIDS_PER_PARTITION`, `OUTBOX_MAINTENANCE_INTERVAL` | `outbox.xidsPerPartition`, `outbox.maintenanceInterval`, внутренние параметры | у пользователя всегда 2^24 и 30 с |
+| `OUTBOX_CURSOR_ANCHOR_INTERVAL` | `outbox.cursorAnchorInterval`, внутренний параметр | у пользователя всегда 1 ч |
 | `HANDLER_DELAY_MS` | `bench.handlerDelayMs`: обработчик Kafka перед каждым `handleBatch` спит столько на каждую запись (прерывание обрывает сон: батч получает NotAttempted) | 0 |
 | `ROLLBACK_PERCENT` | `bench.rollbackPercent`: доля заказов генератора нагрузки, откатываемых после отправки | 0 |
 | `CONSUMER_THREADS` | `kafka.consumer.orders.threads` (`0` выключает потребителя) | 4 |
 | `CONSUMER_MAX_POLL` | `kafka.consumer.orders.driverProperties."max.poll.records"` | 2000 |
+
+Внутренние параметры — значения `Tuning` библиотеки: пользователь их не задаёт, у него они всегда по умолчанию.
+Бенч-приложение читает конфиг `outbox` как `BenchOutboxConfig` и берёт их прямо из-под `outbox` только для того, чтобы
+сценарии могли их менять.
 
 Настройки продюсера (`outbox.kafka.driverProperties`): `linger.ms = 5`, `batch.size = 262144`, `compression.type = lz4`.
 Значения `bench.load` по умолчанию: `rate = 0`, `writers = 8`, `keys = 10000`, `messagesPerTx = 1`, `payloadBytes = 300`.

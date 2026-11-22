@@ -9,6 +9,7 @@ import io.github.dsudomoin.outbox.kora.OutboxModule
 import prodcheck.common.ApiKeyAuthorizer
 import prodcheck.common.Controls
 import prodcheck.common.HandlerControl
+import prodcheck.common.ProdcheckOutboxModule
 import prodcheck.common.Sender
 import ru.tinkoff.kora.application.graph.KoraApplication
 import ru.tinkoff.kora.common.KoraApp
@@ -32,7 +33,8 @@ interface CourierApp :
     UndertowHttpServerModule,
     MetricsModule,
     OutboxModule,
-    OutboxAdminHttpModule {
+    OutboxAdminHttpModule,
+    ProdcheckOutboxModule {
 
     /** Exactly `OutboxHandler`: the one handler behind the routes. */
     fun outboxHandler(target: TargetHttp, control: HandlerControl): OutboxHandler = CourierHandler(target, control)

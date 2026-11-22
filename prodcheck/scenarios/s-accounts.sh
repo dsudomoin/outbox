@@ -254,7 +254,7 @@ requeue_storm() { # requeue_storm NAME [-Dkey=value...]: thousands of records pa
 s_accounts_requeue_storm() { requeue_storm accounts-requeue-storm; }
 
 s_accounts_requeue_storm_delay() { # the same with a longer requeue delay: arrivals and the others' p99 next to the default's
-  requeue_storm accounts-requeue-storm-delay -Doutbox.relay.requeue.delay=5s
+  requeue_storm accounts-requeue-storm-delay -Doutbox.requeueDelay=5s
 }
 
 s_accounts_pool_pressure() { # writers hold the whole pool of 10: the handler's business transaction and the relay compete for it
@@ -401,7 +401,7 @@ s_accounts_corrupt_fixed() { # the recommendation: an envelope that never parses
   letter=$(admin_body 1001 GET "dead-letters?topic=$ACC&limit=10")
   check "$(passes grep -q "$id" <<< "$letter")" "письмо видно в админ-API с причиной: $(echo "$letter" | j 'd["items"][0]["error"][:110]')"
   dead_gauge() { [ "$(on 1001 metric outbox_dead_size)" -gt 0 ]; }
-  check "$(passes wait_for 40 dead_gauge)" "и в метрике outbox.dead.size: обслуживание обновляет её раз в maintenanceInterval"
+  check "$(passes wait_for 40 dead_gauge)" "и в метрике outbox.dead.size: обслуживание обновляет её раз в интервал обслуживания"
   local letter_id
   letter_id=$(echo "$letter" | j 'd["items"][0]["id"]')
   local code
@@ -646,11 +646,11 @@ s_accounts_tail_liveness_retry() { # a retry follower ends the wait, with more o
   acc_end
 }
 
-s_parked_many_keys() { # many keys, each with a small parked tail, one shard: requeue.delay is honoured and no row is left out
+s_parked_many_keys() { # many keys, each with a small parked tail, one shard: requeueDelay is honoured and no row is left out
   acc_begin parked-many-keys
   local i rows delay=1 window=60
   acc_q "insert into subscription (account, id) select 'k' || g, gen_random_uuid() from generate_series(30, 199) g; insert into blocker (account) select 'k' || g from generate_series(0, 199) g" > /dev/null
-  local opts="-Doutbox.relay.batchSize=20 -Doutbox.relay.requeue.delay=${delay}s -Doutbox.shards=1"
+  local opts="-Doutbox.relay.batchSize=20 -Doutbox.requeueDelay=${delay}s -Doutbox.shards=1"
   for i in 1001 1002; do acc "$i" $opts; done
   pc_load 1001 'rate=400&writers=4&keys=200&tags=wait:1'
   sleep 5
@@ -674,7 +674,7 @@ s_parked_many_keys() { # many keys, each with a small parked tail, one shard: re
   ups=$(((upd1 - upd0) / window))
   log "in $window s: arrivals total $total ($((total / window))/s), per row min $min_row p50 $p50 p99 $p99 max $max_row, offered $offered of $all; n_tup_upd $((upd1 - upd0)), $ups/s"
   local allowed=$((window / delay + 6)) updates_allowed=$((2 * rows / delay))
-  check "$(passes is "$max_row" -le "$allowed")" "задержка соблюдается: на строку не больше $allowed прибытий за $window с при requeue.delay = $delay с; было p50 $p50, p99 $p99, max $max_row, всего $total"
+  check "$(passes is "$max_row" -le "$allowed")" "задержка соблюдается: на строку не больше $allowed прибытий за $window с при задержке requeue $delay с; было p50 $p50, p99 $p99, max $max_row, всего $total"
   check "$(passes is "$offered" = "$all")" "за окно предложена каждая строка: $offered из $all, минимум на строку $min_row"
   check "$(passes is "$ups" -le "$updates_allowed")" "обновлений outbox_parked в секунду не больше двух на строку за задержку: $ups при пределе $updates_allowed"
   acc_q "delete from blocker" > /dev/null

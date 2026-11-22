@@ -103,7 +103,7 @@ s_pg_silent_drop_no_timeout() { # the same with pgjdbc's default socketTimeout =
   sleep 3
   tx_send 1001 'topic=payments&key=probe&tag=normal' > /dev/null
   delivered() { [ "$(target_q "select count(*) from pc_effect where key = 'probe'")" = 1 ]; }
-  check "$(passes wait_for 60 delivered)" "запись после обрыва доставлена без рестарта: воркеры вышли по networkTimeout"
+  check "$(passes wait_for 60 delivered)" "запись после обрыва доставлена без рестарта: воркеры вышли по сетевому таймауту библиотеки"
   # the writers' own transactions hang on their sockets, that is the application's socketTimeout: their threads go with a restart
   local i
   for i in 1001 1002 1003; do

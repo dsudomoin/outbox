@@ -5,7 +5,7 @@
 
 | Модуль | Что это |
 |---|---|
-| `common` | Java без процессоров: генератор нагрузки, записи в журнал (`pc_*`), управление обработчиками |
+| `common` | Java: генератор нагрузки, записи в журнал (`pc_*`), управление обработчиками, `ProdcheckOutboxModule` (внутренние значения библиотеки из HOCON, см. «Запуск»); из процессоров только конфигурационный Kora |
 | `target` | Java: HTTP-цель со своей базой и `InboxModule`, неисправности задаются через `PUT /fault` |
 | `shop` | Java: только `OutboxTopicHandler` (`payments`, `ledger`, `projection`, `orders`, `audit`), три релиза контракта |
 | `accounts` | Kotlin 2.1 + KSP: outbox как долговечная очередь входных событий по счёту: своя схема, роль приложения и роль-владелец, миграция вместо bootstrap, `ProtobufOutbox`, `handleBatch` с `requeue`, бизнес-транзакция с блокировкой строки счёта в обработчике, один воркер, значения библиотеки по умолчанию, без метрик и админки |
@@ -59,6 +59,13 @@ docker compose -f prodcheck/docker-compose.yml down -v
 Любой ключ конфигурации задаётся при старте через `JAVA_OPTS`: системные свойства ложатся поверх `application.conf`,
 длительности тоже, например `JAVA_OPTS="-Doutbox.relay.workers=2 -Doutbox.relay.batchTimeout=5s -DhttpClient.target.requestTimeout=1s"`.
 
+Внутренние значения библиотеки (`Tuning` в `io.github.dsudomoin.outbox.internal`: интервал обслуживания, размер
+диапазона xid, число шардов новой таблицы и другие) пользователь не задаёт, у него они всегда по умолчанию. Здесь их
+меняют сценарии: Kora-приложения читают конфиг `outbox` как `ProdcheckOutboxConfig`, `store` — как `StoreOutboxConfig`,
+и ключи лежат прямо под `outbox` с именами методов `Tuning`: `-Doutbox.maintenanceInterval=2s`,
+`-Doutbox.xidsPerPartition=1000`, `-Doutbox.shards=1` (только для новой таблицы), `-Doutbox.requeueDelay=5s`,
+`-Doutbox.deadLetterTimeout=3s`.
+
 Управление во время работы: `POST /load`, `DELETE /load`, `GET /stats`, `POST /tx/send`, `POST /tx/hold`,
 `POST /tx/outside`, `PUT /handler`, `GET /handler`; у `shop` ещё `PUT /hook`, у `courier` ещё `GET /second/status`, у
 `target` `PUT /fault`, `GET /fault`, `GET /health`. Админ-API: `/kora-outbox/admin/v1`, заголовок `X-Api-Key`, ключи
@@ -74,7 +81,8 @@ docker compose -f prodcheck/docker-compose.yml down -v
 ./gradlew -p prodcheck :shop:installDist -Prelease=n1 -q
 ./gradlew -p prodcheck :shop:installDist -Prelease=n2 -q
 ./gradlew -p prodcheck installDist -Prelease=n -q
-# предыдущая версия библиотеки для library-rollback: git archive <rev>, в нём publishToMavenLocal с -Pversion=0.0.0-<rev>
+# предыдущая версия библиотеки для library-rollback: git archive <rev>, в нём publishToMavenLocal с -Pversion=0.0.0-<rev>;
+# с библиотекой до Tuning common берёт ProdcheckOutboxModule без него, а shop читает старый ключ partitions.maintenanceInterval
 ./gradlew -p prodcheck :shop:installDist -Prelease=n -PoutboxVersion=0.0.0-<rev> -q
 docker compose -f prodcheck/docker-compose.yml --profile tools build
 prodcheck/scenarios/run-all.sh                  # вся матрица, около полутора часов

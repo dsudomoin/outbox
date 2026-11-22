@@ -213,7 +213,7 @@ s_wait_handler() { # Outcome.waitFor: no attempt spent, no pause, key order hold
   pc_begin wait-handler
   pc_target
   local i
-  for i in 1001 1002; do pc_courier "$i" -Doutbox.relay.waiting.alertAfter=5s -Doutbox.relay.waiting.delay=200ms; hctl "$i" 'waiting=true'; done
+  for i in 1001 1002; do pc_courier "$i" -Doutbox.waitAlertAfter=5s -Doutbox.waitDelay=200ms; hctl "$i" 'waiting=true'; done
   for i in 1001 1002; do pc_load "$i" 'rate=100&writers=4&keys=30&topics=deliveries&tags=wait:50'; done
   check "$(passes wait_for 30 waits_on 1001)" "waitingSize > 0"
   sleep 12

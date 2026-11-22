@@ -4,6 +4,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.admin.spring.OutboxAdminAuthorizer;
 import jakarta.servlet.http.HttpServletRequest;
 import java.security.MessageDigest;
@@ -16,7 +17,9 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.beans.factory.config.BeanPostProcessor;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.context.annotation.Bean;
+import org.springframework.core.env.Environment;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -66,6 +69,12 @@ public class StoreApp {
                 return bean;
             }
         };
+    }
+
+    /** Replaces the auto-configuration's {@code OutboxProperties}: the same keys, and the library's tuning too. */
+    @Bean
+    OutboxConfig outboxConfig(Environment environment) {
+        return new StoreOutboxConfig(Binder.get(environment));
     }
 
     @Bean

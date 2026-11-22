@@ -2,7 +2,7 @@
 # SOAK_MINUTES (soak.sh sets it). No fault here touches xids. Not in run-all's default list; see ../README.md.
 SOAK_SHOP='rate=60&writers=2&keys=30&topics=payments,ledger,projection&rollbackPercent=5'
 SOAK_ACC='rate=40&writers=2&keys=30&tags=block:97,unblock:101,wait:7&rollbackPercent=3'
-SOAK_PARTS='-Doutbox.partitions.xidsPerPartition=100000' # a few minutes a partition at these rates: rotation runs throughout
+SOAK_PARTS='-Doutbox.xidsPerPartition=100000' # a few minutes a partition at these rates: rotation runs throughout
 SOAK_BATCH=${SOAK_BATCH:-100} # relay.batchSize of accounts: the random blocks of SOAK_ACC take some keys past it, with a limit of their own
 SOAK_ACC_OPTS="$RECOMMENDED $SOAK_PARTS -Doutbox.relay.batchSize=$SOAK_BATCH"
 SOAK_BLOCKED='k30 k31 k32 k33 k34' # accounts the load does not touch: only this cycle's unblock ends their block

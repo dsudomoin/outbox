@@ -2,7 +2,9 @@ package io.github.dsudomoin.outbox.bench
 
 import io.github.dsudomoin.outbox.admin.kora.OutboxAdminAuthorizer
 import io.github.dsudomoin.outbox.admin.kora.OutboxAdminHttpModule
+import io.github.dsudomoin.outbox.internal.Tuning
 import io.github.dsudomoin.outbox.kora.InboxModule
+import io.github.dsudomoin.outbox.kora.KoraOutboxConfig
 import io.github.dsudomoin.outbox.OutboxHandler
 import io.github.dsudomoin.outbox.kora.OutboxModule
 import io.github.dsudomoin.outbox.OutboxRecord
@@ -37,6 +39,7 @@ import ru.tinkoff.kora.common.Component
 import ru.tinkoff.kora.common.KoraApp
 import ru.tinkoff.kora.config.common.annotation.ConfigSource
 import ru.tinkoff.kora.config.common.annotation.ConfigValueExtractor
+import ru.tinkoff.kora.config.common.extractor.ConfigValueExtractor as ValueExtractor
 import ru.tinkoff.kora.config.hocon.HoconConfigModule
 import ru.tinkoff.kora.database.jdbc.JdbcDatabaseModule
 import ru.tinkoff.kora.http.server.undertow.UndertowHttpServerModule
@@ -77,7 +80,18 @@ interface BenchApp :
         }
 
     fun sampler(config: BenchConfig): Sampler = Sampler.parentBased(Sampler.traceIdRatioBased(config.traceRatio()))
+
+    /** The outbox config at `outbox` is read as [BenchOutboxConfig], so the scenarios' env sets the library's tuning. */
+    fun benchOutboxConfigExtractor(tuned: ValueExtractor<BenchOutboxConfig>): ValueExtractor<KoraOutboxConfig> =
+        ValueExtractor { tuned.extract(it) }
 }
+
+/**
+ * The outbox's config with the library's internal [Tuning] read from it too, its keys right under `outbox`
+ * (`outbox.shards`, `outbox.minTickInterval`): the scenarios vary values that no production app can set.
+ */
+@ConfigValueExtractor
+interface BenchOutboxConfig : KoraOutboxConfig, Tuning
 
 /**
  * `bench.telemetry = observation` replaces the module's telemetry with [ObservationOutboxTelemetry]: the outbox's
