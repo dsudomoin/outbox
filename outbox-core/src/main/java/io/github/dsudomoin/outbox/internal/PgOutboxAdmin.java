@@ -124,20 +124,21 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         this.db = db;
         this.ddl = ddl;
         this.names = names;
-        this.shards = config.shards();
+        var tuning = Tuning.of(config);
+        this.shards = OutboxSchema.shards(config);
         this.maintenance = maintenance;
         this.wakeRelay = wakeRelay;
         this.rows = new DeadLetters(names, config);
-        this.partitions = new XidPartitions(names, config.partitions());
+        this.partitions = new XidPartitions(names, config);
         // its dead rows are kept: the abandoned ones
         this.retries = new RetryStore(names, false, OutboxSchema.asciiText(config));
         this.parked = new ParkedStore(names, retries);
         this.recovery = new XidRecovery(names, config);
-        this.socket = new SocketBound(config.networkTimeout());
+        this.socket = new SocketBound(tuning.networkTimeout());
         this.ticks = new Ticks(names, shards);
         this.cursors = new Cursors(names, shards);
         this.resender = new Resender(names, config);
-        this.keyLockWait = XidPartitions.lockWait(config.partitions());
+        this.keyLockWait = XidPartitions.lockWait(tuning);
         this.orphanRestore = maintenance.orphanRestore; // one scan slowdown per instance
         this.dead = names.dead();
         this.shardWait = Maintenance.quiesceTimeout(config);
@@ -334,12 +335,13 @@ public final class PgOutboxAdmin implements OutboxAdmin {
 
     /**
      * Under the maintenance lock ({@link #underMaintenanceLock}), the recovery maintenance runs
-     * ({@link XidRecovery#recover}), whatever {@code outbox.recovery} says. Once it committed the call no longer fails:
-     * the INFO line, then this instance's halt refreshed ({@link Maintenance#checkHalt}), so the relay woken resumes
-     * at once (other instances resume at their next maintenance run); a failure of that refresh, or of releasing the
-     * lock and the session setting, is a WARN, and the relay is woken whatever happens. A commit that fails may still
-     * have gone through on the server ({@link #recoveredAfterAll}): when a read on a new connection finds the recovery
-     * done, the call goes on as committed and returns -1, the count unknown; otherwise it fails with "outcome unknown".
+     * ({@link XidRecovery#recover}), whatever {@link Tuning#xidRegression()} says. Once it committed the call no longer
+     * fails: the INFO line, then this instance's halt refreshed ({@link Maintenance#checkHalt}), so the relay woken
+     * resumes at once (other instances resume at their next maintenance run); a failure of that refresh, or of
+     * releasing the lock and the session setting, is a WARN, and the relay is woken whatever happens. A commit that
+     * fails may still have gone through on the server ({@link #recoveredAfterAll}): when a read on a new connection
+     * finds the recovery done, the call goes on as committed and returns -1, the count unknown; otherwise it fails with
+     * "outcome unknown".
      */
     @Override
     public long recoverXidRegression() {

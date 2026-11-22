@@ -4,6 +4,7 @@ import io.github.dsudomoin.outbox.Outbox;
 import io.github.dsudomoin.outbox.kora.OutboxModule;
 import io.github.dsudomoin.outbox.kora.OutboxOwner;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TunedKoraModule;
 import ru.tinkoff.kora.common.KoraApp;
 import ru.tinkoff.kora.common.Tag;
 import ru.tinkoff.kora.common.annotation.Root;
@@ -17,7 +18,7 @@ import ru.tinkoff.kora.database.jdbc.JdbcDatabaseModule;
 
 /** The app's pool at {@code db} logs in as a DML-only role; a second pool, tagged, as the owner of the tables. */
 @KoraApp
-public interface OwnerTestApp extends HoconConfigModule, JdbcDatabaseModule, OutboxModule {
+public interface OwnerTestApp extends HoconConfigModule, JdbcDatabaseModule, OutboxModule, TunedKoraModule {
 
     default RecordingHandler outboxHandler() {
         return new RecordingHandler();

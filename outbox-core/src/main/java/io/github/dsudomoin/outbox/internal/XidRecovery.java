@@ -23,12 +23,13 @@ import io.github.dsudomoin.outbox.internal.Sql.SqlConsumer;
  * relayed. {@link #recover} rebuilds what a fresh table has (ranges above the current xid, a tail, one tick, one cursor
  * per shard) and re-sends, as new messages, every row the relay may not have delivered, in one transaction that
  * writers wait for. Bootstrap ({@link OutboxSchema}) and {@link Maintenance} run it by themselves under
- * {@code outbox.recovery} ({@link #autoRecover}); both hold {@code LOCK_MAINTENANCE}, so one instance recovers.
+ * the {@link Tuning} recovery values and {@code outbox.recovery.timeout} ({@link #autoRecover}); both hold {@code
+ * LOCK_MAINTENANCE}, so one instance recovers.
  */
 public final class XidRecovery {
 
-    /** Why a halt stays when {@code outbox.recovery.xidRegression = halt}. */
-    static final String HALT_MODE = "outbox.recovery.xidRegression = halt";
+    /** Why a halt stays when {@link Tuning#xidRegression()} is {@code halt}. */
+    static final String HALT_MODE = "the automatic recovery is off (xidRegression halt)";
     /** Why a halt stays when the maintenance lock was not to be had. */
     static final String LOCK_BUSY =
             "another session holds the maintenance lock; the next maintenance run to take it recovers it";
@@ -89,12 +90,13 @@ public final class XidRecovery {
 
     public XidRecovery(TableNames names, OutboxConfig config) {
         this.names = names;
-        this.shards = config.shards();
-        this.maxRows = config.recovery().maxRows();
+        var tuning = Tuning.of(config);
+        this.shards = OutboxSchema.shards(config);
+        this.maxRows = tuning.recoveryMaxRows();
         this.timeout = config.recovery().timeout();
-        this.size = config.partitions().xidsPerPartition();
-        this.partitions = new XidPartitions(names, config.partitions());
-        long margin = TimeUnit.MICROSECONDS.convert(config.recovery().clockMargin());
+        this.size = tuning.xidsPerPartition();
+        this.partitions = new XidPartitions(names, config);
+        long margin = TimeUnit.MICROSECONDS.convert(tuning.recoveryClockMargin());
         this.saved = "select o.id, o.shard, o.created_at, o.message_id, o.topic, o.key, o.payload, o.headers from "
                 + names.base() + " o"
                 + " left join (select c.shard, " + Cursors.effective(shards) + " tick_id from (select distinct on"
@@ -176,7 +178,7 @@ public final class XidRecovery {
 
     /**
      * The automatic recovery, for a caller holding {@code LOCK_MAINTENANCE}: checks again (another instance may have
-     * recovered meanwhile), then recovers when at most {@code outbox.recovery.maxRows} rows are to be re-sent, with an
+     * recovered meanwhile), then recovers when at most {@link Tuning#recoveryMaxRows()} rows are to be re-sent, with an
      * ERROR saying how many were. Returns null when nothing is halted any more, else why the relay stays halted. Above
      * {@code maxRows} the count stands for 5 min, so a halted outbox is not scanned every run. A failed recovery rolls
      * back; it is tried again by the next run only when it failed before its copy under the outbox's lock began. One
@@ -239,7 +241,7 @@ public final class XidRecovery {
     }
 
     private String exceeds(long rows) {
-        return rows + " rows to re-send exceed outbox.recovery.maxRows " + maxRows;
+        return rows + " rows to re-send exceed the automatic recovery's limit of " + maxRows;
     }
 
     private String stopped(String cause) {
@@ -286,9 +288,8 @@ public final class XidRecovery {
      * earliest parked {@code due_at} where it holds parked rows; the saved rows inserted in {@code created_at, id}
      * order, which gives the ids, as no {@code send} gets in before the commit.
      *
-     * @throws IllegalStateException when {@code outbox.shards} differs from the shards of the cursors: saved rows keep
-     *     their shard; or when a detach became pending after the finish before the transaction: the next attempt
-     *     finishes it first
+     * @throws IllegalStateException when a detach became pending after the finish before the transaction: the next
+     *     attempt finishes it first
      */
     public long recover(Connection autocommit) throws SQLException {
         return recover(autocommit, new AtomicBoolean());
@@ -341,13 +342,6 @@ public final class XidRecovery {
                 throw new IllegalStateException("the detach of " + pending + " became pending after the recovery of "
                         + names.base() + " finished the one before it: rolled back, the next attempt finishes it"
                         + " first");
-            }
-            timeLeft(st, deadline);
-            long shardsPresent = queryLong(st, "select count(distinct shard) from " + names.cursor());
-            if (shardsPresent != 0 && shardsPresent != shards) {
-                throw new IllegalStateException("outbox.shards = " + shards + " but " + names.cursor() + " holds"
-                        + " cursors for " + shardsPresent + " shards: the recovery keeps the shard of every row it"
-                        + " re-sends, so set outbox.shards back to " + shardsPresent);
             }
             // before the copy too: a session holding a lock on one of them fails the recovery while it may still be
             // tried again; the outbox's lock above covers its attached partitions, which are dropped below

@@ -10,11 +10,11 @@ public interface OutboxDeadLetterHandler {
 
     /**
      * Returns one {@link DeadLetterDecision} per letter, in the same order, for at most
-     * {@code outbox.deadLetters.batchSize} letters per call.
+     * 100 letters per call.
      *
      * <p>At least once: a letter waits for the hook ({@link DeadLetter.Status#PENDING}) until a decision about it
      * commits. A call that throws (an {@link Error} included), returns an invalid list (null, wrong size, a null
-     * element) or runs past {@code outbox.deadLetters.timeout} (it is then interrupted and abandoned) leaves all its
+     * element) or runs past 130 s (it is then interrupted and abandoned) leaves all its
      * letters pending: each is called again after a backoff ({@code outbox.relay.retry.initialDelay} doubling to
      * {@code maxDelay}) with {@link DeadLetter#handlerAttempts()} one higher. For one letter the hook cannot act on
      * yet, return {@link DeadLetterDecision#retryLater} for it instead of throwing: only that letter backs off, and

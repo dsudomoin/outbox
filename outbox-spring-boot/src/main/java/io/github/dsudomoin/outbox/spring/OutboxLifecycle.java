@@ -10,7 +10,7 @@ import org.springframework.context.SmartLifecycle;
 /**
  * Runs the outbox with the application context: {@link #start()} creates or checks the tables, then starts the relay;
  * {@link #stop()} stops the relay within {@code outbox.relay.shutdown-timeout}, then deletes this instance's heartbeat
- * row. Its phase, {@code outbox.lifecycle.phase}, is {@link #DEFAULT_PHASE} by default: below the web server's, the
+ * row. Its phase is {@link #DEFAULT_PHASE}: below the web server's, the
  * Kafka listener containers' and the default one, so the outbox starts before them and stops after them, while the
  * DataSource is still open. A start after a stop ({@code context.stop()}, then {@code start()}) runs a fresh runtime.
  * <p>
@@ -27,7 +27,6 @@ public final class OutboxLifecycle implements SmartLifecycle {
         + " ApplicationRunner or later, not from @PostConstruct";
 
     private final Supplier<Built> runtimes;
-    private final int phase;
     @Nullable
     private volatile Started current;
     private volatile boolean running;
@@ -37,9 +36,8 @@ public final class OutboxLifecycle implements SmartLifecycle {
      * the app's beans is complete by then: a pool's meters, which Boot binds after every singleton is instantiated.
      * The caller checks the config before, so that an error fails the bean's creation.
      */
-    OutboxLifecycle(Supplier<Built> runtimes, int phase) {
+    OutboxLifecycle(Supplier<Built> runtimes) {
         this.runtimes = runtimes;
-        this.phase = phase;
     }
 
     @Override
@@ -80,7 +78,7 @@ public final class OutboxLifecycle implements SmartLifecycle {
 
     @Override
     public int getPhase() {
-        return phase;
+        return DEFAULT_PHASE;
     }
 
     /**

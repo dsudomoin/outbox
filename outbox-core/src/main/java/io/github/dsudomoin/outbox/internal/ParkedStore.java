@@ -91,7 +91,7 @@ public final class ParkedStore {
     }
 
     /**
-     * {@code delay}, {@code batch}, {@code batchBytes}: {@code relay.requeue.delay}, {@code relay.batchSize} and the
+     * {@code delay}, {@code batch}, {@code batchBytes}: {@link Tuning#requeueDelay()}, {@code relay.batchSize} and the
      * budget of {@code relay.batchBytes} ({@link RowBytes#budget}).
      */
     public ParkedStore(TableNames names, RetryStore retries, Duration delay, int batch, long batchBytes) {

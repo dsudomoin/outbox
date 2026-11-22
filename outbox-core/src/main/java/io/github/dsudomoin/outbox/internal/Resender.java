@@ -15,7 +15,7 @@ import java.util.UUID;
  * The bulk inserts into the outbox: {@code sendAll} ({@link #insertAll}), and every path that puts rows back into it
  * (orphan restore, redrive, stranded-shard repair: {@link #insertFrom}). A row gets a new id and the inserting
  * transaction's xid; it keeps its {@code message_id} and stored headers. {@link #insertAll} stores the shard its caller
- * chose; {@link #insertFrom} recomputes it for the current {@code outbox.shards}. Keyed rows take
+ * chose; {@link #insertFrom} recomputes it for the outbox's shard count. Keyed rows take
  * {@code pg_advisory_xact_lock(keyNamespace, keyHash)}, the lock {@code send} takes, before the identity assigns their
  * ids, so a row cannot interleave with a concurrent {@code send} of its (topic, key).
  */
@@ -40,7 +40,7 @@ public final class Resender {
     static final long STATEMENT_BYTES = 64L << 20;
 
     /**
-     * A row to insert; {@code shard} as {@code send} computes it for the current {@code outbox.shards}
+     * A row to insert; {@code shard} as {@code send} computes it for the outbox's shard count
      * ({@link Hashing#shard} of the key hash, {@link Hashing#randomShard} without a key), {@code headers} in the stored
      * encoding ({@link HeaderCodec}).
      */
@@ -53,34 +53,24 @@ public final class Resender {
     private final int keyNamespace;
     private final TableNames names;
     private final int shards;
-    private final ShardGuard guard;
     private final String insertAll;
     /** {@link #LOCK_ALL}, then {@link #insertAll}: the key locks with the first insert of a {@link #insertAll}. */
     private final String lockAndInsertAll;
     private final long statementBytes;
 
-    /**
-     * Without the instance's {@link ShardGuard}: for tests. Main code builds it from the resolved config
-     * ({@link #Resender(TableNames, OutboxConfig)}) or, in {@link PgOutbox}, with the guard itself.
-     */
     public Resender(TableNames names, int shards) {
-        this(names, shards, ShardGuard.NONE);
+        this(names, shards, STATEMENT_BYTES);
     }
 
-    /** {@code config}: the instance's, as {@link OutboxSchema#config()} resolved it; every insert checks its guard. */
+    /** {@code config}: the instance's, as {@link OutboxSchema#config()} resolved it ({@link OutboxSchema#shards}). */
     public Resender(TableNames names, OutboxConfig config) {
-        this(names, config.shards(), ShardGuard.of(config));
-    }
-
-    Resender(TableNames names, int shards, ShardGuard guard) {
-        this(names, shards, guard, STATEMENT_BYTES);
+        this(names, OutboxSchema.shards(config));
     }
 
     /** {@code statementBytes}: as {@link #STATEMENT_BYTES}, smaller in tests. */
-    Resender(TableNames names, int shards, ShardGuard guard, long statementBytes) {
+    Resender(TableNames names, int shards, long statementBytes) {
         this.names = names;
         this.statementBytes = statementBytes;
-        this.guard = guard;
         this.keyNamespace = names.keyNamespace();
         this.shards = shards;
         this.insertAll = "insert into " + names.base() + " (shard, message_id, topic, key, payload, headers)"
@@ -115,11 +105,9 @@ public final class Resender {
      * Locks the rows' distinct key hashes in one statement, then inserts them, ids in list order: in one statement, or
      * in consecutive ones of at most {@link #STATEMENT_BYTES} of keys, payloads and headers each when the list holds
      * more (a row over it in one of its own), each on its {@link Row#shard()}. Unkeyed rows take no lock. Every key
-     * lock is held until {@code inTx} ends, so callers bound the list. Returns the rows inserted. Throws
-     * {@link IllegalStateException} while the instance's {@link ShardGuard} finds the cursors on another shard count.
+     * lock is held until {@code inTx} ends, so callers bound the list. Returns the rows inserted.
      */
     public int insertAll(Connection inTx, List<Row> rows) throws SQLException {
-        guard.require(names, shards);
         int n = rows.size();
         if (n == 0) {
             return 0;
@@ -197,7 +185,6 @@ public final class Resender {
      * Returns the rows inserted.
      */
     public int insertFrom(Connection inTx, String from, List<Source> rows) throws SQLException {
-        guard.require(names, shards);
         int n = rows.size();
         if (n == 0) {
             return 0;
@@ -224,7 +211,7 @@ public final class Resender {
     }
 
     /**
-     * The shard of each row, recomputed for the current {@code outbox.shards}, a random one when it has no key; the
+     * The shard of each row, recomputed for the outbox's shard count, a random one when it has no key; the
      * keyed rows' distinct key hashes locked in one statement, until {@code inTx} ends.
      */
     private Short[] lockKeys(Connection inTx, String[] topics, byte[][] keys) throws SQLException {

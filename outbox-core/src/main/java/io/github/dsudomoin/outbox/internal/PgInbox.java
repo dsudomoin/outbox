@@ -45,7 +45,7 @@ import org.slf4j.LoggerFactory;
  * (pgbouncer, Odyssey) too. It
  * fails when an existing table has no {@code consumer} column (made by an earlier version, with dedup across
  * consumers); with {@code outbox.schema.bootstrap = false} it creates no table and checks it ({@link SchemaCheck}).
- * It then runs {@link #runMaintenance()} every {@code outbox.partitions.maintenanceInterval} on the daemon thread
+ * It then runs {@link #runMaintenance()} every {@link Tuning#maintenanceInterval()} on the daemon thread
  * {@code outbox-inbox-maintenance} until {@link #close()}.
  */
 public final class PgInbox implements Inbox, AutoCloseable {
@@ -62,6 +62,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
     private final OutboxTransactions ddl;
     private final String notInTx;
     private final OutboxConfig config;
+    private final Tuning tuning;
     private final SocketBound socket;
     private final OutboxTelemetry telemetry;
     private final TableNames names;
@@ -95,7 +96,8 @@ public final class PgInbox implements Inbox, AutoCloseable {
         this.db = db;
         this.notInTx = "Inbox.tryAccept and tryAcceptAll must be called inside " + db.transactionHint();
         this.config = config;
-        this.socket = new SocketBound(config.networkTimeout());
+        this.tuning = Tuning.of(config);
+        this.socket = new SocketBound(tuning.networkTimeout());
         this.telemetry = telemetry;
         this.names = TableNames.of(config.inbox().table());
         this.partitions = new InboxPartitions(names.base(), config);
@@ -238,7 +240,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
         var w = window;
         log.info("outbox inbox {} ready: ids from {} to {} deduplicated", names.base(),
                 Instant.ofEpochMilli(dedupFrom(w)), Instant.ofEpochMilli(w.to()));
-        long every = config.partitions().maintenanceInterval().toNanos();
+        long every = tuning.maintenanceInterval().toNanos();
         var s = Executors.newSingleThreadScheduledExecutor(r -> {
             var t = new Thread(r, "outbox-inbox-maintenance");
             t.setDaemon(true);
@@ -270,13 +272,12 @@ public final class PgInbox implements Inbox, AutoCloseable {
 
     /**
      * One run. On the instance that gets {@code LOCK_INBOX_MAINTENANCE}, which a {@link LockHolder} on a second
-     * connection tries (idle for {@link Maintenance#HOLDER_IDLE} at most, so a frozen holder loses it): finish a pending
-     * detach, drop expired ranges, make ranges up to {@code now + premake} (attaching a table of the next range that
-     * exists but is not attached), drop expired ranges a crash left detached but not dropped and, with
-     * {@code outbox.inbox.attachOrphans}, attach back the ones still inside the window (the gauge
-     * {@code outbox.inbox.partitions.orphaned} counts the ones kept, with an ERROR), each step on its own (a failure is
-     * logged and the next step still runs; none once the holder is gone). The gauge
-     * {@code outbox.inbox.maintenance.transaction_pooling} stays 0. Then, on every instance, the window
+     * connection tries (idle for {@link Maintenance#HOLDER_IDLE} at most, so a frozen holder loses it): finish a
+     * pending detach, drop expired ranges, make ranges up to {@code now + premake} (attaching a table of the next range
+     * that exists but is not attached), drop expired ranges a crash left detached but not dropped and attach back the
+     * ones still inside the window (the gauge {@code outbox.inbox.partitions.orphaned} counts the ones kept, with an
+     * ERROR), each step on its own (a failure is logged and the next step still runs; none once the holder is gone).
+     * The gauge {@code outbox.inbox.maintenance.transaction_pooling} stays 0. Then, on every instance, the window
      * refresh; when that connection or its run fails before the refresh is done, the refresh runs on an application
      * connection (the catalogs it reads need no owner rights), and the run's failure is thrown after it. A window not
      * refreshed for {@code premake - partitionInterval} ends dedup of new ids: the gauge
@@ -423,9 +424,9 @@ public final class PgInbox implements Inbox, AutoCloseable {
     }
 
     /**
-     * Attaches {@code orphan} back when {@code outbox.inbox.attachOrphans} is on and it
-     * {@link InboxPartitions#leavesNoGap}; null when attached, else the advice its ERROR ends with. The attach
-     * statement is advised only for one that leaves no gap: run on another, it would make inserts fail.
+     * Attaches {@code orphan} back when it {@link InboxPartitions#leavesNoGap}; null when attached, else the advice its
+     * ERROR ends with. The attach statement is advised only for one that leaves no gap: run on another, it would make
+     * inserts fail.
      */
     @Nullable
     private String attachBack(Connection c, InboxPartitions.Orphan orphan) throws SQLException {
@@ -436,9 +437,6 @@ public final class PgInbox implements Inbox, AutoCloseable {
         }
         var attach = "attach it back with alter table " + names.base() + " attach partition " + orphan.table() + " "
                 + PartitionDdl.bounds(orphan.from(), orphan.to());
-        if (!config.inbox().attachOrphans()) {
-            return attach;
-        }
         try {
             partitions.attachBack(c, orphan);
         } catch (SQLException e) { // nothing changed, so the step goes on with the next orphan
@@ -456,7 +454,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
         } catch (Throwable t) {
             try {
                 log.error("outbox inbox maintenance of {} failed; next run in {}", names.base(),
-                        config.partitions().maintenanceInterval(), t);
+                        tuning.maintenanceInterval(), t);
             } catch (VirtualMachineError ignored) {
                 // logging ran out of memory too; the next run reports again
             }

@@ -10,6 +10,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import io.github.dsudomoin.outbox.internal.HeaderCodec;
 import io.github.dsudomoin.outbox.internal.OwnerTransactions;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
+import io.github.dsudomoin.outbox.internal.Tuning;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -77,10 +78,17 @@ class OutboxRuntimeIT {
     }
 
     @Test
-    void withoutShardsANewOutboxGetsTheDefaultAndDelivers() throws Exception {
+    void aNewOutboxGetsTheDefaultShardCountAndDelivers() throws Exception {
         var handler = new RecordingHandler();
         var transactions = new JdbcTransactions(TestDataSources.newDataSource());
-        try (var runtime = OutboxRuntime.builder(new TestOutboxConfig().shards(null), transactions, handler).build()) {
+        var table = TestSql.uniqueTable();
+        var config = new OutboxConfig() { // no Tuning: the library's own values
+            @Override
+            public String table() {
+                return table;
+            }
+        };
+        try (var runtime = OutboxRuntime.builder(config, transactions, handler).build()) {
             runtime.start();
             var id = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", "k", "p".getBytes(UTF_8))));
 
@@ -89,7 +97,7 @@ class OutboxRuntimeIT {
                 Thread.sleep(5);
             }
             assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactly(id);
-            assertThat(runtime.admin().status().shards()).isEqualTo(OutboxConfig.DEFAULT_SHARDS);
+            assertThat(runtime.admin().status().shards()).isEqualTo(Tuning.DEFAULTS.shards()).isEqualTo(256);
         }
     }
 
@@ -241,7 +249,7 @@ class OutboxRuntimeIT {
 
     /**
      * A start that fails after the relay began beating (here the halt check's database call) leaves no instance
-     * behind: once the start deleted the bootstrap's row, no beat writes it back, so an emergency reshard counts none.
+     * behind: once the start deleted the bootstrap's row, no beat writes it back.
      */
     @Test
     void aFailedStartLeavesNoInstanceBeating() throws Exception {

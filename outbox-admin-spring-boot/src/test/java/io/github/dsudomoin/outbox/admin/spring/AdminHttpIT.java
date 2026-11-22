@@ -87,15 +87,17 @@ class AdminHttpIT {
         }
     }
 
-    /** Boot's datasource keys, no migrations, a fresh outbox table, no relay, a busy shard waited for 5.1 s. */
+    /**
+     * Boot's datasource keys, no migrations, a fresh outbox table, no relay, a busy shard waited for 5.1 s; with
+     * {@link AdminServer.Base} two shards and two premade ranges.
+     */
     static String[] properties(String... more) {
         return Stream.concat(Stream.of("spring.datasource.url=" + TestDataSources.jdbcUrl(),
             "spring.datasource.username=" + TestDataSources.user(),
             "spring.datasource.password=" + TestDataSources.password(),
             "spring.flyway.enabled=false", "spring.liquibase.enabled=false",
-            "outbox.table=" + TestSql.uniqueTable(), "outbox.shards=2", "outbox.relay.enabled=false",
-            "outbox.relay.batch-timeout=100ms", "outbox.partitions.xids-per-partition=1000000",
-            "outbox.partitions.premake=2"), Stream.of(more)).toArray(String[]::new);
+            "outbox.table=" + TestSql.uniqueTable(), "outbox.relay.enabled=false",
+            "outbox.relay.batch-timeout=100ms"), Stream.of(more)).toArray(String[]::new);
     }
 
     private interface Body {

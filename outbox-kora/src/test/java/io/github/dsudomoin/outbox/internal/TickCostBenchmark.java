@@ -4,7 +4,6 @@ import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static org.assertj.core.api.Assertions.assertThat;
 
-import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -92,7 +91,7 @@ class TickCostBenchmark {
 
     private static void run(TestDatabase db, Connection tick, List<Connection> open, int shards, int[] endedCounts,
             List<Variant> variants, int rounds) throws SQLException {
-        var partitions = new OutboxConfig.PartitionsConfig() {};
+        var partitions = Tuning.DEFAULTS;
         var schema = new OutboxSchema(db, new TestOutboxConfig().shards(shards)
                 .xidsPerPartition(partitions.xidsPerPartition()).premake(partitions.premake()));
         schema.start();

@@ -265,7 +265,7 @@ class KafkaDeadLetterHandlerTest {
         var cut = executor.submit(() -> handler.handle(letters));
         awaitSent(0, 3).errorNext(new RecordTooLargeException("too large"));
         awaitSent(1, 2); // its batch-mates' second round, in flight
-        cut.cancel(true); // as the pass does at outbox.deadLetters.timeout
+        cut.cancel(true); // as the pass does at its hook call timeout
 
         try (var err = new CapturedStderr()) {
             var next = executor.submit(() -> handler.handle(letters)); // runs once the cut call has returned

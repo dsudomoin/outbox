@@ -805,30 +805,6 @@ class PgInboxIT {
     }
 
     @Test
-    void attachOrphansOffKeepsTheError() throws Exception {
-        config.attachOrphans(false);
-        start();
-        var range = rangeOf(System.currentTimeMillis());
-        var far = table() + "_t" + HOURS.format(Instant.ofEpochMilli(highest() + 10 * HOUR));
-        try (var c = TestDb.connect()) {
-            execute(c, "alter table " + table() + " detach partition " + range.name());
-            standalone(c, far);
-        }
-
-        try (var err = new CapturedStderr()) {
-            inbox.runMaintenance();
-
-            assertThat(err.text()).contains("ERROR").contains(range.name()).contains("23514")
-                    .contains("alter table " + table() + " attach partition " + range.name() + " for values from ('"
-                            + range.from() + "') to ('" + range.to() + "')")
-                    .as("the statement only where attaching is safe").contains(far)
-                    .doesNotContain("attach partition " + far);
-        }
-        assertThat(ranges()).doesNotContain(range);
-        assertThat(orphaned(registry)).isEqualTo(2);
-    }
-
-    @Test
     void overlappingOrphanStaysWithItsError() throws Exception {
         start();
         var overlapping = rangeOf(System.currentTimeMillis());
@@ -1012,25 +988,18 @@ class PgInboxIT {
         assertThat(accept(id)).isFalse();
     }
 
+    /** Only {@code outbox.inbox.retention} is checked, against the inbox ranges, which are no keys. */
     @Test
     void rejectsInvalidConfig() {
         var h = Duration.ofHours(1);
         var m = Duration.ofMinutes(1);
-        rejected(config(Duration.ofSeconds(59), h.multipliedBy(2), h.multipliedBy(2), m),
-                "outbox.inbox.partitionInterval must be at least 1m");
-        // a range name holds its lower bound to the minute
-        rejected(config(Duration.ofSeconds(90), Duration.ofMinutes(3), Duration.ofMinutes(5), m),
-                "outbox.inbox.partitionInterval must be a whole number of minutes");
         // the guaranteed dedup span, retention - interval, is at least one interval
-        rejected(config(h, Duration.ofMinutes(119), h.multipliedBy(3), m), "outbox.inbox.retention must be at least 2");
-        // a whole range above the window's top margin
-        rejected(config(h, h.multipliedBy(2), Duration.ofMinutes(119), m), "outbox.inbox.premake must be at least 2");
-        // maintenance extends before the window's top reaches now
-        rejected(config(h, h.multipliedBy(2), h.multipliedBy(2), h), "outbox.partitions.maintenanceInterval");
+        rejected(config(h, Duration.ofMinutes(119), h.multipliedBy(3), m),
+                "outbox.inbox.retention must be at least 2 × the inbox range interval of PT1H (PT2H): PT1H59M");
         // at most 1000 ranges over retention + premake
         rejected(config(m, Duration.ofMinutes(500), Duration.ofMinutes(501), Duration.ofMinutes(10)),
-                "outbox.inbox.partitionInterval must be at least (outbox.inbox.retention + outbox.inbox.premake)"
-                        + " / 1000");
+                "outbox.inbox.retention must be at most PT8H19M, 1000 inbox ranges of PT1M less the PT8H21M made"
+                        + " ahead: PT8H20M");
         rejected(new TestOutboxConfig().inboxTable("bad-name"), "table name");
 
         var metrics = new OutboxMetrics(null); // the limits themselves are valid

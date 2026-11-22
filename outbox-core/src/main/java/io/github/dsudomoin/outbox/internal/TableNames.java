@@ -156,7 +156,7 @@ public record TableNames(
         return base + "_stranded";
     }
 
-    /** How many times each message was redriven, kept for {@code outbox.deadLetters.redriveHistory}. */
+    /** How many times each message was redriven, kept for {@link Tuning#redriveHistory()}. */
     public String redriven() {
         return base + "_redriven";
     }

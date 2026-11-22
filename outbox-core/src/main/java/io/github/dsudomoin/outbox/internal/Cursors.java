@@ -25,7 +25,7 @@ import java.util.concurrent.TimeUnit;
  * instead (one row, {@link #checkpoint}): the latest tick L of its read, a {@code busy} bitmap (bit s, leftmost 0, set
  * for a shard with a batch in progress or {@link Position#behind() behind} at L) and {@code busy_tick_id}, the lowest
  * effective tick of the busy shards (L when none). A shard's <em>effective tick</em> is
- * {@code greatest(cursor.tick_id, ckpt.tick_id)} when the newest checkpoint has {@code outbox.shards} bits and the
+ * {@code greatest(cursor.tick_id, ckpt.tick_id)} when the newest checkpoint has as many bits as shards and the
  * shard's bit is 0, {@code greatest(cursor.tick_id, ckpt.busy_tick_id)} when it is 1, else {@code cursor.tick_id}; a
  * checkpoint counts only while the tick at its {@code tick_id} exists and was made no later than the checkpoint (both
  * {@code created_at} on the database clock, the checkpoint's never below its tick's, so a clock stepped back between
@@ -44,8 +44,8 @@ import java.util.concurrent.TimeUnit;
  *       {@link Ticks}, the ticks after E' chain, so no row of the shard is visible in L and not in E', and by induction
  *       none visible in E' and not in its cursor's tick: so none up to L. (A bitmap of another length, from an
  *       instance with another shard count, reads as all shards, but an empty one reads as none: instances with
- *       different shard counts on one table are not supported: the bootstrap reshards only a drained outbox with no
- *       other instance running, and maintenance halts an instance whose count differs from the cursors'.)</li>
+ *       different shard counts on one table are not supported: every instance takes the cursors' count at
+ *       bootstrap.)</li>
  *   <li>A 1 bit: {@code busy_tick_id} is at most E', so a row visible in it is visible in E', and by induction in the
  *       cursor's tick.</li>
  *   <li>Cursors only move forward, so a cursor appended after the read keeps both. A step that read its cursor and
@@ -68,7 +68,7 @@ import java.util.concurrent.TimeUnit;
  *       forward, so the floor read before the delete stays below every latest row.</li>
  *   <li><em>Anchors</em> ({@link #anchors}): each maintenance run, after its checkpoint, appends for each shard with
  *       a 0 bit, no batch in progress and its latest row on a tick below its effective tick E made
- *       {@code outbox.relay.cursorAnchorInterval} or more ago, that row at E (no batch in progress,
+ *       {@link Tuning#cursorAnchorInterval()} or more ago, that row at E (no batch in progress,
  *       {@code paused_until} and {@code failures} kept). By the 0 bit no row of the shard is visible in E and not in
  *       the row's tick, so it changes neither the shard's rows to read nor its effective tick, and keeps cursors
  *       moving forward; it is written under the shard's lock, from the row a step left. A shard whose row lies
@@ -170,7 +170,7 @@ public final class Cursors {
     private final String anchors;
     private final String lowestTick;
 
-    /** {@code shards}: {@code outbox.shards}, the length of a checkpoint's {@code busy} bitmap. */
+    /** {@code shards}: the outbox's shard count, the length of a checkpoint's {@code busy} bitmap. */
     public Cursors(TableNames names, int shards) {
         this.names = names;
         this.shards = shards;
@@ -269,8 +269,8 @@ public final class Cursors {
     }
 
     /**
-     * The cursors' shard count, 0 without cursors: {@code max(shard) + 1}, an index probe, as bootstrap and a reshard
-     * make the cursors of shards 0..n-1 together. The bootstrap, {@link Maintenance} and {@link Heartbeat} read it.
+     * The cursors' shard count, 0 without cursors: {@code max(shard) + 1}, an index probe, as bootstrap makes the
+     * cursors of shards 0..n-1 together. The bootstrap reads it.
      */
     static String shardCount(TableNames names) {
         return "select coalesce(max(shard) + 1, 0) from " + names.cursor();

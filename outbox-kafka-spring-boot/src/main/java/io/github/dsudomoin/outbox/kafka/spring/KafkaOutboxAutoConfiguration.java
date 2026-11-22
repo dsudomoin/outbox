@@ -51,11 +51,6 @@ public final class KafkaOutboxAutoConfiguration {
             public Properties driverProperties() {
                 return driver;
             }
-
-            @Override
-            public boolean clientIdSuffix() {
-                return properties.clientIdSuffix();
-            }
         };
         var sender = new KafkaOutboxSender(config);
         outbox.ifAvailable(sender::warnAboveBatchTimeout);

@@ -35,7 +35,7 @@ import io.github.dsudomoin.outbox.internal.Sql.SqlFunction0;
  * {@code LOCK_SCHEMA}. Nothing they do is set for the session or outlives its transaction, so they run behind a
  * transaction-pooling proxy too. Besides the xid-regression recovery, the library takes ACCESS EXCLUSIVE on the parent
  * in two places, for milliseconds: the extension's tail swap ({@link #ensurePremade}), taken without waiting unless
- * {@code outbox.partitions.swapLockTimeout} asks for a wait, and the drop of a range left detach-pending
+ * {@link Tuning#swapLockTimeout()} asks for a wait, and the drop of a range left detach-pending
  * ({@link #dropPending}, also used on the inbox parent), always by {@code NOWAIT} tries for {@link #NOWAIT_WINDOW},
  * the hold cut by the server at 260 ms, with {@code FINALIZE} when no try gets the lock; other range drops detach
  * concurrently. On a single attached partition (outbox or inbox) it takes ACCESS EXCLUSIVE when it gives one a member
@@ -210,8 +210,8 @@ public final class XidPartitions {
 
     /**
      * A standalone range {@link #orphans} lists and {@link #dropOrphans} kept; {@code ours} when maintenance detached
-     * it as relayed, and then {@link Maintenance} moves its rows back ({@link OrphanRestore}) unless
-     * {@code restoreOrphans} is off; {@code setAside} when the xid-regression recovery set it aside
+     * it as relayed, and then {@link Maintenance} moves its rows back ({@link OrphanRestore});
+     * {@code setAside} when the xid-regression recovery set it aside
      * ({@link XidRecovery}).
      */
     record Orphan(String table, boolean ours, boolean setAside) {}
@@ -284,13 +284,13 @@ public final class XidPartitions {
     /** Times its {@link #ATTACH_SCAN_RATE} time the next attach back gets: doubled by each cut, 1 after a success. */
     private volatile int attachSlowdown = 1;
 
-    public XidPartitions(TableNames names, OutboxConfig.PartitionsConfig cfg) {
-        this(names, cfg, LONG_TRANSACTION, false);
+    public XidPartitions(TableNames names, OutboxConfig config) {
+        this(names, config, LONG_TRANSACTION, false);
     }
 
     /** {@code longTransaction} replaces {@link #LONG_TRANSACTION}, for tests. */
-    XidPartitions(TableNames names, OutboxConfig.PartitionsConfig cfg, Duration longTransaction) {
-        this(names, cfg, longTransaction, false);
+    XidPartitions(TableNames names, OutboxConfig config, Duration longTransaction) {
+        this(names, config, longTransaction, false);
     }
 
     /**
@@ -298,12 +298,12 @@ public final class XidPartitions {
      * second sample, which would hold the schema lock, and every other instance's startup, for the threshold; and a
      * hot tail is left to maintenance, as turning it into a range scans it ({@link #heal}).
      */
-    static XidPartitions forBootstrap(TableNames names, OutboxConfig.PartitionsConfig cfg) {
-        return new XidPartitions(names, cfg, LONG_TRANSACTION, true);
+    static XidPartitions forBootstrap(TableNames names, OutboxConfig config) {
+        return new XidPartitions(names, config, LONG_TRANSACTION, true);
     }
 
     private XidPartitions(
-            TableNames names, OutboxConfig.PartitionsConfig cfg, Duration longTransaction, boolean bootstrap) {
+            TableNames names, OutboxConfig config, Duration longTransaction, boolean bootstrap) {
         this.names = names;
         this.markDropping = "insert into " + names.dropping() + " (table_name) values (?) on conflict do nothing";
         this.unmarkDropping = "delete from " + names.dropping() + " where table_name = ?";
@@ -319,13 +319,15 @@ public final class XidPartitions {
                 + " = coalesce(tail_oversized_since, ?) returning tail_oversized_since";
         this.clearOversized = "update " + names.maintenance() + " set tail_oversized_since = null"
                 + " where tail_oversized_since is not null";
+        var cfg = Tuning.of(config);
+        var tail = config.partitions().tailConversion();
         this.size = cfg.xidsPerPartition();
         this.premake = cfg.premake();
         this.swapLockTimeout = cfg.swapLockTimeout();
         this.maxTailScan = cfg.maxTailScan();
-        this.window = Window.parse(cfg.tailConversion().window());
-        this.maxStall = cfg.tailConversion().maxStall();
-        this.zone = ZoneId.of(cfg.tailConversion().zone());
+        this.window = Window.parse(tail.window());
+        this.maxStall = tail.maxStall();
+        this.zone = ZoneId.of(tail.zone());
         this.clock = Clock.system(zone);
         this.quiesce = "select pg_advisory_xact_lock(" + names.internalNamespace() + ", " + TableNames.LOCK_SWAP + ")";
         this.longTransaction = longTransaction;
@@ -337,7 +339,7 @@ public final class XidPartitions {
      * orphan restore's insert) may last, so how long the writers of those keys may wait: {@code swapLockTimeout}, or
      * 200 ms when it is 0, past the swap's hold that the insert may meet.
      */
-    public static Duration lockWait(OutboxConfig.PartitionsConfig cfg) {
+    public static Duration lockWait(Tuning cfg) {
         return cfg.swapLockTimeout().isZero() ? DEFAULT_LOCK_WAIT : cfg.swapLockTimeout();
     }
 
@@ -345,10 +347,11 @@ public final class XidPartitions {
     void logTailConversion() {
         if (window == null) {
             log.info("outbox partition tail conversion window of {} is off (outbox.partitions.tailConversion.window"
-                    + " empty): a hot tail over maxTailScan {} MB stays hot", names.base(), mb(maxTailScan));
+                    + " empty): a hot tail over the swap's scan limit of {} MB stays hot", names.base(),
+                    mb(maxTailScan));
         } else {
             log.info("outbox partition tail conversion window {} in zone {} (now {} there), maxStall {} ms: a hot tail"
-                    + " of {} over maxTailScan {} MB is turned into a range only then", window, zone,
+                    + " of {} over the swap's scan limit of {} MB is turned into a range only then", window, zone,
                     LocalTime.now(clock).withNano(0), maxStall.toMillis(), names.base(), mb(maxTailScan));
         }
     }
@@ -545,7 +548,7 @@ public final class XidPartitions {
                                 + maxStall.toMillis() + " ms)"
                         : "until outbox.partitions.tailConversion.window " + window + " (" + zone + "), inside which"
                                 + " it converts it with the scan cut at maxStall " + maxStall.toMillis() + " ms";
-                log.error("outbox partition tail {} holds {} MB, over outbox.partitions.maxTailScan {} MB: turning it"
+                log.error("outbox partition tail {} holds {} MB, over the swap's scan limit of {} MB: turning it"
                         + " into a range scans it under ACCESS EXCLUSIVE on {}, writers waiting for the scan, so"
                         + " maintenance leaves it hot {}. Writes go on into it and nothing is lost; the disk grows"
                         + " until it is converted. Once it has gone a whole window unconverted (at once without one),"
@@ -691,9 +694,9 @@ public final class XidPartitions {
                     + " that runs. Send last in the transaction, end the holders by the pids above (an"
                     + " idle_in_transaction_session_timeout ends a leaked one). This ERROR repeats at most once an"
                     + " hour", names.base(), missed, s.ahead, cause, swapLockTimeout.isZero()
-                    ? "NOWAIT tries for " + NOWAIT_WINDOW.toMillis() + " ms, outbox.partitions.swapLockTimeout 0"
-                    : "NOWAIT tries for " + NOWAIT_WINDOW.toMillis() + " ms, then a wait of"
-                            + " outbox.partitions.swapLockTimeout " + swapLockTimeout.toMillis() + " ms");
+                    ? "NOWAIT tries for " + NOWAIT_WINDOW.toMillis() + " ms, no queued wait"
+                    : "NOWAIT tries for " + NOWAIT_WINDOW.toMillis() + " ms, then a queued wait of "
+                            + swapLockTimeout.toMillis() + " ms");
         }
     }
 
@@ -772,9 +775,9 @@ public final class XidPartitions {
             log.warn("outbox partition extension of {} deferred to the next run, {} ranges ahead: {}, so the tail swap"
                     + " would not get its lock on the outbox while it lasts."
                     + " Long transactions on the outbox table (pg_dump of it, long reports or batch jobs) hold the"
-                    + " extension back; outbox.partitions.premake must outlast the longest. This WARN repeats at most"
+                    + " extension back; the {} ranges made ahead must outlast the longest. This WARN repeats at most"
                     + " once a minute",
-                    names.base(), s.ahead, blocker);
+                    names.base(), s.ahead, blocker, premake);
         }
         return blocker;
     }
@@ -849,7 +852,7 @@ public final class XidPartitions {
                     LOCK_NOT_AVAILABLE));
         }
         if (result.startsWith("large ")) {
-            return "the tail grew past outbox.partitions.maxTailScan under the swap's lock, to "
+            return "the tail grew past the swap's scan limit under its lock, to "
                     + mb(Long.parseLong(result.substring(6))) + " MB: not scanned";
         }
         if (result.equals("passed")) {
@@ -1427,9 +1430,9 @@ public final class XidPartitions {
         overflow = true;
         if (due(overflowLogged)) {
             log.warn("outbox rows went to the partition tail {}: maintenance fell behind; the next extension turns it"
-                    + " into a range while it is within outbox.partitions.maxTailScan, a larger one only inside"
-                    + " tailConversion.window (gauge outbox.partitions.overflow). This WARN repeats at most once a"
-                    + " minute", names.tail());
+                    + " into a range while it is within the swap's scan limit of {} MB, a larger one only inside"
+                    + " outbox.partitions.tailConversion.window (gauge outbox.partitions.overflow). This WARN repeats"
+                    + " at most once a minute", names.tail(), mb(maxTailScan));
         }
     }
 

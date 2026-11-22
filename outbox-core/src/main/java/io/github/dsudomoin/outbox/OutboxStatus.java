@@ -20,9 +20,9 @@ import java.util.Map;
  * ahead of the current xid ({@code outbox.partitions.premade}); {@code xidsLeft}: xids before inserts fail, null while
  * the tail is attached ({@code outbox.partitions.xids_left}); {@code maintenanceSinceSuccessSeconds}: since a
  * maintenance run last completed on any instance, null without that record ({@code outbox.maintenance.since_success});
- * {@code shards}: this instance's shard count, as the bootstrap resolved {@code outbox.shards}; {@code instances}: the
- * instances' heartbeats, by id, expired ones too (a crashed instance's row stays an hour after its heartbeat expired,
- * 3 × {@code maintenanceInterval} after its last beat).
+ * {@code shards}: this instance's shard count, the cursors' as the bootstrap read them (256 for a new outbox); {@code
+ * instances}: the instances' heartbeats, by id, expired ones too (a crashed instance's row stays an hour after its
+ * heartbeat expired, 90 s after its last beat).
  */
 public record OutboxStatus(
         boolean halted,
@@ -48,7 +48,7 @@ public record OutboxStatus(
 
     /**
      * A running instance, by its heartbeat: {@code id} {@code <host>/<pid>/<8 hex>}, its shard count, when it was last
-     * seen (database clock, every {@code maintenanceInterval}), whether it has an active dead-letter hook, whether the
+     * seen (database clock, every 30 s), whether it has an active dead-letter hook, whether the
      * relay runs there, {@code live}: its row has not expired, by the database clock, so a deployment gate need not
      * know each instance's interval; {@code contracts}: the highest contract version it reads, by topic, null when
      * unknown, empty when it reports none; a version that is no positive int shows as 0; and {@code routes}: every
@@ -70,7 +70,7 @@ public record OutboxStatus(
     public enum OrphanKind {
         /**
          * Detached by maintenance as relayed but not dropped; maintenance moves its rows at or above the slowest
-         * shard's horizon back itself, unless {@code outbox.partitions.restoreOrphans} is off.
+         * shard's horizon back itself.
          */
         DETACHED_BY_LIBRARY,
         /**

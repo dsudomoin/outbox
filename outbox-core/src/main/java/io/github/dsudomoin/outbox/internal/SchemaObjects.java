@@ -166,8 +166,9 @@ public record SchemaObjects(List<Table> tables) {
                         column("table_name", "text", true),
                         column("at", TIMESTAMPTZ, true, "now()")),
                         List.of("primary key (table_name)"), List.of(), List.of()),
-                // Heartbeat: the instances running, by the database clock, for the reshard guard and the admin
-                // status; a row is live until its expires_at, which its writer sets from its own maintenanceInterval
+                // Heartbeat: the instances running, by the database clock, for the previous release's reshard guard,
+                // the writer guard and the admin status; a row is live until its expires_at, which its writer sets from
+                // its own maintenanceInterval
                 plain(n.instance(), List.of(
                         column("instance_id", "text", true),
                         column("shards", "integer", true),

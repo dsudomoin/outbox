@@ -1,6 +1,5 @@
 package io.github.dsudomoin.outbox;
 
-import jakarta.annotation.Nullable;
 import java.time.Duration;
 
 /**
@@ -12,32 +11,6 @@ public interface OutboxConfig {
 
     default String table() {
         return "outbox";
-    }
-
-    /** The shard count of a new outbox when {@link #shards()} is not set. */
-    int DEFAULT_SHARDS = 256;
-
-    /**
-     * Null when not set: an existing outbox keeps the shard count of its cursors, a new one gets
-     * {@link #DEFAULT_SHARDS}. A set value that differs from the cursors' reshards at bootstrap, which refuses unless
-     * the outbox is drained and no other instance runs ({@code OutboxSchema}).
-     */
-    @Nullable
-    default Integer shards() {
-        return null;
-    }
-
-    /**
-     * How long the library's own connections wait on a silent socket ({@code Connection.setNetworkTimeout}), when
-     * they have no such bound of their own, as pgjdbc's default {@code socketTimeout = 0}: a connection the network
-     * dropped silently fails after this, and its thread goes on with a new one. Zero: no bound from here. On the
-     * start, relay workers, {@code drain()}, maintenance, the dead-letter pass, the heartbeat (at most an interval, at least
-     * 10 s, which also cuts a longer {@code socketTimeout} of its connections) and admin calls. A statement under a {@code statement_timeout} of the library's gets that long instead,
-     * and the concurrent build of the dead table's index has no bound: its thread asks the database. A step, or a
-     * cleanup, that outlives it fails and is tried again. An application's transactions it cannot bound.
-     */
-    default Duration networkTimeout() {
-        return Duration.ofMinutes(5);
     }
 
     default RelayConfig relay() {
@@ -102,18 +75,6 @@ public interface OutboxConfig {
             return 16L * 1024 * 1024;
         }
 
-        default int maxTicksPerBatch() {
-            return 100;
-        }
-
-        default Duration minTickInterval() {
-            return Duration.ofMillis(50);
-        }
-
-        default Duration idlePollInterval() {
-            return Duration.ofMillis(200);
-        }
-
         /**
          * Bound of one handler call. At 80 % of it the handler thread is interrupted and the call's real outcomes are
          * kept (records it did not start are read again); a call still running at the full timeout is cancelled and
@@ -136,54 +97,12 @@ public interface OutboxConfig {
             return Duration.ofSeconds(30);
         }
 
-        /**
-         * How long a relay worker starts steps on one pooled connection under a backlog before it hands it back and
-         * takes another, so the pool can retire it at its maxLifetime. A step started just before this ends runs on
-         * the same connection, up to 4 × {@link #batchTimeout()}: a pool's leak detection threshold must exceed
-         * connectionHold + 4 × batchTimeout.
-         */
-        default Duration connectionHold() {
-            return Duration.ofMinutes(1);
-        }
-
-        /**
-         * With {@link #enabled()} false, how often this instance makes a tick while it writes: ticks cut the outbox
-         * into batches, and a backlog written while no relay runs would otherwise land in one tick, which the relay
-         * that later drains it reads again from the shard's start on every chunk. A run every this long (fixed delay)
-         * that sees a commit of this instance since the last tick it covered makes a tick unless one of any instance is
-         * at most three quarters of this old; none while an xid-regression halt is recorded. A failed run logs a WARN
-         * at most once a minute and the next run tries again. Maintenance, which deletes old ticks, runs only where a
-         * relay runs: with every relay down while someone writes, the tick table grows by about one row per interval
-         * (about 86 400 a day at 1 s), and once a relay is back maintenance deletes them as the relay drains past them,
-         * not at its first run. Zero: no ticks. Ignored while the relay runs, which ticks itself.
-         */
-        default Duration ticksWithoutRelay() {
-            return Duration.ofSeconds(1);
-        }
-
-        default int headFailuresBeforeDivert() {
-            return 3;
-        }
-
-        /**
-         * How long an idle shard's latest cursor row may stay on a tick below its effective one before maintenance
-         * appends one at the effective tick (an anchor): ticks are kept from the lowest latest cursor row's tick on,
-         * as the previous release starts its steps there. At least {@code outbox.partitions.maintenanceInterval}.
-         */
-        default Duration cursorAnchorInterval() {
-            return Duration.ofHours(1);
-        }
-
         default RetryConfig retry() {
             return new RetryConfig() {};
         }
 
         default RequeueConfig requeue() {
             return new RequeueConfig() {};
-        }
-
-        default WaitConfig waiting() {
-            return new WaitConfig() {};
         }
     }
 
@@ -226,84 +145,20 @@ public interface OutboxConfig {
     /** Records the handler set aside with {@link Outcome#requeue()}. */
     interface RequeueConfig {
 
-        /** A requeued record is due {@code delay} later, or at the handler's later {@code notBefore}. */
-        default Duration delay() {
-            return Duration.ofSeconds(1);
-        }
-
         /** Requeues a record may take; the one past it moves the record to the dead table. 0 = unlimited. */
         default int maxRequeues() {
             return 0;
         }
     }
 
-    /**
-     * Records waiting for an instance that can handle them ({@link Outcome.Waiting}): each is handed again after a
-     * quarter of the time it has waited, at least {@code delay} and at most {@code maxDelay} later.
-     */
-    interface WaitConfig {
-
-        default Duration delay() {
-            return Duration.ofSeconds(1);
-        }
-
-        default Duration maxDelay() {
-            return Duration.ofMinutes(5);
-        }
-
-        /** A record waiting longer turns the periodic WARN about waiting records into an ERROR. */
-        default Duration alertAfter() {
-            return Duration.ofMinutes(15);
-        }
-    }
-
     interface PartitionsConfig {
-
-        default long xidsPerPartition() {
-            return 16_777_216L;
-        }
-
-        default int premake() {
-            return 64;
-        }
-
-        default Duration maintenanceInterval() {
-            return Duration.ofSeconds(30);
-        }
-
-        /**
-         * How long the tail swap waits in the queue for its lock on the outbox once its tries without waiting failed,
-         * writers queueing behind it meanwhile: keep it below their own {@code lock_timeout} and
-         * {@code statement_timeout}. 0 (default): no wait, so writers wait only for the swap's hold. At most 24 days,
-         * with {@code tailConversion.maxStall} added too.
-         */
-        default Duration swapLockTimeout() {
-            return Duration.ZERO;
-        }
-
-        /**
-         * Largest tail, in bytes ({@code pg_relation_size}), that the swap turns into a range when rows went to it,
-         * which scans it under the swap's lock: writers wait for the scan. A larger tail stays hot, writes going on
-         * into it, until {@link #tailConversion()}'s window. Default 16 MB.
-         */
-        default long maxTailScan() {
-            return 16L * 1024 * 1024;
-        }
-
-        /**
-         * Move rows at or above the horizon in a range marked for drop back to the outbox; false only logs. Default
-         * true.
-         */
-        default boolean restoreOrphans() {
-            return true;
-        }
 
         default TailConversionConfig tailConversion() {
             return new TailConversionConfig() {};
         }
     }
 
-    /** When a hot tail over {@code maxTailScan} is turned into a range all the same: writers wait for its scan. */
+    /** When a hot tail over the swap's scan limit (16 MB) is turned into a range all the same: writers wait for it. */
     interface TailConversionConfig {
 
         /**
@@ -335,85 +190,26 @@ public interface OutboxConfig {
             return "inbox";
         }
 
-        default Duration partitionInterval() {
-            return Duration.ofHours(1);
-        }
-
-        default Duration premake() {
-            return Duration.ofHours(24);
-        }
-
         default Duration retention() {
             return Duration.ofHours(24);
-        }
-
-        /** Attach a range detached inside the dedup window back by its name's bounds; false only logs. Default true. */
-        default boolean attachOrphans() {
-            return true;
         }
     }
 
     interface DeadLettersConfig {
 
-        /** Letters per call of the dead-letter hook, 1..1000 (a redrive batch holds a key lock each). Default 100. */
-        default int batchSize() {
-            return 100;
-        }
-
-        /**
-         * Bound of one hook call; a call cut at it leaves its letters pending, retried with backoff. Default 130 s, the
-         * Kafka sender's budget with its default producer settings, as {@code relay.batchTimeout}; at most 24 days.
-         */
-        default Duration timeout() {
-            return Duration.ofSeconds(130);
-        }
-
         /**
          * Kept letters older than this, by their {@code failed_at}, are deleted by maintenance; 0 = kept forever, the
-         * default; at most 3650 days. Letters still pending for the hook are never deleted. Deleted in portions, at
-         * most a {@code maintenanceInterval} per run with {@link #redriveHistory()}'s cleanup; later runs finish the
-         * rest.
+         * default; at most 3650 days. Letters still pending for the hook are never deleted. Deleted in portions, a
+         * maintenance run spending at most its 30 s interval on them with the redrive history's cleanup; later runs
+         * finish the rest.
          */
         default Duration retention() {
             return Duration.ZERO;
-        }
-
-        /**
-         * How long the count of a message's redrives is remembered, so a redriven message that dies again carries
-         * it. Default 30 days, at most 3650 days.
-         */
-        default Duration redriveHistory() {
-            return Duration.ofDays(30);
         }
     }
 
     /** What happens when the xid counter is found below a tick's xmax (a logical restore or migration). */
     interface RecoveryConfig {
-
-        /**
-         * {@code auto} (default): the instance holding the maintenance lock recovers by itself, when at most
-         * {@link #maxRows()} rows are to be re-sent; {@code halt}: never by itself, the relay stays halted until
-         * {@code OutboxAdmin.recoverXidRegression()}.
-         */
-        default String xidRegression() {
-            return "auto";
-        }
-
-        /**
-         * Rows to re-send above which the automatic recovery leaves the relay halted: writers wait while it copies
-         * them. Default 1 000 000.
-         */
-        default long maxRows() {
-            return 1_000_000L;
-        }
-
-        /**
-         * Rows written since the newest pre-regression tick, less this margin for clock skew between the old and the
-         * new server, are re-sent. Default 10 min.
-         */
-        default Duration clockMargin() {
-            return Duration.ofMinutes(10);
-        }
 
         /**
          * The whole recovery transaction's deadline, writers waiting for it all along; each statement gets what is

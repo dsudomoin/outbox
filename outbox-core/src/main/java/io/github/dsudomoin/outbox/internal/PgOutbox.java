@@ -47,7 +47,6 @@ public final class PgOutbox implements Outbox, Contracts.TypedSend {
     private final String insertUnkeyed;
     private final Resender resender;
     private final TableNames names;
-    private final ShardGuard guard;
     private final ContractGuard contracts;
     /** The topics the routes claim; null: a handler takes every other topic, so every topic goes in. */
     @Nullable
@@ -85,8 +84,7 @@ public final class PgOutbox implements Outbox, Contracts.TypedSend {
         var insert = "insert into " + names.base() + " (shard, message_id, topic, key, payload, headers) ";
         this.insertKeyed = insert + "select ?, ?, ?, ?, ?, ? from (select pg_advisory_xact_lock(?, ?)) l";
         this.insertUnkeyed = insert + "values (?, ?, ?, ?, ?, ?)";
-        this.guard = schema.shardGuard(); // the cursors' count as this instance's heartbeat last read it
-        this.resender = new Resender(names, shards, guard);
+        this.resender = new Resender(names, shards);
         this.contracts = schema.contractGuard(); // the live relay instances' reports as its heartbeat last read them
         this.claimedTopics = claimedTopics == null ? null : Set.copyOf(claimedTopics);
     }
@@ -126,7 +124,6 @@ public final class PgOutbox implements Outbox, Contracts.TypedSend {
         if (n == 0) {
             return List.of();
         }
-        guard.require(names, shards); // before any handle: insertAll checks again
         var local = new boolean[n];
         for (int i = 0; i < n; i++) {
             local[i] = admitted(messages.get(i), UNKNOWN_TYPE);
@@ -195,7 +192,6 @@ public final class PgOutbox implements Outbox, Contracts.TypedSend {
 
     /** One message, one enqueue of the telemetry. */
     private UUID insert(Connection c, OutboxMessage m, String type) {
-        guard.require(names, shards);
         boolean local = admitted(m, type);
         var enqueue = telemetry.enqueueStarted();
         var id = UuidV7.next(clock.millis());

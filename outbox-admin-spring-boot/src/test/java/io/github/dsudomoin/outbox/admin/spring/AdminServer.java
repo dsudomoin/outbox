@@ -5,6 +5,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.internal.TableNames;
+import io.github.dsudomoin.outbox.internal.Tuning;
+import io.github.dsudomoin.outbox.spring.OutboxProperties;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestSql;
@@ -22,9 +24,11 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import javax.sql.DataSource;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.env.Environment;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
 
 /** A whole app on a real Tomcat at a free port, its own outbox table, no relay, called over HTTP. */
@@ -39,6 +43,66 @@ final class AdminServer implements AutoCloseable {
         @Bean
         RecordingHandler handler() {
             return new RecordingHandler();
+        }
+
+        /** {@code outbox.*} as Boot binds it, on a small outbox: the library's own sizes are no keys. */
+        @Bean
+        OutboxConfig outboxConfig(Environment environment) {
+            return new SmallOutbox(Binder.get(environment).bindOrCreate("outbox", OutboxProperties.class));
+        }
+    }
+
+    /** Two shards and two premade ranges of a million xids, every other value as {@code properties}. */
+    record SmallOutbox(OutboxProperties properties) implements OutboxConfig, Tuning {
+
+        @Override
+        public String table() {
+            return properties.table();
+        }
+
+        @Override
+        public RelayConfig relay() {
+            return properties.relay();
+        }
+
+        @Override
+        public PartitionsConfig partitions() {
+            return properties.partitions();
+        }
+
+        @Override
+        public InboxConfig inbox() {
+            return properties.inbox();
+        }
+
+        @Override
+        public DeadLettersConfig deadLetters() {
+            return properties.deadLetters();
+        }
+
+        @Override
+        public RecoveryConfig recovery() {
+            return properties.recovery();
+        }
+
+        @Override
+        public SchemaConfig schema() {
+            return properties.schema();
+        }
+
+        @Override
+        public int shards() {
+            return 2;
+        }
+
+        @Override
+        public long xidsPerPartition() {
+            return 1_000_000L;
+        }
+
+        @Override
+        public int premake() {
+            return 2;
         }
     }
 

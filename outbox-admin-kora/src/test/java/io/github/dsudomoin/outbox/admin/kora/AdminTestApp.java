@@ -13,6 +13,7 @@ import io.github.dsudomoin.outbox.admin.kora.testapp.api.AppApiDelegate;
 import io.github.dsudomoin.outbox.admin.kora.testapp.api.AppApiResponses.AppDeadLettersApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.testapp.api.AppApiResponses.AppStatusApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.testapp.api.AppApiResponses.HelloApiResponse;
+import io.github.dsudomoin.outbox.testing.TunedKoraModule;
 import java.util.concurrent.CompletableFuture;
 import ru.tinkoff.kora.common.KoraApp;
 import ru.tinkoff.kora.common.Principal;
@@ -35,7 +36,7 @@ import ru.tinkoff.kora.openapi.management.OpenApiManagementModule;
  */
 @KoraApp
 public interface AdminTestApp extends HoconConfigModule, JdbcDatabaseModule, OutboxModule, UndertowHttpServerModule,
-        JsonModule, OpenApiManagementModule, OutboxAdminHttpModule {
+        JsonModule, OpenApiManagementModule, OutboxAdminHttpModule, TunedKoraModule {
 
     String APP_KEY = "app-secret";
 

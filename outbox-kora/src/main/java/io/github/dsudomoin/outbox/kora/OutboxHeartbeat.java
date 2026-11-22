@@ -5,7 +5,7 @@ package io.github.dsudomoin.outbox.kora;
  * reads the reports that guard routed sends. With such a factory, the beats take their connections from it, whatever
  * {@code outbox.heartbeat.dedicatedConnection} says. An app can so point them past a pooler, run them as another role
  * or give them other timeouts. It must reach the app's database; one connection is all it needs, and its connection
- * timeout should stay well below {@code outbox.partitions.maintenanceInterval}.
+ * timeout should stay well below the 30 s heartbeat interval.
  * <pre>{@code
  * @Tag(OutboxHeartbeat.class)
  * default JdbcDatabase outboxHeartbeatDatabase(Config config, ConfigValueExtractor<JdbcDatabaseConfig> extractor,

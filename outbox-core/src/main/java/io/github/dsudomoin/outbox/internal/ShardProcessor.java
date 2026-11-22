@@ -156,7 +156,7 @@ public final class ShardProcessor implements AutoCloseable {
     /** {@code relay.retry.holdPermanent}: see {@link #callHandler}. */
     private final boolean holdPermanent;
     private final OutboxConfig.RequeueConfig requeue;
-    private final OutboxConfig.WaitConfig waiting;
+    private final Tuning tuning;
     private final OutboxHandler handler;
     private final OutboxTelemetry telemetry;
     private final DatabaseClock clock;
@@ -244,37 +244,38 @@ public final class ShardProcessor implements AutoCloseable {
         this.retry = relay.retry();
         this.holdPermanent = retry.holdPermanent();
         this.requeue = relay.requeue();
-        this.waiting = relay.waiting();
+        this.tuning = Tuning.of(config);
+        int shards = OutboxSchema.shards(config);
         this.internalNamespace = names.internalNamespace();
         this.handler = handler;
         this.telemetry = telemetry;
-        this.ticks = new Ticks(names, config.shards());
-        this.cursors = new Cursors(names, config.shards());
+        this.ticks = new Ticks(names, shards);
+        this.cursors = new Cursors(names, shards);
         this.reader = new BatchReader(names);
         this.retries = new RetryStore(names, deadLetterHook, OutboxSchema.asciiText(config));
         this.batchBytes = RowBytes.budget(relay.batchBytes());
-        var unknown = new long[config.shards()];
+        var unknown = new long[shards];
         Arrays.fill(unknown, UNKNOWN);
         this.recentRowBytes = new AtomicLongArray(unknown);
-        this.parked = new ParkedStore(names, retries, requeue.delay(), relay.batchSize(), batchBytes);
+        this.parked = new ParkedStore(names, retries, tuning.requeueDelay(), relay.batchSize(), batchBytes);
         this.hasRetryRows = "select exists (select 1 from " + names.retry() + " where shard = ?)";
         this.divertAt = retry.maxAttempts() > 0
-                ? Math.min(relay.headFailuresBeforeDivert(), retry.maxAttempts())
-                : relay.headFailuresBeforeDivert();
-        this.batchIds = Math.max(relay.batchSize(), SPAN_PER_SHARD * config.shards());
-        this.targeted = cursors.latestWithTargetsSql(relay.maxTicksPerBatch(), batchIds);
-        this.fullCheckInterval = config.partitions().maintenanceInterval().toNanos();
-        this.fullChecked = new AtomicLongArray(config.shards());
-        this.probing = new AtomicIntegerArray(config.shards());
-        this.solo = new AtomicIntegerArray(config.shards());
-        this.failedFirst = new AtomicLongArray(config.shards());
-        this.busyPauses = new AtomicIntegerArray(config.shards());
-        this.busyUntil = new AtomicLongArray(config.shards());
+                ? Math.min(tuning.headFailuresBeforeDivert(), retry.maxAttempts())
+                : tuning.headFailuresBeforeDivert();
+        this.batchIds = Math.max(relay.batchSize(), SPAN_PER_SHARD * shards);
+        this.targeted = cursors.latestWithTargetsSql(tuning.maxTicksPerBatch(), batchIds);
+        this.fullCheckInterval = tuning.maintenanceInterval().toNanos();
+        this.fullChecked = new AtomicLongArray(shards);
+        this.probing = new AtomicIntegerArray(shards);
+        this.solo = new AtomicIntegerArray(shards);
+        this.failedFirst = new AtomicLongArray(shards);
+        this.busyPauses = new AtomicIntegerArray(shards);
+        this.busyUntil = new AtomicLongArray(shards);
         long created = System.nanoTime();
-        for (int i = 0; i < config.shards(); i++) {
+        for (int i = 0; i < shards; i++) {
             fullChecked.set(i, created - fullCheckInterval); // a shard's first step checks in full
         }
-        var full = new int[config.shards()];
+        var full = new int[shards];
         Arrays.fill(full, relay.batchSize());
         this.limits = new AtomicIntegerArray(full);
         this.executor = new ThreadPoolExecutor(0, Math.max(4, 2 * relay.workers()), 60, TimeUnit.SECONDS,
@@ -634,7 +635,7 @@ public final class ShardProcessor implements AutoCloseable {
         for (var s : work) {
             if (s.target != null && !s.busy) {
                 // probe mode: after headFailuresBeforeDivert failed attempts in a row, the head row alone
-                s.probe = s.cursor.failures() >= relay.headFailuresBeforeDivert();
+                s.probe = s.cursor.failures() >= tuning.headFailuresBeforeDivert();
                 s.limit = s.probe ? 1 : limits.get(s.shard);
                 s.checkBlocked = s.full ? hasRetryRows(inTx, s.shard) : s.retryDue != null || s.wroteRetry;
                 reads.add(s);
@@ -924,7 +925,7 @@ public final class ShardProcessor implements AutoCloseable {
             if (more.isEmpty()) {
                 return;
             }
-            var fresh = ticks.fresh(c, afterIds, latestTickId, relay.maxTicksPerBatch());
+            var fresh = ticks.fresh(c, afterIds, latestTickId, tuning.maxTicksPerBatch());
             var skipped = fresh.skipped();
             var from = new long[more.size()];
             var prevs = new Tick[more.size()];
@@ -1119,7 +1120,7 @@ public final class ShardProcessor implements AutoCloseable {
             }
         }
         if (!fresh.isEmpty()) {
-            var starts = ticks.fresh(c, afterIds, latestTickId, relay.maxTicksPerBatch());
+            var starts = ticks.fresh(c, afterIds, latestTickId, tuning.maxTicksPerBatch());
             var skipped = starts.skipped();
             for (var s : fresh) {
                 var skip = skipped.get(s.shard);
@@ -1181,7 +1182,8 @@ public final class ShardProcessor implements AutoCloseable {
         long first = prior > 0 ? firstRetried(items, parkedCount) : 0;
         int charge = first != 0 && first == failedFirst.get(shard) ? prior + 1 : 1;
         var decision = BatchClassifier.classify(items, prior, charge, divertAt, now, retry.initialDelay(),
-                retry.maxDelay(), requeue.delay(), requeue.maxRequeues(), waiting.delay(), waiting.maxDelay());
+                retry.maxDelay(), tuning.requeueDelay(), requeue.maxRequeues(), tuning.waitDelay(),
+                tuning.waitMaxDelay());
         var next = s.next;
         if (!decision.pause() && !busy) {
             var parkedIds = new HashSet<Long>();
@@ -1260,7 +1262,7 @@ public final class ShardProcessor implements AutoCloseable {
      */
     private long freshTargetId(NavigableMap<Long, Tick> between, long from, Tick prev, long latestTickId) {
         var candidates = List.copyOf(between.subMap(from, false,
-                Math.min(latestTickId, from + relay.maxTicksPerBatch()), true).values());
+                Math.min(latestTickId, from + tuning.maxTicksPerBatch()), true).values());
         return candidates.isEmpty() ? 0 : chooseTarget(prev.maxId(), candidates, batchIds).id();
     }
 
@@ -1943,7 +1945,7 @@ public final class ShardProcessor implements AutoCloseable {
     /** Until a head waiting since {@code waitingSince} (null: a first wait) is handed again. */
     private Duration waitDelay(@Nullable Instant waitingSince, Instant now) {
         var waited = waitingSince == null ? Duration.ZERO : Duration.between(waitingSince, now);
-        return BatchClassifier.waitBackoff(waited, waiting.delay(), waiting.maxDelay());
+        return BatchClassifier.waitBackoff(waited, tuning.waitDelay(), tuning.waitMaxDelay());
     }
 
     /**
@@ -2029,7 +2031,7 @@ public final class ShardProcessor implements AutoCloseable {
 
     /** When a record requeued at {@code now} with {@code notBefore}, or a parked one not attempted, is due. */
     private Instant requeueDue(@Nullable Instant notBefore, Instant now) {
-        return BatchClassifier.dueAt(now.plus(requeue.delay()), notBefore, now);
+        return BatchClassifier.dueAt(now.plus(tuning.requeueDelay()), notBefore, now);
     }
 
     private boolean exhausted(int attempts) {

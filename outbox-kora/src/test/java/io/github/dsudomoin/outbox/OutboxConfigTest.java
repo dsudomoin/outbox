@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.typesafe.config.ConfigFactory;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
+import io.github.dsudomoin.outbox.internal.Tuning;
 import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_ConfigValueExtractor;
 import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraDeadLettersConfig_ConfigValueExtractor;
 import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraInboxConfig_ConfigValueExtractor;
@@ -15,7 +16,7 @@ import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraRequeueConfig_Confi
 import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraRetryConfig_ConfigValueExtractor;
 import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraSchemaConfig_ConfigValueExtractor;
 import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraTailConversionConfig_ConfigValueExtractor;
-import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraWaitConfig_ConfigValueExtractor;
+import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import java.time.Duration;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.config.common.extractor.DurationConfigValueExtractor;
@@ -28,14 +29,13 @@ class OutboxConfigTest {
     private static final $KoraOutboxConfig_ConfigValueExtractor EXTRACTOR = new $KoraOutboxConfig_ConfigValueExtractor(
             new $KoraOutboxConfig_KoraRelayConfig_ConfigValueExtractor(
                     new $KoraOutboxConfig_KoraRetryConfig_ConfigValueExtractor(DURATION),
-                    new $KoraOutboxConfig_KoraRequeueConfig_ConfigValueExtractor(DURATION),
-                    new $KoraOutboxConfig_KoraWaitConfig_ConfigValueExtractor(DURATION), DURATION),
+                    new $KoraOutboxConfig_KoraRequeueConfig_ConfigValueExtractor(), DURATION),
             new $KoraOutboxConfig_KoraPartitionsConfig_ConfigValueExtractor(
-                    new $KoraOutboxConfig_KoraTailConversionConfig_ConfigValueExtractor(DURATION), DURATION),
+                    new $KoraOutboxConfig_KoraTailConversionConfig_ConfigValueExtractor(DURATION)),
             new $KoraOutboxConfig_KoraInboxConfig_ConfigValueExtractor(DURATION),
             new $KoraOutboxConfig_KoraDeadLettersConfig_ConfigValueExtractor(DURATION),
             new $KoraOutboxConfig_KoraRecoveryConfig_ConfigValueExtractor(DURATION),
-            new $KoraOutboxConfig_KoraSchemaConfig_ConfigValueExtractor(), DURATION);
+            new $KoraOutboxConfig_KoraSchemaConfig_ConfigValueExtractor());
 
     private static OutboxConfig parse(String hocon) {
         var config = HoconConfigFactory.fromHocon(
@@ -72,7 +72,7 @@ class OutboxConfigTest {
         assertThat(config.relay().workers()).isEqualTo(2);
         assertThat(config.relay().batchSize()).isEqualTo(10_000);
         assertThat(config.relay().retry().initialDelay()).isEqualTo(Duration.ofSeconds(1));
-        assertThat(config.partitions().xidsPerPartition()).isEqualTo(16_777_216L);
+        assertThat(config.partitions().tailConversion().window()).isEqualTo("03:00-05:00");
         assertThat(config.inbox().table()).isEqualTo("inbox");
     }
 
@@ -80,44 +80,40 @@ class OutboxConfigTest {
     void overridesApply() {
         var config = parse("""
                 outbox {
-                  shards = 8
                   relay.workers = 8
-                  relay.minTickInterval = 20ms
                   relay.retry.maxAttempts = 5
                   relay.retry.holdPermanent = true
-                  partitions.xidsPerPartition = 1000
-                  partitions.restoreOrphans = false
                   inbox.retention = 2h
-                  inbox.attachOrphans = false
                   deadLetters.retention = 90d
-                  recovery.xidRegression = halt
-                  recovery.maxRows = 5000
-                  recovery.clockMargin = 1h
                   recovery.timeout = 30m
                 }
                 """);
 
-        assertThat(config.shards()).isEqualTo(8);
         assertThat(config.relay().workers()).isEqualTo(8);
-        assertThat(config.relay().minTickInterval()).isEqualTo(Duration.ofMillis(20));
         assertThat(config.relay().retry().maxAttempts()).isEqualTo(5);
         assertThat(config.relay().retry().holdPermanent()).isTrue();
-        assertThat(config.partitions().xidsPerPartition()).isEqualTo(1000L);
-        assertThat(config.partitions().restoreOrphans()).isFalse();
         assertThat(config.inbox().retention()).isEqualTo(Duration.ofHours(2));
-        assertThat(config.inbox().attachOrphans()).isFalse();
         assertThat(config.deadLetters().retention()).isEqualTo(Duration.ofDays(90));
-        assertThat(config.recovery().xidRegression()).isEqualTo("halt");
-        assertThat(config.recovery().maxRows()).isEqualTo(5000);
-        assertThat(config.recovery().clockMargin()).isEqualTo(Duration.ofHours(1));
         assertThat(config.recovery().timeout()).isEqualTo(Duration.ofMinutes(30));
     }
 
+    /** The library's own timings are no configuration: a HOCON key of theirs is ignored, as any unknown key is. */
     @Test
-    void networkTimeoutIsReadFromTheTopLevel() {
-        assertThat(parse("outbox { networkTimeout = 10s }").networkTimeout()).isEqualTo(Duration.ofSeconds(10));
-        assertThatThrownBy(() -> OutboxSchema.validate(parse("outbox { networkTimeout = -1s }")))
-                .hasMessageContaining("outbox.networkTimeout");
+    void tuningKeysAreNotRead() {
+        var config = parse("""
+                outbox {
+                  shards = 8
+                  networkTimeout = 10s
+                  relay { minTickInterval = 1ms, waiting.delay = 1ms, requeue.delay = 1ms }
+                  partitions { maintenanceInterval = 1s, maxTailScan = 0, restoreOrphans = false }
+                  inbox.partitionInterval = 1m
+                  deadLetters.timeout = 1s
+                  recovery.xidRegression = halt
+                }
+                """);
+
+        assertThat(config).isNotInstanceOf(Tuning.class);
+        assertThat(Tuning.of(config)).isSameAs(Tuning.DEFAULTS);
     }
 
     @Test
@@ -127,28 +123,10 @@ class OutboxConfigTest {
     }
 
     @Test
-    void swapLockTimeoutIsZeroOrAtLeastOneMillisecond() {
-        var config = parse("outbox.partitions.swapLockTimeout = 0ms");
-
-        OutboxSchema.validate(config);
-        assertThat(config.partitions().swapLockTimeout()).isZero();
-        assertRejected("outbox.partitions.swapLockTimeout = -1ms",
-                "outbox.partitions.swapLockTimeout must be 0 or at least 1ms: PT-0.001S");
-        // sent as whole milliseconds, and lock_timeout = 0 is no limit
-        assertRejected("outbox.partitions.swapLockTimeout = 500us",
-                "outbox.partitions.swapLockTimeout must be 0 or at least 1ms: PT0.0005S");
-    }
-
-    @Test
     void batchBytesIsReadAndValidated() {
         assertThat(parse("outbox.relay.batchBytes = 0").relay().batchBytes()).as("no byte limit").isZero();
         OutboxSchema.validate(parse("outbox.relay.batchBytes = 0"));
         assertRejected("outbox.relay.batchBytes = -1", "outbox.relay.batchBytes must not be negative: -1");
-    }
-
-    @Test
-    void negativeMaxTailScanIsRejected() {
-        assertRejected("outbox.partitions.maxTailScan = -1", "outbox.partitions.maxTailScan must not be negative: -1");
     }
 
     @Test
@@ -173,91 +151,49 @@ class OutboxConfigTest {
     }
 
     @Test
-    void connectionHoldIsReadAndValidated() {
-        assertThat(parse("outbox.relay.connectionHold = 20s").relay().connectionHold())
-                .isEqualTo(Duration.ofSeconds(20));
-        assertRejected("outbox.relay.connectionHold = 0s", "outbox.relay.connectionHold must be positive: PT0S");
-    }
-
-    @Test
-    void ticksWithoutRelayIsReadAndValidated() {
-        assertThat(parse("outbox.relay.ticksWithoutRelay = 250ms").relay().ticksWithoutRelay())
-                .isEqualTo(Duration.ofMillis(250));
-        assertThat(parse("outbox.relay.ticksWithoutRelay = 0s").relay().ticksWithoutRelay()).isZero();
-        assertRejected("outbox.relay.ticksWithoutRelay = -1ms",
-                "outbox.relay.ticksWithoutRelay must not be negative: PT-0.001S");
-        assertRejected("outbox.relay.ticksWithoutRelay = 25d",
-                "outbox.relay.ticksWithoutRelay must be at most 24d: PT600H");
-    }
-
-    @Test
     void requeueKeysAreReadAndValidated() {
-        var requeue = parse("outbox.relay.requeue { delay = 250ms, maxRequeues = 5 }").relay().requeue();
+        var requeue = parse("outbox.relay.requeue { maxRequeues = 5 }").relay().requeue();
 
-        assertThat(requeue.delay()).isEqualTo(Duration.ofMillis(250));
         assertThat(requeue.maxRequeues()).isEqualTo(5);
-        assertRejected("outbox.relay.requeue.delay = 0s", "outbox.relay.requeue.delay must be positive: PT0S");
         assertRejected("outbox.relay.requeue.maxRequeues = -1",
                 "outbox.relay.requeue.maxRequeues must not be negative: -1");
     }
 
     @Test
-    void waitingKeysAreReadAndValidated() {
-        var waiting = parse("outbox.relay.waiting { delay = 2s, maxDelay = 1m, alertAfter = 1h }").relay().waiting();
-
-        assertThat(waiting.delay()).isEqualTo(Duration.ofSeconds(2));
-        assertThat(waiting.maxDelay()).isEqualTo(Duration.ofMinutes(1));
-        assertThat(waiting.alertAfter()).isEqualTo(Duration.ofHours(1));
-        OutboxSchema.validate(parse("outbox.relay.waiting { delay = 1m, maxDelay = 1m }"));
-        assertRejected("outbox.relay.waiting.delay = 0s", "outbox.relay.waiting.delay must be positive: PT0S");
-        assertRejected("outbox.relay.waiting { delay = 2m, maxDelay = 1m }",
-                "outbox.relay.waiting.maxDelay must be at least outbox.relay.waiting.delay: PT1M");
-        assertRejected("outbox.relay.waiting.alertAfter = 0s",
-                "outbox.relay.waiting.alertAfter must be positive: PT0S");
-    }
-
-    @Test
     void badDeadLettersValuesAreRejected() {
-        assertRejected("outbox.deadLetters.batchSize = 0", "outbox.deadLetters.batchSize must be at least 1: 0");
-        assertRejected("outbox.deadLetters.batchSize = 1001",
-                "outbox.deadLetters.batchSize must be at most 1000: 1001");
-        assertRejected("outbox.deadLetters.timeout = 0ms", "outbox.deadLetters.timeout must be positive: PT0S");
         assertRejected("outbox.deadLetters.retention = -1ms",
                 "outbox.deadLetters.retention must not be negative: PT-0.001S");
-        assertRejected("outbox.deadLetters.redriveHistory = 0ms",
-                "outbox.deadLetters.redriveHistory must be positive: PT0S");
         assertRejected("outbox.deadLetters.retention = 3651d",
                 "outbox.deadLetters.retention must be at most 3650d: PT87624H");
-        assertRejected("outbox.deadLetters.redriveHistory = 3651d",
-                "outbox.deadLetters.redriveHistory must be at most 3650d: PT87624H");
     }
 
     @Test
     void badRecoveryValuesAreRejected() {
-        assertRejected("outbox.recovery.xidRegression = manual",
-                "outbox.recovery.xidRegression must be auto or halt: manual");
-        assertRejected("outbox.recovery.maxRows = -1", "outbox.recovery.maxRows must not be negative: -1");
-        assertRejected("outbox.recovery.clockMargin = -1ms",
-                "outbox.recovery.clockMargin must not be negative: PT-0.001S");
         assertRejected("outbox.recovery.timeout = 0ms", "outbox.recovery.timeout must be positive: PT0S");
     }
 
     @Test
     void timeoutsSentAsMillisecondSettingsAreCappedAt24Days() { // Postgres takes at most 2^31-1 ms
         assertRejected("outbox.relay.batchTimeout = 25d", "outbox.relay.batchTimeout must be at most 24d: PT600H");
-        assertRejected("outbox.deadLetters.timeout = 25d", "outbox.deadLetters.timeout must be at most 24d: PT600H");
         assertRejected("outbox.recovery.timeout = 25d", "outbox.recovery.timeout must be at most 24d: PT600H");
-        assertRejected("outbox.partitions.swapLockTimeout = 25d",
-                "outbox.partitions.swapLockTimeout must be at most 24d: PT600H");
         assertRejected("outbox.partitions.tailConversion.maxStall = 25d",
                 "outbox.partitions.tailConversion.maxStall must be at most 24d: PT600H");
-        // a queued swap of an oversized tail sends statement_timeout = swapLockTimeout + maxStall
-        assertRejected("outbox.partitions { swapLockTimeout = 12d, tailConversion.maxStall = 13d }",
-                "outbox.partitions.swapLockTimeout + outbox.partitions.tailConversion.maxStall must be at most 24d:"
-                        + " PT600H");
 
-        OutboxSchema.validate(parse("outbox { relay.batchTimeout = 24d, deadLetters.timeout = 24d,"
-                + " recovery.timeout = 24d, partitions { swapLockTimeout = 12d, tailConversion.maxStall = 12d } }"));
+        OutboxSchema.validate(parse("outbox { relay.batchTimeout = 24d, recovery.timeout = 24d,"
+                + " partitions.tailConversion.maxStall = 24d }"));
+    }
+
+    @Test
+    void aQueuedSwapWaitAndMaxStallTogetherAreCappedAt24Days() { // the oversized tail's swap runs under their sum
+        var config = new TestOutboxConfig().swapLockTimeout(Duration.ofDays(12))
+                .tailConversion("03:00-05:00", Duration.ofDays(13));
+
+        assertThatThrownBy(() -> OutboxSchema.validate(config))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("outbox.partitions.tailConversion.maxStall plus the swap's queued wait of PT288H must be"
+                        + " at most 24d: PT600H");
+
+        OutboxSchema.validate(config.tailConversion("03:00-05:00", Duration.ofDays(12)));
     }
 
     private static void assertRejected(String hocon, String message) {
@@ -271,59 +207,29 @@ class OutboxConfigTest {
 
     private static void assertDefaults(OutboxConfig config) {
         assertThat(config.table()).isEqualTo("outbox");
-        assertThat(config.shards()).as("not set: an existing outbox keeps its count").isNull();
-        assertThat(config.networkTimeout()).isEqualTo(Duration.ofMinutes(5));
 
         var relay = config.relay();
         assertThat(relay.enabled()).isTrue();
         assertThat(relay.workers()).isEqualTo(4);
         assertThat(relay.batchSize()).isEqualTo(10_000);
         assertThat(relay.batchBytes()).isEqualTo(16L * 1024 * 1024);
-        assertThat(relay.maxTicksPerBatch()).isEqualTo(100);
-        assertThat(relay.minTickInterval()).isEqualTo(Duration.ofMillis(50));
-        assertThat(relay.idlePollInterval()).isEqualTo(Duration.ofMillis(200));
         assertThat(relay.batchTimeout()).isEqualTo(Duration.ofSeconds(130));
         assertThat(relay.shutdownTimeout()).isEqualTo(Duration.ofSeconds(30));
-        assertThat(relay.connectionHold()).isEqualTo(Duration.ofMinutes(1));
-        assertThat(relay.ticksWithoutRelay()).isEqualTo(Duration.ofSeconds(1));
-        assertThat(relay.headFailuresBeforeDivert()).isEqualTo(3);
         assertThat(relay.retry().initialDelay()).isEqualTo(Duration.ofSeconds(1));
         assertThat(relay.retry().maxDelay()).isEqualTo(Duration.ofMinutes(5));
         assertThat(relay.retry().maxAttempts()).isZero();
         assertThat(relay.retry().holdPermanent()).isFalse();
-        assertThat(relay.requeue().delay()).isEqualTo(Duration.ofSeconds(1));
         assertThat(relay.requeue().maxRequeues()).isZero();
-        assertThat(relay.waiting().delay()).isEqualTo(Duration.ofSeconds(1));
-        assertThat(relay.waiting().maxDelay()).isEqualTo(Duration.ofMinutes(5));
-        assertThat(relay.waiting().alertAfter()).isEqualTo(Duration.ofMinutes(15));
 
-        var partitions = config.partitions();
-        assertThat(partitions.xidsPerPartition()).isEqualTo(16_777_216L);
-        assertThat(partitions.premake()).isEqualTo(64);
-        assertThat(partitions.maintenanceInterval()).isEqualTo(Duration.ofSeconds(30));
-        assertThat(partitions.swapLockTimeout()).isZero();
-        assertThat(partitions.maxTailScan()).isEqualTo(16L * 1024 * 1024);
-        assertThat(partitions.restoreOrphans()).isTrue();
-        assertThat(partitions.tailConversion().window()).isEqualTo("03:00-05:00");
-        assertThat(partitions.tailConversion().maxStall()).isEqualTo(Duration.ofSeconds(1));
+        var tail = config.partitions().tailConversion();
+        assertThat(tail.window()).isEqualTo("03:00-05:00");
+        assertThat(tail.maxStall()).isEqualTo(Duration.ofSeconds(1));
 
         var inbox = config.inbox();
         assertThat(inbox.table()).isEqualTo("inbox");
-        assertThat(inbox.partitionInterval()).isEqualTo(Duration.ofHours(1));
-        assertThat(inbox.premake()).isEqualTo(Duration.ofHours(24));
         assertThat(inbox.retention()).isEqualTo(Duration.ofHours(24));
-        assertThat(inbox.attachOrphans()).isTrue();
 
-        var deadLetters = config.deadLetters();
-        assertThat(deadLetters.batchSize()).isEqualTo(100);
-        assertThat(deadLetters.timeout()).isEqualTo(Duration.ofSeconds(130));
-        assertThat(deadLetters.retention()).isZero();
-        assertThat(deadLetters.redriveHistory()).isEqualTo(Duration.ofDays(30));
-
-        var recovery = config.recovery();
-        assertThat(recovery.xidRegression()).isEqualTo("auto");
-        assertThat(recovery.maxRows()).isEqualTo(1_000_000L);
-        assertThat(recovery.clockMargin()).isEqualTo(Duration.ofMinutes(10));
-        assertThat(recovery.timeout()).isEqualTo(Duration.ofMinutes(10));
+        assertThat(config.deadLetters().retention()).isZero();
+        assertThat(config.recovery().timeout()).isEqualTo(Duration.ofMinutes(10));
     }
 }

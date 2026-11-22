@@ -63,9 +63,13 @@ class OutboxModuleIT implements KoraAppTestConfigModifier {
                 }
                 outbox {
                   table = %s
+                  relay { enabled = %s, workers = 2 }
+                  # the library's own Tuning: read by the test app's TunedKoraConfig
                   shards = 4
-                  relay { enabled = %s, workers = 2, minTickInterval = 5ms, idlePollInterval = 30s }
-                  partitions { xidsPerPartition = 1000000, premake = 4 }
+                  minTickInterval = 5ms
+                  idlePollInterval = 30s
+                  xidsPerPartition = 1000000
+                  premake = 4
                   inbox.table = %s
                 }
                 """.formatted(TestDataSources.jdbcUrl(), TestDataSources.user(), TestDataSources.password(),

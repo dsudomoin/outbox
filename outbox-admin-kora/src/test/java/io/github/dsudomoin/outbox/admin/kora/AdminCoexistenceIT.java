@@ -69,9 +69,11 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
                 }
                 outbox {
                   table = %s
-                  shards = 2
                   relay.enabled = false
-                  partitions { xidsPerPartition = 1000000, premake = 2 }
+                  # the library's own Tuning: read by the test app's TunedKoraConfig
+                  shards = 2
+                  xidsPerPartition = 1000000
+                  premake = 2
                 }
                 httpServer { publicApiHttpPort = %d, privateApiHttpPort = %d }
                 openapi.management {

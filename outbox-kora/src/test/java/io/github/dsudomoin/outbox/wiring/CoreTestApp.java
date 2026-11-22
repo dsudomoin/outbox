@@ -9,6 +9,7 @@ import io.github.dsudomoin.outbox.OutboxAdmin;
 import io.github.dsudomoin.outbox.OutboxDeadLetterHandler;
 import io.github.dsudomoin.outbox.kora.OutboxModule;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TunedKoraModule;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import ru.tinkoff.kora.common.KoraApp;
@@ -17,7 +18,8 @@ import ru.tinkoff.kora.config.hocon.HoconConfigModule;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabaseModule;
 
 @KoraApp
-public interface CoreTestApp extends HoconConfigModule, JdbcDatabaseModule, OutboxModule, InboxModule {
+public interface CoreTestApp extends HoconConfigModule, JdbcDatabaseModule, OutboxModule, InboxModule,
+        TunedKoraModule {
 
     default RecordingHandler outboxHandler() {
         return new RecordingHandler();

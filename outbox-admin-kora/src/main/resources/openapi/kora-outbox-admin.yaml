@@ -239,7 +239,7 @@ paths:
     post:
       operationId: recoverXidRegression
       tags: [OutboxAdmin]
-      summary: Runs the xid-regression recovery now, whatever outbox.recovery says
+      summary: Runs the xid-regression recovery now, however many rows it re-sends
       description: >-
         Re-sends the rows the relay may not have delivered, in one transaction, as new messages with the same message
         ids. Answers 409 when there is no regression to recover, when a maintenance run held the lock for 60 s, or
@@ -464,12 +464,12 @@ components:
         shards:
           type: integer
           format: int32
-          description: This instance's shard count, outbox.shards as the bootstrap resolved it
+          description: This instance's shard count, the cursors' as the bootstrap read them
         instances:
           type: array
           description: >-
             The instances' heartbeats, by id, expired ones too; a crashed instance's row stays an hour after its
-            heartbeat expired (3 × outbox.partitions.maintenanceInterval after its last beat)
+            heartbeat expired (3 × the 30 s heartbeat interval after its last beat)
           items:
             $ref: '#/components/schemas/Instance'
     Instance:
@@ -485,7 +485,7 @@ components:
         lastSeen:
           type: string
           format: date-time
-          description: Its last heartbeat, by the database clock, every outbox.partitions.maintenanceInterval
+          description: Its last heartbeat, by the database clock, every 30 s
         hookActive:
           type: boolean
           description: It has an active dead-letter hook

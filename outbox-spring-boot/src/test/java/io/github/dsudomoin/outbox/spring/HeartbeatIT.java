@@ -9,6 +9,7 @@ import io.micrometer.core.instrument.MeterRegistry;
 import io.github.dsudomoin.outbox.spring.TestApps.WithRoute;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
+import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import java.io.Closeable;
 import java.sql.Connection;
@@ -44,9 +45,15 @@ class HeartbeatIT {
 
     /** Boot's Hikari pool of two connections, a one-second heartbeat, no relay. */
     private ApplicationContextRunner runner(String... more) {
-        return TestApps.runner("outbox.partitions.maintenance-interval=1s", "outbox.relay.enabled=false",
-                "spring.datasource.hikari.maximum-pool-size=2", "spring.datasource.hikari.pool-name=" + pool)
-            .withPropertyValues(more).withUserConfiguration(WithRoute.class);
+        return runner(new TestOutboxConfig(), more);
+    }
+
+    /** {@link #runner(String...)} on {@code config}'s tables: the app's own config, for the heartbeat's interval. */
+    private ApplicationContextRunner runner(TestOutboxConfig config, String... more) {
+        return TestApps.runner("spring.datasource.hikari.maximum-pool-size=2",
+                "spring.datasource.hikari.pool-name=" + pool)
+            .withPropertyValues(more).withUserConfiguration(WithRoute.class)
+            .withBean(TestOutboxConfig.class, () -> config.relayEnabled(false).maintenanceInterval(INTERVAL));
     }
 
     @Test
@@ -223,7 +230,7 @@ class HeartbeatIT {
     @Test
     void aFailedStartClosesThePool() {
         try (var log = new CapturedStderr()) {
-            runner("outbox.table=s" + TestSql.uniqueTable() + ".outbox") // in a schema that does not exist
+            runner(new TestOutboxConfig().table("s" + TestSql.uniqueTable() + ".outbox")) // in no existing schema
                 .run(context -> {
                     assertThat(context).hasFailed();
                     assertThat(context.getStartupFailure()).hasStackTraceContaining("does not exist");

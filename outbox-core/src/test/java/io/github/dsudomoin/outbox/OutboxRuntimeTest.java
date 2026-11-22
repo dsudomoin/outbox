@@ -16,11 +16,11 @@ class OutboxRuntimeTest {
 
     @Test
     void buildValidatesConfigWithoutDatabase() {
-        var invalid = new TestOutboxConfig().shards(0);
+        var invalid = new TestOutboxConfig().workers(0);
 
         assertThatThrownBy(() -> OutboxRuntime.builder(invalid, transactions, new RecordingHandler()).build())
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("outbox.shards must be within 1..");
+                .hasMessageContaining("outbox.relay.workers must be at least 1");
         assertThat(transactions.asked).hasValue(0);
     }
 

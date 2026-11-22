@@ -677,7 +677,7 @@ class OutboxRelayIT {
         }
     }
 
-    /** A handler slower than requeue.delay that always requeues: rows are due again before the sweep ends, and it ends. */
+    /** A handler slower than the requeue delay that always requeues: rows are due again before the sweep ends, and it ends. */
     @Test
     void drainOffersARowOnceAndReturnsWithItStillParked() throws Exception {
         config.relayEnabled(false).batchSize(2).batchTimeout(Duration.ofSeconds(1)).requeueDelay(Duration.ofMillis(100));
@@ -685,7 +685,7 @@ class OutboxRelayIT {
         var offers = new ConcurrentHashMap<String, Integer>();
         var relay = relay(answering(records -> {
             try {
-                Thread.sleep(200); // within batchTimeout, longer than requeue.delay
+                Thread.sleep(200); // within batchTimeout, longer than the requeue delay
             } catch (InterruptedException e) {
                 throw new IllegalStateException(e);
             }

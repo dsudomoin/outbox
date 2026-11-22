@@ -4387,15 +4387,12 @@ class ShardProcessorIT {
         var cases = List.<Consumer<TestOutboxConfig>>of(
                 c -> c.batchSize(0),
                 c -> c.batchBytes(-1),
-                c -> c.maxTicksPerBatch(0),
                 c -> c.batchTimeout(Duration.ZERO),
-                c -> c.headFailuresBeforeDivert(0),
                 c -> c.retry(Duration.ZERO, Duration.ofSeconds(1), 0),
                 c -> c.retry(Duration.ofSeconds(2), Duration.ofSeconds(1), 0),
                 c -> c.retry(Duration.ofSeconds(1), Duration.ofSeconds(1), -1));
-        var keys = List.of("outbox.relay.batchSize", "outbox.relay.batchBytes", "outbox.relay.maxTicksPerBatch", "outbox.relay.batchTimeout",
-                "outbox.relay.headFailuresBeforeDivert", "outbox.relay.retry.initialDelay",
-                "outbox.relay.retry.maxDelay", "outbox.relay.retry.maxAttempts");
+        var keys = List.of("outbox.relay.batchSize", "outbox.relay.batchBytes", "outbox.relay.batchTimeout",
+                "outbox.relay.retry.initialDelay", "outbox.relay.retry.maxDelay", "outbox.relay.retry.maxAttempts");
         for (int i = 0; i < cases.size(); i++) {
             var invalid = new TestOutboxConfig();
             cases.get(i).accept(invalid);

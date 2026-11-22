@@ -20,6 +20,7 @@ import io.github.dsudomoin.outbox.OutboxTopicHandler;
 import io.github.dsudomoin.outbox.OutboxWaitException;
 import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.TypedOutboxTopicHandler;
+import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import java.io.IOException;
 import java.sql.SQLException;
@@ -811,7 +812,8 @@ class TransactionalHandlerIT {
 
     @Test
     void templatePerRecordInBatch() throws Exception {
-        app(TemplatePerRecordApp.class, "outbox.shards=1").run(context -> { // one shard: one call for the three keys
+        app(TemplatePerRecordApp.class) // one shard: one call for the three keys
+            .withBean(TestOutboxConfig.class, () -> new TestOutboxConfig().shards(1)).run(context -> {
             var effects = effects(context);
             effects.step = attempt -> {
                 if (attempt == 2) {

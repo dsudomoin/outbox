@@ -7,6 +7,7 @@ import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.kora.InboxModule;
 import io.github.dsudomoin.outbox.kora.OutboxModule;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TunedKoraModule;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import ru.tinkoff.kora.application.graph.Lifecycle;
@@ -17,7 +18,8 @@ import ru.tinkoff.kora.database.jdbc.JdbcDatabaseModule;
 
 /** An app component that uses the outbox and the inbox, and looks at them while the app stops. */
 @KoraApp
-public interface ShutdownTestApp extends HoconConfigModule, JdbcDatabaseModule, OutboxModule, InboxModule {
+public interface ShutdownTestApp extends HoconConfigModule, JdbcDatabaseModule, OutboxModule, InboxModule,
+        TunedKoraModule {
 
     default RecordingHandler outboxHandler() {
         return new RecordingHandler();

@@ -73,34 +73,25 @@ final class InboxPartitions {
     private final Map<String, AtomicLong> unparsableLogged = new ConcurrentHashMap<>();
 
     /**
-     * Validates the {@code outbox.inbox} keys against each other, so the window spans at least one interval (ids up
-     * to {@code retention - interval} old are always deduplicated) and maintenance extends before its top reaches
-     * now.
+     * Validates {@code outbox.inbox.retention} against the inbox ranges ({@link Tuning#inboxPartitionInterval()},
+     * {@link Tuning#inboxPremake()}), so the window spans at least one range (ids up to {@code retention - interval}
+     * old are always deduplicated) and holds at most {@value #MAX_RANGES} of them.
      */
     InboxPartitions(String table, OutboxConfig config) {
         this.table = table;
-        var cfg = config.inbox();
-        var interval = cfg.partitionInterval();
+        var tuning = Tuning.of(config);
+        var retention = config.inbox().retention();
+        var interval = tuning.inboxPartitionInterval();
+        var premake = tuning.inboxPremake();
         var twice = interval.multipliedBy(2);
-        var maintenance = config.partitions().maintenanceInterval();
-        require(interval.compareTo(Duration.ofMinutes(1)) >= 0,
-                "outbox.inbox.partitionInterval must be at least 1m: " + interval);
-        require(interval.toMillis() % MINUTE == 0,
-                "outbox.inbox.partitionInterval must be a whole number of minutes: " + interval);
-        require(cfg.retention().compareTo(twice) >= 0, "outbox.inbox.retention must be at least 2 ×"
-                + " outbox.inbox.partitionInterval (" + twice + "): " + cfg.retention());
-        require(cfg.premake().compareTo(twice) >= 0, "outbox.inbox.premake must be at least 2 ×"
-                + " outbox.inbox.partitionInterval (" + twice + "): " + cfg.premake());
-        require(cfg.premake().minus(interval).compareTo(maintenance) > 0, "outbox.inbox.premake ("
-                + cfg.premake() + ") minus outbox.inbox.partitionInterval (" + interval + ") must exceed"
-                + " outbox.partitions.maintenanceInterval: " + maintenance);
-        var span = cfg.retention().plus(cfg.premake());
-        require(interval.multipliedBy(MAX_RANGES).compareTo(span) >= 0, "outbox.inbox.partitionInterval must be at"
-                + " least (outbox.inbox.retention + outbox.inbox.premake) / " + MAX_RANGES + " ("
-                + span.dividedBy(MAX_RANGES) + "), at most " + MAX_RANGES + " ranges: " + interval);
+        require(retention.compareTo(twice) >= 0, "outbox.inbox.retention must be at least 2 × the inbox range"
+                + " interval of " + interval + " (" + twice + "): " + retention);
+        var most = interval.multipliedBy(MAX_RANGES).minus(premake);
+        require(retention.compareTo(most) <= 0, "outbox.inbox.retention must be at most " + most + ", " + MAX_RANGES
+                + " inbox ranges of " + interval + " less the " + premake + " made ahead: " + retention);
         this.interval = interval.toMillis();
-        this.premake = cfg.premake().toMillis();
-        this.retention = cfg.retention().toMillis();
+        this.premake = premake.toMillis();
+        this.retention = retention.toMillis();
         this.wholeHours = this.interval % HOUR == 0;
     }
 

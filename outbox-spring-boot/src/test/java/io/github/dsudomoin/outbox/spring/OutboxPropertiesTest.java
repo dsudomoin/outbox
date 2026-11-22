@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox.spring;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.OutboxConfig;
+import io.github.dsudomoin.outbox.internal.Tuning;
 import java.io.InputStream;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -69,23 +70,31 @@ class OutboxPropertiesTest {
     @Test
     void keysBind() {
         bind(p -> assertThat(p.relay().batchSize()).isEqualTo(7), "outbox.relay.batch-size=7");
-        bind(p -> assertThat(p.deadLetters().batchSize()).isEqualTo(5), "outbox.dead-letters.batch-size=5");
+        bind(p -> assertThat(p.deadLetters().retention()).isEqualTo(Duration.ofDays(5)),
+            "outbox.dead-letters.retention=5d");
         bind(p -> assertThat(p.partitions().tailConversion().window()).isEmpty(),
             "outbox.partitions.tail-conversion.window=");
-        bind(p -> assertThat(p.shards()).isEqualTo(16), "outbox.shards=16");
-        bind(p -> assertThat(p.networkTimeout()).isEqualTo(Duration.ofSeconds(7)),
-            "outbox.network-timeout=7s");
+        bind(p -> assertThat(p.recovery().timeout()).isEqualTo(Duration.ofMinutes(30)), "outbox.recovery.timeout=30m");
         bind(p -> assertThat(p.relay().retry().holdPermanent()).isTrue(), "outbox.relay.retry.hold-permanent=true");
-        bind(p -> assertThat(p.relay().ticksWithoutRelay()).isEqualTo(Duration.ofMillis(250)),
-            "outbox.relay.ticks-without-relay=250ms");
+    }
+
+    /** The library's own timings are no configuration: a property of theirs binds to nothing. */
+    @Test
+    void tuningKeysAreNotBound() {
+        bind(p -> {
+            assertThat(p).isNotInstanceOf(Tuning.class);
+            assertThat(Tuning.of(p)).isSameAs(Tuning.DEFAULTS);
+            assertThat(p.relay().batchSize()).isEqualTo(10_000);
+        }, "outbox.shards=16", "outbox.network-timeout=7s", "outbox.relay.ticks-without-relay=250ms",
+            "outbox.partitions.maintenance-interval=1s", "outbox.dead-letters.batch-size=5",
+            "outbox.recovery.xid-regression=halt", "outbox.lifecycle.phase=0",
+            "outbox.telemetry.observe-unsampled=true");
     }
 
     @Test
     void springOnlyDefaults() {
         bind(p -> {
             assertThat(p.enabled()).isTrue();
-            assertThat(p.lifecycle().phase()).isEqualTo(Integer.MAX_VALUE - 4096);
-            assertThat(p.telemetry().observeUnsampled()).isFalse();
             assertThat(p.json().mapper()).isEqualTo(OutboxProperties.Json.Mapper.AUTO);
             assertThat(p.heartbeat().dedicatedConnection()).isTrue();
         });
@@ -112,17 +121,19 @@ class OutboxPropertiesTest {
         }
         List<String> keys = new ArrayList<>();
         collectKeys("outbox", OutboxConfig.class, keys);
-        assertThat(keys).hasSizeGreaterThan(40);
+        assertThat(keys).hasSize(20);
         for (String key : keys) {
             assertThat(properties).as("metadata of " + key).containsKey(key);
             assertThat((String) properties.get(key).get("description")).as("description of " + key).isNotBlank();
         }
         assertThat(String.valueOf(properties.get("outbox.relay.batch-size").get("defaultValue"))).isEqualTo("10000");
         assertThat(properties.get("outbox.relay.batch-timeout").get("defaultValue")).isEqualTo("130s");
-        assertThat(properties.get("outbox.dead-letters.timeout").get("defaultValue")).isEqualTo("130s");
+        assertThat(properties.get("outbox.recovery.timeout").get("defaultValue")).isEqualTo("10m");
         assertThat(String.valueOf(properties.get("outbox.relay.retry.hold-permanent").get("defaultValue")))
             .isEqualTo("false");
-        assertThat(properties.get("outbox.relay.ticks-without-relay").get("defaultValue")).isEqualTo("1s");
+        assertThat(properties).doesNotContainKeys("outbox.shards", "outbox.network-timeout",
+            "outbox.relay.ticks-without-relay", "outbox.partitions.maintenance-interval", "outbox.lifecycle.phase",
+            "outbox.telemetry.observe-unsampled");
         assertThat(String.valueOf(properties.get("outbox.heartbeat.dedicated-connection").get("defaultValue")))
             .isEqualTo("true");
         assertThat((String) properties.get("outbox.heartbeat.dedicated-connection").get("description")).isNotBlank();

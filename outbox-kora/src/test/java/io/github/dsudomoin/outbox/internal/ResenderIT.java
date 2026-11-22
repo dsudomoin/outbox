@@ -57,7 +57,7 @@ class ResenderIT {
         var headers = HeaderCodec.encode(List.of(new OutboxHeader("h", bytes("v")), new OutboxHeader("n", null)));
         try (var c = TestDb.connect(); var ps = c.prepareStatement("insert into " + names.base()
                 + " (shard, message_id, topic, key, payload, headers) values (?, gen_random_uuid(), ?, ?, ?, ?)")) {
-            // sharded for another shard count, as rows written before a reshard or set aside elsewhere
+            // sharded for another shard count, as rows set aside elsewhere
             for (var row : List.of(new Object[] {"t", bytes("a"), bytes("1"), headers},
                     new Object[] {"t", null, bytes("2"), null}, new Object[] {"u", bytes("b"), null, headers},
                     new Object[] {"t", bytes("a"), bytes("3"), null})) {
@@ -153,7 +153,7 @@ class ResenderIT {
         try (var c = TestDb.connect()) {
             c.setAutoCommit(false);
             var counted = counting(c, inserts, locks);
-            assertThat(new Resender(names, config.shards(), ShardGuard.NONE, 1 << 20).insertAll(counted, rows))
+            assertThat(new Resender(names, config.shards(), 1 << 20).insertAll(counted, rows))
                     .isEqualTo(rows.size());
             c.commit();
         }

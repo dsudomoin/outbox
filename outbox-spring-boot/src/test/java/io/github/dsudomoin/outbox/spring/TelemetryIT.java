@@ -73,7 +73,6 @@ class TelemetryIT {
 
     private static final Duration WAIT = Duration.ofSeconds(10);
     private static final String UNSAMPLED = "test.unsampled=true";
-    private static final String OBSERVE_UNSAMPLED = "outbox.telemetry.observe-unsampled=true";
     private static final String SINCE_SUCCESS = "outbox.maintenance.since_success";
 
     @Configuration(proxyBeanMethods = false)
@@ -360,25 +359,12 @@ class TelemetryIT {
         });
     }
 
-    /** The key is bound on its own, so it holds with the app's own OutboxConfig too. */
-    @Test
-    void observeUnsampledPropertyWithTheAppsOwnConfig() {
-        traced(UNSAMPLED, OBSERVE_UNSAMPLED).withUserConfiguration(TestApps.WithRoute.class)
-            .withBean(TestOutboxConfig.class, TestOutboxConfig::new).run(context -> {
-                assertThat(context).doesNotHaveBean(OutboxProperties.class);
-                var meters = context.getBean(MeterRegistry.class);
-
-                send(context, "orders");
-
-                await().atMost(WAIT).untilAsserted(() -> assertThat(timerCount(meters, "outbox.deliver")).isOne());
-            });
-    }
-
     /** The telemetry bean outlives the runtime: a stop and a start build a new one around it. */
     @Test
     void gaugesFollowTheNewRuntimeAfterARestart() {
-        runner("outbox.partitions.maintenance-interval=100ms").withUserConfiguration(Metered.class,
-            WithPoisonRoute.class).run(context -> {
+        runner().withUserConfiguration(Metered.class, WithPoisonRoute.class)
+            .withBean(TestOutboxConfig.class, () -> new TestOutboxConfig().maintenanceInterval(Duration.ofMillis(100)))
+            .run(context -> {
                 assertThat(context).hasNotFailed();
                 var meters = context.getBean(MeterRegistry.class);
                 await().atMost(WAIT).until(() -> gauge(meters, SINCE_SUCCESS) < 1.0);

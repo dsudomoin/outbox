@@ -121,7 +121,7 @@ class TransactionPoolingIT {
         assertThat(maintenance.runOnce()).as("ran, not skipped").isTrue();
 
         try (var c = TestDb.connect()) {
-            var partitions = XidPartitions.forBootstrap(names, config.partitions());
+            var partitions = XidPartitions.forBootstrap(names, config);
             assertThat(partitions.premadeAhead(c)).as("extended").isGreaterThan(config.premake() / 2);
             long xmin = new Ticks(names, config.shards()).latest(c).snapshot().xmin();
             assertThat(PartitionDdl.listRanges(c, names.base())).as("processed ranges dropped")

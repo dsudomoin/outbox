@@ -218,7 +218,7 @@ class XidRecoveryIT {
         try (var err = new CapturedStderr()) {
             assertThat(maintenance.runOnce()).isTrue();
 
-            assertThat(err.text()).contains("ERROR").contains("100 rows to re-send exceed outbox.recovery.maxRows 10")
+            assertThat(err.text()).contains("ERROR").contains("100 rows to re-send exceed the automatic recovery's limit of 10")
                     .contains("OutboxAdmin.recoverXidRegression()")
                     .contains("POST /kora-outbox/admin/v1/recovery/xid-regression");
         }
@@ -229,7 +229,7 @@ class XidRecoveryIT {
         try (var err = new CapturedStderr()) {
             bootstrap(); // a restart starts halted with the same ERROR
 
-            assertThat(err.text()).contains("100 rows to re-send exceed outbox.recovery.maxRows 10");
+            assertThat(err.text()).contains("100 rows to re-send exceed the automatic recovery's limit of 10");
         }
         assertThat(tickExists(forged)).isTrue();
     }
@@ -348,8 +348,8 @@ class XidRecoveryIT {
     }
 
     /**
-     * While a recovery holds the tick and cursor tables, another instance's halt check and heartbeat wait at most
-     * 100 ms: a starting instance takes no shards (halted) instead of hanging in its relay's init.
+     * While a recovery holds the tick and cursor tables, another instance's halt check waits at most 100 ms: a
+     * starting instance takes no shards (halted) instead of hanging in its relay's init; its heartbeat reads neither.
      */
     @Test
     void otherInstancesWaitForARecoveryAtMostTheirLockTimeout() throws Exception {
@@ -371,7 +371,7 @@ class XidRecoveryIT {
                 assertThat(checked.checkHalt()).as("its last answer stands").isFalse();
                 new Heartbeat(db, schema, schema.config(), false).beat();
                 assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(2));
-                assertThat(err.text()).contains("outbox heartbeat").contains("waited 100 ms for a lock");
+                assertThat(err.text()).doesNotContain("outbox heartbeat");
             } finally {
                 release.shutdown();
             }
@@ -497,7 +497,7 @@ class XidRecoveryIT {
             assertThat(maintenance.runOnce()).isTrue();
             assertThat(maintenance.runOnce()).isTrue();
 
-            assertThat(err.text()).contains("ERROR").contains("outbox.recovery.xidRegression = halt")
+            assertThat(err.text()).contains("ERROR").contains("the automatic recovery is off (xidRegression halt)")
                     .contains("OutboxAdmin.recoverXidRegression()");
         }
         assertThat(maintenance.halted()).isTrue();
@@ -527,24 +527,6 @@ class XidRecoveryIT {
         assertThat(handler.delivered()).isEmpty();
         assertThatThrownBy(relay::drain).isInstanceOf(IllegalStateException.class)
                 .hasMessageStartingWith("outbox halted");
-    }
-
-    @Test
-    void recoveryRefusesWhenTheShardCountChanged() throws Exception {
-        bootstrap(); // 4 shards
-        send(outbox(null), messages("m", 5));
-        long forged = forgeRegression();
-        var resharded = new TestOutboxConfig().table(config.table()).shards(8);
-        var maintenance = new Maintenance(db, names, resharded, new OutboxMetrics(null));
-
-        try (var err = new CapturedStderr()) {
-            assertThat(maintenance.runOnce()).as("the shard guard: nothing maintained").isFalse();
-
-            assertThat(err.text()).contains("ERROR").contains("outbox.shards = 8").contains("4 shards");
-        }
-        assertThat(maintenance.halted()).isTrue();
-        assertThat(tickExists(forged)).isTrue();
-        assertThat(OutboxAdminIT.count(names.base())).isEqualTo(5);
     }
 
     @Test

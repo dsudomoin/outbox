@@ -16,6 +16,7 @@ import io.github.dsudomoin.outbox.OutboxTopicHandler;
 import io.github.dsudomoin.outbox.OutboxTransactions;
 import io.github.dsudomoin.outbox.TypedOutbox;
 import io.github.dsudomoin.outbox.TypedOutboxTopicHandler;
+import io.github.dsudomoin.outbox.internal.Tuning;
 import io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry;
 import io.github.dsudomoin.outbox.micrometer.OutboxDeliveryObservationConvention;
 import io.github.dsudomoin.outbox.micrometer.OutboxDeliveryTracingObservationHandler;
@@ -108,21 +109,20 @@ public final class OutboxAutoConfiguration {
     }
 
     /**
-     * The Micrometer beans are looked up at creation, so no ordering after Boot's configurations of them is needed.
-     * Binds the key itself: an app's own OutboxConfig leaves no OutboxProperties bean.
+     * The Micrometer beans are looked up at creation, so no ordering after Boot's configurations of them is needed. An
+     * app that wants unsampled deliveries observed defines its own {@link OutboxTelemetry} bean
+     * ({@code ObservationOutboxTelemetry.builder(..).observeUnsampled(true)}).
      */
     @Bean
     @ConditionalOnMissingBean(OutboxTelemetry.class)
-    ObservationOutboxTelemetry outboxTelemetry(Environment environment,
-            ObjectProvider<ObservationRegistry> observations, ObjectProvider<MeterRegistry> meters,
+    ObservationOutboxTelemetry outboxTelemetry(ObjectProvider<ObservationRegistry> observations,
+            ObjectProvider<MeterRegistry> meters,
             ObjectProvider<OutboxEnqueueObservationConvention> enqueueConvention,
             ObjectProvider<OutboxDeliveryObservationConvention> deliveryConvention,
             ObjectProvider<OutboxSettleObservationConvention> settleConvention,
             ObjectProvider<OutboxStepObservationConvention> stepConvention, ObjectProvider<TelemetryTracing> tracing) {
         var builder = ObservationOutboxTelemetry.builder(observations.getIfAvailable(() -> ObservationRegistry.NOOP),
-                new OutboxMetrics(meters.getIfAvailable()))
-            .observeUnsampled(Binder.get(environment).bindOrCreate("outbox.telemetry", OutboxProperties.Telemetry.class)
-                .observeUnsampled());
+                new OutboxMetrics(meters.getIfAvailable()));
         enqueueConvention.ifAvailable(builder::enqueueConvention);
         deliveryConvention.ifAvailable(builder::deliveryConvention);
         settleConvention.ifAvailable(builder::settleConvention);
@@ -245,8 +245,7 @@ public final class OutboxAutoConfiguration {
                     throw e;
                 }
             };
-            int phase = binder.bindOrCreate("outbox.lifecycle", OutboxProperties.Lifecycle.class).phase();
-            return new OutboxLifecycle(runtimes, phase);
+            return new OutboxLifecycle(runtimes);
         }
 
         /** A pool of the heartbeat's own derived from the outbox's Hikari pool; null without one or when it fails. */
@@ -255,7 +254,7 @@ public final class OutboxAutoConfiguration {
                 @Nullable HeartbeatPools pools) {
             var log = LoggerFactory.getLogger(OutboxAutoConfiguration.class);
             try {
-                var pool = pools != null ? pools.derive(transactions, config.partitions().maintenanceInterval()) : null;
+                var pool = pools != null ? pools.derive(transactions, Tuning.of(config).maintenanceInterval()) : null;
                 if (pool == null) {
                     log.info("outbox heartbeat gets no pool of its own: the outbox's transactions are not"
                         + " SpringOutboxTransactions over a HikariDataSource, whose pool it would copy;"

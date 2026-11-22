@@ -67,8 +67,10 @@ class OwnerTagIT implements KoraAppTestConfigModifier {
                 outbox {
                   table = %4$s.outbox
                   schema.bootstrap = false
-                  relay { workers = 2, minTickInterval = 5ms }
-                  partitions { xidsPerPartition = 1000, premake = 2 }
+                  relay.workers = 2
+                  minTickInterval = 5ms # the library's own Tuning: read by the test app's TunedKoraConfig
+                  xidsPerPartition = 1000
+                  premake = 2
                 }
                 """.formatted(TestDataSources.jdbcUrl(), app, owner, schema));
     }

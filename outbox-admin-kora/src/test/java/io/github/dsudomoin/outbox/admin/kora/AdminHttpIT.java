@@ -76,9 +76,11 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
                 }
                 outbox {
                   table = %s
-                  shards = 2
                   relay { enabled = false, batchTimeout = 100ms } # a busy shard is waited for 5.1 s
-                  partitions { xidsPerPartition = 1000000, premake = 2 }
+                  # the library's own Tuning: read by the test app's TunedKoraConfig
+                  shards = 2
+                  xidsPerPartition = 1000000
+                  premake = 2
                 }
                 httpServer { publicApiHttpPort = %d, privateApiHttpPort = %d }
                 openapi.management.file = ["openapi/kora-outbox-admin.yaml"]

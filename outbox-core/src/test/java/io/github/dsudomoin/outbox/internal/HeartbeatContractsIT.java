@@ -24,9 +24,9 @@ class HeartbeatContractsIT {
     private static final OutboxMessage V2 = OutboxMessage.of("orders", "k", "p".getBytes(UTF_8))
             .withHeader(Contracts.HEADER, "2".getBytes(US_ASCII));
 
-    /** A beat that gives up on the cursor table's lock, which a recovery holds, has read the reports before. */
+    /** A beat while a recovery holds the cursor table reads the reports: it does not touch that table. */
     @Test
-    void aBeatThatGivesUpOnItsLockStillReadsTheReports() throws Exception {
+    void aBeatWhileTheCursorTableIsLockedReadsTheReports() throws Exception {
         var ds = TestDataSources.newDataSource();
         var db = new JdbcTransactions(ds);
         var config = new TestOutboxConfig().relayEnabled(false); // its own row, reporting nothing, does not count
@@ -49,8 +49,8 @@ class HeartbeatContractsIT {
                 other.setAutoCommit(false);
                 TestSql.execute(other, "lock table " + names.cursor() + " in access exclusive mode");
                 try (var err = new CapturedStderr()) {
-                    new Heartbeat(db, schema, schema.config(), false).beat();
-                    assertThat(err.text()).contains("waited 100 ms for a lock");
+                    assertThat(new Heartbeat(db, schema, schema.config(), false).beat()).isTrue();
+                    assertThat(err.text()).doesNotContain("WARN");
                 }
                 other.rollback();
             }
@@ -162,11 +162,11 @@ class HeartbeatContractsIT {
     }
 
     /**
-     * A recovery holds the cursor table for its run, which may outlast the row's expiry: a beat that gives up on that
-     * lock has refreshed the row, so the instance stays live to every guard.
+     * A recovery holds the cursor table for its run, which may outlast the row's expiry: a beat meanwhile refreshes the
+     * row, so the instance stays live to every guard.
      */
     @Test
-    void aBeatThatGivesUpOnTheCursorLockStillRefreshesItsRow() throws Exception {
+    void aBeatWhileTheCursorTableIsLockedRefreshesItsRow() throws Exception {
         var ds = TestDataSources.newDataSource();
         var db = new JdbcTransactions(ds);
         try (var schema = new OutboxSchema(db, db, new TestOutboxConfig(), Map.of(), Set.of())) {
@@ -183,8 +183,8 @@ class HeartbeatContractsIT {
                 recovering.setAutoCommit(false);
                 TestSql.execute(recovering, "lock table " + names.cursor() + " in access exclusive mode");
                 try (var err = new CapturedStderr()) {
-                    new Heartbeat(db, schema, schema.config(), false).beat();
-                    assertThat(err.text()).contains("waited 100 ms for a lock").doesNotContain("failed");
+                    assertThat(new Heartbeat(db, schema, schema.config(), false).beat()).isTrue();
+                    assertThat(err.text()).doesNotContain("WARN");
                 }
                 String refreshed = live(db, names, schema.instanceId());
                 assertThat(refreshed).as("refreshed while the cursor table is locked").isEqualTo("true");

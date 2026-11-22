@@ -35,7 +35,7 @@ public interface OutboxAdmin {
      * Sends these letters back into the outbox, whatever their status, as {@link DeadLetterDecision#redrive()} does: a
      * new message after the later messages of its (topic, key), with the same message id, topic, key, payload and
      * headers, attempts reset, the dead row deleted in the same transaction; should it die again within
-     * {@code outbox.deadLetters.redriveHistory}, its {@link DeadLetter#redrives()} is one higher. Wakes the relay.
+     * 30 days, its {@link DeadLetter#redrives()} is one higher. Wakes the relay.
      * Returns how many were redriven: ids of no letter count for nothing.
      */
     long redriveDeadLetters(Collection<Long> ids);
@@ -74,24 +74,21 @@ public interface OutboxAdmin {
     long restoreOrphan(String table, long fromXid);
 
     /**
-     * Runs the xid-regression recovery now, the one maintenance runs by itself with
-     * {@code outbox.recovery.xidRegression = auto}, whatever that mode and {@code outbox.recovery.maxRows}: for a halt
-     * in {@code halt} mode or above {@code maxRows}. One transaction re-sends the rows the relay may not have
-     * delivered, as new messages with the same message ids (consumers drop within their inbox window the ones delivered
-     * before); writers wait for it, 2.5 to 3 s per million rows in the library's measurement. A failed recovery rolls
-     * back. Runs as no maintenance run or other recovery call does at the same time: waits up to 60 s for one in
-     * progress, then fails with {@link IllegalStateException}
-     * "maintenance or another outbox admin recovery call is running, retry". Once the recovery committed the call
-     * returns the rows re-sent, and a failure after it is a WARN. A failed commit may still have gone through: when a
-     * read on a new connection then finds the recovery done, the call returns -1, the count unknown. Wakes the relay.
+     * Runs the xid-regression recovery now, the one maintenance runs by itself when at most 1 000 000 rows are to be
+     * re-sent: for a halt above that, or one the automatic recovery gave up on. One transaction re-sends the rows the
+     * relay may not have delivered, as new messages with the same message ids (consumers drop within their inbox window
+     * the ones delivered before); writers wait for it, 2.5 to 3 s per million rows in the library's measurement. A
+     * failed recovery rolls back. Runs as no maintenance run or other recovery call does at the same time: waits up to
+     * 60 s for one in progress, then fails with {@link IllegalStateException} "maintenance or another outbox admin
+     * recovery call is running, retry". Once the recovery committed the call returns the rows re-sent, and a failure
+     * after it is a WARN. A failed commit may still have gone through: when a read on a new connection then finds the
+     * recovery done, the call returns -1, the count unknown. Wakes the relay.
      *
      * @throws IllegalStateException "no xid regression to recover" when the xid counter is at or above every tick's
-     *     xmax and no halt is recorded; "outbox.shards = N but ... cursors for M shards" when the shard count changed
-     *     since the cursors were made: calling again does not help until {@code outbox.shards} is set back to M; "the
-     *     detach of ... became pending" when someone began a partition detach while the call ran: calling again
-     *     retries, finishing it first; "... failed at its commit, outcome unknown, call again" when the commit failed
-     *     and the recovery is not found done: a repeat recovers, or is refused with "no xid regression to recover"
-     *     if the commit went through after all
+     *     xmax and no halt is recorded; "the detach of ... became pending" when someone began a partition detach
+     *     while the call ran: calling again retries, finishing it first; "... failed at its commit, outcome unknown,
+     *     call again" when the commit failed and the recovery is not found done: a repeat recovers, or is refused with
+     *     "no xid regression to recover" if the commit went through after all
      */
     long recoverXidRegression();
 

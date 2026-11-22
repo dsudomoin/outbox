@@ -20,7 +20,7 @@ import java.util.UUID;
  * topic that a live relay instance cannot read; with {@link IllegalArgumentException} when that header gives no
  * version (not a positive decimal int), and, in a runtime whose routes have no handler behind them, when no route
  * claims its topic. {@code sendAll} writes none of its messages then. The live relay instances are as this
- * instance's heartbeat last read their reports; when that read is older than three {@code maintenanceInterval}s, a
+ * instance's heartbeat last read their reports; when that read is older than three beats (90 s), a
  * message these checks cover is let through only if that read found a live relay instance and each one reported and
  * allowed it, else it is refused.
  */

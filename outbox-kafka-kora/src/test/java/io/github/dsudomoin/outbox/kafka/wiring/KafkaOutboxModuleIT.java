@@ -57,9 +57,13 @@ class KafkaOutboxModuleIT implements KoraAppTestConfigModifier {
                 }
                 outbox {
                   table = %s
+                  relay.workers = 2
+                  # the library's own Tuning: read by the test app's TunedKoraConfig
                   shards = 4
-                  relay { workers = 2, minTickInterval = 5ms, idlePollInterval = 100ms }
-                  partitions { xidsPerPartition = 1000000, premake = 4 }
+                  minTickInterval = 5ms
+                  idlePollInterval = 100ms
+                  xidsPerPartition = 1000000
+                  premake = 4
                   kafka {
                     driverProperties { "bootstrap.servers" = "%s" }
                     %s

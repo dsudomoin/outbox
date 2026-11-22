@@ -31,13 +31,9 @@ import org.slf4j.LoggerFactory;
  * {@link ContractGuard}. Then one statement deletes other instances' rows expired for {@link #FORGET_AFTER} (instances
  * that died without a clean shutdown) and upserts the row, committed on their own; on a running relay, the guard's read
  * then takes the row's report as written, as the read before it misses the row when it had expired (a pause, an
- * outage). Last, in a transaction of its own, it reads the cursors' shard count into the instance's {@link ShardGuard},
- * so a writer-only instance stops writing within one beat of another instance's reshard. {@link #stop()} deletes the
- * row, within {@link #STOP_BUDGET}, or leaves it to expire; a beat that commits after it deletes it again. A failed beat
- * is logged, and the next one retries. A beat waits
- * at most {@code 100 ms} for a lock: a recovery holds the cursor table for its run, so the shard count then stands as
- * last read, with a one-line WARN; the reports were read and the row refreshed before, so the guards of other instances
- * keep counting this one. With a connection source of its own ({@link OutboxSchema#heartbeatConnections()}) the beats
+ * outage). {@link #stop()} deletes the row, within {@link #STOP_BUDGET}, or leaves it to expire; a beat that commits
+ * after it deletes it again. A failed beat is logged, and the next one retries. A beat waits at most {@code 100 ms} for
+ * a lock. With a connection source of its own ({@link OutboxSchema#heartbeatConnections()}) the beats
  * and the delete take their connections from it, so business load that exhausts the application's pool does not starve
  * them.
  */
@@ -60,7 +56,6 @@ public final class Heartbeat {
     private final boolean hookActive;
     private final boolean relay;
     private final Duration interval;
-    private final ShardGuard guard;
     private final ContractGuard contracts;
     private final SocketBound socket;
     private final DatabaseClock clock;
@@ -81,11 +76,10 @@ public final class Heartbeat {
         this.connections = own != null ? own : db;
         this.names = schema.names();
         this.id = schema.instanceId();
-        this.shards = config.shards();
+        this.shards = OutboxSchema.shards(config);
         this.hookActive = hookActive;
         this.relay = config.relay().enabled();
-        this.interval = config.partitions().maintenanceInterval();
-        this.guard = schema.shardGuard();
+        this.interval = Tuning.of(config).maintenanceInterval();
         this.contracts = schema.contractGuard();
         this.socket = socketBound(config);
         this.beat = "with gone as (delete from " + names.instance() + " where instance_id <> ? and coalesce(expires_at,"
@@ -99,9 +93,10 @@ public final class Heartbeat {
      * the row expire and the guards go stale.
      */
     static SocketBound socketBound(OutboxConfig config) {
-        var interval = config.partitions().maintenanceInterval();
+        var tuning = Tuning.of(config);
+        var interval = tuning.maintenanceInterval();
         var bound = interval.compareTo(BEAT_BOUND_FLOOR) < 0 ? BEAT_BOUND_FLOOR : interval;
-        var networkTimeout = config.networkTimeout();
+        var networkTimeout = tuning.networkTimeout();
         return SocketBound.atMost(networkTimeout.compareTo(bound) < 0 ? networkTimeout : bound);
     }
 
@@ -228,7 +223,6 @@ public final class Heartbeat {
 
     /** One beat; whether it ended without a failure it logged. Package-private for a test. */
     boolean beat() {
-        boolean refreshed = false;
         Connection used = null;
         try (var c = connections.newConnection(); var bound = socket.on(c)) {
             used = c;
@@ -248,32 +242,18 @@ public final class Heartbeat {
                     c.rollback(); // stop() deleted the row, or is about to
                     return true;
                 }
-                c.commit(); // before the shard count, whose lock a recovery may hold for its run
-                refreshed = true;
+                c.commit();
                 if (relay) {
                     contracts.renewed(id);
                 }
                 if (stopped) { // stop() deleted it before this commit; on c, as its source may hold no second connection
                     delete(c, names, id, STOP_BUDGET);
-                    return true;
                 }
-                lockTimeout(c);
-                try (var st = c.createStatement(); var rs = st.executeQuery(Cursors.shardCount(names))) {
-                    rs.next();
-                    guard.observed(rs.getInt(1));
-                }
-                c.commit();
                 return true;
             } finally {
                 giveBack(c);
             }
         } catch (Throwable t) { // logged, never thrown: a throw would cancel every later beat without a word
-            if (refreshed && t instanceof SQLException e && "55P03".equals(e.getSQLState())) {
-                log.warn("outbox heartbeat of instance {} into {} waited {} ms for a lock (a recovery holds {} for its"
-                        + " run?); the shard count stands as last read, retrying in {}", id, names.instance(),
-                        Maintenance.SHARDS_LOCK_TIMEOUT.toMillis(), names.cursor(), interval);
-                return true; // the row is refreshed
-            }
             if (connections instanceof HeartbeatConnections own && own.cannotWrite(used, t)) {
                 return own.retry((SQLException) t, this::beat);
             }

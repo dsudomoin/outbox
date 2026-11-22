@@ -30,10 +30,7 @@ import org.slf4j.LoggerFactory;
  * Partition maintenance and log cleanup. Every run first checks the xid counter ({@link #halted()}), then reads, from
  * {@code <base>_maintenance}, when a run last completed every step on any instance
  * ({@code outbox.maintenance.since_success}, seconds; unless halted, a WARN at most once a minute once that is over 5 ×
- * {@code maintenanceInterval}); neither needs a lock, so every instance does both, and a failed read is a WARN. Then it
- * compares the cursors' shard count ({@link Cursors#shardCount}) with {@code outbox.shards}: a mismatch, as another
- * instance's reshard leaves it, halts this instance ({@link #halted()}) until they match again, with an ERROR at most
- * once a minute, and the run stops there, taking no lock ({@link #runOnce()} returns false). The
+ * {@code maintenanceInterval}); neither needs a lock, so every instance does both, and a failed read is a WARN. The
  * rest runs on at most one instance at a time, under {@code LOCK_MAINTENANCE}, which a {@link LockHolder} on a second
  * connection only tries: a transaction of its own, idle for {@link #HOLDER_IDLE} at most, so Postgres ends a frozen
  * holder's and frees the lock (the tail swap's quiesce, 5 s, {@link XidPartitions}), released as the run ends. Each
@@ -41,11 +38,11 @@ import org.slf4j.LoggerFactory;
  * does is set for the session or outlives its transaction, so it runs behind a transaction-pooling proxy (pgbouncer,
  * Odyssey) as on a direct connection; {@code outbox.maintenance.transaction_pooling} stays 0, kept for the dashboards
  * that read it. While halted the one step under the
- * lock is the recovery ({@link XidRecovery#autoRecover}), with {@code outbox.recovery.xidRegression = auto}; with
+ * lock is the recovery ({@link XidRecovery#autoRecover}), in {@link Tuning#xidRegression()} {@code auto} mode; with
  * {@code halt} the run takes no lock. Otherwise the steps, each on its own (a failure is logged and the next step
  * still runs): finish a pending detach, premade partitions (the extension swaps the tail in one transaction, a tail
  * with rows becoming a range in it, the library's one ACCESS EXCLUSIVE on the parent besides the recovery's, taken
- * without waiting unless {@code outbox.partitions.swapLockTimeout} asks for a wait: writers wait for its hold;
+ * without waiting unless {@link Tuning#swapLockTimeout()} asks for a wait: writers wait for its hold;
  * before it, a wait of up to {@code batchTimeout} + 5 s for relay steps in flight, which blocks no writer but pauses
  * every shard; a step running longer, as one may, defers the swap to the next run), the checkpoint ({@link Cursors}:
  * the latest tick and the shards busy at it, by which a shard without new rows moves on without a cursor row; the
@@ -54,18 +51,18 @@ import org.slf4j.LoggerFactory;
  * nothing and is replaced, with an ERROR at most once a minute; one whose tick is gone with every latest cursor row
  * at or above it is only obsolete, as the previous release's cleanup leaves it, and is replaced silently), the cursor anchors and due repairs
  * ({@link Cursors#anchors}: a cursor row at its effective tick for each shard idle at that checkpoint whose latest row
- * lies below it and is older than {@code outbox.relay.cursorAnchorInterval}, and one for each shard whose latest row
+ * lies below it and is older than {@link Tuning#cursorAnchorInterval()}, and one for each shard whose latest row
  * misses a due its {@code <retry>} or {@code <parked>} rows need; under the shards' locks, 128 shards per
  * read-committed transaction), drop of
  * processed partitions, drop of ranges left detached but not dropped: by a crash of this library's maintenance once
  * relayed (one still holding rows at or above the horizon first has those moved back into the outbox as new messages,
- * {@link OrphanRestore}, unless {@code outbox.partitions.restoreOrphans} is off), by anyone else only when empty
+ * {@link OrphanRestore}), by anyone else only when empty
  * (and ranges the xid-regression recovery set aside, {@code <base>_o<digits>}, likewise:
  * {@code outbox.partitions.orphaned} counts the ones kept, with an ERROR each run, as their rows lie outside the
  * outbox), tick cleanup (below the lowest effective tick, but never below a latest cursor row's tick, where the
  * previous release starts its steps: see {@link Cursors}), cursor cleanup, deletion of kept dead letters older than
  * {@code outbox.deadLetters.retention} (by {@code failed_at}; none when it is 0, pending or scheduled ones never) and
- * of redrive counts older than {@code outbox.deadLetters.redriveHistory} (both by ranges of blocks, at most a
+ * of redrive counts older than {@link Tuning#redriveHistory()} (both by ranges of blocks, at most a
  * {@code maintenanceInterval} per run: {@link AgedDelete}), the start of the dead table's
  * {@code <dead>_due} build when it is missing or invalid ({@link DeadIndexBuilder}: on its own thread, off the
  * maintenance lock; never a failed step; none with {@code outbox.schema.bootstrap = false}), gauges; when none
@@ -75,7 +72,7 @@ import org.slf4j.LoggerFactory;
  * shard moves on), {@code outbox.waiting.size} (retry heads waiting for an
  * instance that can handle them), {@code outbox.waiting.oldest} (seconds since the oldest of them began to wait, 0
  * when none; while any waits, a WARN at most once a minute, an ERROR instead once that is over
- * {@code outbox.relay.waiting.alertAfter}), {@code outbox.dead.size}, {@code outbox.dead.pending}
+ * {@link Tuning#waitAlertAfter()}), {@code outbox.dead.size}, {@code outbox.dead.pending}
  * (letters waiting for the hook), {@code outbox.dead.pending.oldest} (seconds since the oldest of them failed, 0 when
  * none),
  * {@code outbox.parked.size}, {@code outbox.pending} and {@code outbox.pending.oldest} (with
@@ -121,7 +118,7 @@ public final class Maintenance {
     static final int CLEANUP_BLOCKS = 1024;
     /**
      * The {@code statement_timeout} of one such statement: far above what its blocks take, and below
-     * {@code outbox.networkTimeout} by the server's answer margin (at least 1 s), so with a {@code networkTimeout}
+     * {@link Tuning#networkTimeout()} by the server's answer margin (at least 1 s), so with a {@code networkTimeout}
      * of 6 s or more the cleanup never lengthens the socket bound; a shorter one is raised to 6 s for the statement.
      */
     static final Duration CLEANUP_TIMEOUT = Duration.ofSeconds(30);
@@ -148,7 +145,6 @@ public final class Maintenance {
     private final RetryStore retries;
     private final ParkedStore parked;
     final OrphanRestore orphanRestore; // for a test's seam
-    private final boolean restoreOrphans;
     final XidRecovery recovery; // for a test of its check's plan
     private final boolean autoRecovery;
     private final String sinceSuccess;
@@ -168,7 +164,6 @@ public final class Maintenance {
     private final AtomicLong haltLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong checkpointLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong strandedLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
-    private final AtomicLong mismatchLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final SocketBound socket;
     private final AtomicLong premadeLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong retainedLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
@@ -181,7 +176,6 @@ public final class Maintenance {
     /** One each, so the first ERROR past {@code alertAfter} is not held back by a WARN just before it. */
     private final AtomicLong waitingWarned = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong waitingAlerted = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
-    private final String cursorShards;
     private volatile boolean halted;
     /** Whether a check of the xid counter has answered yet. */
     private volatile boolean xidChecked;
@@ -189,9 +183,6 @@ public final class Maintenance {
     private final ReentrantLock checking = new ReentrantLock();
     /** The first check ran into a lock and has no answer yet: no worker starts, and nothing was found. */
     private volatile boolean unanswered;
-    /** The cursors' shard count when it differs from {@link #shards}, else null. */
-    @Nullable
-    private volatile Integer mismatch;
     private volatile boolean stepFailed; // in the current run, under LOCK_MAINTENANCE
     final DeadIndexBuilder deadIndex; // for tests
     /** Off with {@code outbox.schema.bootstrap = false}: the migrations made the index. */
@@ -228,38 +219,36 @@ public final class Maintenance {
         this.db = db;
         this.names = names;
         this.telemetry = telemetry;
-        this.queueState = new QueueState(names, config.shards(), QueueState.BUDGET);
+        var tuning = Tuning.of(config);
+        this.shards = OutboxSchema.shards(config);
+        this.queueState = new QueueState(names, shards, QueueState.BUDGET);
         this.detachLockTimeout = detachLockTimeout;
-        this.socket = new SocketBound(config.networkTimeout());
+        this.socket = new SocketBound(tuning.networkTimeout());
         this.quiesceTimeout = quiesceTimeout(config);
-        this.partitions = new XidPartitions(names, config.partitions());
-        this.ticks = new Ticks(names, config.shards());
-        this.cursors = new Cursors(names, config.shards());
-        this.shards = config.shards();
-        this.anchorInterval = config.relay().cursorAnchorInterval();
+        this.partitions = new XidPartitions(names, config);
+        this.ticks = new Ticks(names, shards);
+        this.cursors = new Cursors(names, shards);
+        this.anchorInterval = tuning.cursorAnchorInterval();
         this.retries = new RetryStore(names, false); // counts rows only, writes no dead row
         this.parked = new ParkedStore(names, retries);
         this.orphanRestore = new OrphanRestore(
-                names, new Resender(names, config), XidPartitions.lockWait(config.partitions()));
-        this.restoreOrphans = config.partitions().restoreOrphans();
+                names, new Resender(names, config), XidPartitions.lockWait(tuning));
         this.recovery = new XidRecovery(names, config);
-        this.autoRecovery = config.recovery().xidRegression().equals("auto");
+        this.autoRecovery = tuning.xidRegression().equals("auto");
         // the database clock for both ends, so instances with skewed clocks agree
         this.sinceSuccess = "select extract(epoch from clock_timestamp() - succeeded_at)::float8 from "
                 + names.maintenance();
         this.succeeded = "insert into " + names.maintenance() + " (succeeded_at) values (clock_timestamp())"
                 + " on conflict (id) do update set succeeded_at = excluded.succeeded_at";
-        this.staleAfter = config.partitions().maintenanceInterval().multipliedBy(STALE_INTERVALS);
-        this.cursorShards = Cursors.shardCount(names);
-        this.deadIndex = new DeadIndexBuilder(db, names, config.partitions().maintenanceInterval(), detachLockTimeout,
-                socket);
+        this.staleAfter = tuning.maintenanceInterval().multipliedBy(STALE_INTERVALS);
+        this.deadIndex = new DeadIndexBuilder(db, names, tuning.maintenanceInterval(), detachLockTimeout, socket);
         this.buildsDeadIndex = config.schema().bootstrap();
         this.deadRetention = config.deadLetters().retention();
-        this.redriveHistory = config.deadLetters().redriveHistory();
-        var cleanupTimeout = cleanupTimeout(config.networkTimeout());
+        this.redriveHistory = tuning.redriveHistory();
+        var cleanupTimeout = cleanupTimeout(tuning.networkTimeout());
         this.deleteOldKept = new AgedDelete(names.dead(), "status = 'kept' and failed_at", cleanupTimeout);
         this.deleteOldRedrives = new AgedDelete(names.redriven(), "at", cleanupTimeout);
-        this.cleanupBudget = config.partitions().maintenanceInterval();
+        this.cleanupBudget = tuning.maintenanceInterval();
         // due_at is set on every pending letter: the partial index finds them, not a scan of all the kept ones
         this.deadPending = "select count(*), coalesce(extract(epoch from now() - min(failed_at)), 0)::float8 from "
                 + names.dead() + " where status = 'pending' and due_at is not null";
@@ -267,7 +256,7 @@ public final class Maintenance {
         this.waiting = "select (select count(*) from " + names.retry() + " where waiting_since is not null),"
                 + " greatest(extract(epoch from now() - waiting_since), 0)::float8, topic, last_error from "
                 + names.retry() + " where waiting_since is not null order by waiting_since limit 1";
-        this.waitingAlertAfter = config.relay().waiting().alertAfter();
+        this.waitingAlertAfter = tuning.waitAlertAfter();
         // heads only, through the partial index <retry>_due; a key's later records have no next_attempt_at
         this.oldestRetried = "select greatest(coalesce(extract(epoch from now() - min(created_at)), 0), 0)::float8 from "
                 + names.retry() + " where next_attempt_at is not null and waiting_since is null";
@@ -325,11 +314,10 @@ public final class Maintenance {
      * restarts. The counter catching up does not end it (cursors still sit on pre-regression ticks and would skip the
      * rows written meanwhile): only ticks repaired below the recorded xmax with a consistent counter do, as the
      * recovery ({@link XidRecovery}) leaves them, or an operator deleting the row. While halted an ERROR at most once a
-     * minute says why no recovery ran. Also true, on this instance only, while the cursors' shard count differs from
-     * {@code outbox.shards} (see the class comment): its steps would read and write shards that no longer exist.
+     * minute says why no recovery ran.
      */
     public boolean halted() {
-        return halted || unanswered || mismatch != null;
+        return halted || unanswered;
     }
 
     /** The first check has no answer yet: a lock kept it from reading, so {@link #halted()} says nothing was found. */
@@ -339,18 +327,16 @@ public final class Maintenance {
 
     /** Why {@link #halted()}, for the relay's {@code drain()}. */
     public String haltReason() {
-        var m = mismatch;
-        if (m == null && !halted && unanswered) {
+        if (!halted && unanswered) {
             return "outbox could not check for an xid regression: a lock on " + names.halt() + " or on its ticks keeps"
                     + " the check from reading (a recovery holds one for its run); no regression was found";
         }
-        return m != null ? "outbox halted: " + mismatchText(m)
-                : "outbox halted: maintenance found the xid counter below a tick's xmax (see its ERROR log and README"
+        return "outbox halted: maintenance found the xid counter below a tick's xmax (see its ERROR log and README"
                         + " \"xid regression recovery\")";
     }
 
     /**
-     * The xid-regression check and the shard count check alone, without the maintenance lock: refreshes
+     * The xid-regression check alone, without the maintenance lock: refreshes
      * {@link #halted()} and returns it; never recovers, and leaves the ERROR to the run that says why it did not. Each
      * read waits at most {@link #SHARDS_LOCK_TIMEOUT} for a lock on its table, which a recovery holds for its run:
      * after that the last answer stands, and before any, {@link #unanswered()}, so no worker starts on ticks a
@@ -384,37 +370,10 @@ public final class Maintenance {
             }) == null && !xidChecked) {
                 unanswered = true;
             }
-            checkShards(c);
             return halted();
         } catch (SQLException e) {
             throw db.translate(e);
         }
-    }
-
-    /**
-     * Refreshes {@link #mismatch} and returns it: the cursors' shard count while it differs from this instance's. Its
-     * read waits at most {@link #SHARDS_LOCK_TIMEOUT} for a lock on the cursor table (a recovery holds one): after
-     * that the last answer stands until the next run.
-     */
-    @Nullable
-    private Integer checkShards(Connection c) throws SQLException {
-        var present = briefly(c, () -> {
-            try (var st = c.createStatement()) {
-                return (int) Sql.queryLong(st, cursorShards);
-            }
-        });
-        if (present == null) {
-            return mismatch;
-        }
-        Integer found = present == 0 || present == shards ? null : present;
-        var before = mismatch;
-        mismatch = found;
-        if (found == null && before != null) {
-            mismatchLogged.set(System.nanoTime() - LOG_INTERVAL); // a later mismatch is logged at once
-            log.info("outbox relay resumed: {} holds cursors for {} shards again, as outbox.shards", names.cursor(),
-                    shards);
-        }
-        return found;
     }
 
     /**
@@ -445,17 +404,8 @@ public final class Maintenance {
         }
     }
 
-    private String mismatchText(int present) {
-        return names.cursor() + " holds cursors for " + present + " shards, but this instance runs with outbox.shards = "
-                + shards + ": another instance resharded " + names.base() + " since this one started, or this"
-                + " one runs an old config. Its relay takes no shards and its maintenance runs no step until they"
-                + " match, and its writes are refused from its heartbeat's next beat on; restart it with"
-                + " outbox.shards = " + present + " or unset, which takes the cursors' count";
-    }
-
     /**
-     * One run; false without maintaining anything when another session holds the maintenance lock or the cursors'
-     * shard count differs from this instance's. While halted only
+     * One run; false without maintaining anything when another session holds the maintenance lock. While halted only
      * the reads, the xid check and, in {@code auto} mode, the recovery run (true with {@code halt}: no lock is
      * taken).
      */
@@ -465,13 +415,6 @@ public final class Maintenance {
             c.setAutoCommit(true);
             check = checkXidCounter(c); // first: nothing may keep it from running
             readLastSuccess(c, check != null);
-            var present = checkShards(c);
-            if (present != null) {
-                if (due(mismatchLogged)) {
-                    log.error(mismatchText(present) + "; this ERROR repeats at most once a minute");
-                }
-                return false; // nothing maintained
-            }
             if (check != null && !autoRecovery) {
                 logHalt(check, XidRecovery.HALT_MODE);
                 return true;
@@ -504,15 +447,16 @@ public final class Maintenance {
         }
         lastSuccess = System.nanoTime() - (long) (age * 1e9);
         if (!halted && age > staleAfter.toMillis() / 1e3 && due(staleLogged)) {
-            log.warn("outbox maintenance of {} has not completed a run on any instance for {} s, over {} ×"
-                    + " outbox.partitions.maintenanceInterval: a step failed in every run, and its WARN \"outbox"
+            log.warn("outbox maintenance of {} has not completed a run on any instance for {} s, over {} times"
+                    + " its interval of {}: a step failed in every run, and its WARN \"outbox"
                     + " maintenance step '<name>' failed\" names it. Partitions stall only behind 'finish pending"
                     + " detach', 'partition extension', 'cursor read', 'checkpoint' or 'partition drop', and ticks pile"
                     + " up only behind 'cursor read', 'checkpoint' or 'tick cleanup'; any other step leaves both going. If runs never"
                     + " start, a session holds the maintenance lock: select pid from pg_locks where locktype ="
                     + " 'advisory' and classid"
                     + " = {} and objid = {} and objsubid = 2", names.base(), Math.round(age), STALE_INTERVALS,
-                    Integer.toUnsignedLong(names.internalNamespace()), TableNames.LOCK_MAINTENANCE);
+                    staleAfter.dividedBy(STALE_INTERVALS), Integer.toUnsignedLong(names.internalNamespace()),
+                    TableNames.LOCK_MAINTENANCE);
         }
     }
 
@@ -713,22 +657,12 @@ public final class Maintenance {
                 int left = 0;
                 boolean failed = false;
                 for (var orphan : partitions.dropOrphans(c, horizon, detachLockTimeout)) {
-                    if (orphan.ours() && restoreOrphans) {
+                    if (orphan.ours()) {
                         // in xid order: after a failure, a later one may hold the left rows' keys' later rows
                         if (failed || !restored(c, orphan.table(), horizon)) {
                             failed = true;
                             left++;
                         }
-                    } else if (orphan.ours()) {
-                        left++;
-                        // the columns send writes: moved rows are new messages, with new ids and xids
-                        log.error("outbox table {} is a range of {} detached as relayed, yet it holds rows at or above"
-                                + " xid {}, the slowest shard's horizon: they lie outside the outbox, so the relay"
-                                + " cannot deliver them. It is kept (gauge outbox.partitions.orphaned); move them back"
-                                + " with insert into {} (shard, message_id, topic, key, payload, headers) select shard,"
-                                + " message_id, topic, key, payload, headers from {} where xid >= '{}'::xid8 (they get"
-                                + " new ids, so they are delivered after later messages of their keys), then drop it",
-                                orphan.table(), names.base(), horizon, names.base(), orphan.table(), horizon);
                     } else {
                         left++;
                         log.error("outbox table {} holds rows and is a range {}: rows of a range detached before the"

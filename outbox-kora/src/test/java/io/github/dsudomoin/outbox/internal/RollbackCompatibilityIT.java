@@ -213,7 +213,7 @@ class RollbackCompatibilityIT {
             schema = new OutboxSchema(db, cfg);
             schema.start();
             names = schema.names();
-            var partitions = new XidPartitions(names, cfg.partitions());
+            var partitions = new XidPartitions(names, cfg);
             partitions.clock = XidPartitionsIT.at(12, 0); // outside the window
             try (var holder = TestDb.connect(); var c = TestDb.connect()) {
                 if (!state.equals("empty")) { // rows in the tail, then a swap that fails on a young lock holder

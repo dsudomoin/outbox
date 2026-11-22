@@ -29,7 +29,7 @@ import org.slf4j.LoggerFactory;
  * A tick also records the outbox id sequence's high-water mark, which sizes batches by data volume.
  *
  * <p>A tick C also records in {@code dirty} the shards that gained rows since the newest tick P before it, as a bitmap
- * of {@code outbox.shards} bits (bit s, leftmost 0, set for shard s; 128 bytes at 1024 shards), with no bits at all
+ * of shard-count bits (bit s, leftmost 0, set for shard s; 128 bytes at 1024 shards), with no bits at all
  * when no shard gained rows: a superset of the shards whose batch (P, C] is not empty, so the relay steps only those
  * (see {@link Cursors#positions}), and maintenance's checkpoint moves every other shard past C without a write (see
  * {@link Cursors}). Null means every shard: the first tick, a tick made while the table held no tick, and ticks made
@@ -171,7 +171,7 @@ public final class Ticks {
     /** When a failed probe was last logged ({@code nanoTime}), and how many went unlogged since. */
     private final LogLimit probeWarnings = new LogLimit(WARN_INTERVAL);
 
-    /** {@code shards}: {@code outbox.shards}, the length of a tick's {@code dirty} bitmap. */
+    /** {@code shards}: the outbox's shard count, the length of a tick's {@code dirty} bitmap. */
     public Ticks(TableNames names, int shards) {
         this.names = names;
         this.shards = shards;

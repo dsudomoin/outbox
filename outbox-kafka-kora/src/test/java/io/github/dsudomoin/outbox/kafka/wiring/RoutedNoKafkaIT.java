@@ -49,9 +49,14 @@ class RoutedNoKafkaIT implements KoraAppTestConfigModifier {
                 }
                 outbox {
                   table = %s
+                  relay.workers = 2
+                  # the library's own Tuning: read by the test app's TunedKoraConfig
                   shards = 4
-                  relay { workers = 2, minTickInterval = 5ms, idlePollInterval = 100ms, headFailuresBeforeDivert = 1 }
-                  partitions { xidsPerPartition = 1000000, premake = 4 }
+                  minTickInterval = 5ms
+                  idlePollInterval = 100ms
+                  headFailuresBeforeDivert = 1
+                  xidsPerPartition = 1000000
+                  premake = 4
                 }
                 """.formatted(TestDataSources.jdbcUrl(), TestDataSources.user(), TestDataSources.password(), table));
     }

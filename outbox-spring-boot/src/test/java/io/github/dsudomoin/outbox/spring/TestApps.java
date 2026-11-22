@@ -25,7 +25,11 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
-/** Apps for the auto-configuration's ITs: Boot's own DataSource over the tests' Postgres, fast relay settings. */
+/**
+ * Apps for the auto-configuration's ITs: Boot's own DataSource over the tests' Postgres, fast relay settings. The
+ * library's own timings ({@code Tuning}) are its defaults here; a test that needs others gives the app its own
+ * {@code TestOutboxConfig} bean.
+ */
 final class TestApps {
 
     private TestApps() {}
@@ -73,8 +77,7 @@ final class TestApps {
             "spring.datasource.password=" + TestDataSources.password(),
             "spring.flyway.enabled=false", "spring.liquibase.enabled=false",
             "outbox.table=" + TestSql.uniqueTable(), "outbox.inbox.table=" + TestSql.uniqueTable(),
-            "outbox.shards=4", "outbox.relay.workers=2", "outbox.relay.idle-poll-interval=20ms",
-            "outbox.relay.min-tick-interval=5ms", "outbox.relay.batch-timeout=5s",
+            "outbox.relay.workers=2", "outbox.relay.batch-timeout=5s",
             "outbox.relay.shutdown-timeout=5s", "outbox.relay.retry.initial-delay=50ms",
             "outbox.relay.retry.max-delay=500ms"), Stream.of(more)).toArray(String[]::new);
     }

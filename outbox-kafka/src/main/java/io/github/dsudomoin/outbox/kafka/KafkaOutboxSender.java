@@ -29,6 +29,7 @@ import io.github.dsudomoin.outbox.internal.BatchClassifier;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.RecordScope;
 import io.github.dsudomoin.outbox.internal.ShardProcessor;
+import io.github.dsudomoin.outbox.internal.Tuning;
 import jakarta.annotation.Nullable;
 import java.time.Clock;
 import java.time.Duration;
@@ -201,7 +202,11 @@ public final class KafkaOutboxSender implements AutoCloseable {
      * and {@code max.in.flight.requests.per.connection=1} for the pools of held calls (see the class javadoc), and a
      * factory that builds from its own configuration silently loses them: oversized records share producer batches
      * again, and a held record may reach its topic after a later record of its key. A set
-     * {@code client.id} arrives with a per-producer suffix unless {@link KafkaOutboxConfig#clientIdSuffix} is false.
+     * {@code client.id} arrives with a per-producer suffix, as {@code <client.id>-outbox-<n>} and
+     * {@code <client.id>-outbox-unbatched-<n>}, and for calls under {@code relay.retry.holdPermanent}
+     * {@code <client.id>-outbox-held-<n>} and {@code <client.id>-outbox-held-unbatched-<n>}, so that each producer
+     * registers its own JMX metrics; a broker quota on the bare id does not match them. An unset {@code client.id}
+     * Kafka makes unique itself.
      *
      * <p>Each call must return a new producer that nobody else uses, and {@code close(Duration.ZERO)} on it must close
      * it physically and abort its queued batches. A factory that shares or caches producers, such as spring-kafka's
@@ -218,17 +223,17 @@ public final class KafkaOutboxSender implements AutoCloseable {
     /** For tests: the four pools of the public constructors, on {@code clock} and {@code nanos}. */
     KafkaOutboxSender(KafkaOutboxConfig config, Function<Map<String, Object>, Producer<byte[], byte[]>> producers,
             Clock clock, LongSupplier nanos) {
-        this(producerConfig(config.driverProperties()), config.clientIdSuffix(), producers, clock, nanos);
+        this(producerConfig(config.driverProperties()), producers, clock, nanos);
     }
 
-    private KafkaOutboxSender(ProducerConfig config, boolean suffix,
+    private KafkaOutboxSender(ProducerConfig config,
             Function<Map<String, Object>, Producer<byte[], byte[]>> producers, Clock clock, LongSupplier nanos) {
-        this(() -> producers.apply(properties(config, suffix ? "-outbox-" : null)),
-                () -> producers.apply(unbatched(properties(config, suffix ? "-outbox-unbatched-" : null))),
+        this(() -> producers.apply(properties(config, "-outbox-")),
+                () -> producers.apply(unbatched(properties(config, "-outbox-unbatched-"))),
                 config.getInt(MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION) == 1 ? null
-                        : () -> producers.apply(oneInFlight(properties(config, suffix ? "-outbox-held-" : null))),
+                        : () -> producers.apply(oneInFlight(properties(config, "-outbox-held-"))),
                 config.getInt(MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION) == 1 ? null : () -> producers.apply(
-                        unbatched(oneInFlight(properties(config, suffix ? "-outbox-held-unbatched-" : null)))),
+                        unbatched(oneInFlight(properties(config, "-outbox-held-unbatched-")))),
                 Duration.ofMillis(config.getInt(DELIVERY_TIMEOUT_MS_CONFIG)),
                 Duration.ofMillis(config.getLong(MAX_BLOCK_MS_CONFIG)), clock, nanos);
     }
@@ -248,12 +253,12 @@ public final class KafkaOutboxSender implements AutoCloseable {
     /**
      * A fresh copy of the properties for one producer. A set {@code client.id} becomes a prefix: Kafka registers a
      * producer's JMX metrics under its client id, so pooled producers sharing one would overwrite each other's metrics,
-     * and closing any of them would unregister the metrics of the rest. A null {@code infix} leaves it as set.
+     * and closing any of them would unregister the metrics of the rest.
      */
-    private static Map<String, Object> properties(ProducerConfig config, @Nullable String infix) {
+    private static Map<String, Object> properties(ProducerConfig config, String infix) {
         var properties = config.originals();
         // an unset one Kafka replaces with a unique producer-<n>
-        if (infix != null && properties.containsKey(CLIENT_ID_CONFIG)) {
+        if (properties.containsKey(CLIENT_ID_CONFIG)) {
             properties.put(CLIENT_ID_CONFIG,
                     config.getString(CLIENT_ID_CONFIG) + infix + PRODUCERS_MADE.incrementAndGet());
         }
@@ -486,22 +491,24 @@ public final class KafkaOutboxSender implements AutoCloseable {
     public void warnAboveBatchTimeout(OutboxConfig outbox) {
         warnIfLongerThan("outbox.relay.batchTimeout", outbox.relay().batchTimeout(), "The relay cancels a call at"
                 + " batchTimeout; the sender ends it just before, keeps acked records as delivered and retries the"
-                + " rest, so slow sends end as retries");
+                + " rest, so slow sends end as retries", "Raise outbox.relay.batchTimeout or lower");
     }
 
-    /** {@link #warnAboveBatchTimeout} for the dead-letter pass's {@code outbox.deadLetters.timeout}. */
+    /** {@link #warnAboveBatchTimeout} for the dead-letter pass's hook call ({@link Tuning#deadLetterTimeout}). */
     @InternalApi
     public void warnAboveDeadLetterTimeout(OutboxConfig outbox) {
-        warnIfLongerThan("outbox.deadLetters.timeout", outbox.deadLetters().timeout(), "The dead-letter pass abandons"
-                + " a hook call at its timeout and hands its letters again after a backoff, so slow dead-letter sends"
-                + " end as retries and letters acked meanwhile repeat on their dead-letter topic");
+        warnIfLongerThan("the dead-letter hook's call timeout", Tuning.of(outbox).deadLetterTimeout(), "The dead-letter"
+                + " pass abandons a hook call at its timeout and hands its letters again after a backoff, so slow"
+                + " dead-letter sends end as retries and letters acked meanwhile repeat on their dead-letter topic",
+                "Lower");
     }
 
-    private void warnIfLongerThan(String setting, Duration limit, String effect) {
+    /** {@code remedy}: the start of the advice, which goes on with "the producer timeouts". */
+    private void warnIfLongerThan(String setting, Duration limit, String effect, String remedy) {
         if (longestCall.compareTo(limit) > 0) {
             log.warn("A Kafka outbox call can take up to {} (delivery.timeout.ms + 5 s + max.block.ms), longer than "
-                    + "{} ({}). {}. Raise {} or lower the producer timeouts in outbox.kafka.driverProperties",
-                    longestCall, setting, limit, effect, setting);
+                    + "{} ({}). {}. {} the producer timeouts in outbox.kafka.driverProperties",
+                    longestCall, setting, limit, effect, remedy);
         }
     }
 

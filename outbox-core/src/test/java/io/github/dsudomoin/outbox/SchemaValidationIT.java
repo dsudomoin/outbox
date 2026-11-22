@@ -138,7 +138,7 @@ class SchemaValidationIT {
             Thread.sleep(5);
         }
         assertThat(runtime.maintenance().runOnce()).isTrue();
-        assertThat(runtime.admin().status().premade()).isGreaterThanOrEqualTo(config.partitions().premake());
+        assertThat(runtime.admin().status().premade()).isGreaterThanOrEqualTo(config.premake());
     }
 
     @Test

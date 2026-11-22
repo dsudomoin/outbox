@@ -24,6 +24,7 @@ import io.github.dsudomoin.outbox.kafka.TestKafka;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
+import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
@@ -73,8 +74,7 @@ class KafkaOutboxAutoConfigurationIT {
             "spring.datasource.password=" + TestDataSources.password(),
             "spring.flyway.enabled=false", "spring.liquibase.enabled=false",
             "outbox.table=" + TestSql.uniqueTable(), "outbox.inbox.table=" + TestSql.uniqueTable(),
-            "outbox.shards=4", "outbox.relay.workers=2", "outbox.relay.idle-poll-interval=20ms",
-            "outbox.relay.min-tick-interval=5ms", "outbox.relay.batch-timeout=5s",
+            "outbox.relay.workers=2", "outbox.relay.batch-timeout=5s",
             "outbox.relay.shutdown-timeout=5s", "outbox.relay.retry.initial-delay=50ms",
             "outbox.relay.retry.max-delay=500ms"), Stream.of(more)).toArray(String[]::new);
         return new ApplicationContextRunner().withUserConfiguration(Boot.class).withPropertyValues(properties);
@@ -399,13 +399,12 @@ class KafkaOutboxAutoConfigurationIT {
                     Map.entry("max.block.ms", "1000"), Map.entry("linger.ms", "7"));
                 assertThat(properties.deadLetterTopic()).isNull();
                 assertThat(properties.fallback()).isTrue();
-                assertThat(properties.clientIdSuffix()).isTrue();
             });
     }
 
     @Test
     void toStringLeavesOutDriverValues() {
-        var properties = new KafkaOutboxProperties(Map.of("sasl.jaas.config", "secret"), "{topic}.dlq", true, true);
+        var properties = new KafkaOutboxProperties(Map.of("sasl.jaas.config", "secret"), "{topic}.dlq", true);
         assertThat(properties.toString())
             .doesNotContain("secret").contains("sasl.jaas.config", "{topic}.dlq", "fallback=true");
     }
@@ -427,17 +426,23 @@ class KafkaOutboxAutoConfigurationIT {
         }
     }
 
-    /** Only with the hook active: without a dead-letter topic no call is bounded by that timeout. */
+    /**
+     * Only with the hook active: without a dead-letter topic no call is bounded by that timeout. The hook's timeout is
+     * the library's own, so the app's own config gives a short one.
+     */
     @Test
     void shortDeadLetterTimeoutWarns() {
         try (var err = new CapturedStderr()) {
-            runner("outbox.dead-letters.timeout=5s", "outbox.kafka.dead-letter-topic={topic}.dlq")
+            runner("outbox.kafka.dead-letter-topic={topic}.dlq").withBean(TestOutboxConfig.class,
+                    () -> new TestOutboxConfig().deadLettersTimeout(Duration.ofSeconds(5)))
                 .run(context -> assertThat(context).hasNotFailed());
-            assertThat(err.text()).contains("WARN").contains("outbox.deadLetters.timeout (PT5S)")
+            assertThat(err.text()).contains("WARN").contains("the dead-letter hook's call timeout (PT5S)")
                 .contains(DEAD_LETTERS_EFFECT);
         }
         try (var err = new CapturedStderr()) {
-            runner("outbox.dead-letters.timeout=5s").run(context -> assertThat(context).hasNotFailed());
+            runner().withBean(TestOutboxConfig.class,
+                    () -> new TestOutboxConfig().deadLettersTimeout(Duration.ofSeconds(5)))
+                .run(context -> assertThat(context).hasNotFailed());
             assertThat(err.text()).doesNotContain(DEAD_LETTERS_EFFECT);
         }
         try (var err = new CapturedStderr()) {
@@ -476,22 +481,18 @@ class KafkaOutboxAutoConfigurationIT {
         }
     }
 
-    /** The producer's own log names it by the set client.id as it is with client-id-suffix=false, suffixed without. */
+    /** The producer's own log names it by the set client.id with the sender's per-producer suffix. */
     @Test
-    void clientIdSuffixOffKeepsTheClientId() {
+    void aSetClientIdIsSuffixed() {
         var topic = TestKafka.createTopic(1);
-        for (var suffix : List.of(true, false)) {
-            try (var err = new CapturedStderr()) {
-                runner("outbox.enabled=false", "outbox.kafka.driver-properties.client.id=orders-svc",
-                    "outbox.kafka.client-id-suffix=" + suffix)
-                    .run(context -> {
-                        var record = record(topic);
-                        context.getBean(KafkaOutboxSender.class).send(List.of(record));
-                    });
-                assertThat(err.text()).contains("[Producer clientId=orders-svc");
-                assertThat(err.text().contains("[Producer clientId=orders-svc]")).as("client-id-suffix=" + suffix)
-                    .isEqualTo(!suffix);
-            }
+        try (var err = new CapturedStderr()) {
+            runner("outbox.enabled=false", "outbox.kafka.driver-properties.client.id=orders-svc")
+                .run(context -> {
+                    var record = record(topic);
+                    context.getBean(KafkaOutboxSender.class).send(List.of(record));
+                });
+            assertThat(err.text()).contains("[Producer clientId=orders-svc-outbox-")
+                .doesNotContain("[Producer clientId=orders-svc]");
         }
     }
 

@@ -37,7 +37,7 @@ public sealed interface Outcome {
 
     /**
      * Not now: the record steps aside (it is parked) so the later records of its (topic, key) go on, and is handed
-     * again at {@code now + outbox.relay.requeue.delay}, or before that ahead of the next record of its key while the
+     * again 1 s later, or before that ahead of the next record of its key while the
      * key's parked records fit in a call.
      * Not a failure: it counts no attempt and does not pause the shard. Each requeue adds one to
      * {@link OutboxRecord#requeues()}; past {@code outbox.relay.requeue.maxRequeues} the record goes to the dead table.

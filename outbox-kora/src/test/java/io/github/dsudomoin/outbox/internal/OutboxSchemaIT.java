@@ -81,7 +81,7 @@ class OutboxSchemaIT {
             assertThat(queryString(c, "select pg_get_indexdef(to_regclass(?))", n.dead() + "_due"))
                     .endsWith(" (due_at) WHERE (due_at IS NOT NULL)");
             assertThat(queryString(c, "select pg_get_partkeydef(to_regclass(?))", n.base())).isEqualTo("RANGE (xid)");
-            assertThat(new XidPartitions(n, config.partitions()).premadeAhead(c))
+            assertThat(new XidPartitions(n, config).premadeAhead(c))
                     .isGreaterThanOrEqualTo(config.premake());
             assertThat(PartitionDdl.listRanges(c, n.base()))
                     .filteredOn(b -> b.to() == null)
@@ -100,7 +100,7 @@ class OutboxSchemaIT {
         var schema = new OutboxSchema(db, config);
         schema.start();
         var n = schema.names();
-        var partitions = new XidPartitions(n, config.partitions());
+        var partitions = new XidPartitions(n, config);
         PartitionDdl.Bound lowest;
         try (var c = TestDb.connect()) {
             lowest = PartitionDdl.listRanges(c, n.base()).stream()
@@ -411,26 +411,14 @@ class OutboxSchemaIT {
     @Test
     void rejectsBadConfigBeforeAnyDdl() throws Exception {
         List<Map.Entry<String, Consumer<TestOutboxConfig>>> cases = List.of(
-                Map.entry("outbox.shards", c -> c.shards(0)),
-                Map.entry("outbox.shards", c -> c.shards(Short.MAX_VALUE + 1)),
                 Map.entry("outbox.relay.workers", c -> c.workers(0)),
                 Map.entry("outbox.relay.batchSize", c -> c.batchSize(0)),
-                Map.entry("outbox.relay.maxTicksPerBatch", c -> c.maxTicksPerBatch(0)),
-                Map.entry("outbox.relay.minTickInterval", c -> c.minTickInterval(Duration.ofMillis(-1))),
-                Map.entry("outbox.relay.idlePollInterval", c -> c.idlePollInterval(Duration.ZERO)),
                 Map.entry("outbox.relay.batchTimeout", c -> c.batchTimeout(Duration.ZERO)),
                 Map.entry("outbox.relay.shutdownTimeout", c -> c.shutdownTimeout(Duration.ofMillis(-1))),
-                Map.entry("outbox.relay.headFailuresBeforeDivert", c -> c.headFailuresBeforeDivert(0)),
-                Map.entry("outbox.relay.cursorAnchorInterval", c -> c.cursorAnchorInterval(Duration.ZERO)),
-                Map.entry("outbox.relay.cursorAnchorInterval", c -> c.maintenanceInterval(Duration.ofMinutes(2))
-                        .cursorAnchorInterval(Duration.ofMinutes(1))),
                 Map.entry("outbox.relay.retry.initialDelay", c -> c.retry(Duration.ZERO, Duration.ofSeconds(1), 0)),
                 Map.entry("outbox.relay.retry.maxDelay", c -> c.retry(Duration.ofSeconds(2), Duration.ofSeconds(1), 0)),
                 Map.entry("outbox.relay.retry.maxAttempts",
                         c -> c.retry(Duration.ofSeconds(1), Duration.ofSeconds(1), -1)),
-                Map.entry("outbox.partitions.xidsPerPartition", c -> c.xidsPerPartition(999)),
-                Map.entry("outbox.partitions.premake", c -> c.premake(1)),
-                Map.entry("outbox.partitions.maintenanceInterval", c -> c.maintenanceInterval(Duration.ZERO)),
                 Map.entry("outbox.partitions.tailConversion.window",
                         c -> c.tailConversion("3-5", Duration.ofSeconds(1))));
 
@@ -462,7 +450,7 @@ class OutboxSchemaIT {
         for (int shards : new int[] {0, Short.MAX_VALUE + 1}) {
             assertThatThrownBy(() -> new PgOutbox(db, schema, shards, () -> {}, TestTelemetry.kora()))
                     .isInstanceOf(IllegalArgumentException.class)
-                    .hasMessageStartingWith("outbox.shards ");
+                    .hasMessageStartingWith("outbox shard count must be within 1..32767: ");
         }
     }
 
@@ -575,7 +563,7 @@ class OutboxSchemaIT {
                         + " returning tableoid::regclass::text"))
                 .startsWith(n.partitionPrefix())
                 .isNotEqualTo(n.tail());
-        var partitions = new XidPartitions(n, config.partitions());
+        var partitions = new XidPartitions(n, config);
         partitions.ensurePremade(c); // maintenance finishes the extension
         assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(4);
     }

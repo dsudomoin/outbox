@@ -11,7 +11,7 @@ import java.util.UUID;
 /**
  * A stored message as handed to the handler; {@code attempts} counts earlier failed deliveries, {@code requeues} the
  * times it was requeued ({@link Outcome#requeue()}) before this attempt. {@code shard}: the shard the relay read it
- * from, {@code hash(topic, key) mod outbox.shards} (random for a keyless message), {@code -1} when unknown (built by
+ * from, {@code hash(topic, key) mod} the shard count (random for a keyless message), {@code -1} when unknown (built by
  * hand, rebuilt from a dead letter).
  *
  * <p>The {@code key} and {@code payload} arrays belong to the relay: it writes them back on a retry, park or dead

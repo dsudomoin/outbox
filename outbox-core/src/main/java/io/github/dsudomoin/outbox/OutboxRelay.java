@@ -15,6 +15,7 @@ import io.github.dsudomoin.outbox.internal.ShardProcessor.ShardStatus;
 import io.github.dsudomoin.outbox.internal.ShardProcessor;
 import io.github.dsudomoin.outbox.internal.SocketBound;
 import io.github.dsudomoin.outbox.internal.Ticks;
+import io.github.dsudomoin.outbox.internal.Tuning;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -46,23 +47,23 @@ import org.slf4j.LoggerFactory;
  * The background relay: {@code relay.workers} daemon threads {@code outbox-relay-N}, each repeatedly making a tick when
  * due and stepping groups of candidate shards, a {@link ShardProcessor} step of each group in its own transaction
  * ({@link Round}: the workers share one read of the cursors per latest tick); plus maintenance right after start and
- * then every {@code partitions.maintenanceInterval} on the daemon thread {@code outbox-maintenance}. Neither starts
+ * then every {@link Tuning#maintenanceInterval()} on the daemon thread {@code outbox-maintenance}. Neither starts
  * when {@code relay.enabled} is false; {@link #drain()} works either way. Idle workers park until {@link #wake()}, a
  * new tick made by this relay, or the next tick attempt is due, so an idle relay does not spin; an idle attempt makes a
- * tick only when the newest tick of any instance is about {@code idlePollInterval} old, so an idle cluster makes about
- * one tick per {@code idlePollInterval}. A shard is a candidate only when a tick after its effective tick holds its
+ * tick only when the newest tick of any instance is about {@link Tuning#idlePollInterval()} old, so an idle cluster
+ * makes about one tick per that interval. A shard is a candidate only when a tick after its effective tick holds its
  * rows (each tick records the shards that gained rows, see {@link Ticks}), its batch is in progress or a retry head or
  * parked row is due, so a shard without new rows costs no step: maintenance's checkpoint moves its effective tick on
  * (see {@link Cursors}), which keeps tick cleanup and partition drops going. Every tick this relay makes wakes all its
  * workers, which spread the tick's shards with new rows between them, in groups. A wake-up that cannot make a tick yet
- * ({@code minTickInterval}) only brings the tick forward, so under a high commit rate the workers read cursors per
+ * ({@link Tuning#minTickInterval()}) only brings the tick forward, so under a high commit rate the workers read cursors per
  * tick, not per commit. While {@link Maintenance#halted()} the workers take no shards. Dead letters go to the
  * {@link DeadLetterPass} on the daemon thread {@code outbox-dead-letters} (also not started when the relay is disabled;
  * {@link #drain()} ends with one run of it): a run right after start, then after each committed step that moved a row
- * to the dead table, when the earliest letter is due, and at least every {@code maintenanceInterval}; so a slow or
- * failing hook never holds up a shard step. With {@code relay.enabled} false and {@code relay.ticksWithoutRelay} above
- * zero, the daemon thread {@code outbox-ticker} makes the ticks of this instance's commits instead ({@link Ticker}), so
- * a backlog written while no relay runs comes in batches.
+ * to the dead table, when the earliest letter is due, and at least every maintenance interval; so a slow or
+ * failing hook never holds up a shard step. With {@code relay.enabled} false and {@link Tuning#ticksWithoutRelay()}
+ * above zero, the daemon thread {@code outbox-ticker} makes the ticks of this instance's commits instead
+ * ({@link Ticker}), so a backlog written while no relay runs comes in batches.
  */
 public final class OutboxRelay implements AutoCloseable {
 
@@ -80,6 +81,8 @@ public final class OutboxRelay implements AutoCloseable {
     private final OutboxTransactions db;
     private final OutboxConfig config;
     private final OutboxConfig.RelayConfig relay;
+    private final Tuning tuning;
+    private final int shards;
     private final Maintenance maintenance;
     private final Ticks ticks;
     private final Cursors cursors;
@@ -98,7 +101,7 @@ public final class OutboxRelay implements AutoCloseable {
      */
     private final long roundWaitNanos;
     /**
-     * {@code relay.connectionHold}: how long a pass keeps its pooled connection before it hands it back and the
+     * {@link Tuning#connectionHold()}: how long a pass keeps its pooled connection before it hands it back and the
      * worker starts the next pass with another; a backlog would hold one for its whole length, past the pool's
      * maxLifetime and its leak detection.
      */
@@ -215,36 +218,38 @@ public final class OutboxRelay implements AutoCloseable {
         this.db = db;
         this.config = config;
         this.relay = config.relay();
+        this.tuning = Tuning.of(config);
+        this.shards = OutboxSchema.shards(config);
         this.maintenance = maintenance;
-        this.ticks = new Ticks(schema.names(), config.shards());
-        this.cursors = new Cursors(schema.names(), config.shards());
+        this.ticks = new Ticks(schema.names(), shards);
+        this.cursors = new Cursors(schema.names(), shards);
         this.deadLetters = deadLetters;
         this.processor = new ShardProcessor(schema.names(), config, handler, telemetry, deadLetters.active(), clock);
         this.telemetry = telemetry;
         // the pass runs only where the relay does
         this.heartbeat = new Heartbeat(db, schema, config, relay.enabled() && deadLetters.active(), clock);
-        this.idleNanos = relay.idlePollInterval().toNanos();
-        this.minTickNanos = relay.minTickInterval().toNanos();
-        this.passBound = relay.connectionHold().toNanos();
+        this.idleNanos = tuning.idlePollInterval().toNanos();
+        this.minTickNanos = tuning.minTickInterval().toNanos();
+        this.passBound = tuning.connectionHold().toNanos();
         this.retryInitialNanos = relay.retry().initialDelay().toNanos();
         this.retryMaxNanos = relay.retry().maxDelay().toNanos();
         this.roundWaitNanos = Math.max(TimeUnit.SECONDS.toNanos(1), 5 * idleNanos);
         this.roundReadSince = System.nanoTime() - roundWaitNanos;
-        this.socket = new SocketBound(config.networkTimeout());
+        this.socket = new SocketBound(tuning.networkTimeout());
         this.idleTickAge = Duration.ofNanos(Math.max(minTickNanos, idleNanos - idleNanos / 4));
         this.wakeTickAge = Duration.ofNanos(minTickNanos - minTickNanos / 4);
         this.lastTickAttempt = System.nanoTime() - idleNanos; // the first pass ticks
-        this.stepStarted = new AtomicLongArray(config.shards());
-        this.isolated = new AtomicIntegerArray(config.shards());
-        this.failedAlone = new AtomicIntegerArray(config.shards());
-        this.retryAfter = new AtomicLongArray(config.shards());
-        this.expected = new AtomicIntegerArray(config.shards());
-        this.batchRows = new AtomicIntegerArray(config.shards());
-        this.inFlight = new AtomicIntegerArray(config.shards());
-        this.wanted = new AtomicIntegerArray(config.shards());
-        this.steppedTick = new AtomicLongArray(config.shards());
+        this.stepStarted = new AtomicLongArray(shards);
+        this.isolated = new AtomicIntegerArray(shards);
+        this.failedAlone = new AtomicIntegerArray(shards);
+        this.retryAfter = new AtomicLongArray(shards);
+        this.expected = new AtomicIntegerArray(shards);
+        this.batchRows = new AtomicIntegerArray(shards);
+        this.inFlight = new AtomicIntegerArray(shards);
+        this.wanted = new AtomicIntegerArray(shards);
+        this.steppedTick = new AtomicLongArray(shards);
         long created = System.nanoTime();
-        for (int i = 0; i < config.shards(); i++) {
+        for (int i = 0; i < shards; i++) {
             stepStarted.set(i, created);
         }
     }
@@ -257,7 +262,7 @@ public final class OutboxRelay implements AutoCloseable {
 
     /**
      * Starts the workers, the dead-letter thread and maintenance, unless {@code relay.enabled} is false, which starts
-     * the {@link Ticker} instead when {@code relay.ticksWithoutRelay} is above zero. Runs once:
+     * the {@link Ticker} instead when {@link Tuning#ticksWithoutRelay()} is above zero. Runs once:
      * a second call, or one after {@link #close()}, throws {@link IllegalStateException}, since {@code close()} stops
      * only the threads of one start.
      */
@@ -271,12 +276,12 @@ public final class OutboxRelay implements AutoCloseable {
         } catch (SQLException | RuntimeException e) {
             log.debug("outbox could not read the database's clock at start: the JVM's until the first beat", e);
         }
-        heartbeat.start(); // with the relay disabled too: the reshard guard counts writers
+        heartbeat.start(); // with the relay disabled too: its row reports this instance's routes
         if (!relay.enabled()) {
-            var every = relay.ticksWithoutRelay();
+            var every = tuning.ticksWithoutRelay();
             if (every.isZero()) {
                 log.info("outbox relay disabled (outbox.relay.enabled = false); messages are delivered only by"
-                        + " drain(); this instance makes no ticks (outbox.relay.ticksWithoutRelay = 0)");
+                        + " drain(); this instance makes no ticks");
                 return;
             }
             try {
@@ -296,7 +301,7 @@ public final class OutboxRelay implements AutoCloseable {
                 throw e;
             }
             log.info("outbox relay disabled (outbox.relay.enabled = false); messages are delivered only by drain();"
-                    + " this instance makes a tick every {} while it writes (outbox.relay.ticksWithoutRelay)", every);
+                    + " this instance makes a tick every {} while it writes", every);
             return;
         }
         try {
@@ -320,7 +325,7 @@ public final class OutboxRelay implements AutoCloseable {
         dead.setDaemon(true);
         deadLetterThread = dead;
         dead.start();
-        var maintenanceInterval = config.partitions().maintenanceInterval().toNanos();
+        var maintenanceInterval = tuning.maintenanceInterval().toNanos();
         var s = Executors.newSingleThreadScheduledExecutor(r -> {
             var t = new Thread(r, "outbox-maintenance");
             t.setDaemon(true);
@@ -328,7 +333,7 @@ public final class OutboxRelay implements AutoCloseable {
         });
         s.scheduleWithFixedDelay(this::runMaintenance, 0, maintenanceInterval, TimeUnit.NANOSECONDS);
         scheduler = s;
-        log.info("outbox relay started: {} workers over {} shards", threads.length, config.shards());
+        log.info("outbox relay started: {} workers over {} shards", threads.length, shards);
     }
 
     /**
@@ -668,7 +673,7 @@ public final class OutboxRelay implements AutoCloseable {
      * that fails after its hook call (its decisions could not be written) calls the hook again each time.
      */
     private void runDeadLetters() {
-        var interval = config.partitions().maintenanceInterval();
+        var interval = tuning.maintenanceInterval();
         long intervalNanos = interval.toNanos();
         int failures = 0;
         while (!stopping) {
@@ -711,7 +716,7 @@ public final class OutboxRelay implements AutoCloseable {
             maintenance.runOnce();
         } catch (Throwable t) {
             try {
-                log.error("outbox maintenance failed; next run in {}", config.partitions().maintenanceInterval(), t);
+                log.error("outbox maintenance failed; next run in {}", tuning.maintenanceInterval(), t);
             } catch (VirtualMachineError again) {
                 // logging ran out of memory too; the next run reports again
             }
@@ -871,7 +876,7 @@ public final class OutboxRelay implements AutoCloseable {
     }
 
     /**
-     * The ticks of an instance whose relay is disabled, a run every {@code relay.ticksWithoutRelay} (fixed delay) on
+     * The ticks of an instance whose relay is disabled, a run every {@link Tuning#ticksWithoutRelay()} (fixed delay) on
      * the daemon thread {@code outbox-ticker}: ticks cut the outbox into batches, and without them a backlog written
      * while no relay runs lands in one tick, which the relay draining it later reads again from the shard's start on
      * every chunk. A run does nothing unless {@link #wake()} came since the commits a tick is known to cover, so the
@@ -958,8 +963,7 @@ public final class OutboxRelay implements AutoCloseable {
             if (suppressed < 0) {
                 return;
             }
-            var denied = denied(t) ? ": the role needs the grants OutboxSql.outbox(config, role) gives, or set"
-                    + " outbox.relay.ticksWithoutRelay = 0" : "";
+            var denied = denied(t) ? ": the role needs the grants OutboxSql.outbox(config, role) gives" : "";
             log.warn("outbox tick of an instance with the relay disabled failed{}, tried again in {} ({} failures since"
                     + " the previous report not logged)", denied, every, suppressed, t);
         }
@@ -1025,7 +1029,7 @@ public final class OutboxRelay implements AutoCloseable {
                     }
                     Thread.interrupted(); // not stopping: a stray interrupt is one more failure
                     try {
-                        warn("outbox relay worker failed, retrying in " + relay.idlePollInterval(), t);
+                        warn("outbox relay worker failed, retrying in " + tuning.idlePollInterval(), t);
                         telemetry.relayFailed(t);
                     } catch (VirtualMachineError again) {
                         // reporting it ran out of memory: the worker pauses all the same, allocating nothing
@@ -1259,7 +1263,6 @@ public final class OutboxRelay implements AutoCloseable {
          * candidates, whichever instance made the ticks.
          */
         private List<Integer> candidates(List<Position> all, Instant now) {
-            int shards = config.shards();
             int offset = ThreadLocalRandom.current().nextInt(shards);
             long nanos = System.nanoTime();
             return all.stream()

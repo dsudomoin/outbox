@@ -18,6 +18,7 @@ import io.github.dsudomoin.outbox.TypedOutbox;
 import io.github.dsudomoin.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.outbox.internal.Maintenance;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
+import io.github.dsudomoin.outbox.internal.Tuning;
 import io.opentelemetry.api.trace.Tracer;
 import jakarta.annotation.Nullable;
 import org.slf4j.LoggerFactory;
@@ -90,7 +91,7 @@ public interface OutboxModule extends OutboxCommonModule {
         } else if (heartbeatConfig.dedicatedConnection()) {
             var log = LoggerFactory.getLogger(OutboxModule.class);
             try {
-                pool = HeartbeatPool.derive(db, config.partitions().maintenanceInterval());
+                pool = HeartbeatPool.derive(db, Tuning.of(config).maintenanceInterval());
                 if (pool == null) {
                     log.info("outbox heartbeat gets no pool of its own: the outbox's transactions are not"
                             + " KoraOutboxTransactions over a Hikari-backed JdbcDatabase, whose pool it would copy;"

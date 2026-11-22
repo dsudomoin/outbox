@@ -2,7 +2,6 @@ package io.github.dsudomoin.outbox.kafka.kora;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.typesafe.config.ConfigFactory;
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.Outcome;
@@ -18,9 +17,6 @@ import java.util.UUID;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.Test;
-import ru.tinkoff.kora.config.common.extractor.PropertiesConfigValueExtractor;
-import ru.tinkoff.kora.config.common.origin.SimpleConfigOrigin;
-import ru.tinkoff.kora.config.hocon.HoconConfigFactory;
 
 /**
  * The warnings {@link KafkaOutboxModule} gives when a Kafka call can outlast the caller's own time limit, and the
@@ -54,7 +50,7 @@ class KafkaOutboxModuleTest {
 
     /**
      * A sender's call can take delivery.timeout.ms + 5 s + max.block.ms; the dead-letter pass gives a hook call
-     * {@code outbox.deadLetters.timeout}. The defaults fit: 120 s + 5 s + 5 s against 130 s.
+     * 130 s. The defaults fit: 120 s + 5 s + 5 s against 130 s.
      */
     @Test
     void warnsOnlyWhenACallCanOutlastTheHookTimeout() {
@@ -67,11 +63,11 @@ class KafkaOutboxModuleTest {
             module.kafkaDeadLetterHandler(defaults, new KafkaOutboxSender(defaults), outbox);
             module.kafkaDeadLetterHandler(slow, new KafkaOutboxSender(slow), null); // no relay in the app
             module.kafkaDeadLetterHandler(off, new KafkaOutboxSender(off), outbox); // no calls
-            assertThat(err.text()).doesNotContain("deadLetters.timeout");
+            assertThat(err.text()).doesNotContain("the dead-letter hook's call timeout");
         }
         try (var err = new CapturedStderr()) {
             module.kafkaDeadLetterHandler(slow, new KafkaOutboxSender(slow), outbox);
-            assertThat(err.text()).contains("WARN").contains("outbox.deadLetters.timeout");
+            assertThat(err.text()).contains("WARN").contains("the dead-letter hook's call timeout (PT2M10S)");
         }
     }
 
@@ -95,19 +91,6 @@ class KafkaOutboxModuleTest {
         } finally {
             sender.release();
         }
-    }
-
-    /** {@code outbox.kafka.clientIdSuffix} reads as the core's default, true, and false when set so. */
-    @Test
-    void clientIdSuffixReadsFromHocon() {
-        var module = new KafkaOutboxModule() {};
-        var extractor = new $KoraKafkaOutboxConfig_ConfigValueExtractor(new PropertiesConfigValueExtractor());
-        var on = HoconConfigFactory.fromHocon(new SimpleConfigOrigin("test"),
-                ConfigFactory.parseString("outbox.kafka.driverProperties { \"bootstrap.servers\" = \"a:1\" }"));
-        var off = HoconConfigFactory.fromHocon(new SimpleConfigOrigin("test"),
-                ConfigFactory.parseString("outbox.kafka { driverProperties {}, clientIdSuffix = false }"));
-        assertThat(module.kafkaOutboxConfig(on, extractor).clientIdSuffix()).isTrue();
-        assertThat(module.kafkaOutboxConfig(off, extractor).clientIdSuffix()).isFalse();
     }
 
     private static OutboxConfig outboxConfig(Duration batchTimeout) {

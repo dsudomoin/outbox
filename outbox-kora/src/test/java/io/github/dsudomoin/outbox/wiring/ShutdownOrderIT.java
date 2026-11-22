@@ -34,7 +34,7 @@ class ShutdownOrderIT implements KoraAppTestConfigModifier {
                 }
                 outbox {
                   table = %s
-                  shards = 4
+                  shards = 4 # the library's own Tuning: read by the test app's TunedKoraConfig
                   inbox.table = %s
                 }
                 """.formatted(TestDataSources.jdbcUrl(), TestDataSources.user(), TestDataSources.password(),

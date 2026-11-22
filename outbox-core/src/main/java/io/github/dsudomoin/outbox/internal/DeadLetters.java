@@ -42,7 +42,7 @@ final class DeadLetters {
     DeadLetters(TableNames names, OutboxConfig config) {
         this.resender = new Resender(names, config);
         this.dead = names.dead();
-        this.lockTimeout = "set local lock_timeout = '" + XidPartitions.lockWait(config.partitions()).toMillis()
+        this.lockTimeout = "set local lock_timeout = '" + XidPartitions.lockWait(Tuning.of(config)).toMillis()
                 + "ms'; set local idle_in_transaction_session_timeout = '5s'";
         // one row per message, should two of its letters be redriven together
         this.remember = "insert into " + names.redriven() + " (message_id, redrives)"

@@ -1,22 +1,22 @@
 package io.github.dsudomoin.outbox.testing;
 
 import io.github.dsudomoin.outbox.OutboxConfig;
+import io.github.dsudomoin.outbox.internal.Tuning;
 import java.time.Duration;
 
 /**
- * Mutable config with fast test defaults and fresh {@link TestSql#uniqueTable()} names for both tables. Relay, retry,
- * requeue, partition, tail conversion (its window off by default) and recovery settings live on this object itself
- * ({@link #relay()}, {@link #retry()}, {@link #requeue()}, {@link #partitions()}, {@link #tailConversion()} and
- * {@link #recovery()} return {@code this}); the inbox, dead-letter and wait
- * blocks are separate because their {@code table()}, {@code premake()}, {@code batchSize()}, {@code delay()} and
- * {@code maxDelay()} clash with the outbox ones.
+ * Mutable config with fast test defaults and fresh {@link TestSql#uniqueTable()} names for both tables, and the
+ * library's {@link Tuning} too. Relay, retry, requeue, partition, tail conversion (its window off by default) and
+ * recovery settings live on this object itself ({@link #relay()}, {@link #retry()}, {@link #requeue()},
+ * {@link #partitions()}, {@link #tailConversion()} and {@link #recovery()} return {@code this}); the inbox and
+ * dead-letter blocks are separate because their {@code table()} and {@code retention()} clash with other ones.
  */
 public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayConfig, OutboxConfig.RetryConfig,
         OutboxConfig.RequeueConfig, OutboxConfig.PartitionsConfig, OutboxConfig.TailConversionConfig,
-        OutboxConfig.RecoveryConfig {
+        OutboxConfig.RecoveryConfig, Tuning {
 
     private String table = TestSql.uniqueTable();
-    private Integer shards = 4;
+    private int shards = 4;
     private boolean relayEnabled = true;
     private int workers = 2;
     private int batchSize = 100;
@@ -45,8 +45,7 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     private int premake = 4;
     private Duration maintenanceInterval = Duration.ofHours(1); // tests call maintenance directly
     private Duration swapLockTimeout = Duration.ZERO;
-    private long maxTailScan = new PartitionsConfig() {}.maxTailScan();
-    private boolean restoreOrphans = true;
+    private long maxTailScan = Tuning.DEFAULTS.maxTailScan();
     private String tailConversionWindow = ""; // off, whatever time the test runs at
     private Duration tailConversionMaxStall = Duration.ofSeconds(1);
     private String tailConversionZone = java.time.ZoneId.systemDefault().getId();
@@ -54,7 +53,6 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     private Duration inboxPartitionInterval = Duration.ofHours(1);
     private Duration inboxPremake = Duration.ofHours(24);
     private Duration inboxRetention = Duration.ofHours(24);
-    private boolean inboxAttachOrphans = true;
     private int deadLettersBatchSize = 100;
     private Duration deadLettersTimeout = Duration.ofSeconds(5);
     private Duration deadLettersRetention = Duration.ZERO;
@@ -78,12 +76,12 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     }
 
     @Override
-    public Integer shards() {
+    public int shards() {
         return shards;
     }
 
-    /** Null: not set, as {@link OutboxConfig#shards()}. */
-    public TestOutboxConfig shards(Integer shards) {
+    /** A new outbox's shard count; an existing one keeps its cursors'. */
+    public TestOutboxConfig shards(int shards) {
         this.shards = shards;
         return this;
     }
@@ -107,23 +105,8 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
             }
 
             @Override
-            public Duration partitionInterval() {
-                return inboxPartitionInterval;
-            }
-
-            @Override
-            public Duration premake() {
-                return inboxPremake;
-            }
-
-            @Override
             public Duration retention() {
                 return inboxRetention;
-            }
-
-            @Override
-            public boolean attachOrphans() {
-                return inboxAttachOrphans;
             }
         };
     }
@@ -132,25 +115,35 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     public DeadLettersConfig deadLetters() {
         return new DeadLettersConfig() {
             @Override
-            public int batchSize() {
-                return deadLettersBatchSize;
-            }
-
-            @Override
-            public Duration timeout() {
-                return deadLettersTimeout;
-            }
-
-            @Override
             public Duration retention() {
                 return deadLettersRetention;
             }
-
-            @Override
-            public Duration redriveHistory() {
-                return deadLettersRedriveHistory;
-            }
         };
+    }
+
+    @Override
+    public int deadLetterBatchSize() {
+        return deadLettersBatchSize;
+    }
+
+    @Override
+    public Duration deadLetterTimeout() {
+        return deadLettersTimeout;
+    }
+
+    @Override
+    public Duration redriveHistory() {
+        return deadLettersRedriveHistory;
+    }
+
+    @Override
+    public Duration inboxPartitionInterval() {
+        return inboxPartitionInterval;
+    }
+
+    @Override
+    public Duration inboxPremake() {
+        return inboxPremake;
     }
 
     @Override
@@ -332,25 +325,19 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
         return this;
     }
 
-    /** Separate, as {@code delay()} and {@code maxDelay()} clash with the requeue and retry ones. */
     @Override
-    public WaitConfig waiting() {
-        return new WaitConfig() {
-            @Override
-            public Duration delay() {
-                return waitDelay;
-            }
+    public Duration waitDelay() {
+        return waitDelay;
+    }
 
-            @Override
-            public Duration maxDelay() {
-                return waitMax;
-            }
+    @Override
+    public Duration waitMaxDelay() {
+        return waitMax;
+    }
 
-            @Override
-            public Duration alertAfter() {
-                return waitAlertAfter;
-            }
-        };
+    @Override
+    public Duration waitAlertAfter() {
+        return waitAlertAfter;
     }
 
     public TestOutboxConfig waiting(Duration delay, Duration maxDelay, Duration alertAfter) {
@@ -390,7 +377,7 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     // RequeueConfig
 
     @Override
-    public Duration delay() {
+    public Duration requeueDelay() {
         return requeueDelay;
     }
 
@@ -409,7 +396,7 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
         return this;
     }
 
-    // PartitionsConfig
+    // PartitionsConfig and the partitions' Tuning
 
     @Override
     public long xidsPerPartition() {
@@ -492,16 +479,6 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
         return this;
     }
 
-    @Override
-    public boolean restoreOrphans() {
-        return restoreOrphans;
-    }
-
-    public TestOutboxConfig restoreOrphans(boolean restoreOrphans) {
-        this.restoreOrphans = restoreOrphans;
-        return this;
-    }
-
     // InboxConfig
 
     /** This config on {@code other}'s outbox and inbox tables: a second instance of the same outbox. */
@@ -529,11 +506,6 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
         return this;
     }
 
-    public TestOutboxConfig attachOrphans(boolean attachOrphans) {
-        this.inboxAttachOrphans = attachOrphans;
-        return this;
-    }
-
     // DeadLettersConfig
 
     public TestOutboxConfig deadLettersBatchSize(int deadLettersBatchSize) {
@@ -556,7 +528,7 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
         return this;
     }
 
-    // RecoveryConfig
+    // RecoveryConfig and the recovery's Tuning
 
     @Override
     public String xidRegression() {
@@ -569,7 +541,7 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     }
 
     @Override
-    public long maxRows() {
+    public long recoveryMaxRows() {
         return maxRows;
     }
 
@@ -579,7 +551,7 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     }
 
     @Override
-    public Duration clockMargin() {
+    public Duration recoveryClockMargin() {
         return clockMargin;
     }
 

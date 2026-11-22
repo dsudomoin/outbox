@@ -9,7 +9,6 @@ import io.github.dsudomoin.outbox.kora.KoraOutboxConfig.KoraRequeueConfig;
 import io.github.dsudomoin.outbox.kora.KoraOutboxConfig.KoraRetryConfig;
 import io.github.dsudomoin.outbox.kora.KoraOutboxConfig.KoraSchemaConfig;
 import io.github.dsudomoin.outbox.kora.KoraOutboxConfig.KoraTailConversionConfig;
-import io.github.dsudomoin.outbox.kora.KoraOutboxConfig.KoraWaitConfig;
 
 /**
  * One shared instance per nested block a HOCON leaves out. Kora's graph refresh stops at a component whose new value
@@ -21,7 +20,6 @@ final class KoraConfigDefaults {
     static final KoraRelayConfig RELAY = new KoraRelayConfig() {};
     static final KoraRetryConfig RETRY = new KoraRetryConfig() {};
     static final KoraRequeueConfig REQUEUE = new KoraRequeueConfig() {};
-    static final KoraWaitConfig WAITING = new KoraWaitConfig() {};
     static final KoraPartitionsConfig PARTITIONS = new KoraPartitionsConfig() {};
     static final KoraTailConversionConfig TAIL_CONVERSION = new KoraTailConversionConfig() {};
     static final KoraInboxConfig INBOX = new KoraInboxConfig() {};

@@ -1219,7 +1219,7 @@ class MaintenanceIT {
         var schema = new OutboxSchema(db, config);
         schema.start();
         var names = schema.names();
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null));
         // a lock awaited on the parent, which defers every swap at any age; rows go on into the tail once they get in
         try (var holder = TestDb.connect(); var waiter = TestDb.connect(); var c = TestDb.connect()) {
@@ -1633,24 +1633,6 @@ class MaintenanceIT {
     }
 
     @Test
-    void restoreOrphansOffKeepsTheError() throws Exception {
-        config.restoreOrphans(false);
-        bootstrap();
-        var orphan = oursOrphan(relay(new RecordingHandler(), maintenance()), 2);
-        var registry = new SimpleMeterRegistry();
-
-        try (var err = new CapturedStderr()) {
-            assertThat(new Maintenance(db, names, config, new OutboxMetrics(registry)).runOnce()).isTrue();
-
-            assertThat(err.text()).contains("ERROR").contains(orphan.table()).contains("cannot deliver")
-                    .contains("move them back with insert into " + names.base());
-        }
-        assertThat(exists(orphan.table())).isTrue();
-        assertThat(count(orphan.table(), orphan.above())).isEqualTo(2);
-        assertThat(gauge(registry, "outbox.partitions.orphaned")).isEqualTo(1);
-    }
-
-    @Test
     void dropDoesNotBlockConcurrentInserts() throws Exception {
         config.xidsPerPartition(10_000).premake(8);
         bootstrap();
@@ -1776,7 +1758,7 @@ class MaintenanceIT {
                     .isEqualTo(queryLong(c, "select count(*) from " + names.parked()))
                     .isEqualTo(1);
             assertThat(gauge(registry, "outbox.partitions.premade"))
-                    .isEqualTo(new XidPartitions(names, config.partitions()).premadeAhead(c));
+                    .isEqualTo(new XidPartitions(names, config).premadeAhead(c));
         }
         assertThat(gauge(registry, "outbox.partitions.overflow")).isZero();
         assertThat(gauge(registry, "outbox.shard.lag")).isBetween(10.0, 20.0);
@@ -1808,7 +1790,7 @@ class MaintenanceIT {
 
     @Test
     void waitingRecordsAreGaugedAndTheirWarnTurnsIntoAnErrorPastAlertAfter() throws Exception {
-        bootstrap(); // outbox.relay.waiting.alertAfter = 15 min, the default
+        bootstrap(); // the waiting alert after 15 min, the default
         var registry = new SimpleMeterRegistry();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
 
@@ -2540,7 +2522,7 @@ class MaintenanceIT {
 
     /** Burns xids until at most premake / 2 ranges lie ahead: the next run extends. */
     private void burnIntoExtensionWindow(Connection c) throws SQLException {
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
         while (partitions.premadeAhead(c) > config.premake() / 2) {
             TestDb.burnXids(200);
         }

@@ -13,6 +13,7 @@ import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.OutboxStatus;
 import io.github.dsudomoin.outbox.Outcome;
+import io.github.dsudomoin.outbox.internal.Tuning;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -612,7 +613,7 @@ class KafkaClusterFaultsIT {
     private static TestOutboxConfig config() {
         if (DELIVERY_TIMEOUT == null) {
             return new TestOutboxConfig().batchTimeout(new OutboxConfig.RelayConfig() {}.batchTimeout())
-                    .deadLettersTimeout(new OutboxConfig.DeadLettersConfig() {}.timeout());
+                    .deadLettersTimeout(Tuning.DEFAULTS.deadLetterTimeout());
         }
         var timeout = Duration.ofMillis(Long.parseLong(DELIVERY_TIMEOUT)).plusSeconds(10);
         return new TestOutboxConfig().batchTimeout(timeout).deadLettersTimeout(timeout);

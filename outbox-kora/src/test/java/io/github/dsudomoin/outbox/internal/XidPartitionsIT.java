@@ -53,7 +53,7 @@ class XidPartitionsIT {
     void extendsWhenHalfOfPremadeConsumed() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
         TestDb.burnXids(2500);
 
         try (var c = TestDb.connect()) {
@@ -72,7 +72,7 @@ class XidPartitionsIT {
     void extensionDoesNotBlockConcurrentInserts() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(10_000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
         var done = new AtomicBoolean();
         var maxLatency = new AtomicLong();
         var sawPending = new AtomicBoolean();
@@ -159,7 +159,7 @@ class XidPartitionsIT {
     void shortWriterTransactionsNeverBlockTheSwap() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
         var done = new AtomicBoolean();
         var errors = new ConcurrentLinkedQueue<Throwable>();
         // each commits every few ms: between pg_locks and pg_stat_activity it may be idle
@@ -188,7 +188,7 @@ class XidPartitionsIT {
     void anotherRolesShortTransactionsDoNotDeferTheSwap() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1)); // 20 s in production
+        var partitions = new XidPartitions(names, config, Duration.ofSeconds(1)); // 20 s in production
         var done = new AtomicBoolean();
         var errors = new ConcurrentLinkedQueue<Throwable>();
         // the app's own writers under another login role: their age is hidden
@@ -217,7 +217,7 @@ class XidPartitionsIT {
     void anotherRolesTransactionHeldAcrossBothSamplesDefers() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1));
+        var partitions = new XidPartitions(names, config, Duration.ofSeconds(1));
 
         try (var holder = TestDb.connect(); var c = TestDb.connect(TestDb.login(TestDb.newLoginRole()))) {
             holder.setAutoCommit(false); // just begun, but its age is hidden from the maintenance role
@@ -234,7 +234,7 @@ class XidPartitionsIT {
     void aPgDumpThatStartsDuringTheSecondSampleCounts() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(2));
+        var partitions = new XidPartitions(names, config, Duration.ofSeconds(2));
         var dump = new Properties();
         dump.setProperty("ApplicationName", "pg_dump");
 
@@ -291,7 +291,7 @@ class XidPartitionsIT {
     void bootstrapLeavesATailWithRowsAttachedAndFlagsOverflow() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var atStartup = XidPartitions.forBootstrap(names, config.partitions());
+        var atStartup = XidPartitions.forBootstrap(names, config);
         TestDb.burnXids(6000);
 
         try (var c = TestDb.connect()) {
@@ -321,7 +321,7 @@ class XidPartitionsIT {
     void hotTailIsConvertedIntoARangeByTheAttachScan() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
 
         try (var c = TestDb.connect()) {
             long lower = overflowTail(c, names, 20_000);
@@ -362,7 +362,7 @@ class XidPartitionsIT {
     void hotTailOfASchemaQualifiedOutboxIsConverted() throws Exception {
         var config = new TestOutboxConfig().table("public." + TestSql.uniqueTable()).xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
 
         try (var c = TestDb.connect()) {
             long lower = overflowTail(c, names, 10);
@@ -387,9 +387,9 @@ class XidPartitionsIT {
     void noPathLeavesACheckThatCouldRefuseAnInsert() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1));
+        var partitions = new XidPartitions(names, config, Duration.ofSeconds(1));
         var small = new XidPartitions(names, new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(0)
-                .partitions());
+                );
 
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
             TestDb.burnXids(2500); // cold: the empty tail swapped for ranges
@@ -441,7 +441,7 @@ class XidPartitionsIT {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(Duration.ofSeconds(5));
         var names = bootstrap(config);
         var partitions = new XidPartitions(names, new TestOutboxConfig().xidsPerPartition(1000).premake(4)
-                .swapLockTimeout(Duration.ofSeconds(5)).maxTailScan(64 * 1024).partitions());
+                .swapLockTimeout(Duration.ofSeconds(5)).maxTailScan(64 * 1024));
 
         try (var writer = TestDb.connect(); var c = TestDb.connect()) {
             long lower = overflowTail(c, names, 10_000);
@@ -459,7 +459,7 @@ class XidPartitionsIT {
             assertThat(Duration.ofNanos(System.nanoTime() - start)).as("no lock waited for")
                     .isLessThan(Duration.ofSeconds(2));
             writer.commit();
-            assertThat(log.split("over outbox.partitions.maxTailScan", -1)).as("one ERROR an hour").hasSize(2);
+            assertThat(log.split("MB, over the swap's scan limit of", -1)).as("one ERROR an hour").hasSize(2);
             assertThat(log).contains("ERROR").contains(names.tail());
             assertThat(tail(c, names)).isEqualTo(lower);
             assertThat(partitions.overflow()).isTrue();
@@ -479,7 +479,7 @@ class XidPartitionsIT {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(0)
                 .tailConversion("03:00-05:00", Duration.ofSeconds(5));
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
 
         try (var c = TestDb.connect()) {
             long lower = overflowTail(c, names, 1000);
@@ -493,7 +493,7 @@ class XidPartitionsIT {
 
             assertThat(tail(c, names)).as("outside the window: still hot").isEqualTo(lower);
             assertThat(partitions.overflow()).isTrue();
-            assertThat(log).contains("ERROR").contains("over outbox.partitions.maxTailScan")
+            assertThat(log).contains("ERROR").contains("MB, over the swap's scan limit of")
                     .contains("outbox.partitions.tailConversion.window 03:00-05:00").contains("maxStall 5000 ms");
             partitions.clock = at(4, 0);
 
@@ -516,7 +516,7 @@ class XidPartitionsIT {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(0)
                 .tailConversion("23:00-01:00", Duration.ofMillis(1));
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
         partitions.clock = at(0, 30);
         var done = new AtomicBoolean();
         var errors = new ConcurrentLinkedQueue<Throwable>();
@@ -577,7 +577,7 @@ class XidPartitionsIT {
     void aLeakedHolderNeverFailsAnInsertAndTheTailHealsAfterIt() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1));
+        var partitions = new XidPartitions(names, config, Duration.ofSeconds(1));
 
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
             holder.setAutoCommit(false);
@@ -627,7 +627,7 @@ class XidPartitionsIT {
         var schema = new OutboxSchema(db, config);
         schema.start();
         var names = schema.names();
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
         var handler = new RecordingHandler();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null));
         var relay = new OutboxRelay(db, config, schema, handler, TestTelemetry.kora(), maintenance,
@@ -656,7 +656,7 @@ class XidPartitionsIT {
     void swapRollsBackWhenTheXidPassedTheBound() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
 
         try (var c = TestDb.connect()) {
             long lower = overflowTail(c, names, 10);
@@ -683,7 +683,7 @@ class XidPartitionsIT {
     void failedConversionLeavesNoCheckAndTheNextRunConverts() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
 
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
             long lower = overflowTail(c, names, 10);
@@ -710,7 +710,7 @@ class XidPartitionsIT {
     void tailThatOverflowedWhileItsSwapWasDeferredIsConverted() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1));
+        var partitions = new XidPartitions(names, config, Duration.ofSeconds(1));
 
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
             long lower = tail(c, names);
@@ -737,7 +737,7 @@ class XidPartitionsIT {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
         // xidsPerPartition shrunk since: half of premake used up, yet the ranges reach past premake new ones
-        var shrunk = new XidPartitions(names, new TestOutboxConfig().xidsPerPartition(100).premake(4).partitions());
+        var shrunk = new XidPartitions(names, new TestOutboxConfig().xidsPerPartition(100).premake(4));
         TestDb.burnXids(2500);
 
         try (var c = TestDb.connect()) {
@@ -761,7 +761,7 @@ class XidPartitionsIT {
     void tailNextLeftBeforeAColumnWasAddedIsMadeAnew() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
         TestDb.burnXids(2500);
 
         try (var c = TestDb.connect()) {
@@ -781,7 +781,7 @@ class XidPartitionsIT {
     void pendingTailDetachIsFinalizedOnNextExtension() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
 
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
             holder.setAutoCommit(false);
@@ -810,7 +810,7 @@ class XidPartitionsIT {
     void snapshotsDoNotDeferTheSwap() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1)); // 20 s in production
+        var partitions = new XidPartitions(names, config, Duration.ofSeconds(1)); // 20 s in production
 
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
             // a report on other tables: a snapshot, no lock on the outbox
@@ -837,7 +837,7 @@ class XidPartitionsIT {
     void oldLockOnTheParentDefersTheSwapUntilItEnds() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1));
+        var partitions = new XidPartitions(names, config, Duration.ofSeconds(1));
 
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
             holder.setAutoCommit(false); // read committed, idle in transaction: no snapshot, but its lock stays
@@ -870,7 +870,7 @@ class XidPartitionsIT {
     void pgDumpDefersTheSwapAtAnyAge() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions()); // the production 20 s
+        var partitions = new XidPartitions(names, config); // the production 20 s
         var dump = new Properties();
         dump.setProperty("ApplicationName", "pg_dump");
 
@@ -895,7 +895,7 @@ class XidPartitionsIT {
     void relayStepHoldersDoNotCountAsBlockers() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1));
+        var partitions = new XidPartitions(names, config, Duration.ofSeconds(1));
 
         try (var step = TestDb.connect(); var c = TestDb.connect()) {
             step.setAutoCommit(false); // a relay step whose handler runs past the threshold
@@ -913,7 +913,7 @@ class XidPartitionsIT {
     void failedSwapLeavesTheTailAttached() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
 
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
             long lower = tail(c, names);
@@ -953,7 +953,7 @@ class XidPartitionsIT {
     void aLockOnAPreCreatedRangeFailsTheSwapBeforeItHoldsTheParent() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(Duration.ofSeconds(1));
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
         var done = new AtomicBoolean();
         var slowest = new AtomicLong();
         var errors = new ConcurrentLinkedQueue<Throwable>();
@@ -999,7 +999,7 @@ class XidPartitionsIT {
     void aStallInsideTheHoldIsCutByTheServerAndWritersGoOn() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
         var done = new AtomicBoolean();
         var slowest = new AtomicLong();
         var errors = new ConcurrentLinkedQueue<Throwable>();
@@ -1044,7 +1044,7 @@ class XidPartitionsIT {
     void aSwapAttachesAtMostFourRangesWithTheIndexesMadeAheadOfIt() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(16);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1));
+        var partitions = new XidPartitions(names, config, Duration.ofSeconds(1));
 
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
             long lower = tail(c, names);
@@ -1094,7 +1094,7 @@ class XidPartitionsIT {
     void aTailThatGrewPastTheCapBeforeTheLockIsNotScanned() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(256 * 1024);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
 
         try (var c = TestDb.connect()) {
             long lower = overflowTail(c, names, 10);
@@ -1117,7 +1117,7 @@ class XidPartitionsIT {
             assertThat(tail(c, names)).as("not converted").isEqualTo(lower);
             assertThat(queryLong(c, "select count(*) from " + names.tail())).isEqualTo(2010);
             assertThat(partitions.overflow()).isTrue();
-            assertThat(log).contains("grew past outbox.partitions.maxTailScan under the swap's lock");
+            assertThat(log).contains("grew past the swap's scan limit under its lock");
         }
     }
 
@@ -1130,7 +1130,7 @@ class XidPartitionsIT {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(0)
                 .tailConversion("23:00-01:00", Duration.ofMillis(1));
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
 
         try (var c = TestDb.connect()) {
             overflowTail(c, names, 600_000);
@@ -1152,7 +1152,7 @@ class XidPartitionsIT {
 
             assertThat(log.split("ended without a conversion", -1)).as("one ERROR").hasSize(2);
             assertThat(log).as("the run that says the window ended says nothing more")
-                    .doesNotContain("over outbox.partitions.maxTailScan");
+                    .doesNotContain("MB, over the swap's scan limit of");
             assertThat(log).contains("ERROR").contains(" MB").contains("maxStall 1 ms").contains("raise");
             partitions.clock = at(23, 30);
             ensurePremadeAsMaintenance(partitions, c);
@@ -1170,12 +1170,12 @@ class XidPartitionsIT {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(0)
                 .tailConversion("03:00-05:00", Duration.ofMillis(1));
         var names = bootstrap(config);
-        var outside = new XidPartitions(names, config.partitions());
+        var outside = new XidPartitions(names, config);
         // its own table: the first sighting is the fleet's, so on one table it would be outside's
         var insideConfig = new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(0)
                 .tailConversion("03:00-05:00", Duration.ofMillis(1));
         var insideNames = bootstrap(insideConfig);
-        var inside = new XidPartitions(insideNames, insideConfig.partitions());
+        var inside = new XidPartitions(insideNames, insideConfig);
 
         try (var c = TestDb.connect()) {
             overflowTail(c, names, 600_000);
@@ -1216,20 +1216,20 @@ class XidPartitionsIT {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(0)
                 .tailConversion("03:00-05:00", Duration.ofMillis(1));
         var names = bootstrap(config);
-        var first = new XidPartitions(names, config.partitions());
+        var first = new XidPartitions(names, config);
 
         try (var c = TestDb.connect()) {
             overflowTail(c, names, 600_000);
             first.clock = at(1, 0);
             ensurePremadeAsMaintenance(first, c);
-            var restarted = new XidPartitions(names, config.partitions());
+            var restarted = new XidPartitions(names, config);
             restarted.clock = at(3, 30);
             ensurePremadeAsMaintenance(restarted, c);
             assertThat(restarted.oversizedAttempts).as("cut by maxStall").hasValue(1);
 
             restarted.clock = at(5, 10);
             ensurePremadeAsMaintenance(restarted, c);
-            var added = new XidPartitions(names, config.partitions());
+            var added = new XidPartitions(names, config);
             added.clock = at(5, 10);
             ensurePremadeAsMaintenance(added, c);
 
@@ -1268,7 +1268,7 @@ class XidPartitionsIT {
                 var schema = new OutboxSchema(db17, config);
                 schema.start();
                 var names = schema.names();
-                var partitions = new XidPartitions(names, config.partitions());
+                var partitions = new XidPartitions(names, config);
                 try (var c = DriverManager.getConnection(pg17.getJdbcUrl(), pg17.getUsername(), pg17.getPassword())) {
                     burn(c, 2500);
                     roomInTheRange(c, 600); // its own xids must not carry the counter into the next range
@@ -1317,7 +1317,7 @@ class XidPartitionsIT {
                 var schema = new OutboxSchema(own, config);
                 schema.start();
                 var names = schema.names();
-                var partitions = new XidPartitions(names, config.partitions());
+                var partitions = new XidPartitions(names, config);
                 burn(c, 2500);
                 roomInTheRange(c, 600);
                 long lower = tail(c, names);
@@ -1365,7 +1365,7 @@ class XidPartitionsIT {
     void aColumnAddedToTheParentReachesTheRangesMadeAhead() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1));
+        var partitions = new XidPartitions(names, config, Duration.ofSeconds(1));
 
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
             TestDb.burnXids(2500);
@@ -1396,7 +1396,7 @@ class XidPartitionsIT {
     void everySwapFailureCountsTowardsTheError() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
 
         try (var c = TestDb.connect()) {
             while (partitions.premadeAhead(c) >= config.premake() / 2) { // ranges running out: the ERROR is due
@@ -1420,7 +1420,7 @@ class XidPartitionsIT {
     void quiesceWaitsForARelayStepAndTimesOutWithoutALock() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
         TestDb.burnXids(2500);
 
         try (var step = TestDb.connect(); var c = TestDb.connect()) {
@@ -1456,7 +1456,7 @@ class XidPartitionsIT {
     void aClientFrozenUnderTheQuiesceLosesItWithinSeconds() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
         TestDb.burnXids(2500);
 
         try (var watch = TestDb.connect(); var c = TestDb.connect()) {
@@ -1504,7 +1504,7 @@ class XidPartitionsIT {
     void aQuiesceTimeoutNamesTheRelayStepsInFlight() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
 
         try (var step = TestDb.connect(); var c = TestDb.connect()) {
             while (partitions.premadeAhead(c) >= config.premake() / 2) { // ranges running out: the ERROR is due
@@ -1537,7 +1537,7 @@ class XidPartitionsIT {
     void errorMidSwapRollsBackAndReleasesTheSwapLock() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
         TestDb.burnXids(2500);
 
         try (var c = TestDb.connect()) {
@@ -1565,7 +1565,7 @@ class XidPartitionsIT {
     void tailRowCommittedWhileTheSwapWaitsIsNotDropped() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(Duration.ofSeconds(5));
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
         TestDb.burnXids(2500);
 
         try (var writer = TestDb.connect(); var c = TestDb.connect()) {
@@ -1602,7 +1602,7 @@ class XidPartitionsIT {
                 names = schema.names();
                 log = err.text();
             }
-            var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1));
+            var partitions = new XidPartitions(names, config, Duration.ofSeconds(1));
 
             try (var holder = TestDb.connect(); var c = TestDb.connect(TestDb.login(role))) {
                 // a pg_dump by a backup role, under another application name
@@ -1658,7 +1658,7 @@ class XidPartitionsIT {
             var schema = new OutboxSchema(app, config);
             schema.start();
             var names = schema.names();
-            var partitions = new XidPartitions(names, config.partitions());
+            var partitions = new XidPartitions(names, config);
 
             try (var holder = TestDb.connect(TestDb.login(role)); var c = TestDb.connect(TestDb.login(role))) {
                 assertThat(queryString(c, "show statement_timeout")).isEqualTo("1s");
@@ -1690,7 +1690,7 @@ class XidPartitionsIT {
     void tailRowRacingTheDetachSurvives() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
         var id = UUID.randomUUID();
 
         try (var c = TestDb.connect(); var racer = TestDb.connect()) {
@@ -1734,7 +1734,7 @@ class XidPartitionsIT {
     void pendingTailWithRowsIsFinalizedAndReattached() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
         TestDb.burnXids(6000);
 
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
@@ -1765,7 +1765,7 @@ class XidPartitionsIT {
     void standaloneTailWithRowsIsReattached() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
         TestDb.burnXids(6000);
 
         try (var c = TestDb.connect()) {
@@ -1790,7 +1790,7 @@ class XidPartitionsIT {
     void aLargeStandaloneTailIsAttachedBackUnderABoundScaledToItsSize() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
         partitions.attachMargin = Duration.ZERO;
 
         try (var c = TestDb.connect()) {
@@ -1812,7 +1812,7 @@ class XidPartitionsIT {
     void bootstrapLeavesALargeStandaloneTailToMaintenance() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(64 * 1024);
         var names = bootstrap(config);
-        var atStartup = XidPartitions.forBootstrap(names, config.partitions());
+        var atStartup = XidPartitions.forBootstrap(names, config);
 
         try (var c = TestDb.connect()) {
             long lower = tail(c, names);
@@ -1824,7 +1824,7 @@ class XidPartitionsIT {
             assertThat(PartitionDdl.attachment(c, names.base(), names.tail())).isEqualTo(Attachment.STANDALONE);
             assertThat(atStartup.overflow()).isTrue();
 
-            new XidPartitions(names, config.partitions()).ensurePremade(c);
+            new XidPartitions(names, config).ensurePremade(c);
 
             assertThat(PartitionDdl.attachment(c, names.base(), names.tail())).isEqualTo(Attachment.ATTACHED);
             assertThat(queryLong(c, "select count(*) from " + names.base())).isEqualTo(10_000);
@@ -1840,7 +1840,7 @@ class XidPartitionsIT {
     void aRangeDetachedOrDroppedByHandBelowTheTailIsAttachedAgain() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
 
         try (var c = TestDb.connect()) {
             long lower = tail(c, names);
@@ -1880,7 +1880,7 @@ class XidPartitionsIT {
     void theEmptyRangeOfTheCurrentXidDetachedByHandIsMadeAgain() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
 
         try (var c = TestDb.connect()) {
             roomInTheRange(c, 500); // room for the xids the DDL below takes, within the one range
@@ -1912,7 +1912,7 @@ class XidPartitionsIT {
     void missingTailIsAttachedAboveLastRange() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config);
 
         try (var c = TestDb.connect()) {
             execute(c, "alter table " + names.base() + " detach partition " + names.tail());

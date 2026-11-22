@@ -35,27 +35,26 @@ import org.slf4j.LoggerFactory;
  * Hands pending dead letters to the {@link OutboxDeadLetterHandler} and redrives scheduled ones, on its own connection
  * and the hook's own daemon thread {@code outbox-dead-letter-hook}, never a relay thread or transaction. Each batch is
  * one transaction (read committed, {@code idle_in_transaction_session_timeout} = hook timeout + 30 s): claim up to
- * {@code deadLetters.batchSize} due letters {@code for update skip locked}, so no two passes on any instance hand one
- * letter at once; call the hook, bounded by {@code deadLetters.timeout}, while the claim holds them; commit its
- * decisions, a {@code retryLater} as the backoff of a failed call for its letter alone, or, after a failed call, a
- * backoff for every letter of it. That transaction takes no key lock: a
- * {@code redrive} commits as {@code redriveAt(now)}, so a decision is never lost and the hook is called once for it.
- * Scheduled letters due are redriven, a batch per transaction ({@link Resender}, the {@code <redriven>} count, the dead
- * rows deleted), one batch after each full hand-over and the rest once those end, so a steady stream of pending letters
- * does not hold them back. Their key locks are taken without waiting ({@code pg_try_advisory_xact_lock}): a letter
- * whose key is held, by an open {@code send} of it, is due again after {@code relay.retry.initialDelay} while the
- * others of its batch go on, and the phase ends with that batch. Right after the claim the batch's
- * {@code lock_timeout} becomes {@link XidPartitions#lockWait}: it bounds each lock wait of the batch, not their
- * sum, and while one lasts the writers of the keys the batch holds wait too, so a batch that meets several held
- * table locks stalls them for that many waits. Its {@code idle_in_transaction_session_timeout} becomes 5 s then
- * too, as no hook runs in it: a session cut while it holds key locks frees them that soon. A batch that fails after
- * its claim rolls back, and those of its letters still due are then due again after {@code initialDelay} (none
- * another pass decided meanwhile), so they hold back no letter behind them. In the redrive phase a lock timeout (55P03) is a WARN, at most once a minute, and ends
- * the phase until the next pass; any other failure, and any failure of a hand-over (a lock timeout writing the hook's
- * decisions included: the hook is called again for them), propagates. Hook failures have a WARN of their own, at
- * most once a minute too. Until {@code <dead>_due} exists (an upgraded dead table with rows gets it from
- * {@link Maintenance}) the claim and the other {@code due_at} queries are as correct, only slower: each pass scans the
- * whole dead table.
+ * {@link Tuning#deadLetterBatchSize()} due letters {@code for update skip locked}, so no two passes on any instance
+ * hand one letter at once; call the hook, bounded by {@link Tuning#deadLetterTimeout()}, while the claim holds them;
+ * commit its decisions, a {@code retryLater} as the backoff of a failed call for its letter alone, or, after a failed
+ * call, a backoff for every letter of it. That transaction takes no key lock: a {@code redrive} commits as {@code
+ * redriveAt(now)}, so a decision is never lost and the hook is called once for it. Scheduled letters due are redriven,
+ * a batch per transaction ({@link Resender}, the {@code <redriven>} count, the dead rows deleted), one batch after each
+ * full hand-over and the rest once those end, so a steady stream of pending letters does not hold them back. Their key
+ * locks are taken without waiting ({@code pg_try_advisory_xact_lock}): a letter whose key is held, by an open {@code
+ * send} of it, is due again after {@code relay.retry.initialDelay} while the others of its batch go on, and the phase
+ * ends with that batch. Right after the claim the batch's {@code lock_timeout} becomes {@link XidPartitions#lockWait}:
+ * it bounds each lock wait of the batch, not their sum, and while one lasts the writers of the keys the batch holds
+ * wait too, so a batch that meets several held table locks stalls them for that many waits. Its {@code
+ * idle_in_transaction_session_timeout} becomes 5 s then too, as no hook runs in it: a session cut while it holds key
+ * locks frees them that soon. A batch that fails after its claim rolls back, and those of its letters still due are
+ * then due again after {@code initialDelay} (none another pass decided meanwhile), so they hold back no letter behind
+ * them. In the redrive phase a lock timeout (55P03) is a WARN, at most once a minute, and ends the phase until the next
+ * pass; any other failure, and any failure of a hand-over (a lock timeout writing the hook's decisions included: the
+ * hook is called again for them), propagates. Hook failures have a WARN of their own, at most once a minute too. Until
+ * {@code <dead>_due} exists (an upgraded dead table with rows gets it from {@link Maintenance}) the claim and the other
+ * {@code due_at} queries are as correct, only slower: each pass scans the whole dead table.
  */
 public final class DeadLetterPass {
 
@@ -120,15 +119,16 @@ public final class DeadLetterPass {
             @Nullable OutboxDeadLetterHandler hook, OutboxTelemetry telemetry, InstantSource jvmClock) {
         OutboxSchema.validate(config);
         this.jvmClock = jvmClock;
-        this.socket = new SocketBound(config.networkTimeout());
+        var tuning = Tuning.of(config);
+        this.socket = new SocketBound(tuning.networkTimeout());
         this.db = db;
         this.hook = hook;
         this.active = hook != null && hook.active(); // read once: the relay's steps write by it
         this.telemetry = telemetry;
         this.rows = new DeadLetters(names, config);
         this.dead = names.dead();
-        this.batchSize = config.deadLetters().batchSize();
-        this.timeout = config.deadLetters().timeout();
+        this.batchSize = tuning.deadLetterBatchSize();
+        this.timeout = tuning.deadLetterTimeout();
         this.initialDelay = config.relay().retry().initialDelay();
         this.maxDelay = config.relay().retry().maxDelay();
         this.asciiText = OutboxSchema.asciiText(config);
@@ -301,8 +301,8 @@ public final class DeadLetterPass {
             if (e instanceof ExecutionException x) {
                 return failed(tx, claimed, x.getCause());
             }
-            return failed(tx, claimed, new TimeoutException("outbox dead-letter hook exceeded"
-                    + " outbox.deadLetters.timeout " + timeout));
+            return failed(tx, claimed, new TimeoutException("outbox dead-letter hook exceeded its call timeout of "
+                    + timeout));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("outbox dead-letter pass interrupted", e);
@@ -472,7 +472,7 @@ public final class DeadLetterPass {
             // never started, as one queued behind a call still running, counts too: that call holds the thread
             if (e instanceof TimeoutException && !ended.await(INTERRUPT_GRACE.toNanos(), TimeUnit.NANOSECONDS)
                     && ignoresInterrupts.compareAndSet(false, true)) {
-                log.error("outbox dead-letter hook ignores interrupts: its call cut at outbox.deadLetters.timeout {}"
+                log.error("outbox dead-letter hook ignores interrupts: its call cut at its timeout of {}"
                         + " still runs {} later and holds the hook thread outbox-dead-letter-hook, so dead letters are"
                         + " not decided on this instance until it returns or the instance restarts (each pass waits"
                         + " out the timeout and counts a failed call). The hook must honour Thread.interrupt(): use"

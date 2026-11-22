@@ -17,15 +17,15 @@ import java.util.UUID;
  * first one accepted. The methods of the unscoped inbox are the scope {@code ""}.
  *
  * <p>The window goes back {@code outbox.inbox.retention} from now, by the UUIDv7 timestamp of the id (the outbox
- * message id, Kafka header {@code outbox-message-id}), less up to one {@code outbox.inbox.partitionInterval} of margin:
- * ids up to {@code retention - partitionInterval} old are always deduplicated while inbox maintenance makes ranges ahead
+ * message id, Kafka header {@code outbox-message-id}), less up to one inbox range (an hour) of margin: ids up to
+ * {@code retention} - 1 h old are always deduplicated while inbox maintenance makes ranges ahead
  * (the gauge {@code outbox.inbox.window.remaining}). An id outside the window, or an id that is not UUIDv7, is accepted
  * without dedup ({@code true}, nothing recorded, a rate-limited WARN and {@code outbox.inbox.outside_window}); it never
  * fails the transaction. A forward step of X on the inbox database's clock lowers that always-deduplicated age by X, so
  * size {@code retention} with the largest expected clock error as margin.
  *
- * <p>Services that share one inbox table must use the same {@code outbox.inbox.retention},
- * {@code partitionInterval} and {@code premake}: otherwise the shortest retention wins for all of them. Give each
+ * <p>Services that share one inbox table must use the same {@code outbox.inbox.retention}: otherwise the
+ * shortest retention wins for all of them. Give each
  * service its own {@code outbox.inbox.table} if the settings must differ.
  */
 public interface Inbox {

@@ -12,6 +12,7 @@ import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.PartitionDdl;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.TableNames;
+import io.github.dsudomoin.outbox.internal.Tuning;
 import io.github.dsudomoin.outbox.internal.XidPartitions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.Await;
@@ -170,7 +171,7 @@ class TailSwapIT {
         var swapsAtReturn = new AtomicInteger(-1);
         try (var pause = TestDb.connect(); var c = TestDb.connect()) {
             maintenanceLock(pause, "pg_advisory_lock");
-            var partitions = new XidPartitions(names, config.partitions());
+            var partitions = new XidPartitions(names, config);
             burnUntil(() -> partitions.premadeAhead(c) <= config.premake() / 2); // the extension is due
             int before = swaps().size();
             beforeNextCall.set(() -> {
@@ -214,7 +215,7 @@ class TailSwapIT {
      */
     @Test
     void writersWithAShortLockTimeoutNeverFailDuringSwaps() throws Exception {
-        var defaults = new OutboxConfig.PartitionsConfig() {};
+        var defaults = Tuning.DEFAULTS;
         config.xidsPerPartition(defaults.xidsPerPartition()).premake(defaults.premake());
         writerLockTimeout = Duration.ofMillis(50);
         writerPause = Duration.ofMillis(20);
@@ -267,7 +268,7 @@ class TailSwapIT {
             var longOutbox = new PgOutbox(longDb, schema, config.shards(), relay::wake, new OutboxMetrics(null));
             try (var pause = TestDb.connect(); var c = TestDb.connect()) {
                 maintenanceLock(pause, "pg_advisory_lock");
-                var partitions = new XidPartitions(names, config.partitions());
+                var partitions = new XidPartitions(names, config);
                 burnUntil(() -> partitions.premadeAhead(c) <= config.premake() / 2); // the extension is due
                 for (int i = 0; i < LONG_WRITERS; i++) {
                     run("long-writer-" + i, () -> {
@@ -330,7 +331,7 @@ class TailSwapIT {
      */
     @Test
     void swapAtTheDefaultPartitionSizes() throws Exception {
-        var defaults = new OutboxConfig.PartitionsConfig() {};
+        var defaults = Tuning.DEFAULTS;
         config.xidsPerPartition(defaults.xidsPerPartition()).premake(defaults.premake());
         bootstrap();
         try (var pause = TestDb.connect(); var c = TestDb.connect()) {
@@ -349,7 +350,7 @@ class TailSwapIT {
         assertThat(swaps).hasSize(expected).allSatisfy(swap -> assertThat(swap.group())
                 .contains("attached 4 ranges"));
         try (var c = TestDb.connect()) {
-            assertThat(new XidPartitions(names, config.partitions()).premadeAhead(c))
+            assertThat(new XidPartitions(names, config).premadeAhead(c))
                     .isGreaterThanOrEqualTo(config.premake());
         }
     }
@@ -365,7 +366,7 @@ class TailSwapIT {
         }
         execute(c, "alter table " + names.base() + " attach partition " + names.tail() + " for values from ('"
                 + used.get(0).from() + "') to (maxvalue)");
-        assertThat(new XidPartitions(names, config.partitions()).premadeAhead(c)).isEqualTo(config.premake() / 2);
+        assertThat(new XidPartitions(names, config).premadeAhead(c)).isEqualTo(config.premake() / 2);
     }
 
     private void bootstrap() throws Exception {

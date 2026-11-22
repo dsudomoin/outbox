@@ -14,6 +14,9 @@ dependencies {
     compileOnly("com.google.protobuf:protobuf-java:3.25.8")
 
     testFixturesApi(testFixtures(project(":outbox-core")))
+    // TunedKoraConfig: the tests' extractor of the library's Tuning from HOCON, next to the keys
+    testFixturesAnnotationProcessor(platform("ru.tinkoff.kora:kora-parent:${property("koraVersion")}"))
+    testFixturesAnnotationProcessor("ru.tinkoff.kora:config-annotation-processor")
     testFixturesApi("ru.tinkoff.kora:database-jdbc")
     testFixturesApi("ru.tinkoff.kora:opentelemetry-common")
 
