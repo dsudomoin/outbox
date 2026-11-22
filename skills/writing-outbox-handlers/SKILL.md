@@ -183,7 +183,7 @@ class OrderProjection implements OutboxTopicHandler {
 - `Outcome.Waiting` is neither a delivery nor a failure. The record becomes its key's head in `<table>_retry`, later
   records of the key queue behind it, `attempts` stays, `maxAttempts` never applies, the shard does not pause. It is
   handed again, with the other due heads but without the records behind it, after a quarter of its wait so far, within
-  `outbox.relay.waiting.delay` (1 s) and `maxDelay` (5 min), until an instance that can handle it takes it. `kind`:
+  1 s and 5 min, until an instance that can handle it takes it. `kind`:
   `contract`, `no_route`, `handler` (yours).
 - Use it for «another release handles this»; a failing target is `Retry`, a blocked entity is `requeue`. A wait does
   not pause the shard: while the target is down every key of the topic becomes a waiting head and every later record a

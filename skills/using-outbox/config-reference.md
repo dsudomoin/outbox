@@ -20,26 +20,17 @@ outbox {
 | Key | Default | Rule and meaning |
 |---|---|---|
 | `table` | `"outbox"` | `[schema.]name`, each part `[A-Za-z_][A-Za-z0-9_]{0,40}`, lowercased. Base name of `<table>`, `_retry`, `_parked`, `_dead`, `_redriven`, `_tick`, `_checkpoint`, `_cursor`, `_halt`, `_maintenance`, `_stranded`, `_dropping`, `_instance`. Unqualified = `current_schema()` of each connection. The schema, or an unqualified name, must not be a reserved Postgres keyword (`user`, `order`, `left`...): names go into SQL unquoted, so start and `OutboxSql` both fail asking for a rename; `public.user` works. |
-| `shards` | unset: `256` for a new outbox | 1..32767. A shard is processed by one worker at a time across all instances; a key always maps to one shard. **Leave it unset**: an existing outbox then keeps its cursors' count (INFO at startup), so an upgrade needs no setting. Shards are chosen once; a set value that differs from the cursors' count is the emergency reshard (below), never a routine change. |
-| `networkTimeout` | `5m` | 0 or from 1 ms. How long the library's own connections (startup, relay workers, `drain()`, maintenance, the dead-letter pass, the heartbeat, admin calls) wait on a silent socket when the connection has no bound of its own (pgjdbc's `socketTimeout`, 0 by default, which wins when set, except on the heartbeat: it waits at most its interval, at least 10 s, and a longer `socketTimeout` is cut to that for the beat, unless `networkTimeout` is 0, which lifts the heartbeat's bound too): a connection the network dropped silently fails, and the thread goes on with a new one. Taken back before the connection goes back to its pool. Above the longest statement of a step, or the step fails and is tried again. `0` = not set. A statement under a `statement_timeout` of the library's gets that long, and the concurrent build of `<table>_dead_due` none: maintenance asks the database whether its backend still runs it. Business transactions are not covered: without `socketTimeout` a WARN at start names the key. |
 
 ## `outbox.relay`
 
 | Key | Default | Rule and meaning |
 |---|---|---|
-| `enabled` | `true` | `false`: no relay workers, no partition maintenance and no dead-letter pass on this instance (the hook then gets letters only from the pass at the end of `drain()`); `OutboxRelay.drain()` still works; the heartbeat still runs, and so do the ticks of its writes (`ticksWithoutRelay`). Keep it on for at least one production instance. |
-| `workers` | `4` | ≥ 1. Relay threads per instance; each holds a DB connection while working, and under a backlog hands it back to the pool and takes another every `connectionHold`, once the step in flight ends. |
+| `enabled` | `true` | `false`: no relay workers, no partition maintenance and no dead-letter pass on this instance (the hook then gets letters only from the pass at the end of `drain()`); `OutboxRelay.drain()` still works; the heartbeat still runs, and so does the ticker (thread `outbox-ticker`): while this instance writes it makes a tick once a second, so a backlog written while no relay runs comes in batches. It does nothing unless this instance committed since its last tick, inserts none when any instance's tick is at most 3/4 of a second old, and stops while an xid-regression halt is recorded. Needs the grants of `OutboxSql.outbox(config, role)`; a failure is a WARN at most once a minute. Ticks are deleted by maintenance, which runs only with a relay: with every relay down while someone writes the tick table grows by about one row a second (~26 MB a day). Keep it on for at least one production instance. |
+| `workers` | `4` | ≥ 1. Relay threads per instance; each holds a DB connection while working, and under a backlog hands it back to the pool and takes another every minute, once the step in flight ends. |
 | `batchSize` | `10000` | ≥ 1. Rows per chunk read and per handler call, for every handler. A call may also carry the parked (requeued) records of the chunk's keys: up to 2 × `batchSize` records. A key with more parked records than `batchSize` brings none of them: it comes in portions, see `requeue.md`. A handler spending milliseconds per record (sending records one by one) sets 1000 or lower: `batchSize` × time per record must stay well below 80 % of `batchTimeout` (10 ms × 10 000 = 100 s of the default 104), and a failed step redelivers every record of its call. At 10 000, rows above about 420 B (payload + key + headers) go through the byte-budgeted read (see `batchBytes`). A shard's read sorts about a thousand rows, so rows up to a few KB fit the default `work_mem` (4 MB; measured at 1 and 3 KB: no temp files). Measured against 1000 (Postgres 1 ms away, 4 workers, 256 shards): 300 B rows about 2.4× faster, 1 KB in the database's memory about 1.2×, a backlog larger than its memory within 10 %. |
 | `batchBytes` | `16777216` | ≥ 0, 0 = no limit. Bytes (payload + key + headers as stored) per chunk read and per handler call, as `batchSize` bounds rows: a call takes records while they fit, at least one, so a record larger than this goes alone. Parked records and the retry pass get as much again (up to 2 × `batchBytes` a call); a key whose parked records pass `batchBytes` does not fit in a call. Heap for the relay: about `workers × 2 × batchBytes × 2` (the driver keeps a copy). While a shard's rows are small (`batchSize` of its largest recent rows below a quarter of `batchBytes`: up to about 420 B at the defaults), its chunk is read by the plain statement at no extra cost; larger rows go by the byte-budgeted one (at 1 KB still faster than `batchSize` 1000: 240k vs 200k msg/s in memory); the first read of a shard after a start or a worker's fatal error is always bounded, and a sudden jump in message size can make one unbounded read per worker. |
-| `maxTicksPerBatch` | `100` | ≥ 1. |
-| `minTickInterval` | `50ms` | ≥ 0. Under load, at most one tick per interval. |
-| `idlePollInterval` | `200ms` | > 0. Idle tick rate; how fast a commit on another instance is noticed. |
 | `batchTimeout` | `130s` | > 0, ≤ 24 days. Bound of one handler call: wind-down at 80 %, abandoned (all records retried) at 100 %. With Kafka ≥ `delivery.timeout.ms + 5 s + max.block.ms`; the default is that budget with the default producer settings, a handler without such long calls may set it lower. `drain()` gives up after 4 × this + 10 s (530 s by default) without progress, longer than a relay step runs: a step over several shards starts a shard's retry pass until it has spent `batchTimeout`, one started just before runs up to 2 × `batchTimeout`, and the main pass's shared call up to another `batchTimeout`. |
 | `shutdownTimeout` | `30s` | ≥ 0. Grace for in-flight batches at shutdown; then they are interrupted and redelivered later, a step still waiting for a Kafka call through an outage included. `close()` spends up to about 8 s more: interrupted workers and the instance row's delete (a locked row or an exhausted pool is left to expire). |
-| `connectionHold` | `1m` | > 0. Under a backlog a relay worker starts steps on one pooled connection for this long, then hands it back and takes another, so the pool can retire it at `maxLifetime`. A step started just before the end runs on the same connection, up to 4 × `batchTimeout` (see `batchTimeout`), so a pool's `leakDetectionThreshold` must exceed `connectionHold` + 4 × `batchTimeout`; to keep leak detection below a minute lower both. |
-| `ticksWithoutRelay` | `1s` | ≥ 0, ≤ 24 days, `0` = off. Only with `enabled = false`: how often this instance makes a tick while it writes (thread `outbox-ticker`), so a backlog written while no relay runs comes in batches; in one tick the relay draining it re-reads the shard on every chunk (10M rows drained at 2.5k msg/s that way; 2M with a tick a second drained about 1.8× faster than with one). A run every interval (fixed delay) does nothing unless this instance committed since its last tick, and inserts none when any instance's tick is at most 3/4 of the interval old; none while an xid-regression halt is recorded. Needs the grants of `OutboxSql.outbox(config, role)`; a failure is a WARN at most once a minute, the next run tries again. Ticks are deleted by maintenance, which runs only with a relay: with every relay down while someone writes the tick table grows by about one row per interval (~86 400 rows, ~26 MB a day at `1s`); once a relay is back, maintenance deletes them as the relay drains past them, not at its first run. |
-| `headFailuresBeforeDivert` | `3` | ≥ 1. Consecutive failures before a shard isolates a single failing key. |
-| `cursorAnchorInterval` | `1h` | > 0 and ≥ `partitions.maintenanceInterval`. Maintenance writes an idle shard one cursor row this often; ticks are kept about this long (at most about 10 000: a shard that far behind is anchored at the next run), so a rollback to the previous release resumes from these anchors. |
 
 ## `outbox.relay.retry`
 
@@ -52,62 +43,40 @@ outbox {
 
 ## `outbox.relay.requeue`
 
-Records a `handleBatch` override set aside with `Outcome.requeue()` (writing-outbox-handlers, `requeue.md`).
+Records a `handleBatch` override set aside with `Outcome.requeue()` (writing-outbox-handlers, `requeue.md`). A requeued record comes back after 1 s unless its key fits in a call (`batchSize` parked records and `batchBytes` at most) and a new record of the key, its retry head, or a newer parked record whose time has come, brings it back first, so the delay does not cut the repeats of a busy key (bound them with `maxRequeues` or the handler); `requeue(notBefore)` due not before `notBefore` (capped at 24 h). A parked record handed back and not attempted waits at least 1 s too.
 
 | Key | Default | Rule and meaning |
 |---|---|---|
-| `delay` | `1s` | > 0. A requeued record comes back after this unless its key fits in a call (`batchSize` parked records and `batchBytes` at most) and a new record of the key, its retry head, or a newer parked record whose time has come, brings it back first, so a longer `delay` does not cut the repeats of a busy key (bound them with `maxRequeues` or the handler); `requeue(notBefore)` due not before `notBefore` (capped at 24 h). A parked record handed back and not attempted waits at least this too. |
 | `maxRequeues` | `0` | ≥ 0. The requeue past this moves the record to `<table>_dead` with «requeue limit reached», attempts unchanged. Every hand-back answered with `requeue` counts, merges ahead of a new record of the key and early offers ahead of a newer due record of the key included. `0` = unlimited. Global; a handler can bound per route with `record.requeues()` (merges spend requeues at an unpredictable rate). Bound the count, not the age: `record.createdAt()` is the database's time and `Instant.now()` the JVM's, so the two differ by the clock offset. |
-
-## `outbox.relay.waiting`
-
-Records that wait for an instance able to handle them (`Outcome.Waiting`: a newer contract version, a topic no route
-here claims, or the handler's `Outcome.waitFor`; writing-outbox-handlers). A waiting head is handed again after a
-quarter of the time it has waited, no sooner than `delay` and no later than `maxDelay`.
-
-| Key | Default | Rule and meaning |
-|---|---|---|
-| `delay` | `1s` | > 0. The shortest gap before a waiting head is handed again. |
-| `maxDelay` | `5m` | ≥ `delay`. The longest gap; 100 000 keys waiting at it cost about 333 UPDATEs per second fleet-wide. |
-| `alertAfter` | `15m` | > 0. While any record waits, maintenance logs a WARN at most once a minute; once the oldest has waited longer, an ERROR instead. The threshold for alerting on `outbox.waiting.oldest`. |
 
 ## `outbox.partitions`
 
+Spring Boot: `outbox.partitions.tail-conversion.window`, `.zone`, `.max-stall`.
+
 | Key | Default | Rule and meaning |
 |---|---|---|
-| `xidsPerPartition` | `16777216` | ≥ 1000. Size of one xid range partition. An extension adds at most 4 ranges per maintenance run, so keep `4 × xidsPerPartition / maintenanceInterval` above the peak xid/s (a concern only for tiny ranges). Tests: `1000000`. |
-| `premake` | `64` | ≥ 2. Ranges kept ahead of the current xid; must cover the longest snapshot: `premake / 2 × xidsPerPartition ≥ peak xid/s × longest snapshot s`. Tests: `4`. |
-| `maintenanceInterval` | `30s` | > 0. Outbox and inbox maintenance period; also the heartbeat period of each instance in `<table>_instance`. |
-| `swapLockTimeout` | `0` | 0 or 1ms..24 days, whole ms; plus `tailConversion.maxStall` ≤ 24 days too. `0`: the tail swap takes `ACCESS EXCLUSIVE` on the outbox only by `NOWAIT` tries (200 ms of them), so writers never queue behind it and wait only for its hold: one server-side statement of at most 4 ranges, committed locally (`synchronous_commit = local`), cut by the server at 260 ms, plus its local WAL flush; typically 3–6 ms warm. A writer whose `lock_timeout` and `statement_timeout` are each ≥ 300 ms (or unset) never fails by day; with a wait > 0, ≥ `swapLockTimeout` + 300 ms. Above 0: after the tries it waits that long in the lock queue, writers queueing behind it; keep it below the writers' own `lock_timeout` and `statement_timeout`. Also each lock wait when the library moves rows back (orphans, dead letters), 200 ms when 0. |
-| `maxTailScan` | `16777216` | ≥ 0, bytes (`pg_relation_size`). A tail with rows up to this size becomes a range in the swap, Postgres scanning it under the lock (writers wait for the scan: typically 5–6 ms for 15.8 MB, warm; at most the 260 ms bound); the size is re-read under the lock. A larger one stays hot, writes going on into it, until `tailConversion.window`; once it has gone a whole window unconverted (at once with `""`), every maintenance run counts as failed, so `outbox.maintenance.since_success` pages. The library puts no CHECK of its own on a range bound; a CHECK the owner adds to the parent is copied into every range and the tail, and it rejects only rows the parent's CHECK already rejects. |
-| `tailConversion.window` | `"03:00-05:00"` | `HH:mm-HH:mm` in `tailConversion.zone`, may cross midnight (`"23:00-01:00"`); `""`: never. Validated and logged at startup. Inside it maintenance also converts a hot tail over `maxTailScan`; an attempt cut by `maxStall` is not retried in that window, and one ERROR fires when the window ends without a fit. Tests: `""` (the fixture's default). |
+| `tailConversion.window` | `"03:00-05:00"` | `HH:mm-HH:mm` in `tailConversion.zone`, may cross midnight (`"23:00-01:00"`); `""`: never. Validated and logged at startup. Inside it maintenance also converts a hot tail over 16 MiB; an attempt cut by `maxStall` is not retried in that window, and one ERROR fires when the window ends without a fit. Tests: `""` (the fixture's default). |
 | `tailConversion.zone` | JVM default zone | IANA zone id (`Europe/Moscow`), validated at startup. Containers usually run in UTC: set it. |
-| `tailConversion.maxStall` | `1s` | 1ms..24 days (plus `swapLockTimeout` too). The window's hold bound (its statement's `statement_timeout`), so the writers' longest wait. At night writers' own `lock_timeout` and `statement_timeout` must each be ≥ `maxStall` + 300 ms (Postgres default `lock_timeout` 0 = none); else lower it. A scan that does not fit rolls back cleanly with a WARN. |
-| `restoreOrphans` | `true` | Rows of a range the library detached as relayed, at or above the slowest shard's horizon, are moved back by maintenance; `false`: ERROR only. |
+| `tailConversion.maxStall` | `1s` | 1ms..24 days. The window's hold bound (its statement's `statement_timeout`), so the writers' longest wait. At night writers' own `lock_timeout` and `statement_timeout` must each be ≥ `maxStall` + 300 ms (Postgres default `lock_timeout` 0 = none); else lower it. A scan that does not fit rolls back cleanly with a WARN. |
+
+## `outbox.recovery`
+
+What to do when the xid counter is found below a tick's xmax (README «Восстановление после регрессии xid (xid
+regression recovery)»). The automatic recovery re-sends at most 1 000 000 rows; more leave the relay halted until
+`recoverXidRegression` (admin API).
+
+| Key | Default | Rule and meaning |
+|---|---|---|
+| `timeout` | `10m` | > 0, ≤ 24 days. Deadline of the whole recovery transaction (writers wait for it); each statement gets what is left; also the row count's `statement_timeout`. An automatic recovery that failed after locking the outbox is not tried again by itself. |
 
 ## `outbox.inbox` (`InboxModule`)
 
 | Key | Default | Rule and meaning |
 |---|---|---|
 | `table` | `"inbox"` | Same naming rules as `outbox.table`. Created only when a component uses `Inbox`. |
-| `partitionInterval` | `1h` | ≥ 1m, a whole number of minutes. |
-| `premake` | `24h` | ≥ 2 × `partitionInterval`; `premake − partitionInterval` > `outbox.partitions.maintenanceInterval`. |
-| `retention` | `24h` | ≥ 2 × `partitionInterval`; `(retention + premake) / partitionInterval` ≤ 1000. Ids younger than `retention − partitionInterval` (23 h) are always deduplicated while inbox maintenance makes ranges ahead (`outbox.inbox.window.remaining`); a forward step of X on the database clock lowers that age by X, so leave the margin. Change on all instances at once; services sharing one `outbox.inbox.table` keep the same `retention`, `partitionInterval` and `premake`, or the shortest `retention` wins for all. |
-| `attachOrphans` | `true` | A range detached inside the dedup window is attached back by inbox maintenance; `false`: ERROR only. |
+| `retention` | `24h` | ≥ 2 h (a whole number of minutes); `retention + 24 h` ≤ 1000 h. Ids younger than `retention − 1 h` (23 h) are always deduplicated while inbox maintenance makes ranges ahead (`outbox.inbox.window.remaining`); a forward step of X on the database clock lowers that age by X, so leave the margin. Change on all instances at once; services sharing one `outbox.inbox.table` keep the same `retention`, or the shortest `retention` wins for all. |
 
-An inbox-only service also reads `outbox.partitions.maintenanceInterval` and `outbox.relay.shutdownTimeout`.
-
-## `outbox.recovery`
-
-What to do when the xid counter is found below a tick's xmax (README «Восстановление после регрессии xid (xid
-regression recovery)»).
-
-| Key | Default | Rule and meaning |
-|---|---|---|
-| `xidRegression` | `"auto"` | `auto` or `halt`. `auto`: the instance holding the maintenance lock recovers by itself when at most `maxRows` rows must be re-sent. `halt`: never by itself; the relay waits for `recoverXidRegression` (admin API). |
-| `maxRows` | `1000000` | ≥ 0. Rows the automatic recovery re-sends while writers wait for it; more leave the relay halted. |
-| `clockMargin` | `10m` | ≥ 0. Rows written since the newest tick before the regression minus this margin are re-sent, in `created_at, id` order: a new server's clock behind the old one's can put a key's new message before its old undelivered one. |
-| `timeout` | `10m` | > 0, ≤ 24 days. Deadline of the whole recovery transaction (writers wait for it); each statement gets what is left; also the row count's `statement_timeout`. An automatic recovery that failed after locking the outbox is not tried again by itself. |
+An inbox-only service also reads `outbox.relay.shutdownTimeout`.
 
 ## `outbox.deadLetters`
 
@@ -115,10 +84,7 @@ The dead-letter hook and the dead table (writing-outbox-handlers, `dead-letter-h
 
 | Key | Default | Rule and meaning |
 |---|---|---|
-| `batchSize` | `100` | 1..1000. Letters per hook call; also key locks per redrive transaction. |
-| `timeout` | `130s` | > 0, ≤ 24 days. Bound of one hook call (by default the Kafka sender's budget, as `relay.batchTimeout`); a call past it leaves its letters pending with backoff `relay.retry.initialDelay` doubling to `maxDelay`. With the Kafka DLQ ≥ `delivery.timeout.ms + 5 s + max.block.ms`, else a WARN at startup. |
-| `retention` | `0` | 0..3650 days. Maintenance deletes `kept` letters older than this by `failed_at`; `0` keeps them forever. `pending` and `scheduled` letters are never deleted. Deleted in portions, at most `maintenanceInterval` per run; later runs finish the rest. |
-| `redriveHistory` | `30d` | > 0, ≤ 3650 days. How long `<table>_redriven` remembers a message's redrive count, which a letter that dies again carries in `redrives`. Old entries go in portions, within the same per-run budget as `retention`. |
+| `retention` | `0` | 0..3650 days. Maintenance deletes `kept` letters older than this by `failed_at`; `0` keeps them forever. `pending` and `scheduled` letters are never deleted. Deleted in portions, at most 30 s per run; later runs finish the rest. |
 
 ## `outbox.schema`
 
@@ -154,29 +120,13 @@ join pg_class c on c.oid in (select inhrelid from pg_inherits where inhparent = 
 where c.relowner = '<member>'::regrole \gexec
 ```
 
-## Shard count and the emergency reshard
+## Shard count
 
-- Rough sizing: 256 suits typical services. Go lower only for tiny installs. More than 256 is rarely needed; 1024
-  works but costs bulk throughput at saturation. Many shards are cheap: idle shards write nothing
-  ([sizing-examples.md](sizing-examples.md)).
+- A new outbox gets 256 shards; an existing one keeps the count of its cursors (INFO at startup). A shard is processed
+  by one worker at a time across all instances; a key always maps to one shard. Many shards are cheap: idle shards
+  write nothing ([sizing-examples.md](sizing-examples.md)).
 - Every instance heartbeats into `<table>_instance` (id `<host>/<pid>/<8 hex>`, shard count, whether its dead-letter
-  hook is active) every `maintenanceInterval`; `OutboxAdmin.status()` lists them as `instances`.
-- An explicit `shards` that differs from the cursors' count takes the emergency reshard path at bootstrap. It refuses
-  while another instance with a different count has a live heartbeat, and while any relay ticks: the newest tick must be
-  at least 1 min old (more for slow tick rates), which it waits up to 2 min for, so a relay of a release without the
-  heartbeat counts too. An instance of the previous release (5fc60dd) with its relay disabled is invisible to both
-  checks: stop every old instance before an explicit reshard. Under locks it then requires a drained outbox: empty retry
-  and parked tables, no batch in progress, no committed row unrelayed, no standalone range, no xid regression. Each
-  failed check is named with its count, and startup fails. Waiting records (`waitingSize` in `/status`) sit in the retry
-  table and block it until a release that reads them delivers them or they are abandoned to dead letters
-  (operating-outbox). Procedure: stop writers, wait for `outbox.shard.lag` 0, stop
-  all instances, start one instance with the new value, wait for its INFO «outbox resharded ... from N to M shards»,
-  then start the rest with the same value or unset (README «Решардинг»).
-- After a reshard, an instance still running with the old count halts: ERROR «... holds cursors for N shards, but
-  this instance runs with outbox.shards = M ...», its relay takes no shards, its maintenance runs no step, `drain()`
-  throws, and `send` and redrives are refused within one heartbeat (`IllegalStateException` «... refuses this write
-  ...»): restart it with the new count or with `shards` unset. Dead
-  letters keep their old shard; a redrive computes it again.
+  hook is active) every 30 s; `OutboxAdmin.status()` lists them as `instances`.
 
 ## `outbox.heartbeat` (`OutboxModule`)
 
@@ -185,12 +135,12 @@ end); without a framework, `OutboxRuntime.builder(...).heartbeatConnections(hear
 
 | Key | Default | Rule and meaning |
 |---|---|---|
-| `dedicatedConnection` | `true` | `true`: the heartbeat gets a pool of its own, so business load that exhausts the app pool does not starve its beats. A copy of the HikariCP pool of the `JdbcDatabase` behind the outbox's transactions (same database, role, driver properties and meters), named `<db.poolName>-outbox-heartbeat`, with `maximumPoolSize` and `minimumIdle` 1, `initializationFailTimeout` -1, `connectionTimeout` = max(500 ms, min(copied, `maintenanceInterval` / 4)) and `validationTimeout` = max(250 ms, min(copied, `connectionTimeout` / 2)); closed after the runtime. Its connection stays open: +1 server connection per instance, outside `db.maxPoolSize`. `false`: the heartbeat takes the app's connections, as before. |
+| `dedicatedConnection` | `true` | `true`: the heartbeat gets a pool of its own, so business load that exhausts the app pool does not starve its beats. A copy of the HikariCP pool of the `JdbcDatabase` behind the outbox's transactions (same database, role, driver properties and meters), named `<db.poolName>-outbox-heartbeat`, with `maximumPoolSize` and `minimumIdle` 1, `initializationFailTimeout` -1, `connectionTimeout` = max(500 ms, min(copied, 7.5 s)) and `validationTimeout` = max(250 ms, min(copied, `connectionTimeout` / 2)); closed after the runtime. Its connection stays open: +1 server connection per instance, outside `db.maxPoolSize`. `false`: the heartbeat takes the app's connections, as before. |
 
 - A `JdbcConnectionFactory` tagged `@Tag(OutboxHeartbeat.class)` replaces the pool whatever the key says: to bypass a
   pooler, run as another role (with the app role's DML rights on the outbox tables and `USAGE` on their schema) or use
   other timeouts. It must reach the app's database; keep its connection and validation timeouts together well below
-  `maintenanceInterval`, as one borrow can take both.
+  30 s, as one borrow can take both.
 - Transactions that are not Kora's over a Hikari-backed `JdbcDatabase` (an app's own `OutboxTransactions` or
   `JdbcConnectionFactory`) leave nothing to copy: the heartbeat shares the app's connections, and a startup INFO names
   the tag.
@@ -228,8 +178,6 @@ In Kora as below; in Spring Boot `outbox.admin.check-origin`.
 the letter's topic, e.g. `"{topic}.dlq"`. Validated at startup: a Kafka topic name (up to 249 of `[a-zA-Z0-9._-]`),
 not `{topic}` alone. Behaviour and duplicates: writing-outbox-handlers, `dead-letter-hook.md`.
 
-`clientIdSuffix` (default `true`): a set `client.id` gets a suffix per producer, as below. `false`: every producer
-gets `client.id` unchanged, and their JMX metrics collide (see the end of this section).
 
 `driverProperties`: Kafka producer properties, validated at startup.
 
@@ -257,9 +205,7 @@ Producer client metrics are not bound to Micrometer; they are visible through JM
 prefix, since JMX tells producers apart by it: each producer gets `<client.id>-outbox-<n>`, one of the second pool
 `<client.id>-outbox-unbatched-<n>`, and those of calls under `relay.retry.holdPermanent` `<client.id>-outbox-held-<n>`
 and `<client.id>-outbox-held-unbatched-<n>`. Broker quotas match the whole `client.id`, so a quota on the bare id does not
-cover the outbox producers: set it on the user principal. If the quota must stay on `client.id`, set
-`clientIdSuffix = false`: every producer then gets `client.id` as it is, and they share their JMX metrics: each
-overwrites the others', and closing any of them unregisters the rest. With no `client.id` Kafka names them
+cover the outbox producers: set it on the user principal. With no `client.id` Kafka names them
 `producer-<n>`.
 
 ## Spring Boot
@@ -274,10 +220,13 @@ with or without brackets: `outbox.kafka.driver-properties.max.block.ms=3000`. Th
 | Spring-only key | Default | Meaning |
 |---|---|---|
 | `outbox.enabled` | `true` | `false`: no `Outbox`, `OutboxAdmin`, relay or admin API; `Inbox` stays |
-| `outbox.lifecycle.phase` | `2147479551` (`Integer.MAX_VALUE - 4096`) | `SmartLifecycle` phase: below the web server, the Kafka listener containers and the default phase, so the outbox starts before them and stops after |
-| `outbox.telemetry.observe-unsampled` | `false` | Whether to observe the delivery of a record whose stored trace is not sampled |
 | `outbox.json.mapper` | `auto` | `auto`: Jackson 2's `ObjectMapper` bean if any, else Jackson 3's `JsonMapper`; `jackson2`, `jackson3`: that one, the start failing when absent |
 | `outbox.kafka.fallback` | `true` | `true`: Kafka takes every topic no route claims, and an app's own `OutboxHandler` bean fails the start. `false`: that bean takes them or, with none, a send to such a topic is refused before writing |
+
+The `SmartLifecycle` phase is fixed at `2147479551` (`Integer.MAX_VALUE - 4096`): below the web server, the Kafka
+listener containers and the default phase, so the outbox starts before them and stops after. Observing the delivery of
+a record whose stored trace is not sampled is off; to turn it on, define your own `OutboxTelemetry` bean with
+`ObservationOutboxTelemetry.builder().observeUnsampled(true)`.
 
 `outbox.enabled` and `outbox.kafka.fallback` take every boolean Spring binds: `false`, `off`, `no`, `0` turn them off,
 `true`, `on`, `yes`, `1` on, in any case; any other value fails the start.

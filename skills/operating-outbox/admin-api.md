@@ -10,12 +10,12 @@ A component of `OutboxModule`, a bean in Spring Boot. Each call runs its own tra
 
 | Method | Does |
 |---|---|
-| `status()` | Relay halt, lag, retry and parked sizes, waiting records (`waitingSize` heads, `waitingOldestSeconds` for the oldest, 0 when none), dead letters by topic and status (null when counting them took over 10 s, absent over HTTP, the rest returned all the same), orphans, tail overflow, `premade`, `xidsLeft`, seconds since maintenance, shards, and `instances`: every heartbeat row, expired ones included (id, shard count, `lastSeen`, whether its dead-letter hook is active, `relay`, `live`: its row has not expired, by the database clock, `contracts`: the highest contract version it reads by topic, null unknown, empty none, a non-positive value shown as 0, and `routes`: the topics its routes claim, typed and plain, sorted, null unknown (absent over HTTP), empty none). A new route may be written to once every instance with `relay` and `live` lists its topic in `routes`, and that set matches your deployment. `live` says the process runs, not that its queue moves. A `lastSeen` older than 3 × `maintenanceInterval` means the instance is not running; a crashed instance's row stays about an hour after its heartbeat expires, 3 × `maintenanceInterval` + 1 h after its last beat. |
+| `status()` | Relay halt, lag, retry and parked sizes, waiting records (`waitingSize` heads, `waitingOldestSeconds` for the oldest, 0 when none), dead letters by topic and status (null when counting them took over 10 s, absent over HTTP, the rest returned all the same), orphans, tail overflow, `premade`, `xidsLeft`, seconds since maintenance, shards, and `instances`: every heartbeat row, expired ones included (id, shard count, `lastSeen`, whether its dead-letter hook is active, `relay`, `live`: its row has not expired, by the database clock, `contracts`: the highest contract version it reads by topic, null unknown, empty none, a non-positive value shown as 0, and `routes`: the topics its routes claim, typed and plain, sorted, null unknown (absent over HTTP), empty none). A new route may be written to once every instance with `relay` and `live` lists its topic in `routes`, and that set matches your deployment. `live` says the process runs, not that its queue moves. A `lastSeen` older than 90 s means the instance is not running; a crashed instance's row stays about an hour after its heartbeat expires, 90 s + 1 h after its last beat. |
 | `findDeadLetters(filter, afterId, limit)`, `countDeadLetters(filter)` | Dead letters by `DeadLetterFilter` (topic, key, error substring, `failedFrom` inclusive, `failedTo` exclusive, status), id order, up to 1 000 per page. A page carries up to `limit` full payloads (base64 in JSON): with large letters (records Kafka refused as too large) ask for small pages. |
 | `redriveDeadLetters(ids)` / `(filter)` | Back to the outbox as the hook's `redrive`: a new message after the later messages of its key, same message id. Returns the count. |
 | `discardDeadLetters(ids)` / `(filter)` | Delete; returns the count. |
 | `restoreOrphan(table, fromXid)` | Rows at `fromXid` and above back to the outbox, the rest dropped with the table. |
-| `recoverXidRegression()` | The xid regression recovery now, in any mode and for any `maxRows`. |
+| `recoverXidRegression()` | The xid regression recovery now, for any number of rows (the automatic one stops at 1 000 000 and leaves the relay halted). |
 | `recoverStrandedShards()` | Repairs shards whose starting tick, or their batch's target tick, no longer exists, on running instances; returns the rows re-sent. Refused while an xid regression halt is recorded. |
 | `abandonWaiting(topic, key, reason, dryRun)` | Records of `topic` (of `key` only unless null) waiting for an instance able to handle them, the whole key each (waiting head, its followers, its parked records; an unkeyed head alone), to the dead table as `kept` (the hook is not asked) with error `abandoned: <reason>`. Returns `Abandoned(keys, records)`; `dryRun` counts only. Shard by shard, chunks of 1 000 keys, each under the shard's lock, waited up to `batchTimeout` + 5 s, then `IllegalStateException` «... busy, retry» (done chunks stay done; call again). Later records of the key are delivered ahead of the abandoned ones. |
 | `abandonKey(topic, key, reason, dryRun)` | Every row of `key` in the retry and parked tables, whether or not its head waits, to the dead table as `kept` (the hook is not asked) with error `abandoned: <reason>`. For a record that requeues for ever or fails for ever with `maxAttempts = 0`. Returns `Abandoned(keys, records)`, with `dryRun` what it would move. Records not read yet, or sent later, are delivered: it moves only the rows there when its first chunk runs, and what the relay reads between chunks stays, the lowest of it made the head, due now. Chunks of 1 000 rows, newest first, under the shard's lock: «busy, retry» past `batchTimeout` + 5 s, calling again goes on. |
@@ -142,7 +142,7 @@ class ApiKeyAuthorizer implements OutboxAdminAuthorizer {
 ## Procedures
 
 - **Dead letters** («Dead letters»): `/status`, then list, redrive or discard. A redrive keeps the message id, so
-  inbox consumers deduplicate it within `retention − partitionInterval` (23 h by default).
+  inbox consumers deduplicate it within `retention − 1 h` (23 h by default).
 - **Orphans** («Осиротевшие партиции»): compare the orphan's rows with what consumers got (the README's `select`),
   then one `restore` call with the cut-off `fromXid` (`0` returns all; a negative one gets 400, nothing changed).
   Its id-index build and first chunk read the whole orphan, given 90 s + 1 s per 20 MB; each cut of that read
@@ -151,7 +151,7 @@ class ApiKeyAuthorizer implements OutboxAdminAuthorizer {
   then call again; once it is at 16 times the error says the next call is cut the same way.
 - **xid halt** («Восстановление после регрессии xid (xid regression recovery)»): one `POST /recovery/xid-regression`;
   writers wait about 2.5–3 s per million rows re-sent. On a large outbox, or after the ERROR «failed after it locked
-  the outbox», first raise `outbox.recovery.timeout` on the calling instance and restart it. Never delete the
+  the outbox», first raise `outbox.recovery.timeout` (10 min) on the calling instance and restart it. Never delete the
   `<table>_halt` row.
 - **Stranded shards** («Застрявшие шарды»): one `POST /recovery/stranded-shards` on the running instances; stop
   nothing, the other shards keep flowing. 409: nothing is stranded, or something holds a lock (call again, what moved
@@ -163,7 +163,7 @@ class ApiKeyAuthorizer implements OutboxAdminAuthorizer {
   cause in the ERROR line or `outbox.messages.waiting{kind}`. If the release that reads them will not return,
   `waiting/abandon` with `dryRun: true`, then without; body `{"topic", "key"?, "reason", "dryRun"?}`, `key` as UTF-8.
   The audit line carries topic, key, reason and dryRun. Later: redrive with `{"filter":{"topic":"orders",
-  "error":"abandoned"}}` once a reading release runs, or discard. A reshard needs them gone first.
+  "error":"abandoned"}}` once a reading release runs, or discard.
 - **A key that never gets through** («Ключ, который не проходит никогда»): a record that requeues for ever (`parkedSize`
   stays up) or fails for ever with `maxAttempts = 0` (`outbox.retry.oldest` grows, shard lag does not; the WARN «streams diverted
   to retry» with its error fires once, at the divert). No rollout: `keys/abandon`

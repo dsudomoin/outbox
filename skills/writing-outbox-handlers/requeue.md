@@ -8,7 +8,7 @@ another process of the same account running, a process that ends on its own.
 |---|---|---|
 | Means | the target failed | the record is not ready; the target is fine |
 | Its key | waits: later records queue behind it in `<table>_retry` | goes on: later records are delivered while it waits |
-| Comes back | after backoff (1 s doubling to 5 min), or at `notBefore` if later | whichever comes first: its due time `now + outbox.relay.requeue.delay`, or, while the key's parked records fit in `batchSize`, right before the next new record of its key (in the same call) (1 s); with `requeue(notBefore)`, `max(now + delay, notBefore)`, at most 24 h ahead. A record whose time comes brings the older parked records of its key along, not yet due as they may be, so `notBefore` is no lower bound |
+| Comes back | after backoff (1 s doubling to 5 min), or at `notBefore` if later | whichever comes first: its due time `now + 1 s`, or, while the key's parked records fit in `batchSize`, right before the next new record of its key (in the same call); with `requeue(notBefore)`, `max(now + 1 s, notBefore)`, at most 24 h ahead. A record whose time comes brings the older parked records of its key along, not yet due as they may be, so `notBefore` is no lower bound |
 | Counts | `record.attempts()`, `relay.retry.maxAttempts` | `record.requeues()`, `relay.requeue.maxRequeues` |
 | Shard | pauses and backs off when nothing was delivered | no pause, no backoff, chunk size unchanged |
 
@@ -99,7 +99,7 @@ public final class AccountJobsHandler implements OutboxTopicHandler {
   `<table>_dead` with the error «requeue limit reached», attempts unchanged. Every hand-back answered with `requeue`
   counts, a merge ahead of a new record of the key and an early offer ahead of a newer due record of the key included,
   so a busy key spends requeues faster than one per
-  `delay`, at a rate you cannot predict. Bound the count, not the age: `record.createdAt()` is the database's time and
+  second, at a rate you cannot predict. Bound the count, not the age: `record.createdAt()` is the database's time and
   `Instant.now()` the JVM's, so the two differ by the clock offset.
 
 ## Order
@@ -113,8 +113,8 @@ comes in portions in the order they came due, due `D = delay × ceil(N / batchSi
 `N / batchSize ×` the step time, main call included), as a later record may
 carry what the older ones wait for. When a key's offered records have all left, its next `batchSize` come at once, in order,
 whatever their due times, a `notBefore` included; where the key's oldest just answered `requeue` and newer ones left, they are
-offered again at most once per `delay` per instance, so after a block ends one portion passes them, or what leaves within
-`delay` of an earlier such pull. An unkeyed record comes back only at its due time, alone.
+offered again at most once per second per instance, so after a block ends one portion passes them, or what leaves within
+1 s of an earlier such pull. An unkeyed record comes back only at its due time, alone.
 
 ## When a parked record is handed back
 

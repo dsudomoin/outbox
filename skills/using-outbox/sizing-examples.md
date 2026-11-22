@@ -8,7 +8,7 @@ on Apple M5 Pro cores and a single Kafka broker with replication factor 1. Your 
 
 ## How shards, workers and Kafka partitions relate
 
-- **Shard** = `hash(topic, key) mod outbox.shards`. It decides which relay worker may deliver a message. Each shard is
+- **Shard** = `hash(topic, key) mod` the outbox's shard count. It decides which relay worker may deliver a message. Each shard is
   processed by at most one worker at a time across all instances (a transaction advisory lock per step), sequentially.
   A worker steps the shards that got rows since the last tick as a group, in one transaction, so many shards do not
   mean many steps.
@@ -21,10 +21,8 @@ on Apple M5 Pro cores and a single Kafka broker with replication factor 1. Your 
   instances × workers: workers are the knob. When an instance dies, the remaining workers pick up its shards on their
   next step.
 - Each working worker holds one DB connection; each instance has `max(4, 2 × workers)` handler threads.
-- **Shards are chosen once.** Leave `outbox.shards` unset: a new outbox gets 256, an existing one keeps its count, so
-  an upgrade needs no setting. Changing the count later is the emergency reshard (stop writers, drain, stop all
-  instances; [config-reference.md](config-reference.md)), never a routine change. Topic partitions can only be added,
-  and adding them moves keys: choose them for the target load from the start.
+- **Shards are chosen once.** A new outbox gets 256, an existing one keeps the count of its cursors. Topic partitions
+  can only be added, and adding them moves keys: choose them for the target load from the start.
 
 ## Formulas used below
 
@@ -34,36 +32,13 @@ on Apple M5 Pro cores and a single Kafka broker with replication factor 1. Your 
 | Postgres connections | Σ over services and instances of `maxPoolSize` + 1 per outbox instance (the heartbeat's own connection) + other clients + `superuser_reserved_connections` (3) ≤ `max_connections` (Postgres default 100); the + 1 also counts against the role's `CONNECTION LIMIT` and a pooler's per-user pool | Postgres, README «Размер пула соединений» |
 | Advisory lock slots | `max_locks_per_transaction × (max_connections + max_prepared_transactions)` ≥ concurrent writer transactions × distinct keys each + other locks | README «max_locks_per_transaction для массовой отправки» |
 | Kafka call budget | `batchTimeout ≥ delivery.timeout.ms + 5 s + max.block.ms` (defaults 120 + 5 + 5 = 130 s) | `KafkaOutboxSender` |
-| Dead-letter hook budget | `deadLetters.timeout` ≥ the same sum with the Kafka DLQ | README «Kafka DLQ» |
+| Dead-letter hook budget | the hook call's bound (130 s) is the same sum with the Kafka DLQ | README «Kafka DLQ» |
 | Handler call budget | `batchSize × p99(record) ≤ 0.8 × batchTimeout − per-record timeout` | `OutboxHandler`, `OutboxConfig` |
 | Sequential handler throughput | ≤ min(shards, instances × workers) / mean seconds per record | Little's law; RESULTS «chaos: slow-handler» |
 | Concurrent handler throughput | rows/s ≤ min(shards, instances × workers) × `batchSize` / (call time + step overhead), call time ≈ ceil(route records / P) × p99; check with one instance down, aim for ≥ 2× | One call per worker step; P = requests in flight per call |
 | Requests in flight at a target | ≤ min(shards, instances × workers) × P | One call per running worker |
-| Idle relay cost | ≈ `1 / idlePollInterval` write transactions per second per cluster plus one maintenance run per `maintenanceInterval`, at any shard count; idle shards write nothing but one anchor cursor row per `relay.cursorAnchorInterval` (1 h) | README «Стоимость простоя» |
-| Time one xid range covers | `xidsPerPartition / cluster xid/s`; the outbox holds about 1–2 ranges of rows | README «Партиции» |
-| Long snapshots | `premake / 2 × xidsPerPartition ≥ peak xid/s × longest snapshot s` | README «Партиции» |
-| Inbox dedup window | `retention − partitionInterval` (default 23 h) | `Inbox` javadoc |
-
-## Choosing the shard count
-
-Rough sizing: **256 suits typical services.** Go lower only for tiny installs. More than 256 is rarely needed; 1024
-works but costs bulk throughput at saturation. Many shards are cheap: idle shards write nothing.
-
-Measured with the library defaults of the time (one instance, workers 4, `batchSize` 1000, now 10 000), RESULTS «Под нагрузкой после исправлений
-ревью (fix round 1)» and «Простой после чекпоинтов»:
-
-| shards | 1 000 msg/s, Kafka: p50 / p99, DB CPU (of 200 %) | bulk, noop handler: delivered msg/s, p50 | idle xid/s |
-|---|---|---|---|
-| 32 | 0.048–0.049 / 0.110 s, 26 % | 293–296k, 0.33–3.1 s | 5.1 |
-| 256 | 0.053 / 0.110 s, 27–28 % | 288–289k, 0.40 s | |
-| 1024 | 0.057 / 0.111 s, 31 % | 261k, 1.6 s | 5.1 |
-
-- The code before the shard work (baseline `574601d`) at 32 shards: 0.074 / 0.146 s and 68 % DB CPU at 1 000 msg/s, bulk
-  299–308k msg/s; 256 shards on this release are within the spread of its bulk runs.
-- Relay steps per second stay about 40 at 1 000 msg/s for any shard count: one step per tick and group, not per
-  shard.
-- Bulk at 32 shards delivers as much but its queue grew in most windows (writers got faster, relay capacity did not),
-  hence the wide p50. 1024 shards: about 10 % less bulk throughput and a 1.6 s p50 at saturation.
+| Idle relay cost | ≈ 5 write transactions per second per cluster (one per 200 ms) plus one maintenance run per 30 s, at any shard count; idle shards write nothing but one anchor cursor row per hour | README «Стоимость простоя» |
+| Inbox dedup window | `retention − 1 h` (default 23 h) | `Inbox` javadoc |
 
 ## 1. Small service
 
@@ -75,7 +50,7 @@ db {
   maxPoolSize = 15              # own 8 + relay.workers 2 + 5
 }
 outbox {
-  table = "orders.outbox"       # outbox.shards unset: 256 for a new outbox
+  table = "orders.outbox"
   relay.workers = 2             # 2 instances × 2 = 4 workers, 2 with one instance down
   kafka.driverProperties {
     "bootstrap.servers" = ${KAFKA_BOOTSTRAP}
@@ -111,7 +86,7 @@ db {
   maxPoolSize = 28              # own 20 + relay.workers 3 + 5
 }
 outbox {
-  table = "orders.outbox"       # outbox.shards unset: 256
+  table = "orders.outbox"
   relay.workers = 3             # 3 instances × 3 = 9 workers, 6 with one instance down
   kafka.driverProperties {
     "bootstrap.servers" = ${KAFKA_BOOTSTRAP}
@@ -129,7 +104,7 @@ db {
   maxPoolSize = 10              # 4 listener threads (one transaction per poll) + 2 inbox maintenance (work + lock holder) + own 4
 }
 outbox.inbox {
-  table = "billing.inbox"       # defaults: partitionInterval 1h, premake 24h, retention 24h
+  table = "billing.inbox"       # default retention 24h
 }
 kafka.consumer.orders {
   topics = ["orders"]
@@ -155,7 +130,7 @@ kafka-topics.sh --bootstrap-server "$KAFKA" --create --topic orders --partitions
 - Locks: ≤ 3 keys per transaction, so the default `max_locks_per_transaction` is enough. Send several keyed messages
   of one transaction with one `sendAll`.
 - Inbox disk: rows ≈ consumed msg/s × retention. The bench soak held 9.0 GB of inbox after 1 h at ~22k msg/s, about
-  114 B per id, so 5k msg/s × 24 h needs ~49 GB. Lower `retention` (≥ 2 × `partitionInterval`) if your largest
+  114 B per id, so 5k msg/s × 24 h needs ~49 GB. Lower `retention` (≥ 2 h) if your largest
   consumer lag or replay allows.
 
 **Why these numbers:**
@@ -178,12 +153,8 @@ db {
   maxPoolSize = 17              # own 6 + 2 writers + relay.workers 4 + 5
 }
 outbox {
-  table = "imports.outbox"      # outbox.shards unset: 256
+  table = "imports.outbox"
   relay.workers = 4             # one instance can carry the load alone, as in the bench
-  partitions {
-    xidsPerPartition = 60000    # EXAMPLE for 200 xid/s measured: ≈ 5 min per range; see below
-    premake = 128               # 64 × 60000 / 200 xid/s ≈ 5.3 h of snapshot cover
-  }
   kafka.driverProperties {
     "bootstrap.servers" = ${KAFKA_BOOTSTRAP}
     "linger.ms" = 5
@@ -211,9 +182,6 @@ kafka-topics.sh --bootstrap-server "$KAFKA" --create --topic imports --partition
   DB CPU (2 writers × 10 000 per transaction, payload 100 B, noop handler; RESULTS «Под нагрузкой после исправлений
   ревью (fix round 1)»). The Kafka handler adds producer work: re-check with `outbox.shard.lag`.
 - A relay batch covers about 1000 ids per shard (`1000 × shards`, at least `batchSize`).
-- Bulk burns few xids per message, so a 16 777 216-xid default range can hold hours of rows. Measure the cluster xid
-  rate (`select pg_current_xact_id()` twice, a minute apart), set `xidsPerPartition ≈ xid/s × 300` (≥ 1000), then
-  size `premake` with the snapshot formula.
 
 ## 4. Slow external target next to Kafka
 
@@ -229,7 +197,7 @@ db {
   maxPoolSize = 28              # own 20 + relay.workers 3 + 5
 }
 outbox {
-  table = "orders.outbox"       # outbox.shards unset: 256
+  table = "orders.outbox"
   relay {
     workers = 3
     batchSize = 75              # (0.8 × 130 s − 1 s) / 0.3 s = 343 is the call budget; see below for 75
@@ -289,12 +257,10 @@ db {
 }
 outbox {
   table = "outbox_orders_it"    # unique per test class when classes share one database
-  shards = 4                    # a tiny install: set once, at the table's creation
   relay {
     enabled = false             # deliver with OutboxRelay.drain(); also in every test that does not check delivery
     workers = 1
   }
-  partitions { xidsPerPartition = 1000000, premake = 4 }
   kafka.driverProperties { "bootstrap.servers" = ${KAFKA_BOOTSTRAP} }
 }
 ```
@@ -302,13 +268,8 @@ outbox {
 - Topic: `Admin.createTopics(List.of(new NewTopic("orders", 1, (short) 1)))` before sending, with broker auto-create
   off.
 - Tests with many distinct keys per `sendAll`: `.withCommand("postgres", "-c", "max_locks_per_transaction=256")`.
-- Tests that keep the relay on: `relay { workers = 2, minTickInterval = 5ms, idlePollInterval = 100ms }`, as the
-  library's own Kafka wiring test.
 
 **Why these numbers:**
 
-- `xidsPerPartition` 1 000 000 with `premake` 4 builds 6 partitions instead of 66 at bootstrap.
-- `shards` 4 keeps `drain()` short: every shard is stepped up to the tick (the library's own wiring tests use 4). A
-  test table is new each run, so the count is never changed on an existing outbox.
 - The pool follows the production formula. With the relay disabled, no workers, outbox maintenance or dead-letter
   thread run, so 7 is an upper bound, not a requirement.

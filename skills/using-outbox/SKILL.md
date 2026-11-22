@@ -84,7 +84,7 @@ data (a record no running release reads waits; it is never lost or dead-lettered
   (30 s) stale, a crashed old instance blocks up to about 90 s, an old instance started after the check still gets v2
   (it waits), plain handlers and Kafka-bound topics are not version-checked, no live relay instance (on a fresh read)
   means nothing is refused.
-- A writer whose heartbeat has not read the reports for over 3 × `maintenanceInterval` decides both the version and
+- A writer whose heartbeat has not read the reports for over 90 s decides both the version and
   the route check by its last read: refused if there was none, if it found no live relay instance, or if a live relay
   instance in it had no report (`contracts` or `routes` null) or an incompatible one; otherwise let through, counted in
   `outbox.messages.route_unchecked`. Such a refusal names no instance. An exhausted app pool no longer causes a stale
@@ -143,9 +143,8 @@ no route check.
 ## Config rules
 
 - `outbox.relay.batchTimeout ≥ delivery.timeout.ms + 5 s + max.block.ms` (defaults 120 + 5 + 5 = 130 s, the default `batchTimeout`).
-- `outbox.relay.waiting { delay = 1s, maxDelay = 5m, alertAfter = 15m }`: how often a record that waits for another
-  release is handed again (a quarter of its wait, within `delay`..`maxDelay`) and when its WARN becomes an ERROR
-  ([config-reference.md](config-reference.md)). Defaults fit; alert on `outbox.waiting.oldest > alertAfter`.
+- A record that waits for another release is handed again after a quarter of its wait, within 1 s..5 min; its WARN
+  becomes an ERROR after 15 min. Alert on `outbox.waiting.oldest > 900`.
 - With Kafka, `outbox.relay.retry.maxDelay` < 10 min (default 5 min): a record kept for an unbatched resend is
   forgotten after 10 min ([config-reference.md](config-reference.md), «Oversized records»).
 - Metrics need a Micrometer `MeterRegistry`: Kora's `MetricsModule`, only with an HTTP server module (`/metrics` on
@@ -158,7 +157,7 @@ no route check.
   `@Tag(OutboxHeartbeat.class)` replaces it whatever the key says (to bypass a pooler, or for other timeouts). Without a
   framework, pass a pool of one connection on the app's database (another role needs the app role's DML rights on the
   outbox tables and `USAGE` on their schema), its connection and validation timeouts together well below
-  `maintenanceInterval`:
+  30 s:
 
   ```java
   var runtime = OutboxRuntime.builder(config, new JdbcTransactions(appDataSource), handler)
@@ -171,7 +170,7 @@ no route check.
 
   A heartbeat source that hands out no connection makes that beat use the app's, with a WARN at most once a minute;
   one unreachable at start does not fail the start; one on another database fails the start when seen there, else
-  logs an ERROR and the heartbeat keeps the app's connections for 5 × `maintenanceInterval`, then checks it again. One
+  logs an ERROR and the heartbeat keeps the app's connections for 150 s, then checks it again. One
   that cannot write (a standby, a read-only role, missing rights) while the app's connections can goes off the same way;
   when the app's cannot write either, the database is to blame and the source stays on.
 
@@ -325,8 +324,7 @@ for ops:
    × (`relay.workers` + 5) plus the service's own load. Start checks the prepared statements and fails naming the fix.
    The `CONCURRENTLY` statements (detach, `<table>_dead_due` build) run under the role's `statement_timeout`.
    Maintenance locks live in a lock-holder transaction on a second connection: a maintenance run takes two.
-   `db.maxPoolSize` ≥ the service's own peak + `relay.workers` + 5 (+ 1 while `drain()` runs). Leave `outbox.shards`
-   unset (256 for a new outbox). The heartbeat's own pool adds one server connection per instance: count it into
+   `db.maxPoolSize` ≥ the service's own peak + `relay.workers` + 5 (+ 1 while `drain()` runs). A new outbox gets 256 shards. The heartbeat's own pool adds one server connection per instance: count it into
    `max_connections`, the role's `CONNECTION LIMIT` and a pooler's per-user pool. A limit sized to exactly instances
    × `maxPoolSize`: raise it by 1 per instance before the upgrade, or set
    `outbox.heartbeat.dedicatedConnection = false`. Otherwise either the heartbeat pool cannot connect (the heartbeat
@@ -348,12 +346,9 @@ for ops:
    record until `delivery.timeout.ms`). One line per topic:
    `kafka-topics.sh --bootstrap-server "$KAFKA" --create --topic <topic> --partitions <N> --replication-factor 3 --config min.insync.replicas=2 --config unclean.leader.election.enable=false`
 7. **Relay** enabled on at least one instance: maintenance and the dead-letter pass run only there.
-8. **Alerts**: `outbox.shard.lag` growing, `outbox.dead.size > 0`, `outbox.maintenance.since_success > 5 ×
-   maintenanceInterval`, `outbox.partitions.premade < 2`, `overflow = 1`,
-   `xids_left` not NaN, `orphaned > 0`, `retained ≥ 2` over 3 runs, `outbox.waiting.oldest > 900`
-   (`relay.waiting.alertAfter`), `outbox.retry.oldest > N × relay.retry.maxDelay` (e.g. 30 min at the 5 min default),
+8. **Alerts**: `outbox.shard.lag` growing, `outbox.dead.size > 0`, `outbox.maintenance.since_success > 150`, `outbox.partitions.premade < 2`, `overflow = 1`,
+   `xids_left` not NaN, `orphaned > 0`, `retained ≥ 2` over 3 runs, `outbox.waiting.oldest > 900`, `outbox.retry.oldest > N × relay.retry.maxDelay` (e.g. 30 min at the 5 min default),
    `outbox.messages.contract_rejected` or `outbox.messages.route_rejected` growing, `outbox.messages.route_unchecked`
    growing (morning: the heartbeat fails, operating-outbox); with a dead-letter hook, `outbox.dead.pending.oldest`;
-   with an inbox, `outbox.inbox.window.remaining < (inbox.premake − inbox.partitionInterval) / 2` (41 400 s by
-   default).
+   with an inbox, `outbox.inbox.window.remaining < 41 400` (s).
    Dead letters: admin API, never SQL.

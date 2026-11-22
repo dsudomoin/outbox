@@ -10,8 +10,7 @@ description: Use when writing or fixing tests of a Kora 1.x or Spring Boot servi
 If the test does not assert delivery, its config contains `outbox.relay.enabled = false`. Otherwise each such test
 starts relay workers and Kafka producers against a broker that is not there. Keep
 `outbox.kafka.driverProperties."bootstrap.servers"` set (it is validated at startup; with the relay off nothing
-connects). Add `outbox.partitions { xidsPerPartition = 1000000, premake = 4 }`: startup then creates 6 partitions
-instead of 66.
+connects).
 
 With `outbox.schema.bootstrap = false` startup checks the base tables instead of creating them: run the service's
 own migrations against the container before the graph starts (do not switch bootstrap on in tests, it hides a broken
@@ -53,7 +52,6 @@ class OrderDeliveryTest implements KoraAppTestConfigModifier {
                 db { jdbcUrl = "%s", username = "%s", password = "%s", poolName = "test" }
                 outbox {
                   relay.enabled = false
-                  partitions { xidsPerPartition = 1000000, premake = 4 }
                   kafka.driverProperties { "bootstrap.servers" = "%s" }
                 }
                 """.formatted(PG.getJdbcUrl(), PG.getUsername(), PG.getPassword(), KAFKA.getBootstrapServers()));
@@ -78,8 +76,7 @@ Testcontainers 2.x packages: `org.testcontainers.postgresql`, `org.testcontainer
 The same rules: `outbox.relay.enabled=false`, deliver with `OutboxRelay.drain()`, check the retry table too.
 
 ```java
-@SpringBootTest(properties = {"outbox.relay.enabled=false", "outbox.partitions.xids-per-partition=1000000",
-        "outbox.partitions.premake=4"})
+@SpringBootTest(properties = {"outbox.relay.enabled=false"})
 class OrderDeliveryTest {
 
     static final PostgreSQLContainer PG = new PostgreSQLContainer("postgres:16-alpine"); // Testcontainers 2.x
@@ -128,11 +125,9 @@ class OrderDeliveryTest {
 - **Custom handler without Kafka**: a test `@KoraApp` whose `OutboxHandler` factory returns a handler that records
   what it got; `OutboxTopicHandler` components still get their own topics. The library's own test fixtures are not
   published; write the ten lines.
-- **Retry path**: failing keys, one or several, are each moved to `<table>_retry` after `headFailuresBeforeDivert`
-  (3) pauses, one key per probe, and `drain()` then returns with a smaller count: assert that count. `drain()` throws
+- **Retry path**: failing keys, one or several, are each moved to `<table>_retry` after 3 pauses, one key per probe, and `drain()` then returns with a smaller count: assert that count. `drain()` throws
   `IllegalStateException` only when no pending shard's position moves for 4 × `batchTimeout` + 10 s (the longest a relay step over several shards runs), for example
-  when `headFailuresBeforeDivert(1000)` keeps every failing key paused in place and the pause backoff grows past that
-  bound, or when the relay is halted. Lower `batchTimeout` only with a non-Kafka handler; with Kafka it must stay ≥
+  when the relay is halted. Lower `batchTimeout` only with a non-Kafka handler; with Kafka it must stay ≥
   `delivery.timeout.ms + 5 s + max.block.ms`.
 - **Unit tests**: `Outbox` and `Inbox` are interfaces; mock them.
   `new TypedOutbox<>(outbox, serializer, OrderCreated.class)` wraps a mock.

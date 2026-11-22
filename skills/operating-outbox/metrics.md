@@ -29,7 +29,7 @@ README «Наблюдаемость» → «Контракт по этапам»
 | `outbox.messages.waiting` | counter | `topic`, `kind` = `contract` / `no_route` / `handler` | Every «wait» answer (`Outcome.Waiting`), repeats of one head included. Not a failure, never in `failed`. `kind`: a newer contract version, a topic no route claims, the handler's own `waitFor`. |
 | `outbox.messages.contract_rejected` | counter | `topic`, `type`, `version` | Sends refused by the writer guard (`OutboxIncompatibleContractException`); `type` the class, `?` through `Outbox`. Instance ids are in the exception and the WARN, never in tags. |
 | `outbox.messages.route_rejected` | counter | `topic` | Sends to a topic a route of the writer claims, refused by the writer guard (`OutboxMissingRouteException`) because a live relay instance does not report the route. Instance ids are in the exception and the WARN, never in tags. |
-| `outbox.messages.route_unchecked` | counter | `topic` | Messages the writer guard let through unchecked on a stale read of the reports (the writer's heartbeat has not read them for over 3 × `maintenanceInterval`) that allowed them, route and version check alike, one per message. Counted before the insert, so a message may still not be written. With the heartbeat's own pool (Kora default) an exhausted app pool does not cause it: check the heartbeat source (operating-outbox SKILL.md). |
+| `outbox.messages.route_unchecked` | counter | `topic` | Messages the writer guard let through unchecked on a stale read of the reports (the writer's heartbeat has not read them for over 90 s) that allowed them, route and version check alike, one per message. Counted before the insert, so a message may still not be written. With the heartbeat's own pool (Kora default) an exhausted app pool does not cause it: check the heartbeat source (operating-outbox SKILL.md). |
 | `outbox.delivery.delay` | timer, percentile histogram | `topic` | Row insert to delivered outcome; buckets 1 ms to 6 h (about 110 bucket series per topic). |
 | `outbox.batch.duration` | timer, percentile histogram | | One relay step that found work in at least one of its locked shards; one step may cover several shards. Steps without work are not timed. |
 | `outbox.shard.paused` | counter | | Shard pauses: target down, failing head, no free handler thread. |
@@ -41,13 +41,13 @@ README «Наблюдаемость» → «Контракт по этапам»
 | `outbox.retry.size`, `outbox.parked.size`, `outbox.dead.size` | gauges | | Rows in `<table>_retry`, `<table>_parked` (requeued records waiting) and `<table>_dead` (every status). |
 | `outbox.retry.oldest` | gauge, seconds | | Since `created_at` of the oldest retry head that retries, not waits; 0 when none. Counts from the send, not the first failure. Shard lag does not see such heads. Alert above N × `relay.retry.maxDelay` (operating-outbox SKILL.md). |
 | `outbox.waiting.size` | gauge | | Retry heads waiting for an instance able to handle them; they and their keys' later records also count in `outbox.retry.size`. |
-| `outbox.waiting.oldest` | gauge, seconds | | Since the oldest of them first waited; 0 when none. Alert above `outbox.relay.waiting.alertAfter` (15 min). |
+| `outbox.waiting.oldest` | gauge, seconds | | Since the oldest of them first waited; 0 when none. Alert above 15 min. |
 | `outbox.dead.pending` | gauge | | Dead letters waiting for the hook's decision (`pending`); 0 without an active hook. |
 | `outbox.dead.pending.oldest` | gauge, seconds | | Since `failed_at` of the oldest `pending` letter; 0 when there is none. |
 | `outbox.dead.decisions` | counter | `decision` = `keep` / `discard` / `redrive` / `redrive_at` / `retry_later` | Committed hook decisions. Admin API calls are not counted. |
-| `outbox.dead.hook.failures` | counter | | Failed hook calls (exception, invalid answer, `deadLetters.timeout`): one per call, not per letter. |
+| `outbox.dead.hook.failures` | counter | | Failed hook calls (exception, invalid answer, the hook's 130 s bound): one per call, not per letter. |
 | `outbox.partitions.premade` | gauge | | xid ranges above the current xid. |
-| `outbox.partitions.overflow` | gauge | | 1 while the tail partition holds rows: writes go on into it; the next swap turns it into a range (over `maxTailScan`: inside `tailConversion.window`; a whole window without that fails maintenance runs, so `since_success` pages). |
+| `outbox.partitions.overflow` | gauge | | 1 while the tail partition holds rows: writes go on into it; the next swap turns it into a range (over 16 MiB: inside `tailConversion.window`; a whole window without that fails maintenance runs, so `since_success` pages). |
 | `outbox.partitions.xids_left` | gauge | | xids left before inserts fail while the tail is detached; NaN while attached. |
 | `outbox.partitions.retained` | gauge | | Attached ranges entirely below the one holding the current xid: passed, not dropped yet; 0 after a run normally. Counts ranges a shard behind keeps too. When ≥ 2 of them lie above the latest tick's xmin (kept with every shard past them) for 3 runs in a row, a WARN «outbox keeps N ranges of ...» (at most once a minute) names the cluster's oldest xid holders; another role's session is named without `pg_read_all_stats` too, with its state and transaction age hidden. |
 | `outbox.partitions.orphaned` | gauge | | Detached ranges kept because they hold rows. |
@@ -58,7 +58,7 @@ README «Наблюдаемость» → «Контракт по этапам»
 | `outbox.inbox.maintenance.transaction_pooling` | gauge | | Always 0, deprecated, like `outbox.maintenance.transaction_pooling`. |
 | `outbox.inbox.window.remaining` | gauge, seconds | | Until the top of this instance's dedup window (database clock); newer ids are accepted without dedup. Every inbox maintenance run refreshes the window. NaN before the inbox starts; with no range left it keeps falling from the last window's top, below 0. Read at scrape time. |
 
-Outbox gauges are refreshed by maintenance every `outbox.partitions.maintenanceInterval` on the instance that runs
+Outbox gauges are refreshed by maintenance every 30 s on the instance that runs
 it; another instance keeps its previous values (NaN before its first run). `since_success` is read by every instance.
 Gauges register once per name and read the latest runtime built around the same telemetry, so a hot config reload that
 rebuilds outbox components moves them along. A reload that rebuilds Kora's `Tracer` (a change under `tracing.*`)
@@ -71,7 +71,7 @@ the hook kept them, or the Kafka DLQ refused them): morning work. `outbox.dead.p
 putting letters off (Kafka DLQ: a missing DLQ topic, say): wake someone. Take X above `relay.retry.maxDelay` (5 min),
 the hook's backoff ceiling.
 
-Waiting records: `outbox.waiting.oldest` above `outbox.relay.waiting.alertAfter` (Prometheus
+Waiting records: `outbox.waiting.oldest` above 15 min (Prometheus
 `max(outbox_waiting_oldest) > 900`) means no running release reads them: wake someone (operating-outbox SKILL.md).
 With the two-release rule followed it stays 0; a canary that skipped the rule shows short waits.
 
@@ -90,13 +90,12 @@ connection source unreachable at start («... unreachable at start ...») or fai
 application's connections ...», once a minute), waiting records («outbox: N keys of ... wait for an instance that can
 handle them ...», once a minute), sends the writer guard refused («outbox ... refused a send», once a minute per check)
 or let through unchecked («... through unchecked ...»), and unmarked writes to a topic a live relay instance routes
-(«... wrote to topic ... unmarked ...»); ERROR for records waiting past `relay.waiting.alertAfter` (the same line), dead
-letters, handler errors, stranded shards, the shard-count mismatch after a reshard («... holds cursors for N shards, but
-this instance runs with outbox.shards = M ...»), a heartbeat connection source on another database, seen after startup
+(«... wrote to topic ... unmarked ...»); ERROR for records waiting past 15 min (the same line), dead
+letters, handler errors, stranded shards, a heartbeat connection source on another database, seen after startup
 («outbox heartbeat connection source reaches another database ...»), or one that cannot write while the app's connections
 can: a standby, a read-only role or missing rights («outbox heartbeat connection source of ... cannot write ...»; both at
-most hourly, the source is checked again after 5 × `maintenanceInterval`), the xid regression, a detached tail,
-a swap not run on 10 due runs or with ranges running out (hourly, names the cause), a hot tail over `maxTailScan`
+most hourly, the source is checked again after 150 s), the xid regression, a detached tail,
+a swap not run on 10 due runs or with ranges running out (hourly, names the cause), a hot tail over 16 MiB
 outside the window (hourly), a window that ended without converting it («... ended without a conversion», once) and orphans.
 WARN «outbox tick made without its shard set» (at most once a minute): a partition is held by
 an `ACCESS EXCLUSIVE` lock (`ALTER TABLE`, `VACUUM FULL`, `TRUNCATE`, a manual `LOCK`), so ticks step every shard and

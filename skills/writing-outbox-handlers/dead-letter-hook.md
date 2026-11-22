@@ -21,14 +21,14 @@ public interface OutboxDeadLetterHandler {
 ```
 
 `DeadLetter` carries the dead row: `id`, `messageId`, `topic`, `key`, `payload`, `headers`, `createdAt`, `attempts`,
-`failedAt`, `error`, `status`, `redrives`, `handlerAttempts`, `dueAt`. Up to `outbox.deadLetters.batchSize` (100)
+`failedAt`, `error`, `status`, `redrives`, `handlerAttempts`, `dueAt`. Up to 100
 letters per call.
 
 | Decision | Effect |
 |---|---|
 | `DeadLetterDecision.keep()` | Stays for humans (`kept`); the hook never gets it again. |
 | `discard()` | Deleted. |
-| `redrive()` | Right after the decision commits, back to the outbox as a new message after the later messages of its key: same message id, topic, key, payload and headers, `attempts` from zero, shard computed for the current `outbox.shards`. While a transaction that sends its key is open, it waits `scheduled` and tries again after `relay.retry.initialDelay`. |
+| `redrive()` | Right after the decision commits, back to the outbox as a new message after the later messages of its key: same message id, topic, key, payload and headers, `attempts` from zero, shard computed again. While a transaction that sends its key is open, it waits `scheduled` and tries again after `relay.retry.initialDelay`. |
 | `redriveAt(at)` | Waits `scheduled` and redrives at `at`, without another hook call; `at` is clamped to [now, now + 7 days]. By the JVM's clock: `Instant.now().plusSeconds(3)` means 3 s on the database's clock, however far off this instance's is. |
 | `retryLater(error)` | Not yet: stays `pending` and comes again after the backoff of a failed call, `handlerAttempts` one higher, `error` as its `last_handler_error`. The other letters' decisions commit. A call that answers `retryLater` for every letter ends the pass, as a failed call does. |
 
@@ -38,19 +38,18 @@ it by message id within their window.
 ## The rules
 
 - **A failed call fails all its letters.** A call that throws (an `Error` too), returns an invalid list (null, wrong
-  size, a null element) or runs past `outbox.deadLetters.timeout` (130 s; it is interrupted and abandoned) leaves every
+  size, a null element) or runs past 130 s (it is interrupted and abandoned) leaves every
   one of its letters `pending`, decided letters included. When one letter cannot be handled now (its target is down,
   say), return `retryLater(e)` for it and decide the rest: throw only when nothing can be decided.
 - **At least once.** A failed call is repeated after a backoff (`relay.retry.initialDelay` doubling to `maxDelay`)
   with `handlerAttempts` one higher; a crash between the call and the commit repeats it too, and a shutdown
   interrupts it and hands the letters to another instance or the next start. So an alert sent from the hook may go
   twice: make every side effect idempotent by `letter.messageId()`.
-- **Honour the interrupt.** Use interruptible calls or client timeouts shorter than `deadLetters.timeout`. The hook
+- **Honour the interrupt.** Use interruptible calls or client timeouts shorter than the hook's 130 s bound. The hook
   has one thread: a call that ignores the interrupt holds it past the timeout, and the instance decides no letter
   until that call returns (one ERROR «hook ignores interrupts»).
 - **Stop redrive loops with `redrives`.** `DeadLetter.redrives()` counts how often the message was redriven before
-  this death, by the hook and by admin calls, remembered in `<table>_redriven` for `outbox.deadLetters.redriveHistory`
-  (30 d). A hook that always redrives a record that always fails loops forever; bound it:
+  this death, by the hook and by admin calls, remembered in `<table>_redriven` for 30 days. A hook that always redrives a record that always fails loops forever; bound it:
 
   ```java
   @Override
@@ -103,8 +102,7 @@ module's hook publishes each letter through the relay's producers:
 - **Duplicates.** A broker refusal after the append closes the producer: batch-mates still in flight are sent again in
   the same call and may land twice. DLQ consumers deduplicate by `outbox-message-id`.
 - Create DLQ topics before deploy when the broker does not auto-create them; until then the letters of those topics
-  wait `pending`, while the others go to their DLQ topics. Keep `outbox.deadLetters.timeout` ≥ `delivery.timeout.ms + 5 s + max.block.ms` (130 s by default), else
-  a WARN at startup: a cut call repeats acknowledged letters too.
+  wait `pending`, while the others go to their DLQ topics.
 
 ## Alerts
 
